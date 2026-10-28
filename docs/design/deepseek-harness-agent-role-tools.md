@@ -1,6 +1,6 @@
 # DeepSeek Harness 角色工具适配设计
 
-- **状态：** `PROPOSED`（待独立审查与冻结；不代表已实现）
+- **状态：** `FROZEN`（设计已冻结；不代表运行时已实现，DSH 真实运行时验证仍待 #163 / #167 完成）
 - **日期：** 2026-10-28
 - **关联：** Epic [#160](https://github.com/ctrlshiftaltdel/AgentOrch/issues/160)、设计冻结 [#161](https://github.com/ctrlshiftaltdel/AgentOrch/issues/161)
 - **阶段计划：** [#162](https://github.com/ctrlshiftaltdel/AgentOrch/issues/162)
@@ -296,7 +296,7 @@ Node 单测、mock tool registry 或 YAML 结构检查不能证明真实 DSH 能
 
 ## 12. 文档影响
 
-- 本设计文档：新增，当前状态 PROPOSED。
+- 本设计文档：设计已冻结（`FROZEN`）；不代表 DSH runtime 已实现、已安装或兼容，真实 API、scope、identity、工作目录、安装及 E2E 验证仍由 #163 / #167 把关。
 - docs/implementation-plan.md：由 #162 更新；本设计 PR 不修改。
 - README.md / docs/README.md / release/README.md：待 #166 依据已实现行为与真实测试结果更新。
 - scripts/validate_kit.py、scripts/build_release.py、VERSION.md：本设计 PR 不修改。
