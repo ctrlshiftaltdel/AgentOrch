@@ -153,6 +153,7 @@ python scripts/run_delivery_scenarios.py --list
 - 角色选择 fixture（E 组）在沙箱内建临时项目根与一个初始化 scope，`agent-registry.md`、`observed-performance.md` 与 `selection-history.md` 都由**真实 S1 store** 写入；发现使用内存中的固定 adapter 或该 scope 的注册表，模型数据是内存里的 `SnapshotBatch`，`UNKNOWN` / `STALE` / `AUTH_FAILED` 由真实 S3 判定，不访问网络、不需要 API Key，也不读真实 `.local`。没有任何场景在运行时真正 spawn 子代理。
 - 需要 git 的只有 B12（隔离 worktree）；`git init` / `commit` / `worktree` 都在场景沙箱内执行，`GIT_CONFIG_NOSYSTEM=1`、`GIT_TERMINAL_PROMPT=0`，不读写真实仓库。
 - 同一个场景重复运行得到同样的判定与摘要（迁移摘要由内容决定，不写时间戳）。
+- 场景实现按组放在 `scripts/delivery_scenarios/`：`group_a.py` … `group_e.py` 各管一组，跨组共享的 fixture 与 helper 在 `common.py`；注册表、选择器、执行器与 CLI 仍在 `scripts/run_delivery_scenarios.py`。分组只是代码组织，不改变场景 ID、顺序、类别或报告结构。
 
 ## 6. 清理
 
@@ -192,7 +193,7 @@ python scripts/run_delivery_scenarios.py --list
 ## 9. 结果解读与维护规则
 
 - 负向组**必须是 `PASS`**：它通过意味着拦截发生了。看到一堆 `PASS` 不代表“没有失败”，先看 `totals.negative_passed` 是否等于 `totals.negative`。
-- 新增或修改核心契约、校验器、模板、锁/状态机、发行流程时：先在本文件补场景行，再在 `scripts/run_delivery_scenarios.py` 注册，最后跑 `python scripts/run_delivery_scenarios.py --json` 与 `python scripts/validate_kit.py`。
+- 新增或修改核心契约、校验器、模板、锁/状态机、发行流程时：先在本文件补场景行，再在对应组的 `scripts/delivery_scenarios/group_<x>.py` 实现，并在 `scripts/run_delivery_scenarios.py` 的注册表登记，最后跑 `python scripts/run_delivery_scenarios.py --json` 与 `python scripts/validate_kit.py`。
 - 场景表与运行器必须同步：`tests/test_run_delivery_scenarios.py` 会检查每个场景 ID 都出现在本文件的矩阵里。
 - 发现契约本身有问题时，另开 Issue 并先取得授权，**不要**通过放宽场景或删断言把它变成绿色。
 - 本文件与 [kit/orchestration.md](../../kit/orchestration.md) 的 I 段配套：验收程序说“什么时候必须跑”，本文件说“跑什么、期望什么”。
