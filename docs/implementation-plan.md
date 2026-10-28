@@ -449,7 +449,7 @@
 
 ### 15.1 实时基线与提案状态
 
-- **执行基线**：`main` @ `16753d96102754062e42c327e0ea244b4516d093`；核对时无开放 PR；活动登记块只有本任务 #197（其 `locked_paths` 为 `docs/implementation-plan.md`）。
+- **执行基线**：`main` @ `16753d96102754062e42c327e0ea244b4516d093`；本任务首次派发时无开放 PR——这是 **PR #200 创建前的派发快照**，PR #200 已于 2026-10-28 15:42 UTC 创建，因此当前并非无开放 PR；派发快照中的活动登记块只有本任务 #197（其 `locked_paths` 为 `docs/implementation-plan.md`）。
 - **三份专案提案已交付、设计仍未冻结**：PR [#182](https://github.com/ctrlshiftaltdel/AgentOrch/pull/182) → #183、PR [#190](https://github.com/ctrlshiftaltdel/AgentOrch/pull/190) → #199、PR [#196](https://github.com/ctrlshiftaltdel/AgentOrch/pull/196) → #198 均为 `MERGED`，对应 Issue 均 `VERIFIED`；但 [task-driven-agent-topology.md](design/task-driven-agent-topology.md)、[adaptive-verification-and-quality-gates.md](design/adaptive-verification-and-quality-gates.md)、[semver-proactive-release-policy.md](design/semver-proactive-release-policy.md) 的文稿状态仍是 `PROPOSED`。**提案交付 ≠ 契约冻结 ≠ 运行时已实现 ≠ 发行已授权。**
 - **DSH 设计已冻结、运行时未验证**：设计 #161 与状态修正 #172 已 `VERIFIED`，[deepseek-harness-agent-role-tools.md](design/deepseek-harness-agent-role-tools.md) 为 `FROZEN`；这只表示设计冻结，真实 DSH API、角色隔离与实机行为仍待 #163 / #167。
 - **身份与探测纠偏仍未冻结**：#170 为 `OPEN`（`bug`），可信底层模型身份来源、核验与失效规则未冻结；#174 为 `OPEN` / `status:blocked`，所有者已批准方案 1 方向，但设计未冻结、未派发、未实现。
@@ -619,15 +619,22 @@ Owner 最新排序决定（2026-10-28）覆盖早先“主动发行优先”的�
 
 ### 15.6 T0–T4 路由建议（符合现行权限）
 
+**现行默认规则、临时授权与未来方向必须分开**：
+
+1. **现行默认规则（当前生效）**：[kit/orchestration.md](../kit/orchestration.md) 第一部分“角色选择入口”与第二部分 §5 规定，C1–C4 任一项不是 `PASS`（包括 `UNKNOWN` / `STALE` / 已过期）时，**停止自动派发并转人工交接**。`UNKNOWN` / `FAIL` 一律不等于 `PASS`；没有真实证据就不能推进依赖该能力的状态。
+2. **#146 限定临时授权（仅限其记录范围）**：[#146 评论 6468103536](https://github.com/ctrlshiftaltdel/AgentOrch/issues/146#issuecomment-6468103536) 只对其中明确列出的**本轮相关任务**授予有限的派发 / 路由例外。它不是长期政策，不覆盖其他任务，也不构成能力 `PASS`、上下文隔离或 Reviewer 身份证明。
+3. **#174 未来方向（尚未生效）**：[#174 评论 6468107357](https://github.com/ctrlshiftaltdel/AgentOrch/issues/174#issuecomment-6468107357) 的“能力探测缺失 / `UNKNOWN` / `STALE` / 未证明客观缺失的 `FAIL` 以风险提示为主、而非默认阻断”仍是待设计冻结、实现与回归的目标方向，**当前不生效**，不得据草稿扩写成新政策。
+
 | 拓扑 | 适用 | 现行边界 |
 |---|---|---|
 | **T0 工具 / 主循环** | 只读或确定性工具完成状态、依赖与证据检查；简单查询 | Master 默认不实现产品文件；涉及实现文件仍需明确例外授权，不得以 T0 绕开探测或权限 |
 | **T1 单执行实例** | 需要文档 / 代码产物的单任务 | 交给真实 Execution 实例与专属 worktree；真实失败照实记录，不伪造派发 |
 | **T2 执行 + 独立 Reviewer** | 风险或任务策略明确要求独立判断 | 需要**可信独立身份证据**；#170 未解决前，额外 Reviewer 只能作为第二意见，不证明 T2 独立身份 |
 | **T3 并行隔离执行** | 多个可独立验收的子任务，依赖为 DAG | 仅在路径 / 资源锁不冲突时并行；并发数按机器余量，不写固定 Agent 数量 |
-| **T4 外部 / 人工交接** | 工具 / 实例客观不存在、本任务实际调用已失败，或任务特定权限 / 安全前置无法满足 | 输出可执行交接包；**单纯探测 `UNKNOWN` / `FAIL`（未证明工具客观不存在）不作为默认 T4 理由** |
+| **T4 外部 / 人工交接** | 工具 / 实例客观不存在、本任务实际调用已失败，或任务特定权限 / 安全前置无法满足 | 输出可执行交接包；**现行默认规则下，C1–C4 任一项不是 `PASS`（含 `UNKNOWN` / `STALE` / 已过期）仍停止自动派发并转人工交接**（见上方三段区分）；#146 临时授权只在限定范围适用；`UNKNOWN` / `FAIL` 不得写成 `PASS`，也不得凭 #174 未生效方向排除 T4 或扩写为新政策 |
 
 - 本轮 #197 实际采用工具核验与真实执行会话；这不能证明 C1–C4 全部能力、上下文隔离或 Reviewer 底层身份独立。
+- **实际调用失败、结果为空、句柄失效或无法核对**时，继续如实记为失败 / 未完成 / 交接，不得伪成功；**权限、安全、锁、Reviewer 身份与 G1–G6 保持各自独立边界**，不因能力探测状态而放宽或合并判定。
 - 任何“已启动 / 已完成 / 已独立审查”的说法都必须有真实句柄、产物、退出码与当前 head 证据；没有就如实标 `NOT_RUN` / `BLOCKED` / `UNKNOWN`。
 
 ### 15.7 本任务交付证据
