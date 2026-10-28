@@ -340,17 +340,17 @@ Master 因具有产品目标理解、整体计划、冲突裁决和最终交付�
 
 | 阶段 | 交付 | 前置依赖 |
 |---|---|---|
-| S0 设计冻结 | 本文、核心决策与边界经独立审查 | Epic #146 / Issue #147 |
-| P0 阶段计划登记 | 在 `docs/implementation-plan.md` 登记阶段、依赖、状态与出口条件 | S0 |
-| G1 文件地图 / 生命周期 | repository map、document lifecycle、权威目录和过期文件治理 | P0 |
-| G2 核心契约迁移 | `kit/orchestration.md` → `docs/orchestration.md`，打包 / 更新 / 旧版迁移兼容 | G1 |
-| G3 计划精简 | 精简实施计划，历史信息正确转链 / 归档，保留未完成风险 | G1 |
-| G4 文档一致性门禁 | 文件登记、引用、路径、影响记录、状态和发行清单检查 | G1–G3 |
-| I1 旧项目隔离接入 | `agentorch/` 布局、root AGENTS managed block、相对路径、ignore、升级 / 回滚 | S0、P0；可与 G2–G4 在不冲突路径下并行 |
-| E1 Token telemetry / ETR | 真实 Token 用量、贡献权重、覆盖率与阈值 | S0、P0 |
-| E2 三角色互评 / 可信度 | 评价事件、双评、冲突处理和评价者可靠性 | S0、P0 |
-| E3 多候选路由 | 复用 Phase D，使用 ETR / 可信度选择配置好的 Execution / Reviewer，Master 手动 | E1、E2 |
-| V0 集成回归 | 两条主线集成、旧项目迁移演练、负向场景、发行与用户文档完整验收 | G4、I1、E3 |
+| S0 设计冻结 | [Issue #147](https://github.com/ctrlshiftaltdel/AgentOrch/issues/147) / [Draft PR #148](https://github.com/ctrlshiftaltdel/AgentOrch/pull/148)；本文与关键决策经独立审查 | Epic #146 |
+| P0 阶段计划登记 | [Issue #149](https://github.com/ctrlshiftaltdel/AgentOrch/issues/149)；登记阶段、依赖、状态与出口条件 | S0 |
+| G1 文件地图 / 生命周期 | [Issue #150](https://github.com/ctrlshiftaltdel/AgentOrch/issues/150)；文件责任、权威来源与 outdated 退出机制 | P0 |
+| G2 核心契约迁移 | [Issue #151](https://github.com/ctrlshiftaltdel/AgentOrch/issues/151)；`kit/orchestration.md` → `docs/orchestration.md`，兼容发行 / 更新 | G1 |
+| G3 计划精简 | [Issue #152](https://github.com/ctrlshiftaltdel/AgentOrch/issues/152)；历史信息转链 / 归档，保留当前未完成风险 | G1、G2 |
+| I1 旧项目隔离接入 | [Issue #153](https://github.com/ctrlshiftaltdel/AgentOrch/issues/153)；`agentorch/` 布局、根 AGENTS managed block、相对路径、ignore、升级 / 回滚 | G1、G2 |
+| G4 文档一致性门禁 | [Issue #154](https://github.com/ctrlshiftaltdel/AgentOrch/issues/154)；检查文件登记、链接、文档影响、计划状态和发行清单 | G1–G3、I1 |
+| E1 Token telemetry / ETR | [Issue #155](https://github.com/ctrlshiftaltdel/AgentOrch/issues/155)；真实 Token 用量、贡献权重、覆盖率与阈值 | S0、P0 |
+| E2 三角色互评 / 可信度 | [Issue #156](https://github.com/ctrlshiftaltdel/AgentOrch/issues/156)；独立双评、冲突处理和评价者可靠性 | E1 |
+| E3 多候选路由 | [Issue #157](https://github.com/ctrlshiftaltdel/AgentOrch/issues/157)；复用 Phase D，基于 ETR / 可信度选择配置好的 Execution / Reviewer，Master 手动 | E1、E2 |
+| V0 集成回归 | [Issue #158](https://github.com/ctrlshiftaltdel/AgentOrch/issues/158)；旧项目迁移演练、负向场景、发行与文档验收 | G4、I1、E3 |
 
 若两个任务会修改同一路径、同一发行清单或同一更新引擎，应串行执行或显式协调，不能仅因为分属不同主线就并行。Issue 拆分后，每项都必须列明可改 / 禁改路径、验收标准和证据、`invariants`、`negative_cases`、`migration_cases`、`integration_paths`、`unverified_assumptions`、验证命令以及文档影响记录。
 
