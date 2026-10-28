@@ -163,7 +163,7 @@ git rev-parse 953c194:kit/orchestration.md          # c2d451e43efca6b1cd89f700f8
 git rev-parse 953c194:templates/metrics.md          # dee47b6b717270b2d112ffa3bf0d0038828f606c
 ```
 
-本节所有窗口内数字的终点都是 `2026-10-28T21:47:00Z`。本轮复跑与 registry 复核发生在 `22:20–22:49Z`，只用于验证命令和记录后续观察，不改变任何窗口内数字；上面的 `gh api` 复跑退出码均为 0。特别地，不加窗口的 Actions 总数会随新运行创建而变化（22:23Z 为 220，22:48Z 为 221），不能当作 21:47 的快照常量，也不能替代加窗口后的 219。
+本节所有窗口内数字的终点都是 `2026-10-28T21:47:00Z`。复跑与 registry 复核发生在 `22:20–22:56Z`，只用于验证命令和记录后续观察，不改变任何窗口内数字；上面的 `gh api` 复跑退出码均为 0。特别地，不加窗口的 Actions 总数会随新运行创建而变化（22:23Z 为 220，22:48Z 为 221），不能当作 21:47 的快照常量，也不能替代加窗口后的 219。
 
 口径提醒：`/actions/runs/{id}/jobs` 返回的是该运行**最新 attempt** 的作业列表；被沿用的作业会保留 attempt 1 的时间戳，被重跑的作业带 `run_attempt=2` 与新时间戳。因此 §7.4 的 job-minutes 是「每个运行最新 attempt 实际执行过的作业」之和，**不含**被替换掉的早期 attempt 执行量（那部分对 2 个运行已不可取，见 §7.4「重跑」）。`gh run list --limit 500 --json …` 等价可用，但本次采集中出现过一次网络 `EOF`（退出码 1，重试后 0），故复现以 `gh api` 为准。
 
@@ -223,9 +223,11 @@ git rev-parse 953c194:templates/metrics.md          # dee47b6b717270b2d112ffa3bf
 | 提交数 / PR | median 1；mean 1.875；max 7（n=**80**，含 PR #92 的 3 个提交；分布 43×1、18×2、11×3、5×4、1×5、1×6、1×7） | 修复轮次的**下界代理**，不是 M3 |
 | head 修订数 | 有 CI 的 77 个 PR：median 1、mean 1.84、max 7；把 3 个无 CI 的 PR 计 0 后（n=80）：median 1、mean 1.78 | 修订数 = 该分支的 `pull_request` 运行数（运行与 head 一一对应） |
 | 有 CI 证据的合并 PR | 77/80（96.25%） | 缺的 3 个是 PR #10 / #11 / #12，合并于 CI 引入（PR #16，`10-22T13:50Z`）之前 → 结构性缺失，不是漏采 |
-| 多平台证据分类（按合并 head 的证据，不是全历史） | 45 个有 4 作业证据：其中 **43 个全程 4 作业**；**PR #80 为 2/4 混合**（4 个运行：1 个 2 作业 + 3 个 4 作业）；**PR #159 为 0/4 混合**（3 个运行：1 个无作业 + 2 个 4 作业）。另有 32 个只有 2 作业证据、3 个无 CI | 45 + 32 + 3 = 80。分类规则：只要该 PR 的任一运行（含合并 head）出现 4 作业，即计入 45；因此 45 是「合并 head 有 4 作业证据」的 PR 数，**不等于**「全历史始终 4 作业」的 PR 数（后者为 43）。PR #159 的无作业运行为 `40621009594`，4 作业运行为 `40622934728`、`40623829181`。 |
+| 多平台证据分类（按**合并 head** 那次运行的作业记录归类，不是全历史） | 45 个 PR 的合并 head 运行有 **4 个作业**：其中 **43 个全程 4 作业**；**PR #80 为 2/4 混合**（4 个运行：1 个 2 作业 + 3 个 4 作业，合并 head 运行为 4 作业）；**PR #159 为 0/4 混合**（3 个运行：1 个无作业 + 2 个 4 作业，合并 head 运行为 4 作业）。另有 32 个 PR 的合并 head 运行只有 **2 个作业**、3 个 PR 的合并 head **无 CI 运行** | 45 + 32 + 3 = 80。分类规则：取 PR 合并时的 head SHA 对应的那次运行，按该运行的作业记录数归类——**4 个作业 → 45，2 个作业 → 32，无运行 → 3**。因此 45 是「合并 head 有 4 作业」的 PR 数，**不等于**「全历史始终 4 作业」的 PR 数（后者为 43）。复核结果：本窗口内没有任何「合并 head 为 2 作业」的 PR 在更早运行里出现过 4 作业，所以「任一运行出现 4 作业」的计数也恰好是 45——这只是复核得到的事实，不是分类规则。PR #159 的无作业运行为 `40621009594`，4 作业运行为 `40622934728`、`40623829181`。 |
 | 关闭的非 PR Issue | 84（其中 `status:verified` 60，无该标签 24） | 标签不带时间戳，`Issue closed` 只能当**闭环代理**：60 个 verified Issue 的 created→closed 为 median 1.05 h / mean 5.01 h / max 48.19 h，含规划时间，**不是 M1** |
 | 开放的非 PR Issue | 36 | 见 §7.7 |
+
+**多平台分类的复算方法**：把 80 个已合并 PR 的合并 head SHA 与 219 个运行的 `head_sha` 做等值匹配（本窗口 219 个运行对应 219 个唯一 head，运行与 head 一一对应），取匹配到的那次运行的最新 attempt 作业记录数：4 → 45、2 → 32、无匹配 → 3（无匹配的 3 个即 PR #10 / #11 / #12）。再用同一分支的全部 `pull_request` 运行复核「全程 / 混合」：45 组内 43 个的所有运行都是 4 作业，仅 #80（作业数 `4,4,4,2`，合并 head 4）与 #159（`4,4,0`，合并 head 4）为混合；32 组没有任何一个 PR 在更早运行里出现 4 作业。按此分组复算每任务 job-min：45 组 median 10.6 / mean 12.3 / range 4.4–40.0，32 组 median 0.9 / mean 1.2 / range 0.2–3.8（只合计各分支的 `pull_request` 运行）。
 
 **CI 普查**（窗口内全部运行，n=219）：
 
@@ -239,7 +241,7 @@ git rev-parse 953c194:templates/metrics.md          # dee47b6b717270b2d112ffa3bf
 | 每运行作业分钟（按作业数拆开） | 2 作业运行：mean 0.80（n=81，合计 64.9）；4 作业运行：mean 6.23 / median 6.03（n=137，合计 853.55） | 窗口内 CI 形态从 2 作业变为 4 作业，合并成一个统计量会失真（混合值 median 5.07 / mean 4.21） |
 | **每任务 CI 成本（同一分母）** | 全部 80 个任务：918.45 / 80 = **11.48 job-min/任务**；有 CI 的 77 个任务：918.45 / 77 = **11.93 job-min/任务** | 分子是同一份 918.45（PR 端 ≈590.93 + main push 端 ≈327.52）；两个分母分别对应「全部已合并任务」与「有 CI 证据的任务」，不能相加后再除 |
 | 分端（同一份 918.45） | PR 端 ≈590.93（÷80 = 7.39；÷77 = 7.67）；main push 端 ≈327.52（÷80 = 4.09；÷77 = 4.25） | 3 个无 CI 的 PR 既无 PR 端运行，也无对应的 main push 运行 |
-| 4 作业时代单任务成本（合并 head 有 4 作业证据的完整总体） | n=45（含 #80 / #159 的混合历史）：median **10.6** job-min、mean 12.3、range **4.4–40.0** | 只描述这 45 个任务，不外推到 2 作业时代；2 作业时代 n=32：median 0.9、mean 1.2、range 0.2–3.8 |
+| 4 作业时代单任务成本（合并 head 运行有 4 个作业的完整总体） | n=45（含 #80 的 2 作业运行 / #159 的无作业运行等混合历史）：median **10.6** job-min、mean 12.3、range **4.4–40.0** | 按合并 head 作业数归类的 45 个任务，不外推到 2 作业时代；2 作业时代 n=32：median 0.9、mean 1.2、range 0.2–3.8。两组的每任务成本都只合计该分支的 `pull_request` 运行（含混合历史里的其他运行） |
 | 首次 CI 通过率 | 71/77 = **92.21%**（分母只含「至少有 1 次 CI 运行」的合并 PR；3 个无 CI 的 PR 不并入分母，也不记作通过） | 代理值，**不是 M2**：模板要求 `CHECK_RECORDED` 事件，本底座未登记 |
 | ≥1 次失败运行的 PR | 6/77 = **7.79%** | 即 8 个中有 1 个不到 |
 | 合并 head 上 CI 全绿 | 77/77 = 100% | 每个有 CI 的 PR 合并前最后一次运行都在**合并 head** 上且为 success；失败全部发生在更早的 head |
@@ -356,7 +358,7 @@ PR 编号按运行的 `head_branch` 与 GitHub PR 记录核对。本环境 `GET 
 | head `6090f0ac`（PR #159）的 G4 | `UNKNOWN` | 对应运行 `40621009594` 结论 failure 但**无作业记录**，无法判定是产品失败还是基建失败 |
 | 2 个运行（`40622934728`、`40623829181`）的 attempt 1 作业与耗时 | `UNKNOWN` | `/attempts/1/jobs` 返回空列表，早期执行量与「重跑范围」不可复算；§7.4 的 job-minutes 只含最新 attempt |
 | 32 个只有 2 作业证据的合并 PR 的多平台结论 | `UNKNOWN` | macOS / Windows 作业在 `10-26T14:14Z` 前不存在，不能倒推为「当时通过」 |
-| 快照时点的 registry 字段值 | `UNKNOWN` | 该评论在快照之后被编辑；GitHub 不公开评论编辑历史，无法复原 21:47 的字段内容（可定位的只有创建时间、标签事件与 22:20:51Z / 22:43:51Z 的同期读取，见 §7.7 registry 时间线） |
+| 快照时点的 registry 登记块存在性与字段值 | `UNKNOWN` | 该评论在快照之后被编辑；GitHub 不公开评论编辑历史，无法复原 21:47 的正文——既不能确认当时是否含 `ORCH-TASK-REGISTRY`，也不能复原字段内容。评论创建时间与 21:39 的标签事件只证明评论存在与标签状态（可定位的同期读取见 §7.7 registry 时间线） |
 | 「放弃的分支 / 关闭未合并 PR」成本 | 不可观测 | 窗口内 0 个关闭未合并 PR，无法测量该类浪费 |
 | 计费成本（美元） | `UNKNOWN` | 私有计费数据不采集；本节只有 job-minutes |
 
@@ -367,8 +369,8 @@ PR 编号按运行的 `head_branch` 与 GitHub PR 记录核对。本环境 `GET 
 | 观察项 | 实际 | 来源 / 方法 |
 | --- | --- | --- |
 | 开放 PR（21:47 快照） | **0** | 快照时 `gh pr list --state open --json number` 返回空数组。快照后 `2026-10-28T21:49:50Z` PR #201 创建（[PR #201](https://github.com/ctrlshiftaltdel/AgentOrch/pull/201)）；22:43Z 复核时开放 PR 为 #201（Master 记录于 [review comment 6482627194](https://github.com/ctrlshiftaltdel/AgentOrch/pull/201#issuecomment-6482627194)）；本轮 22:48Z 复核 `gh pr list --state open` 也只返回 #201。**0 是快照值，1 是后续观察**，不能合并表述。 |
-| 活动任务登记块 | 快照时刻 **1**（仅 #185；登记块结构存在，字段值见下） | 见下方「登记块扫描」：对 36 个开放 Issue 逐一取全部评论并匹配 `ORCH-TASK-REGISTRY`，只有 #185 含真正的登记块；#170 只是文字提及 |
-| 快照后 registry 编辑（不是快照值） | 21:47 的字段值 `UNKNOWN`；后续可定位观察见下方时间线 | 评论 `created_at=2026-10-28T21:38:59Z`；GitHub 不公开评论编辑历史；22:20:51Z / 22:43:51Z 的同期读取由 Master 记录于 [review comment 6482627194](https://github.com/ctrlshiftaltdel/AgentOrch/pull/201#issuecomment-6482627194) |
+| 活动任务登记块（21:47 快照） | **`UNKNOWN`**：快照时刻 36 个开放 Issue 中登记块是否存在、有几个，均无法复原 | 评论 `6481323299` 创建于 `2026-10-28T21:38:59Z`，但正文在快照之后被编辑，GitHub 不公开编辑历史；21:39:19Z 的 `status:in-progress` 标签事件只证明标签状态，**不证明**该评论正文在 21:47 已含 `ORCH-TASK-REGISTRY`。**后续观察（不是快照值）**：22:23Z / 22:49Z / 22:56Z 三次 36/36 评论扫描时只有 #185 有真正的登记块，见下方「登记块扫描」 |
+| 快照后 registry 编辑（不是快照值） | 21:47 的登记块存在性与字段值均 `UNKNOWN`；后续可定位观察见下方时间线 | 评论 `created_at=2026-10-28T21:38:59Z`；GitHub 不公开评论编辑历史；22:20:51Z / 22:43:51Z 的同期读取由 Master 记录于 [review comment 6482627194](https://github.com/ctrlshiftaltdel/AgentOrch/pull/201#issuecomment-6482627194) |
 | 有 `status:` 标签的开放 Issue（扫描 / 复核时） | #185 `status:in-progress`；#162 / #174 `status:blocked`；其余 33 个无状态标签 | `gh issue list --state open --json number,labels`；无标签者按 `PLANNED` / 未 `READY` 记账（依据 `docs/implementation-plan.md` §15） |
 | 开放 Issue 总数 | 36（另有 84 个已关闭） | 同上 |
 | 本地残留 worktree | 8 个：`147` / `149` / `172` / `183` / `197` / `198` / `199` / `73` | `git worktree list`；对应 PR 均已合并，**不作为活动任务状态**，也不构成路径锁 |
@@ -377,28 +379,30 @@ PR 编号按运行的 `head_branch` 与 GitHub PR 记录核对。本环境 `GET 
 
 | 时点 (UTC) | 观察 | 来源 |
 | --- | --- | --- |
-| 2026-10-28T21:38:59Z | 评论 `6481323299` 创建，正文含 `ORCH-TASK-REGISTRY`；创建时的字段值未单独留存 | [comment 6481323299](https://github.com/ctrlshiftaltdel/AgentOrch/issues/185#issuecomment-6481323299) |
-| 2026-10-28T21:39:19Z | Issue 标签 `status:ready` → `status:in-progress` | [Issue #185 timeline](https://github.com/ctrlshiftaltdel/AgentOrch/issues/185) |
-| **2026-10-28T21:47:00Z** | **快照终点；registry 字段值 `UNKNOWN`**（评论此后被编辑，GitHub 不提供编辑历史） | 同上 |
-| 2026-10-28T22:20:51Z | Master 执行 `gh api repos/ctrlshiftaltdel/AgentOrch/issues/comments/6481323299`，响应正文含 `status: IN_PROGRESS` | [Master review comment 6482627194](https://github.com/ctrlshiftaltdel/AgentOrch/pull/201#issuecomment-6482627194) 的同期记录 |
-| 2026-10-28T22:23Z | Execution 对 36/36 开放 Issue 的评论扫描读取当时评论，报告 `IN_PROGRESS` | 本节「登记块扫描」 |
+| 2026-10-28T21:38:59Z | 评论 `6481323299` 创建于该时刻；**创建时的正文内容与是否含 `ORCH-TASK-REGISTRY` 未留存**，不能由当前正文反推 | [comment 6481323299](https://github.com/ctrlshiftaltdel/AgentOrch/issues/185#issuecomment-6481323299) |
+| 2026-10-28T21:39:19Z | Issue 标签 `status:ready` → `status:in-progress`（只证明标签状态，不证明评论正文） | [Issue #185 timeline](https://github.com/ctrlshiftaltdel/AgentOrch/issues/185) |
+| **2026-10-28T21:47:00Z** | **快照终点；登记块存在性与 registry 字段值均为 `UNKNOWN`**（评论此后被编辑，GitHub 不提供编辑历史） | 同上 |
+| 2026-10-28T22:20:51Z | Master 执行 `gh api repos/ctrlshiftaltdel/AgentOrch/issues/comments/6481323299`，响应正文含 `status: IN_PROGRESS`（后续观察） | [Master review comment 6482627194](https://github.com/ctrlshiftaltdel/AgentOrch/pull/201#issuecomment-6482627194) 的同期记录 |
+| 2026-10-28T22:23Z | Execution 对 36/36 开放 Issue 的评论扫描读取当时评论，报告 #185 有登记块且为 `IN_PROGRESS`（后续观察） | 本节「登记块扫描」 |
 | 2026-10-28T22:34:52Z | 评论被编辑为 `MASTER_REVIEW` | Master review comment 6482627194 的复核记录 |
 | 2026-10-28T22:34:59Z | Issue 标签 `status:in-progress` → `status:review` | [Issue #185 timeline](https://github.com/ctrlshiftaltdel/AgentOrch/issues/185) |
 | 2026-10-28T22:43:51Z | Master 复核 `gh api` 响应为 `MASTER_REVIEW` | Master review comment 6482627194 |
 | 2026-10-28T22:45:14Z | 交回执行时评论再次编辑为 `IN_PROGRESS` | 当前 `GET /issues/comments/6481323299` 的 `updated_at` |
 | 2026-10-28T22:45:20Z | Issue 标签 `status:review` → `status:in-progress` | [Issue #185 timeline](https://github.com/ctrlshiftaltdel/AgentOrch/issues/185) |
+| 2026-10-28T22:49Z | 同一 36/36 评论扫描复核，结果同上（仅 #185 有登记块）；后续观察，不改变 21:47 快照值 | 本节「登记块扫描」 |
+| 2026-10-28T22:56Z | 同一 36/36 评论扫描再次复核，结果同上（仅 #185 有登记块）；后续观察，不改变 21:47 快照值 | 本节「登记块扫描」 |
 
-**登记块扫描（方法 + 结果）**：对快照时刻的 36 个开放 Issue，逐个分页读取 `/issues/{n}/comments` 并在返回文本中匹配 `ORCH-TASK-REGISTRY`；命中后检查其后是否紧跟 `status:` 行（区分「登记块」与「正文提及」）。首次执行时间：`2026-10-28T22:23Z`（快照后 36 分钟）；本轮 `22:49Z` 复核同一扫描，仍为 36/36 个 Issue 全部返回、结果相同。
+**登记块扫描（方法 + 结果）**：对快照时刻的 36 个开放 Issue，逐个分页读取 `/issues/{n}/comments` 并在返回文本中匹配 `ORCH-TASK-REGISTRY`；命中后检查其后是否紧跟 `status:` 行（区分「登记块」与「正文提及」）。**扫描时点不是快照时点**：首次执行于 `2026-10-28T22:23Z`（快照后 36 分钟），`22:49Z` 与 `22:56Z` 各复核一次，三次均为 36/36 个 Issue 全部返回、结果相同。这些结果只证明 **22:23Z 及之后**的状态，不能证明 `21:47:00Z` 快照时 #185（或任何其他 Issue）已有登记块。
 
 | 结果 | Issue | 说明 |
 | --- | --- | --- |
-| 真正的登记块 | #185 | 当时为 `IN_PROGRESS`（编辑后状态）；**字段值在 21:47 时点不可复核**，见上表 |
+| 真正的登记块 | #185 | 扫描时（22:23Z 起）为 `IN_PROGRESS`（编辑后状态）；**21:47 时点是否存在登记块与字段值均不可复核**，见上表 |
 | 仅文字提及，无登记块 | #170 | 该 Issue 自己的核验评论明确写「Issue #170 当前没有 status 标签或 ORCH-TASK-REGISTRY，因此尚未 READY / DISPATCHED，无路径锁」——载体是 [comment 6463485914](https://github.com/ctrlshiftaltdel/AgentOrch/issues/170#issuecomment-6463485914)（创建后未编辑），不是 Issue 正文 |
 | 未命中 | 其余 34 个 | 评论列表已全部读取，无 `ORCH-TASK-REGISTRY` 字样 |
 
-**关于 `gh search issues` 的边界**：`gh search issues "ORCH-TASK-REGISTRY" --repo …` 本次返回 82 条（2 条开放：#170、#185；80 条已关闭）。它确实索引评论（#185 的登记块只存在于评论里却被命中），但它同时覆盖已关闭 Issue、不解析块状态、也不能证明某个开放 Issue「没有」登记块——因此只当线索。上面的结论来自 36/36 的评论扫描，而不是搜索命中率。
+**关于 `gh search issues` 的边界**：`gh search issues "ORCH-TASK-REGISTRY" --repo …` 本次返回 82 条（2 条开放：#170、#185；80 条已关闭）。它确实索引评论（#185 的登记块只存在于评论里却被命中），但它同时覆盖已关闭 Issue、不解析块状态、也不能证明某个开放 Issue「没有」登记块——因此只当线索。上面关于扫描时点（22:23Z 及之后）的结论来自 36/36 的评论扫描，而不是搜索命中率；它们不构成 21:47 快照的证据。
 
-**历史可复核性**：快照时点的登记块**内容**（`status` / `head_sha` / `pr` 等字段）`UNKNOWN`——评论在快照之后被编辑，GitHub 不提供评论编辑历史。可定位的事实是评论创建时间、Issue 标签事件，以及 Master 在 `22:20:51Z` / `22:43:51Z` 两次同期读取的记录；这些只能证明相应时点的当前版本，不能证明 21:47 的字段值。任何「21:47 时 registry 写着 X」的说法都不可由当前正文反推。
+**历史可复核性**：快照时点的登记块**存在性与内容**（是否存在 `ORCH-TASK-REGISTRY`，以及 `status` / `head_sha` / `pr` / `locked_paths` 等字段）均为 `UNKNOWN`——评论在快照之后被编辑，GitHub 不提供评论编辑历史。可定位的事实是评论创建时间、Issue 标签事件，以及 Master 在 `22:20:51Z` / `22:43:51Z` 两次同期读取的记录；这些只能证明相应时点的存在性与当前版本，不能证明 21:47 的正文。任何「21:47 时 registry 写着 X」或「21:47 已有 1 个登记块」的说法都不可由当前正文或流程惯例反推。
 
 **路径重叠（潜在冲突，非当前锁冲突）**：3 个尚未派发的开放 Issue 把 `docs/metrics.md` 写进允许路径——
 
@@ -408,7 +412,7 @@ PR 编号按运行的 `head_branch` 与 GitHub PR 记录核对。本环境 `GET 
 | [#156](https://github.com/ctrlshiftaltdel/AgentOrch/issues/156) 三角色互评 | 「`docs/metrics.md`（如确需列出指标口径）」 | 同上 | 同上 |
 | [#158](https://github.com/ctrlshiftaltdel/AgentOrch/issues/158) 端到端回归与文档同步 | 「`README.md`、`docs/README.md`、`docs/upgrade.md`、`docs/metrics.md`、`release/README.md`」 | 同上 | 同上 |
 
-结论：截至快照时刻**没有活动锁冲突**（这 3 个 Issue 未被派发、无登记块、无开放 PR、无分支）。**按当前（22:45Z 之后的）登记块**，#185 的 `locked_paths` 为 `docs/metrics.md`，因此在其持有期间这三条不能派发；21:47 快照时的 `locked_paths` 字段本身不可复核（见上），不能从当前登记块反推。#185 合并后 Master 需重新检查这三条的重叠与顺序。
+结论：快照时刻**可观测的部分**没有冲突——快照时 0 个开放 PR（本表首行）；复核时这 3 个 Issue 没有分支，22:23Z 起的三次评论扫描中它们也都没有登记块。但 **21:47 时点的登记块存在性本身是 `UNKNOWN`**，因此「快照时刻没有活动锁冲突」只能在上述可观测证据范围内成立，不能写成已证明的全量结论。**按当前（22:45Z 之后的）登记块**，#185 的 `locked_paths` 为 `docs/metrics.md`，因此在其持有期间这三条不能派发；21:47 快照时的 `locked_paths` 字段本身不可复核（见上），不能从当前登记块反推。#185 合并后 Master 需重新检查这三条的重叠与顺序。
 
 **依赖与「观察 vs 硬依赖」分类**：
 
