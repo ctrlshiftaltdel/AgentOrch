@@ -129,8 +129,10 @@ gh api --paginate "repos/ctrlshiftaltdel/AgentOrch/pulls?state=closed&per_page=1
         and .merged_at <  "2026-10-28T21:47:00Z")
         | [.number,.merged_at,.head.sha,.additions,.deletions,.changed_files] | @tsv' | wc -l
 
-# 窗口内 Actions 运行（本快照：219；不加窗口时是 220，多出的是窗口终点之后
-# 由 PR #201 触发的 run 40775160225，因此必须用 created_at 加同一上界）
+# 窗口内 Actions 运行（本快照：219）。不加窗口的同一查询是动态总数，不是快照值：
+# 22:23Z 复核为 220（219 + PR #201 的首个 run 40775160225，创建于 21:49:54Z）；
+# 22:26:10Z 新 head 的 run 40779945818 创建后为 221（22:48Z 复核仍为 221）。
+# 因此本节只使用 created_at 加上界后的 219。
 gh api --paginate "repos/ctrlshiftaltdel/AgentOrch/actions/runs?per_page=100" \
   --jq '.workflow_runs[] | select(.created_at >= "2026-10-22T00:00:00Z"
         and .created_at <  "2026-10-28T21:47:00Z")
@@ -146,7 +148,9 @@ gh api "repos/ctrlshiftaltdel/AgentOrch/actions/runs/<run_id>/jobs?per_page=100"
 gh api repos/ctrlshiftaltdel/AgentOrch/rulesets/25644959 \
   --jq '.rules[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context'
 
-# 窗口内 80 个 PR 的正式 review 汇总（本快照：3 条，全部在 PR #159）
+# 窗口内 80 个 PR 的正式 review 汇总（本快照：3 条，全部在 PR #159）。
+# 查询有显式上限：pullRequests(first:100) 本次返回窗口内 80 条（完整）；
+# 每个 PR 的 reviews(first:30) 本次最多 3 条。窗口超过 100 个 PR 时需分页。
 gh api graphql -f query='query{repository(owner:"ctrlshiftaltdel",name:"AgentOrch"){pullRequests(first:100,states:[MERGED],orderBy:{field:CREATED_AT,direction:DESC}){nodes{number mergedAt reviews(first:30){totalCount nodes{state submittedAt}}}}}}' \
   --jq '[.data.repository.pullRequests.nodes[] | select(.mergedAt != null
         and .mergedAt >= "2026-10-22T00:00:00Z"
@@ -158,6 +162,8 @@ git rev-parse 953c194:.github/workflows/ci.yml      # d042171c106c5ff270880a9ead
 git rev-parse 953c194:kit/orchestration.md          # c2d451e43efca6b1cd89f700f83c3943dc30ed07
 git rev-parse 953c194:templates/metrics.md          # dee47b6b717270b2d112ffa3bf0d0038828f606c
 ```
+
+本节所有窗口内数字的终点都是 `2026-10-28T21:47:00Z`。本轮复跑与 registry 复核发生在 `22:20–22:49Z`，只用于验证命令和记录后续观察，不改变任何窗口内数字；上面的 `gh api` 复跑退出码均为 0。特别地，不加窗口的 Actions 总数会随新运行创建而变化（22:23Z 为 220，22:48Z 为 221），不能当作 21:47 的快照常量，也不能替代加窗口后的 219。
 
 口径提醒：`/actions/runs/{id}/jobs` 返回的是该运行**最新 attempt** 的作业列表；被沿用的作业会保留 attempt 1 的时间戳，被重跑的作业带 `run_attempt=2` 与新时间戳。因此 §7.4 的 job-minutes 是「每个运行最新 attempt 实际执行过的作业」之和，**不含**被替换掉的早期 attempt 执行量（那部分对 2 个运行已不可取，见 §7.4「重跑」）。`gh run list --limit 500 --json …` 等价可用，但本次采集中出现过一次网络 `EOF`（退出码 1，重试后 0），故复现以 `gh api` 为准。
 
@@ -171,8 +177,10 @@ git rev-parse 953c194:templates/metrics.md          # dee47b6b717270b2d112ffa3bf
 | 平台强制 required status check | `checks (Python 3.13)` | 同上 | 同上 | 同上 |
 | CI 作业（工作流定义） | `checks (Python 3.12)`、`checks (Python 3.13)`、`checks-macos (Python 3.13)`、`checks-windows (Python 3.13)`：前两个在 `ubuntu-latest`，第三个在 `macos-latest`，第四个在 `windows-latest`，每个作业跑同一组 7 个步骤 | `.github/workflows/ci.yml`（blob `d042171c…` @ `953c194`） | `pull_request`→`main`、`push`→`main`、`workflow_dispatch` | 仅 `github` 底座；平台层只强制前两个，macOS / Windows 的绿由契约 G4 与审查要求覆盖，**不由分支保护强制** |
 | 每个作业内的 7 个步骤 | ① `scripts/validate_kit.py` ② `scripts/architecture/check.py --project . --json`（诊断模式） ③ `unittest discover -s tests` ④ `scripts/run_delivery_scenarios.py --json` ⑤ `scripts/report_metrics.py --gold-sample --since 2026-01-01 --until 2026-02-01 --json` ⑥ 语法检查：`py_compile` 覆盖 **9 个显式文件**（`scripts/orchestrator.py`、`validate_kit.py`、`check_drift.py`、`architecture/check.py`、`contract.py`、`report.py`、`rules.py`、`adapters/python_ast.py`、`adapters/rust.py`）**加两个目录 glob**（`scripts/update_agentorch/*.py`、`scripts/self_improvement/*.py`，在 Python 内展开） ⑦ `scripts/build_release.py` 自检 | 同上 | 同上 | 随所属作业；无 `continue-on-error`、无 `\|\| true` |
-| 项目验证命令（**两个底座都适用**） | 交付时：`uv run python scripts/validate_kit.py`、`uv run python -m unittest discover -s tests`、`python3 -m py_compile scripts/orchestrator.py scripts/validate_kit.py`；**合并到主分支后必须执行**：快速测试 + 完整回归 + `python scripts/orchestrator.py backup` + 静态检查 | [docs/PROJECT.md](PROJECT.md)「验证命令」及其中的「合并后必须执行」一条；`kit/orchestration.md`「门禁之后」第 4 条（「合并后运行 `docs/PROJECT.md` 指定的验证命令，保存日志与退出码；全部通过后转 `VERIFIED`」，edition-neutral） | 任务交付时；`MERGED` → `VERIFIED` 之前 | 两个底座都适用；`github` 底座另有「当前 head 的 CI」门（上一行 + G4），二者不能互相替代 |
+| 项目验证命令（**两个底座都适用**） | 配置原文：`python scripts/validate_kit.py`、`python -m unittest discover -s tests`、`python -m py_compile scripts/orchestrator.py scripts/validate_kit.py`；本环境实跑：`uv run python scripts/validate_kit.py`、`uv run python -m unittest discover -s tests`、`python3 -m py_compile scripts/orchestrator.py scripts/validate_kit.py`（解释器前缀差异，见下方口径）；**合并到主分支后必须执行**：快速测试 + 完整回归 + `python scripts/orchestrator.py backup` + 静态检查 | [docs/PROJECT.md](PROJECT.md)「验证命令」及其中的「合并后必须执行」一条；`kit/orchestration.md`「门禁之后」第 4 条（「合并后运行 `docs/PROJECT.md` 指定的验证命令，保存日志与退出码；全部通过后转 `VERIFIED`」，edition-neutral） | 任务交付时；`MERGED` → `VERIFIED` 之前 | 两个底座都适用；`github` 底座另有「当前 head 的 CI」门（上一行 + G4），二者不能互相替代 |
 | 设计目标层验收清单 | `validate_kit`、`unittest`、`py_compile`、`build_release` 自检、证据条目、两个底座当前 head 全绿、计划分层可判定 | [docs/PLAN.md](PLAN.md) §6「可度量的全局验收」 | 阶段 / 设计目标验收 | 设计目标权威，不是平台门 |
+
+**项目验证命令的复现口径**：`docs/PROJECT.md`「验证命令」的原文使用 `python`，并注明「Python 路径按机器调整；文档中以 `python` 指代」。本环境实跑前两条用 `uv run python …`、第三条用 `python3 -m py_compile …`；这是同一组命令的解释器前缀差异，**不是逐项逐字相同**。交付报告与证据矩阵记录的是本环境实跑的命令、输出与退出码。
 
 测量时观察到的两处**文档与配置不一致**（只登记，不在本任务修改）：
 
@@ -215,7 +223,7 @@ git rev-parse 953c194:templates/metrics.md          # dee47b6b717270b2d112ffa3bf
 | 提交数 / PR | median 1；mean 1.875；max 7（n=**80**，含 PR #92 的 3 个提交；分布 43×1、18×2、11×3、5×4、1×5、1×6、1×7） | 修复轮次的**下界代理**，不是 M3 |
 | head 修订数 | 有 CI 的 77 个 PR：median 1、mean 1.84、max 7；把 3 个无 CI 的 PR 计 0 后（n=80）：median 1、mean 1.78 | 修订数 = 该分支的 `pull_request` 运行数（运行与 head 一一对应） |
 | 有 CI 证据的合并 PR | 77/80（96.25%） | 缺的 3 个是 PR #10 / #11 / #12，合并于 CI 引入（PR #16，`10-22T13:50Z`）之前 → 结构性缺失，不是漏采 |
-| 多平台证据分类（按合并 head 运行的作业数） | 45 个有 4 作业证据（其中 44 个全程 4 作业、1 个 PR #80 的运行历史同时含 2 作业与 4 作业）；32 个只有 2 作业证据；3 个无 CI | 45 + 32 + 3 = 80；「混合历史」指该 PR 早期运行只有 2 个作业、合并 head 已是 4 个作业，不另算一类 |
+| 多平台证据分类（按合并 head 的证据，不是全历史） | 45 个有 4 作业证据：其中 **43 个全程 4 作业**；**PR #80 为 2/4 混合**（4 个运行：1 个 2 作业 + 3 个 4 作业）；**PR #159 为 0/4 混合**（3 个运行：1 个无作业 + 2 个 4 作业）。另有 32 个只有 2 作业证据、3 个无 CI | 45 + 32 + 3 = 80。分类规则：只要该 PR 的任一运行（含合并 head）出现 4 作业，即计入 45；因此 45 是「合并 head 有 4 作业证据」的 PR 数，**不等于**「全历史始终 4 作业」的 PR 数（后者为 43）。PR #159 的无作业运行为 `40621009594`，4 作业运行为 `40622934728`、`40623829181`。 |
 | 关闭的非 PR Issue | 84（其中 `status:verified` 60，无该标签 24） | 标签不带时间戳，`Issue closed` 只能当**闭环代理**：60 个 verified Issue 的 created→closed 为 median 1.05 h / mean 5.01 h / max 48.19 h，含规划时间，**不是 M1** |
 | 开放的非 PR Issue | 36 | 见 §7.7 |
 
@@ -226,12 +234,12 @@ git rev-parse 953c194:templates/metrics.md          # dee47b6b717270b2d112ffa3bf
 | 运行数 | 219（`pull_request` 142 / `push`(main) 77） | 窗口内没有 `workflow_dispatch` 触发的运行 |
 | 运行结论 | success 205 / failure 14；运行级 `cancelled` 0 | 失败明细见 §7.5 表 S2 |
 | 作业记录 | 710（success 688 / failure 20 / cancelled 2）；218 个运行至少有 1 条作业记录，1 个运行**一条都没有** | 作业数不等于运行数 × 4：平台矩阵随窗口变化 |
-| 作业分钟（job-minutes，按最新 attempt 的 `started_at`→`completed_at` 求和） | 合计 **918.45**；PR 端 590.9；main push 端 327.5 | 只统计真的启动过的作业；不是计费分钟；不含被替换的早期 attempt（见下「重跑」） |
+| 作业分钟（job-minutes，按最新 attempt 的 `started_at`→`completed_at` 求和） | 合计 **918.45**；PR 端 **≈590.93**；main push 端 **≈327.52** | 只统计真的启动过的作业；不是计费分钟；不含被替换的早期 attempt（见下「重跑」）。分项为四舍五入到 0.01 min 的显示值，原始分端和为 918.45；若按 1 位小数写成 590.9 + 327.5 会显示成 918.4，故此处保留 2 位并标 ≈。 |
 | 运行墙钟 | median 2.87 min；mean 3.26 min；max 87.10 min | max 即那个无作业记录的运行 |
 | 每运行作业分钟（按作业数拆开） | 2 作业运行：mean 0.80（n=81，合计 64.9）；4 作业运行：mean 6.23 / median 6.03（n=137，合计 853.55） | 窗口内 CI 形态从 2 作业变为 4 作业，合并成一个统计量会失真（混合值 median 5.07 / mean 4.21） |
-| **每任务 CI 成本（同一分母）** | 全部 80 个任务：918.45 / 80 = **11.48 job-min/任务**；有 CI 的 77 个任务：918.45 / 77 = **11.93 job-min/任务** | 分子是同一份 918.45（PR 端 590.9 + main push 端 327.5）；两个分母分别对应「全部已合并任务」与「有 CI 证据的任务」，不能相加后再除 |
-| 分端（同一份 918.45） | PR 端 590.9（÷80 = 7.39；÷77 = 7.67）；main push 端 327.5（÷80 = 4.09；÷77 = 4.25） | 3 个无 CI 的 PR 既无 PR 端运行，也无对应的 main push 运行 |
-| 4 作业时代单任务成本（完整符合总体） | n=45（合并 head 有 4 作业证据的 PR）：median **10.6** job-min、mean 12.3、range **4.4–40.0** | 只描述这 45 个任务，不外推到 2 作业时代；2 作业时代 n=32：median 0.9、mean 1.2、range 0.2–3.8 |
+| **每任务 CI 成本（同一分母）** | 全部 80 个任务：918.45 / 80 = **11.48 job-min/任务**；有 CI 的 77 个任务：918.45 / 77 = **11.93 job-min/任务** | 分子是同一份 918.45（PR 端 ≈590.93 + main push 端 ≈327.52）；两个分母分别对应「全部已合并任务」与「有 CI 证据的任务」，不能相加后再除 |
+| 分端（同一份 918.45） | PR 端 ≈590.93（÷80 = 7.39；÷77 = 7.67）；main push 端 ≈327.52（÷80 = 4.09；÷77 = 4.25） | 3 个无 CI 的 PR 既无 PR 端运行，也无对应的 main push 运行 |
+| 4 作业时代单任务成本（合并 head 有 4 作业证据的完整总体） | n=45（含 #80 / #159 的混合历史）：median **10.6** job-min、mean 12.3、range **4.4–40.0** | 只描述这 45 个任务，不外推到 2 作业时代；2 作业时代 n=32：median 0.9、mean 1.2、range 0.2–3.8 |
 | 首次 CI 通过率 | 71/77 = **92.21%**（分母只含「至少有 1 次 CI 运行」的合并 PR；3 个无 CI 的 PR 不并入分母，也不记作通过） | 代理值，**不是 M2**：模板要求 `CHECK_RECORDED` 事件，本底座未登记 |
 | ≥1 次失败运行的 PR | 6/77 = **7.79%** | 即 8 个中有 1 个不到 |
 | 合并 head 上 CI 全绿 | 77/77 = 100% | 每个有 CI 的 PR 合并前最后一次运行都在**合并 head** 上且为 success；失败全部发生在更早的 head |
@@ -240,12 +248,14 @@ git rev-parse 953c194:templates/metrics.md          # dee47b6b717270b2d112ffa3bf
 
 判定规则：以 `/actions/runs/{id}/jobs` 返回的最新 attempt 为准；同一 job 若被沿用，其 `started_at` 与 attempt 1 相同；被判为「**再次执行**」需要它在 attempt 2 里有新的 `started_at`（或 attempt 1 记录不可取但 attempt 2 有独立执行时间）。用 `/actions/runs/{id}/attempts/{1,2}/jobs` 逐 attempt 对照。
 
-| 运行 | PR | attempt 1 → 2 | 再次执行的作业 | 沿用 | 备注 |
-| --- | --- | --- | --- | --- | --- |
-| [39807779663](https://github.com/ctrlshiftaltdel/AgentOrch/actions/runs/39807779663) | #7 | 2 个 ubuntu job 全 success → attempt 2 重跑 1 个 | `checks (Python 3.12)` | `checks (Python 3.13)` | **attempt 1 已经全绿仍被重跑**，直接推翻「从不重跑已绿 head」 |
-| [40576858380](https://github.com/ctrlshiftaltdel/AgentOrch/actions/runs/40576858380) | #123 | attempt 1 `checks (Python 3.13)` 失败 → attempt 2 只重跑该 job | `checks (Python 3.13)` | 其余 3 个 | 失败作业重跑到成功 |
-| [40622934728](https://github.com/ctrlshiftaltdel/AgentOrch/actions/runs/40622934728) | #169 | attempt 1 作业记录不可取（`/attempts/1/jobs` 为空） | attempt 2 的 4 个 job 全部在 02:51:30 起跑 | 无法判定 | 重跑范围 `UNKNOWN`；attempt 2 的 Windows 仍失败 |
-| [40623829181](https://github.com/ctrlshiftaltdel/AgentOrch/actions/runs/40623829181) | #169 | 同上 | attempt 2 的 4 个 job 全部在 03:18:30 起跑 | 无法判定 | 重跑范围 `UNKNOWN` |
+PR 编号按运行的 `head_branch` 与 GitHub PR 记录核对。本环境 `GET /actions/runs/{id}/pull_requests` 返回 404，故改用 `gh api repos/ctrlshiftaltdel/AgentOrch/commits/<head_sha>/pulls` 与 `gh pr list --state all --head <branch>` 复核；映射为：`39807779663` → PR #22（Issue #7）；`40576858380` → PR #136（Issue #123）；`40622934728` / `40623829181` → PR #159（Issue #169）。
+
+| 运行 | PR | Issue | attempt 1 → 2 | 再次执行的作业 | 沿用 | 备注 |
+| --- | --- | --- | --- | --- | --- | --- |
+| [39807779663](https://github.com/ctrlshiftaltdel/AgentOrch/actions/runs/39807779663) | [PR #22](https://github.com/ctrlshiftaltdel/AgentOrch/pull/22) | [#7](https://github.com/ctrlshiftaltdel/AgentOrch/issues/7) | 2 个 ubuntu job 全 success → attempt 2 重跑 1 个 | `checks (Python 3.12)` | `checks (Python 3.13)` | **attempt 1 已经全绿仍被重跑**，直接推翻「从不重跑已绿 head」 |
+| [40576858380](https://github.com/ctrlshiftaltdel/AgentOrch/actions/runs/40576858380) | [PR #136](https://github.com/ctrlshiftaltdel/AgentOrch/pull/136) | [#123](https://github.com/ctrlshiftaltdel/AgentOrch/issues/123) | attempt 1 `checks (Python 3.13)` 失败 → attempt 2 只重跑该 job | `checks (Python 3.13)` | 其余 3 个 | 失败作业重跑到成功 |
+| [40622934728](https://github.com/ctrlshiftaltdel/AgentOrch/actions/runs/40622934728) | [PR #159](https://github.com/ctrlshiftaltdel/AgentOrch/pull/159) | [#169](https://github.com/ctrlshiftaltdel/AgentOrch/issues/169) | attempt 1 作业记录不可取（`/attempts/1/jobs` 为空） | attempt 2 的 4 个 job 全部在 02:51:30 起跑 | 无法判定 | 重跑范围 `UNKNOWN`；attempt 2 的 Windows 仍失败 |
+| [40623829181](https://github.com/ctrlshiftaltdel/AgentOrch/actions/runs/40623829181) | [PR #159](https://github.com/ctrlshiftaltdel/AgentOrch/pull/159) | [#169](https://github.com/ctrlshiftaltdel/AgentOrch/issues/169) | 同上 | attempt 2 的 4 个 job 全部在 03:18:30 起跑 | 无法判定 | 重跑范围 `UNKNOWN` |
 
 汇总：4 个运行有 `run_attempt=2`（占 219 的 1.83%）；默认 `/jobs` 列表里带 `run_attempt=2` 的行共 **14** 条，其中 **4 条是沿用**（时间戳与 attempt 1 相同），**10 条是实际再次执行**，再次执行的作业分钟合计 **12.10 min（占 918.45 的 1.3%）**。可完整对比 attempt 1/2 的只有 2 个运行；另 2 个运行的 attempt 1 记录不可取。因此「重复执行」的可测下界是 1 个已全绿 attempt 上的重跑 + 1 个失败作业重跑，**上界 `UNKNOWN`**；`219 运行 / 219 唯一 head` 只能说明没有「同一 head 的第二个运行记录」，不能推出没有重跑。
 
@@ -346,7 +356,7 @@ git rev-parse 953c194:templates/metrics.md          # dee47b6b717270b2d112ffa3bf
 | head `6090f0ac`（PR #159）的 G4 | `UNKNOWN` | 对应运行 `40621009594` 结论 failure 但**无作业记录**，无法判定是产品失败还是基建失败 |
 | 2 个运行（`40622934728`、`40623829181`）的 attempt 1 作业与耗时 | `UNKNOWN` | `/attempts/1/jobs` 返回空列表，早期执行量与「重跑范围」不可复算；§7.4 的 job-minutes 只含最新 attempt |
 | 32 个只有 2 作业证据的合并 PR 的多平台结论 | `UNKNOWN` | macOS / Windows 作业在 `10-26T14:14Z` 前不存在，不能倒推为「当时通过」 |
-| 快照时点的 registry 字段值 | `UNKNOWN` | 该评论在快照之后被编辑；GitHub 不公开评论编辑历史，无法复原 21:47 的字段内容（可定位的只有创建时间与标签事件，见 §7.7） |
+| 快照时点的 registry 字段值 | `UNKNOWN` | 该评论在快照之后被编辑；GitHub 不公开评论编辑历史，无法复原 21:47 的字段内容（可定位的只有创建时间、标签事件与 22:20:51Z / 22:43:51Z 的同期读取，见 §7.7 registry 时间线） |
 | 「放弃的分支 / 关闭未合并 PR」成本 | 不可观测 | 窗口内 0 个关闭未合并 PR，无法测量该类浪费 |
 | 计费成本（美元） | `UNKNOWN` | 私有计费数据不采集；本节只有 job-minutes |
 
@@ -356,14 +366,29 @@ git rev-parse 953c194:templates/metrics.md          # dee47b6b717270b2d112ffa3bf
 
 | 观察项 | 实际 | 来源 / 方法 |
 | --- | --- | --- |
-| 开放 PR | **0** | `gh pr list --state open --json number` 返回空数组（快照时刻与本次修订时刻均如此） |
-| 活动任务登记块 | 快照时刻 **1**（仅 #185） | 见下方「登记块扫描」：对 36 个开放 Issue 逐一取全部评论并匹配 `ORCH-TASK-REGISTRY`，只有 #185 含真正的登记块；#170 只是文字提及 |
-| 快照后状态 | #185 的 registry 评论在窗口终点之后被编辑（现为 `IN_PROGRESS`） | 评论 `created_at=2026-10-28T21:38:59Z`、`updated_at` 已晚于快照；Issue timeline 记录 `unlabeled status:ready` + `labeled status:in-progress` 于 `2026-10-28T21:39:19Z`，之后至本次修订无新的标签事件 |
-| 有 `status:` 标签的开放 Issue | #185 `status:in-progress`；#162 / #174 `status:blocked`；其余 33 个无状态标签 | `gh issue list --state open --json number,labels`；无标签者按 `PLANNED` / 未 `READY` 记账（依据 `docs/implementation-plan.md` §15） |
+| 开放 PR（21:47 快照） | **0** | 快照时 `gh pr list --state open --json number` 返回空数组。快照后 `2026-10-28T21:49:50Z` PR #201 创建（[PR #201](https://github.com/ctrlshiftaltdel/AgentOrch/pull/201)）；22:43Z 复核时开放 PR 为 #201（Master 记录于 [review comment 6482627194](https://github.com/ctrlshiftaltdel/AgentOrch/pull/201#issuecomment-6482627194)）；本轮 22:48Z 复核 `gh pr list --state open` 也只返回 #201。**0 是快照值，1 是后续观察**，不能合并表述。 |
+| 活动任务登记块 | 快照时刻 **1**（仅 #185；登记块结构存在，字段值见下） | 见下方「登记块扫描」：对 36 个开放 Issue 逐一取全部评论并匹配 `ORCH-TASK-REGISTRY`，只有 #185 含真正的登记块；#170 只是文字提及 |
+| 快照后 registry 编辑（不是快照值） | 21:47 的字段值 `UNKNOWN`；后续可定位观察见下方时间线 | 评论 `created_at=2026-10-28T21:38:59Z`；GitHub 不公开评论编辑历史；22:20:51Z / 22:43:51Z 的同期读取由 Master 记录于 [review comment 6482627194](https://github.com/ctrlshiftaltdel/AgentOrch/pull/201#issuecomment-6482627194) |
+| 有 `status:` 标签的开放 Issue（扫描 / 复核时） | #185 `status:in-progress`；#162 / #174 `status:blocked`；其余 33 个无状态标签 | `gh issue list --state open --json number,labels`；无标签者按 `PLANNED` / 未 `READY` 记账（依据 `docs/implementation-plan.md` §15） |
 | 开放 Issue 总数 | 36（另有 84 个已关闭） | 同上 |
 | 本地残留 worktree | 8 个：`147` / `149` / `172` / `183` / `197` / `198` / `199` / `73` | `git worktree list`；对应 PR 均已合并，**不作为活动任务状态**，也不构成路径锁 |
 
-**登记块扫描（方法 + 结果）**：对快照时刻的 36 个开放 Issue，逐个分页读取 `/issues/{n}/comments` 并在返回文本中匹配 `ORCH-TASK-REGISTRY`；命中后检查其后是否紧跟 `status:` 行（区分「登记块」与「正文提及」）。执行时间：本次修订时 `2026-10-28T22:23Z`（快照后 36 分钟），36/36 个 Issue 全部返回。
+**registry 时间线（可定位的后续观察，不改变 21:47 快照值）**
+
+| 时点 (UTC) | 观察 | 来源 |
+| --- | --- | --- |
+| 2026-10-28T21:38:59Z | 评论 `6481323299` 创建，正文含 `ORCH-TASK-REGISTRY`；创建时的字段值未单独留存 | [comment 6481323299](https://github.com/ctrlshiftaltdel/AgentOrch/issues/185#issuecomment-6481323299) |
+| 2026-10-28T21:39:19Z | Issue 标签 `status:ready` → `status:in-progress` | [Issue #185 timeline](https://github.com/ctrlshiftaltdel/AgentOrch/issues/185) |
+| **2026-10-28T21:47:00Z** | **快照终点；registry 字段值 `UNKNOWN`**（评论此后被编辑，GitHub 不提供编辑历史） | 同上 |
+| 2026-10-28T22:20:51Z | Master 执行 `gh api repos/ctrlshiftaltdel/AgentOrch/issues/comments/6481323299`，响应正文含 `status: IN_PROGRESS` | [Master review comment 6482627194](https://github.com/ctrlshiftaltdel/AgentOrch/pull/201#issuecomment-6482627194) 的同期记录 |
+| 2026-10-28T22:23Z | Execution 对 36/36 开放 Issue 的评论扫描读取当时评论，报告 `IN_PROGRESS` | 本节「登记块扫描」 |
+| 2026-10-28T22:34:52Z | 评论被编辑为 `MASTER_REVIEW` | Master review comment 6482627194 的复核记录 |
+| 2026-10-28T22:34:59Z | Issue 标签 `status:in-progress` → `status:review` | [Issue #185 timeline](https://github.com/ctrlshiftaltdel/AgentOrch/issues/185) |
+| 2026-10-28T22:43:51Z | Master 复核 `gh api` 响应为 `MASTER_REVIEW` | Master review comment 6482627194 |
+| 2026-10-28T22:45:14Z | 交回执行时评论再次编辑为 `IN_PROGRESS` | 当前 `GET /issues/comments/6481323299` 的 `updated_at` |
+| 2026-10-28T22:45:20Z | Issue 标签 `status:review` → `status:in-progress` | [Issue #185 timeline](https://github.com/ctrlshiftaltdel/AgentOrch/issues/185) |
+
+**登记块扫描（方法 + 结果）**：对快照时刻的 36 个开放 Issue，逐个分页读取 `/issues/{n}/comments` 并在返回文本中匹配 `ORCH-TASK-REGISTRY`；命中后检查其后是否紧跟 `status:` 行（区分「登记块」与「正文提及」）。首次执行时间：`2026-10-28T22:23Z`（快照后 36 分钟）；本轮 `22:49Z` 复核同一扫描，仍为 36/36 个 Issue 全部返回、结果相同。
 
 | 结果 | Issue | 说明 |
 | --- | --- | --- |
@@ -373,17 +398,17 @@ git rev-parse 953c194:templates/metrics.md          # dee47b6b717270b2d112ffa3bf
 
 **关于 `gh search issues` 的边界**：`gh search issues "ORCH-TASK-REGISTRY" --repo …` 本次返回 82 条（2 条开放：#170、#185；80 条已关闭）。它确实索引评论（#185 的登记块只存在于评论里却被命中），但它同时覆盖已关闭 Issue、不解析块状态、也不能证明某个开放 Issue「没有」登记块——因此只当线索。上面的结论来自 36/36 的评论扫描，而不是搜索命中率。
 
-**历史可复核性**：快照时点的登记块**内容**（`status` / `head_sha` / `pr` 等字段）`UNKNOWN`——评论在快照之后被编辑，GitHub 不提供评论编辑历史。可定位的历史事实只有两条：评论创建于 `21:38:59Z`；Issue 标签在 `21:39:19Z` 从 `status:ready` 变为 `status:in-progress` 且此后无标签事件。任何「21:47 时 registry 写着 X」的说法都不可由当前正文反推。
+**历史可复核性**：快照时点的登记块**内容**（`status` / `head_sha` / `pr` 等字段）`UNKNOWN`——评论在快照之后被编辑，GitHub 不提供评论编辑历史。可定位的事实是评论创建时间、Issue 标签事件，以及 Master 在 `22:20:51Z` / `22:43:51Z` 两次同期读取的记录；这些只能证明相应时点的当前版本，不能证明 21:47 的字段值。任何「21:47 时 registry 写着 X」的说法都不可由当前正文反推。
 
 **路径重叠（潜在冲突，非当前锁冲突）**：3 个尚未派发的开放 Issue 把 `docs/metrics.md` 写进允许路径——
 
-| Issue | 允许路径中对 `docs/metrics.md` 的表述 | 当前状态 | 与 #185 的关系 |
+| Issue | 允许路径中对 `docs/metrics.md` 的表述 | 复核时状态（22:45Z 后） | 与 #185 的关系 |
 | --- | --- | --- | --- |
 | [#155](https://github.com/ctrlshiftaltdel/AgentOrch/issues/155) ETR 计算与阈值 | 「`docs/metrics.md`（如新指标定义确需同步）」 | 开放、无状态标签、无 registry、无 PR（未 `READY`） | 语义相邻：它要**新增/同步指标口径**，#185 只加**只读快照**；同文件，需串行 |
 | [#156](https://github.com/ctrlshiftaltdel/AgentOrch/issues/156) 三角色互评 | 「`docs/metrics.md`（如确需列出指标口径）」 | 同上 | 同上 |
 | [#158](https://github.com/ctrlshiftaltdel/AgentOrch/issues/158) 端到端回归与文档同步 | 「`README.md`、`docs/README.md`、`docs/upgrade.md`、`docs/metrics.md`、`release/README.md`」 | 同上 | 同上 |
 
-结论：截至快照时刻**没有活动锁冲突**（这 3 个 Issue 未被派发、无登记块、无开放 PR、无分支），但 #185 持有 `docs/metrics.md` 期间它们不能派发；#185 合并后 Master 需重新检查这三条的重叠与顺序。
+结论：截至快照时刻**没有活动锁冲突**（这 3 个 Issue 未被派发、无登记块、无开放 PR、无分支）。**按当前（22:45Z 之后的）登记块**，#185 的 `locked_paths` 为 `docs/metrics.md`，因此在其持有期间这三条不能派发；21:47 快照时的 `locked_paths` 字段本身不可复核（见上），不能从当前登记块反推。#185 合并后 Master 需重新检查这三条的重叠与顺序。
 
 **依赖与「观察 vs 硬依赖」分类**：
 
@@ -400,7 +425,7 @@ git rev-parse 953c194:templates/metrics.md          # dee47b6b717270b2d112ffa3bf
 
 以下每条都写明支撑数据与「能/不能」推出的结论。
 
-1. **可测的重复执行量很小，但无法给出「重复占比」的总体值。** 142 个 PR 运行 / 80 个任务（中位数 1 次运行）；219 个运行对应 219 个唯一 `head_sha`（没有同一 head 的第二个运行）。但「重跑」确实存在：4 个运行有 `run_attempt=2`（1.83%），10 个作业被再次执行（12.10 job-min，占 918.45 的 1.3%），其中 1 次发生在 attempt 1 已全绿的运行上（`39807779663`），另 2 个运行的 attempt 1 记录不可取（`UNKNOWN`）。12 个 PR 端失败运行（11 个有作业记录）合计 **16.45 job-min，占 PR 端 590.9 的 2.8%**。→ 能确认的是「失败运行与已测重跑的绝对量很小」；**不能**确认「重复执行占比很小」，因为 attempt 1 的缺失部分无法测量。
+1. **可测的重复执行量很小，但无法给出「重复占比」的总体值。** 142 个 PR 运行 / 80 个任务（中位数 1 次运行）；219 个运行对应 219 个唯一 `head_sha`（没有同一 head 的第二个运行）。但「重跑」确实存在：4 个运行有 `run_attempt=2`（1.83%），10 个作业被再次执行（12.10 job-min，占 918.45 的 1.3%），其中 1 次发生在 attempt 1 已全绿的运行上（`39807779663`），另 2 个运行的 attempt 1 记录不可取（`UNKNOWN`）。12 个 PR 端失败运行（11 个有作业记录）合计 **16.45 job-min，占 PR 端 ≈590.93 的 2.8%**。→ 能确认的是「失败运行与已测重跑的绝对量很小」；**不能**确认「重复执行占比很小」，因为 attempt 1 的缺失部分无法测量。
 2. **成本集中在平台广度，而不是重复。** Windows 占 51.0%、macOS 占 19.1% 的 job-minutes（合计 70.1%），ubuntu 两个版本合计 29.8%。同时，137 个 4 作业运行里只有 3 个出现「ubuntu 全绿、macOS/Windows 红」的平台专属失败（3/137 = 2.19%）；这 3 个也计入 PR 端 12 个失败运行（3/12 = 25.0%）与全部 14 个失败运行（3/14 = 21.4%）。→ 平台作业很贵，但确实抓到过 ubuntu 抓不到的缺陷（#77 的 Windows、#124 的 macOS+Windows、#169 的 Windows）；现有证据**不**支持直接删除这两个平台，也不支持把「平台专属失败率低」当成等价性证明。
 3. **失败模式高度集中，且混入基建噪声。** 14 个失败运行里 10 个是单元测试、1 个规则校验、1 个无作业记录、2 个 macOS 作业被取消（0 步、约 15 分钟）。基建/取消共 **3 个（3/14 = 21.4%）**，与第 2 条的「平台专属 3 个」是**不同的三个运行**，两组都恰好是 3，不可混为一谈。→ 若把「首次通过率」「运行失败率」直接当质量指标，会先被基建事件污染；这些指标在使用前必须按失败类别拆分。
 4. **任务周期短，墙钟不是当前主要痛点（但无法用 M1 证明）。** PR created→merged 的 median 仅 0.16 h、p90 1.36 h；60 个 `status:verified` Issue 的 created→closed median 1.05 h。单任务 cycle 短意味着「省验证时间」的收益上限也低；同时 M1 未接线，**不能**据此宣称「审查很快」或「阻塞很少」。
