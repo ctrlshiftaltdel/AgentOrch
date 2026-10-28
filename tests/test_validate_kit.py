@@ -1079,5 +1079,64 @@ class MarkdownLinkScanTests(unittest.TestCase):
             self.assertFalse(any('broken relative link' in e for e in errors), errors)
 
 
+class VendoredTreeScanTests(unittest.TestCase):
+    """Vendored dependency trees are not project documentation.
+
+    A downstream checkout may keep a JavaScript plugin's `node_modules/` next
+    to its own documents. Those third-party README files are not the project's
+    governance surface, and their relative links do not resolve against the
+    project, so the documentation scan must ignore them in both places it runs
+    (the governance-concept text scan and the relative-link scan).
+    """
+
+    CONCEPTS = 'PLANNED DISPATCHED MASTER_REVIEW APPROVED VERIFIED NEEDS_HUMAN_DECISION'
+
+    def test_node_modules_markdown_is_not_link_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'AGENTS.md').write_text(f'# A\n\n{self.CONCEPTS}\n', encoding='utf-8')
+            vendored = root / 'node_modules' / 'some-plugin'
+            vendored.mkdir(parents=True)
+            (vendored / 'README.md').write_text('[坏链](missing.md)\n', encoding='utf-8')
+
+            errors, _ = validate.validate_kit(root)
+
+            self.assertFalse(any('node_modules' in error for error in errors), errors)
+
+    def test_project_documents_under_scripts_are_still_link_checked(self):
+        # The vendored-tree exclusion must not widen into the directories the
+        # link scan already covered: a downstream project may keep its own
+        # Markdown under scripts/, and broken links there stay errors.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'AGENTS.md').write_text(f'# A\n\n{self.CONCEPTS}\n', encoding='utf-8')
+            scripts = root / 'scripts'
+            scripts.mkdir()
+            (scripts / 'README.md').write_text('[坏链](missing.md)\n', encoding='utf-8')
+
+            errors, _ = validate.validate_kit(root)
+
+            # The validator renders the relative path with the platform
+            # separator, so the expectation has to be built the same way
+            # (`scripts\README.md` on Windows, `scripts/README.md` elsewhere).
+            expected = f'{Path("scripts") / "README.md"}: broken relative link: missing.md'
+            self.assertTrue(any(expected in error for error in errors), errors)
+
+    def test_node_modules_markdown_cannot_supply_governance_concepts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'AGENTS.md').write_text('# A\n\nnothing here\n', encoding='utf-8')
+            vendored = root / 'node_modules' / 'some-plugin'
+            vendored.mkdir(parents=True)
+            (vendored / 'README.md').write_text(f'{self.CONCEPTS}\n', encoding='utf-8')
+
+            errors, _ = validate.validate_kit(root)
+
+            self.assertTrue(
+                any('missing expected governance concept: PLANNED' in error for error in errors),
+                errors,
+            )
+
+
 if __name__ == '__main__':
     unittest.main()

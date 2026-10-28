@@ -881,7 +881,12 @@ def validate_kit(root=ROOT, project_ready=False):
     # files (*.md / *.txt) and skip code dirs and binaries so the check cannot be
     # satisfied by the validator's own source or by non-document assets.
     doc_suffixes = ('.md', '.txt')
-    excluded_dirs = {'scripts', '.orchestration', '.git', '__pycache__'}
+    # Vendored dependency trees are not project documentation: a downstream
+    # checkout may keep a JavaScript plugin's `node_modules/`, whose README
+    # files belong to third parties and whose relative links do not resolve
+    # against the project. Skip them in both document scans below.
+    vendored_dirs = {'node_modules'}
+    excluded_dirs = {'scripts', '.orchestration', '.git', '__pycache__'} | vendored_dirs
     doc_texts = []
     for p in root.rglob('*'):
         if not p.is_file():
@@ -904,7 +909,12 @@ def validate_kit(root=ROOT, project_ready=False):
     # messages by template_structure_errors(), so skip them here to avoid one
     # break being reported twice.
     for md in root.rglob('*.md'):
-        if md.relative_to(root).as_posix() in TEMPLATE_SECTIONS:
+        rel = md.relative_to(root)
+        if rel.as_posix() in TEMPLATE_SECTIONS:
+            continue
+        # Keep this scan's established exclusions narrow: only vendored trees
+        # are added, so project documents under `scripts/` are still checked.
+        if vendored_dirs & set(rel.parts):
             continue
         content = md.read_text(encoding='utf-8')
         for target in markdown_links(content):
