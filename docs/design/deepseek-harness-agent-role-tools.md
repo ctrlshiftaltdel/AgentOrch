@@ -32,7 +32,9 @@ AgentOrch 与 DeepSeek Harness（DSH）的集成应采用**独立的角色工具
 - AgentOrch 当前核心契约文件仍是 kit/orchestration.md，且在 scripts/validate_kit.py 的 REQUIRED 中。#151 所规划的迁移目标 docs/orchestration.md 不能在迁移完成前被描述为现行事实。
 - 当前仓库的 docs/PROJECT.md 将 edition 设为 github。现有 scripts/orchestrator.py 是本地 CLI / 任务库工具，并明确不启动 Agent、不合并 Git 分支；github edition 下不能用它写本地 SQLite 来冒充 GitHub 任务载体。
 - #147 / #148、#149、#151、#153、#154 等治理工作仍需以各自 Issue、PR、head SHA 和验证记录重新核验。本设计仅声明对它们的依赖，不将未来的契约路径或 agentorch/ 下游布局提前写成已交付功能。
-- DSH 官方 Release 页面在 2026-10-28 当前可见的最新条目是 v0.2.1-rc.3，属于预发布版，发布日期为 2026-10-23。它是本设计的 API 调研起点，不等于 AgentOrch 已支持该版本，更不代表任何更高 DSH 版本已兼容。
+- **DSH 官方 Release 快照（历史事实，带查询时间）：** 对 `deepseek-ai/deepseek-harness` 的 GitHub Releases API 查询发生在 **2026-10-28T07:37:16Z（UTC）**，当时返回的最新发布条目为 `dsh-v0.2.2-alpha.2`（published `2026-10-28T02:50:54Z`，`prerelease=true`），其下一条为 `dsh-v0.2.1-rc.4`（published `2026-10-28T02:49:58Z`，同样为预发布）。本执行实例于 2026-10-28T07:40:20Z 按同一 API 复核，前两条结果相同。
+  - 这是**该时刻的历史快照**，不是「当前最新」的无时间断言：后续条目随时可能新增或变更，任何引用、调研或测试前都必须重新查询并记录新的时间戳与 tag。
+  - 快照里出现预发布条目，只说明 DSH 存在可调研的 API 起点；**预发布条目不证明** AgentOrch 已支持、已兼容或已实测该版本，也不代表任何更高 DSH 版本兼容。支持的版本范围只能由 #163 / #167 在锁定版本上的实测证据给出。
 
 参考：
 - [AgentOrch Releases](https://github.com/ctrlshiftaltdel/AgentOrch/releases)
@@ -242,23 +244,40 @@ Node 单测、mock tool registry 或 YAML 结构检查不能证明真实 DSH 能
 
 ## 10. 阶段依赖与执行顺序
 
-| Issue | 交付 | 依赖 / 门禁 |
+| Issue | 交付 | 依赖 / 门禁（硬依赖须 VERIFIED；路径顺序另见 §10.1） |
 |---|---|---|
 | [#161](https://github.com/ctrlshiftaltdel/AgentOrch/issues/161) | 本设计冻结 | Epic #160；设计 PR 审查、合并并 VERIFIED |
-| [#162](https://github.com/ctrlshiftaltdel/AgentOrch/issues/162) | 登记唯一阶段计划 | #161 完成；与 #147/#149 的治理阶段状态协调 |
+| [#162](https://github.com/ctrlshiftaltdel/AgentOrch/issues/162) | 登记唯一阶段计划 | **硬依赖 #161 与 #149**；#149 对 `docs/implementation-plan.md` 的登记先完成，才轮到 #162 编辑同一文件 |
 | [#163](https://github.com/ctrlshiftaltdel/AgentOrch/issues/163) | DSH API、角色 scope、身份 / 工作目录上下文与兼容范围实测 | #161 完成 |
 | [#164](https://github.com/ctrlshiftaltdel/AgentOrch/issues/164) | 三个角色工具和安全适配器 | #161、#162、#163 完成；涉及根布局时遵守 #151/#153 的真实状态 |
 | [#165](https://github.com/ctrlshiftaltdel/AgentOrch/issues/165) | 独立、可信、可复现的 DSH bundle builder | #161、#162、#163 完成 |
 | [#166](https://github.com/ctrlshiftaltdel/AgentOrch/issues/166) | DSH CI、Release 双资产流程与文档 | #163、#165 完成 |
 | [#167](https://github.com/ctrlshiftaltdel/AgentOrch/issues/167) | 隔离、迁移、安装、回滚与实际 DSH E2E 验收 | #162–#166 完成；治理依赖达到可验证状态 |
 
-路径冲突必须按当前 AgentOrch 的任务锁 / 依赖政策协调。尤其不得在多个 Issue 中并发修改 release/README.md、build_release / validate_kit 相关路径或同一份 DSH package 入口。Issue 创建只代表任务登记；所有实现任务在其依赖及设计 / 计划门禁满足前都不能进入 READY。
+### 10.1 计划文件路径顺序与治理依赖
+
+`docs/implementation-plan.md` 是阶段顺序 / 状态的唯一权威，因此凡是编辑它的任务都必须串行，顺序为：
+
+1. **#149** — 先登记治理与 Agent 表现评价阶段（#149 自身以 #147 / PR #148 为设计门禁，并按自己的验收标准完成）。
+2. **#162** — 再登记 DSH 角色工具阶段；硬依赖 #161 与 #149，必须在 #149 完成同一文件的登记之后执行。
+3. **#151** — 随后把核心契约迁移到 `docs/orchestration.md`；迁移时**必须保留 DSH 阶段登记段**（#151 自身另有 #150、#169 等实现前置，按其 Issue 核对）。
+4. **#152** — 最后精简计划；精简**必须保留 DSH 阶段登记与依赖**，不得以「清理过期规划」为由删除。
+
+即计划文件的路径序列是 **#149 → #162 → #151 → #152**。其中 #162 与 #151 / #152 是同一文件的路径顺序，不是可并行或可倒序的独立任务；后续任务都从最新主分支重验。
+
+治理侧的其它已核验顺序（不改变本阶段 DAG，但会与本阶段任务路径相交）：
+
+- **#152 → #153**：#153 依赖 #150–#152，且与 #152 共享 `docs/README.md`，必须先完成计划 / 导航清理，再串行加入旧项目安装说明。
+- **#153、#154 不是 #162 的登记前置**：#153 是 #164 / #167 涉及目标 `agentorch/` 布局时的实现前置，#154 是后续文档一致性门禁；#162 只按 #161 与 #149 判定，不得因 #153 / #154 未完成而阻塞登记，也不得把二者写成已完成。
+- **#158 等待 #73 VERIFIED**：#73 与 #158 修改同一场景 runner / 场景注册与文档路径，必须先完成场景拆分，再做全阶段回归；#158 同时等待 #153–#157 与 #147 / #149。
+
+路径冲突必须按当前 AgentOrch 的任务锁 / 依赖政策协调。尤其不得在多个 Issue 中并发修改 release/README.md、build_release / validate_kit 相关路径或同一份 DSH package 入口。Issue 创建只代表任务登记；所有实现任务在其依赖及设计 / 计划门禁满足前都不能进入 READY，本表不把任何未验证任务写成已完成。
 
 ## 11. 风险、未知项与冻结条件
 
 | 风险 / 未知项 | 当前处置 |
 |---|---|
-| DSH 版本快速变化，当前公开最新版本为预发布版 | 锁定具体测试版；#163 实测完成前不宣称兼容范围 |
+| DSH 版本快速变化，快照时点的官方最新条目仍为预发布版（见 §2.1，查询时间 2026-10-28T07:37:16Z） | 锁定具体测试版并重新查询 tag；#163 实测完成前不宣称兼容范围 |
 | per-agent 工具隔离或调用者身份 API 不足 | 阻塞实现，不退回全局工具暴露 |
 | 不能获取可信会话工作目录 | 不猜 process.cwd()；无法绑定项目根则返回 ROOT_UNKNOWN |
 | 只依赖下游 MANIFEST.json | 不接受；使用 bundle 中由可信发行资产建立的 SHA 基线 |
