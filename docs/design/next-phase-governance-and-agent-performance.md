@@ -226,7 +226,7 @@ ETR 是“在有真实 Token 用量、且已完成评价的调用中，与有效
 | `INEFFECTIVE` | 0.0 | 有证据显示没有有效贡献、产生误导性结果或重复消耗但没有推进 |
 | `UNRATED` | 不计入已评分分子 / 分母 | 评价尚未完成，不代表无效或有效；必须单独计算覆盖率 |
 
-### 7.2 初始公式与覆盖率
+### 7.2 初始公式、覆盖率与零分母语义
 
 对于已评分调用，令 (T_i) 为该调用已观测的 Token 总量，(w_i) 为有效贡献权重：
 
@@ -240,7 +240,27 @@ ETR 分母仅包含被评价调用的已观测 Token；未评价 Token 不能自
 Token\ Coverage = 100\% \times \frac{\text{已评分调用的已观测 Token}}{\text{全部已观测 Token}}
 ]
 
-ETR 只有在 Token 用量可观测、评价证据足够且覆盖率达到策略门槛时才可用于阈值决策。低覆盖率时可以报告“当前样本的 ETR”，但整体状态必须为 `UNKNOWN` / `PROVISIONAL`，不能触发自动淘汰或优先规则。
+**零分母与缺失数据的判定。** 两个指标都只在分母大于 0 时有数值。无法计算时必须报告非数值状态，**不得填入 `0` 或 `100`**：
+
+- `UNKNOWN`：Token telemetry 缺失或不可信——没有真实来源、字段缺失、计量单位不明或无法归一到总量，连“全部已观测 Token”都无法确认。这是“没有观测到数据”，不是“观测到 0”。
+- `NO_DATA`：telemetry 存在，但该指标的分母为 0，数学上未定义。这是“有观测，但没有可计算样本”。
+
+| 情形 | 全部已观测 Token（coverage 分母） | 已评分调用的已观测 Token（ETR 分母） | ETR | Token Coverage | 阈值动作 |
+|---|---|---|---|---|---|
+| T1 telemetry 缺失 / 不可信 | 无法确认 | 无法确认 | `UNKNOWN` | `UNKNOWN` | 禁止 |
+| T2 telemetry 存在，但观测总量为 0 | 0 | 0 | `NO_DATA` | `NO_DATA` | 禁止 |
+| T3 有观测 Token，但没有已评分 Token | > 0 | 0 | `NO_DATA` | `0%` | 禁止 |
+| T4 有已评分调用且其已观测 Token > 0 | > 0 | > 0 | 按公式计算 | 按公式计算 | 仅在 §7.3 门槛全部满足时 |
+
+T3 的 coverage 是真实的 0%（分母 > 0、分子为 0），但 ETR 没有可计算样本，只能是 `NO_DATA`；把 ETR 写成 0% 会把“没有评价”误读成“全部无效”。T2 的总量为 0，coverage 也不能写成 0% 或 100%，因为它的分母同样是 0。任一指标为 `NO_DATA` 或 `UNKNOWN` 时，该 `model ID × role × task category` 不得进入阈值判定，不得执行 §7.3 的 40% / 80% 动作。上表 T1–T3 就是 #155 固定测试必须固定的期望结果（覆盖 telemetry 缺失、零观测 Token 与零已评分样本）。
+
+**手算示例。**
+
+- 示例 A（T2）：某角色 3 次调用，Runtime 报告 telemetry 可用，但三次都报告 0 Token。全部已观测 Token = 0 + 0 + 0 = 0，已评分 Token = 0。ETR 与 coverage 都是 `NO_DATA`，不得输出 ETR = 0% 或 coverage = 100%。
+- 示例 B（T3）：4 次调用分别观测到 1200、800、0、2000 Token（合计 4000），且都还未评价。ETR 分母 = 0 → `NO_DATA`；coverage = 0 / 4000 = 0%。ETR 缺失不得触发 40% 低线动作，也不得据此把模型判为无效。
+- 示例 C（T4，可复算）：两次已评分调用各 1000 Token，权重分别为 1.0 与 0.0，另有 2000 Token 未评分。全部已观测 = 4000，已评分 = 2000。ETR = 100% × (1000 × 1.0 + 1000 × 0.0) / 2000 = 50%；coverage = 2000 / 4000 = 50%。这里的 50% 是实测值，与 §7.3 的 50% 中性先验无关。
+
+ETR 只有在 Token 用量可观测、评价证据足够且覆盖率达到策略门槛时才可用于阈值决策。低覆盖率时仍可报告“当前样本的 ETR”作为观测值，但整体判定状态只能是 `PROVISIONAL`，不能触发自动淘汰或优先规则；若分母为 0 或 telemetry 缺失，则连观测值也不存在，按上表记 `NO_DATA` / `UNKNOWN`。
 
 主指标可以使用总 Token 消耗衡量实际成本；为解释模型差异，报告还应尽可能展示 input / output / cached / reasoning 分项和上下文大小。输入 Token 往往受上游 Prompt、上下文长度及工具链影响，因此比较模型时应按角色 / 任务类型分组，记录 Runtime 与配置变化，避免将不同上下文工作负担简单误认为模型能力差异。
 
@@ -251,7 +271,8 @@ ETR 只有在 Token 用量可观测、评价证据足够且覆盖率达到策略
 - 建议暂定统计窗口为最近 90 天；达到至少 20 个已完成且可评价的任务，并且 Token 计量 / 评价覆盖率至少 80% 后，才能执行阈值动作。这是待验证的初始运营门槛，不是已经得到统计证明的通用结论。
 - 低于 40% 且满足门槛：暂停该 `model ID × role × task category` 的**自动**选用；不删除候选、不永久禁止人工使用。记录排除原因并定义重新评测路径。
 - 高于 80% 且满足门槛：在本任务所有硬约束、质量要求和评价可信度合格的候选中提高优先级；不能仅凭 ETR 证明正确性。
-- 样本不足、Token 数据未知、模型 ID / Runtime / 配置变化或覆盖率不足：不得将缺失数据填成 0 或 100；报告 `UNKNOWN` / `PROVISIONAL` / `STALE` 并安全降级。
+- ETR 或 coverage 为 `NO_DATA` / `UNKNOWN`（分母为 0，或 telemetry 缺失 / 不可信）：不得执行 40% / 80% 阈值动作，也不得把缺失值填成 0 或 100。
+- 样本不足、模型 ID / Runtime / 配置变化或覆盖率低于门槛：不得将缺失数据填成 0 或 100；报告 `UNKNOWN` / `PROVISIONAL` / `STALE` 并安全降级。
 - 分数始终分开维护在模型身份、角色和任务类别之下；不得把 Execution 表现直接迁移为 Reviewer 评分。
 
 ## 8. 三角色互评与评价可信度
@@ -319,7 +340,7 @@ Execution / Reviewer 的候选来自用户在当前工具 / Runtime 中已经配
 1. 确认真实调用路径、底层模型身份、当前 Runtime、Scope 与证据新鲜度。
 2. 先做硬筛选：可调用性、所需模态、上下文、工具、授权、预算与 Reviewer / Execution 底层模型独立性。
 3. 依据任务类型比较独立验证的正确性 / 交付质量、角色专项基准、具有足够覆盖率和可信度的 ETR、本地项目表现、成本与延迟。
-4. 在具备足够样本和可信度时，应用 40% / 80% 的临时阈值规则。
+4. 在具备足够样本和可信度、且 ETR 与 coverage 都不是 `NO_DATA` / `UNKNOWN` 时，应用 40% / 80% 的临时阈值规则。
 5. 记录首选、备选、淘汰原因、身份 / 数据来源、可信度、覆盖率、未验证限制及是否需要人工决定。
 
 不得让 ETR、总分、低成本或外部排行榜冲抵硬性限制。没有候选满足要求时停止自动选型，提供人工路径，而不是自动创建 / 授权新的 Subagent。
@@ -341,18 +362,26 @@ Master 因具有产品目标理解、整体计划、冲突裁决和最终交付�
 | 阶段 | 交付 | 前置依赖 |
 |---|---|---|
 | S0 设计冻结 | [Issue #147](https://github.com/ctrlshiftaltdel/AgentOrch/issues/147) / [Draft PR #148](https://github.com/ctrlshiftaltdel/AgentOrch/pull/148)；本文与关键决策经独立审查 | Epic #146 |
-| P0 阶段计划登记 | [Issue #149](https://github.com/ctrlshiftaltdel/AgentOrch/issues/149)；登记阶段、依赖、状态与出口条件 | S0 |
-| G1 文件地图 / 生命周期 | [Issue #150](https://github.com/ctrlshiftaltdel/AgentOrch/issues/150)；文件责任、权威来源与 outdated 退出机制 | P0 |
-| G2 核心契约迁移 | [Issue #151](https://github.com/ctrlshiftaltdel/AgentOrch/issues/151)；`kit/orchestration.md` → `docs/orchestration.md`，兼容发行 / 更新 | G1 |
+| P0 阶段计划登记 | [Issue #149](https://github.com/ctrlshiftaltdel/AgentOrch/issues/149)；登记本阶段、依赖、状态与出口条件 | S0 |
+| P1 DSH 阶段登记 | [Issue #162](https://github.com/ctrlshiftaltdel/AgentOrch/issues/162)；把 DSH 角色工具阶段登记进同一份 `docs/implementation-plan.md` | P0；另有 #162 自身的设计冻结前置 [#161](https://github.com/ctrlshiftaltdel/AgentOrch/issues/161) / PR #168 |
+| G1 文件地图 / 生命周期 | [Issue #150](https://github.com/ctrlshiftaltdel/AgentOrch/issues/150)；文件责任、权威来源与 outdated 退出机制 | S0、P0；与 P1 路径不重叠，可并行 |
+| G2 核心契约迁移 | [Issue #151](https://github.com/ctrlshiftaltdel/AgentOrch/issues/151)；`kit/orchestration.md` → `docs/orchestration.md`，兼容发行 / 更新 | G1、P1；另需共享 `scripts/validate_kit.py` 的 #169 已 `VERIFIED` |
 | G3 计划精简 | [Issue #152](https://github.com/ctrlshiftaltdel/AgentOrch/issues/152)；历史信息转链 / 归档，保留当前未完成风险 | G1、G2 |
-| I1 旧项目隔离接入 | [Issue #153](https://github.com/ctrlshiftaltdel/AgentOrch/issues/153)；`agentorch/` 布局、根 AGENTS managed block、相对路径、ignore、升级 / 回滚 | G1、G2 |
+| I1 旧项目隔离接入 | [Issue #153](https://github.com/ctrlshiftaltdel/AgentOrch/issues/153)；`agentorch/` 布局、根 AGENTS managed block、相对路径、ignore、升级 / 回滚 | G1、G2、G3（与 G3 共享 `docs/README.md`，先完成计划 / 导航清理） |
 | G4 文档一致性门禁 | [Issue #154](https://github.com/ctrlshiftaltdel/AgentOrch/issues/154)；检查文件登记、链接、文档影响、计划状态和发行清单 | G1–G3、I1 |
 | E1 Token telemetry / ETR | [Issue #155](https://github.com/ctrlshiftaltdel/AgentOrch/issues/155)；真实 Token 用量、贡献权重、覆盖率与阈值 | S0、P0 |
 | E2 三角色互评 / 可信度 | [Issue #156](https://github.com/ctrlshiftaltdel/AgentOrch/issues/156)；独立双评、冲突处理和评价者可靠性 | E1 |
 | E3 多候选路由 | [Issue #157](https://github.com/ctrlshiftaltdel/AgentOrch/issues/157)；复用 Phase D，基于 ETR / 可信度选择配置好的 Execution / Reviewer，Master 手动 | E1、E2 |
-| V0 集成回归 | [Issue #158](https://github.com/ctrlshiftaltdel/AgentOrch/issues/158)；旧项目迁移演练、负向场景、发行与文档验收 | G4、I1、E3 |
+| V0 集成回归 | [Issue #158](https://github.com/ctrlshiftaltdel/AgentOrch/issues/158)；旧项目迁移演练、负向场景、发行与文档验收 | G4、I1、E1–E3；另需场景拆分 [#73](https://github.com/ctrlshiftaltdel/AgentOrch/issues/73) `VERIFIED`（共享 delivery-scenario runner 与场景注册表） |
 
-若两个任务会修改同一路径、同一发行清单或同一更新引擎，应串行执行或显式协调，不能仅因为分属不同主线就并行。Issue 拆分后，每项都必须列明可改 / 禁改路径、验收标准和证据、`invariants`、`negative_cases`、`migration_cases`、`integration_paths`、`unverified_assumptions`、验证命令以及文档影响记录。
+路径顺序约束（与上表的依赖同等有效）：
+
+- **计划文件编辑串行：`#149` → `#162` → `#151` → `#152`。** 四个任务都写同一份 `docs/implementation-plan.md`，必须按此顺序串行、各自基于最新主分支重验；#151 / #152 实施时必须保留 #162 登记的 DSH 阶段段落。
+- **#150 可与 #162 并行。** 两者路径不重叠（`docs/architecture/**` 与 `docs/implementation-plan.md`），在 S0、P0 门禁都满足后即可并行。这不等于“#150–#154 全部完成后才能登记 DSH 阶段”：#162 只需 P0 与自身设计冻结，不把治理实施任务作为前置。
+- **`#152` → `#153`。** 两者都修改 `docs/README.md`，必须先完成计划精简与导航清理，再加入旧项目安装说明。
+- **`#73` `VERIFIED` → `#158`。** 两者修改同一 delivery-scenario runner 与场景注册路径，先完成场景拆分再新增集成场景。
+
+上表与上述顺序只表达依赖与路径约束，不代表这些任务已经派发、进入 `READY` 或完成；实际状态以 Issue / PR 与 `docs/implementation-plan.md` 为准。若两个任务会修改同一路径、同一发行清单或同一更新引擎，应串行执行或显式协调，不能仅因为分属不同主线就并行。Issue 拆分后，每项都必须列明可改 / 禁改路径、验收标准和证据、`invariants`、`negative_cases`、`migration_cases`、`integration_paths`、`unverified_assumptions`、验证命令以及文档影响记录。
 
 ## 11. 核心文件更新原则
 
@@ -370,7 +399,7 @@ Master 因具有产品目标理解、整体计划、冲突裁决和最终交付�
 
 ## 12. 风险和需要保留的限制
 
-- **Token 观测差异**：不同 Runtime / 供应商未必暴露完全一致的 Token 细分；无法可信采集时 ETR 必须 UNKNOWN，不能用字符估算假装真实遥测。
+- **Token 观测差异**：不同 Runtime / 供应商未必暴露完全一致的 Token 细分；无法可信采集时 ETR 必须 `UNKNOWN`，不能用字符估算假装真实遥测。telemetry 可用但观测总量为 0 时记 `NO_DATA`，不得当作 0% 或 100%。
 - **归因限制**：一次调用可能同时产生有效和无效内容；调用级 0.5 是简化代理值，后续可依据可追溯证据细化，但不能没有证据就做 Token 级语义切分。
 - **评价者相关性**：不同模型家族不保证独立，双评一致不替代确定性测试 / 事实证据。
 - **模型版本变化**：底层模型 ID、Runtime、工具链或主要配置变化时，旧历史必须标明适用范围；不可未经核验直接迁移新版本成绩。
@@ -387,7 +416,7 @@ Master 因具有产品目标理解、整体计划、冲突裁决和最终交付�
 - [ ] 精简后的核心计划保留所有未完成事项与阻塞，历史详情能由权威载体追溯，并移除已过时的“当前状态”叙述。
 - [ ] 旧项目接入仅增加 `agentorch/` 并增量更新根 `AGENTS.md`；宿主其他文件 / 目录内容与位置保持不变。
 - [ ] 相对路径不依赖当前工作目录猜测；根 `AGENTS.md` managed block 更新可幂等运行，冲突时失败关闭。
-- [ ] ETR 在固定 Token 数据上可复算；未知 Token、未评分调用、低覆盖率、模型身份变化和低样本均有正确状态。
+- [ ] ETR 在固定 Token 数据上可复算；未知 Token、零观测 Token、有观测但未评分、低覆盖率、模型身份变化和低样本均有正确状态，零分母场景不产生数值、也不触发阈值动作。
 - [ ] 评价可信度覆盖单评、独立双评一致、同底层模型伪双评、意见冲突、错误评价者、无漏报对照等场景。
 - [ ] 多候选选择先硬筛选，再使用质量 / ETR / 可信度 / 成本；Master 永远只接受用户手动切换。
 - [ ] README、完整用户手册、设计 / 阶段计划、发行与升级文档均经过文档影响分析。
