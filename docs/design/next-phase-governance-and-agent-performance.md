@@ -138,7 +138,7 @@
 6. 源仓库必需文件、发行清单、包内自检和禁止分发路径一致。
 7. AgentOrch 私有记录不提交、不上传、不进入发行包。
 
-语义级漂移扫描只能作为诊断建议，不能自动覆盖文档或将猜测当作确定性错误。所有自动修复必须有明确的路径范围、差异报告和回滚方案。
+语义级漂移扫描在首版（v1）只做检测与报告，是纯诊断能力：不自动改写文档、不修改 Issue 状态、不覆盖项目所有者管理的文字，也不改动下游项目文件。任何后续自动修复都必须是单独授权的任务，且即便获得授权仍不得覆盖所有者或下游文件，也不得把猜测当作确定性错误。
 
 ## 6. 旧项目接入：`agentorch/` 隔离布局
 
@@ -254,6 +254,8 @@ Token\ Coverage = 100\% \times \frac{\text{已评分调用的已观测 Token}}{\
 
 T3 的 coverage 是真实的 0%（分母 > 0、分子为 0），但 ETR 没有可计算样本，只能是 `NO_DATA`；把 ETR 写成 0% 会把“没有评价”误读成“全部无效”。T2 的总量为 0，coverage 也不能写成 0% 或 100%，因为它的分母同样是 0。任一指标为 `NO_DATA` 或 `UNKNOWN` 时，该 `model ID × role × task category` 不得进入阈值判定，不得执行 §7.3 的 40% / 80% 动作。上表 T1–T3 就是 #155 固定测试必须固定的期望结果（覆盖 telemetry 缺失、零观测 Token 与零已评分样本）。
 
+本节 ETR 的 `NO_DATA` / coverage 规则不修改 `templates/metrics.md` 中 M1–M7 七个交付指标的既有口径：M1–M7 的 coverage 仍为不可空的 `0.0`，ETR 的 T2 也不采用该 `coverage=0.0` 规则而保持 `NO_DATA`；反之不得把 ETR 的 `NO_DATA` / 可空语义扩展到 M1–M7。
+
 **手算示例。**
 
 - 示例 A（T2）：某角色 3 次调用，Runtime 报告 telemetry 可用，但三次都报告 0 Token。全部已观测 Token = 0 + 0 + 0 = 0，已评分 Token = 0。ETR 与 coverage 都是 `NO_DATA`，不得输出 ETR = 0% 或 coverage = 100%。
@@ -272,7 +274,9 @@ ETR 只有在 Token 用量可观测、评价证据足够且覆盖率达到策略
 - 低于 40% 且满足门槛：暂停该 `model ID × role × task category` 的**自动**选用；不删除候选、不永久禁止人工使用。记录排除原因并定义重新评测路径。
 - 高于 80% 且满足门槛：在本任务所有硬约束、质量要求和评价可信度合格的候选中提高优先级；不能仅凭 ETR 证明正确性。
 - ETR 或 coverage 为 `NO_DATA` / `UNKNOWN`（分母为 0，或 telemetry 缺失 / 不可信）：不得执行 40% / 80% 阈值动作，也不得把缺失值填成 0 或 100。
-- 样本不足、模型 ID / Runtime / 配置变化或覆盖率低于门槛：不得将缺失数据填成 0 或 100；报告 `UNKNOWN` / `PROVISIONAL` / `STALE` 并安全降级。
+- 可计算 ETR 但样本量不足或覆盖率低于门槛：该 ETR 仍是有效观测值，整体判定状态只能是 `PROVISIONAL`，不得触发 40% / 80% 阈值动作；不得将缺失数据填成 0 或 100。
+- 模型 ID / Runtime / 主要配置变化后，此前结果标记为 `STALE`，不得直接沿用为当前版本分数或用于阈值判定，须按新身份重新积累样本。
+- `UNKNOWN` 仅用于 telemetry 缺失 / 不可信（T1）；`NO_DATA` 仅用于零分母情形（T2 的 ETR 与 coverage、T3 的 ETR），其中 T3 保持 ETR `NO_DATA`、coverage `0%`。任何未定义值都不得用数值替代。
 - 分数始终分开维护在模型身份、角色和任务类别之下；不得把 Execution 表现直接迁移为 Reviewer 评分。
 
 ## 8. 三角色互评与评价可信度
@@ -357,22 +361,22 @@ Master 因具有产品目标理解、整体计划、冲突裁决和最终交付�
 
 ## 10. 实施阶段与依赖建议
 
-所有任务均须在本设计及阶段计划登记分别合并并 `VERIFIED` 后才可进入 `READY`。以下是建议依赖，不表示任务已经派发或实施。
+所有任务均须在本设计及阶段计划登记分别合并并 `VERIFIED` 后才可进入 `READY`。在 PR [#148](https://github.com/ctrlshiftaltdel/AgentOrch/pull/148) 合并并标记 `VERIFIED` 之前，本设计保持 `PROPOSED`，不得作为已冻结依据。以下是建议依赖，不表示任务已经派发或实施。
 
 | 阶段 | 交付 | 前置依赖 |
 |---|---|---|
-| S0 设计冻结 | [Issue #147](https://github.com/ctrlshiftaltdel/AgentOrch/issues/147) / [Draft PR #148](https://github.com/ctrlshiftaltdel/AgentOrch/pull/148)；本文与关键决策经独立审查 | Epic #146 |
+| S0 设计冻结 | [Issue #147](https://github.com/ctrlshiftaltdel/AgentOrch/issues/147) / [PR #148](https://github.com/ctrlshiftaltdel/AgentOrch/pull/148)；本文与关键决策经独立审查；合并并 `VERIFIED` 前保持 `PROPOSED` | Epic #146 |
 | P0 阶段计划登记 | [Issue #149](https://github.com/ctrlshiftaltdel/AgentOrch/issues/149)；登记本阶段、依赖、状态与出口条件 | S0 |
 | P1 DSH 阶段登记 | [Issue #162](https://github.com/ctrlshiftaltdel/AgentOrch/issues/162)；把 DSH 角色工具阶段登记进同一份 `docs/implementation-plan.md` | P0；另有 #162 自身的设计冻结前置 [#161](https://github.com/ctrlshiftaltdel/AgentOrch/issues/161) / PR #168 |
-| G1 文件地图 / 生命周期 | [Issue #150](https://github.com/ctrlshiftaltdel/AgentOrch/issues/150)；文件责任、权威来源与 outdated 退出机制 | S0、P0；与 P1 路径不重叠，可并行 |
-| G2 核心契约迁移 | [Issue #151](https://github.com/ctrlshiftaltdel/AgentOrch/issues/151)；`kit/orchestration.md` → `docs/orchestration.md`，兼容发行 / 更新 | G1、P1；另需共享 `scripts/validate_kit.py` 的 #169 已 `VERIFIED` |
-| G3 计划精简 | [Issue #152](https://github.com/ctrlshiftaltdel/AgentOrch/issues/152)；历史信息转链 / 归档，保留当前未完成风险 | G1、G2 |
-| I1 旧项目隔离接入 | [Issue #153](https://github.com/ctrlshiftaltdel/AgentOrch/issues/153)；`agentorch/` 布局、根 AGENTS managed block、相对路径、ignore、升级 / 回滚 | G1、G2、G3（与 G3 共享 `docs/README.md`，先完成计划 / 导航清理） |
-| G4 文档一致性门禁 | [Issue #154](https://github.com/ctrlshiftaltdel/AgentOrch/issues/154)；检查文件登记、链接、文档影响、计划状态和发行清单 | G1–G3、I1 |
+| GOV-1 文件地图 / 生命周期 | [Issue #150](https://github.com/ctrlshiftaltdel/AgentOrch/issues/150)；文件责任、权威来源与 outdated 退出机制 | S0、P0；与 P1 路径不重叠，可并行 |
+| GOV-2 核心契约迁移 | [Issue #151](https://github.com/ctrlshiftaltdel/AgentOrch/issues/151)；`kit/orchestration.md` → `docs/orchestration.md`，兼容发行 / 更新 | GOV-1、P1；另需共享 `scripts/validate_kit.py` 的 #169 已 `VERIFIED` |
+| GOV-3 计划精简 | [Issue #152](https://github.com/ctrlshiftaltdel/AgentOrch/issues/152)；历史信息转链 / 归档，保留当前未完成风险 | GOV-1、GOV-2 |
+| I1 旧项目隔离接入 | [Issue #153](https://github.com/ctrlshiftaltdel/AgentOrch/issues/153)；`agentorch/` 布局、根 AGENTS managed block、相对路径、ignore、升级 / 回滚 | GOV-1、GOV-2、GOV-3（与 GOV-3 共享 `docs/README.md`，先完成计划 / 导航清理） |
+| GOV-4 文档一致性门禁 | [Issue #154](https://github.com/ctrlshiftaltdel/AgentOrch/issues/154)；检查文件登记、链接、文档影响、计划状态和发行清单 | GOV-1–GOV-3、I1 |
 | E1 Token telemetry / ETR | [Issue #155](https://github.com/ctrlshiftaltdel/AgentOrch/issues/155)；真实 Token 用量、贡献权重、覆盖率与阈值 | S0、P0 |
 | E2 三角色互评 / 可信度 | [Issue #156](https://github.com/ctrlshiftaltdel/AgentOrch/issues/156)；独立双评、冲突处理和评价者可靠性 | E1 |
 | E3 多候选路由 | [Issue #157](https://github.com/ctrlshiftaltdel/AgentOrch/issues/157)；复用 Phase D，基于 ETR / 可信度选择配置好的 Execution / Reviewer，Master 手动 | E1、E2 |
-| V0 集成回归 | [Issue #158](https://github.com/ctrlshiftaltdel/AgentOrch/issues/158)；旧项目迁移演练、负向场景、发行与文档验收 | G4、I1、E1–E3；另需场景拆分 [#73](https://github.com/ctrlshiftaltdel/AgentOrch/issues/73) `VERIFIED`（共享 delivery-scenario runner 与场景注册表） |
+| V0 集成回归 | [Issue #158](https://github.com/ctrlshiftaltdel/AgentOrch/issues/158)；旧项目迁移演练、负向场景、发行与文档验收 | GOV-4、I1、E1–E3；另需场景拆分 [#73](https://github.com/ctrlshiftaltdel/AgentOrch/issues/73) `VERIFIED`（共享 delivery-scenario runner 与场景注册表） |
 
 路径顺序约束（与上表的依赖同等有效）：
 
@@ -391,7 +395,7 @@ Master 因具有产品目标理解、整体计划、冲突裁决和最终交付�
 - `docs/implementation-plan.md`：阶段登记和状态唯一落点；只保留当前推进所需的信息。
 - `docs/PROJECT.md`：只有 AgentOrch 上游仓库自身的适配配置 / 根路径语义有变化时更新，不将下游项目特例写入上游配置。
 - `AGENTS.md`：协作契约或入口路径变化时更新；旧项目接入的合并区块规则必须是增量、幂等、可检测冲突，不得覆盖宿主规则。
-- `docs/orchestration.md`：核心状态、入口 / 门禁定义的唯一权威。
+- `docs/orchestration.md`：核心状态、入口 / 门禁定义的唯一权威，**仅在 #151 迁移完成后生效**；迁移前 `kit/orchestration.md` 仍是当前唯一权威（见 §2.1、§3.1）。
 - `repository-map.md` 与 `document-lifecycle.md`：文件职责、路径与生命周期规则的权威定义位置。
 - 发布清单 / 升级文档 / 包内自检：任何文件路径、发行内容或迁移行为变化都必须影响分析。
 
