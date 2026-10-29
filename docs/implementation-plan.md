@@ -61,7 +61,7 @@
 | [#180](https://github.com/ctrlshiftaltdel/AgentOrch/issues/180) | D / P1：端到端目标达成评测与回退 | #177、#178 | 未 READY（`OPEN` / `PLANNED`；#177 / #178 未 `VERIFIED`；可与 #179 条件并行） | Issue 正文；§15.3 |
 | [#181](https://github.com/ctrlshiftaltdel/AgentOrch/issues/181) | E / P2：试点、双底座验收与发行兼容 | #179、#180；核心权限变更须 Owner 批准 | 未 READY（`OPEN` / `PLANNED`；#179 / #180 未 `VERIFIED`） | Issue 正文；§15.3 |
 | [#183](https://github.com/ctrlshiftaltdel/AgentOrch/issues/183) | 恢复并交付任务驱动拓扑设计提案 | PR #182（同一交付） | 已完成 / `VERIFIED` | PR [#182](https://github.com/ctrlshiftaltdel/AgentOrch/pull/182) 合并 `5c3b933`；[主分支验证](https://github.com/ctrlshiftaltdel/AgentOrch/issues/183#issuecomment-6471323341)；设计仍 `PROPOSED` |
-| [#184](https://github.com/ctrlshiftaltdel/AgentOrch/issues/184) | Epic：Adaptive Verification（AVE） | #199 / PR #190 已 `VERIFIED`；#185–#189 未 READY | 规划中（Epic `OPEN`；设计仍 `PROPOSED`） | Issue 正文；§15.2.4 |
+| [#184](https://github.com/ctrlshiftaltdel/AgentOrch/issues/184) | Epic：Adaptive Verification（AVE） | #199 / PR #190 与 #185 已 `VERIFIED`；#186–#189 未 READY | 规划中（Epic `OPEN`；设计仍 `PROPOSED`） | Issue 正文；§15.2.4 |
 | [#185](https://github.com/ctrlshiftaltdel/AgentOrch/issues/185) | A / P0：验证成本基线与门禁审计 | 无功能硬依赖；审计在途任务 | 已完成 / `VERIFIED` | PR [#201](https://github.com/ctrlshiftaltdel/AgentOrch/pull/201) 合并并验证 head `a09fb2e11d2d5d1467b2e07c0ba23854cda1adbe`；[VERIFIED 评论](https://github.com/ctrlshiftaltdel/AgentOrch/issues/185#issuecomment-6484091982)；Issue 已关闭并标 `status:verified` |
 | [#186](https://github.com/ctrlshiftaltdel/AgentOrch/issues/186) | B / P0：风险分级与只读影子 Gate Planner | #185 已 `VERIFIED` | 未 READY（`OPEN` / `PLANNED`；设计 DRAFT 未书面冻结） | Issue 正文；[DRAFT v2](https://github.com/ctrlshiftaltdel/AgentOrch/issues/186#issuecomment-6486678110)；§15.2.4 / §15.5 |
 | [#187](https://github.com/ctrlshiftaltdel/AgentOrch/issues/187) | C / P1：影响面测试选择与证据等价性 | #186 | 未 READY（`OPEN` / `PLANNED`；#186 未 `VERIFIED`） | Issue 正文；§15.2.4 |
@@ -453,7 +453,7 @@
 - **三份专案提案已交付、设计仍未冻结**：PR [#182](https://github.com/ctrlshiftaltdel/AgentOrch/pull/182) → #183、PR [#190](https://github.com/ctrlshiftaltdel/AgentOrch/pull/190) → #199、PR [#196](https://github.com/ctrlshiftaltdel/AgentOrch/pull/196) → #198 均为 `MERGED`，对应 Issue 均 `VERIFIED`；但 [task-driven-agent-topology.md](design/task-driven-agent-topology.md)、[adaptive-verification-and-quality-gates.md](design/adaptive-verification-and-quality-gates.md)、[semver-proactive-release-policy.md](design/semver-proactive-release-policy.md) 的文稿状态仍是 `PROPOSED`。**提案交付 ≠ 契约冻结 ≠ 运行时已实现 ≠ 发行已授权。**
 - **DSH 设计已冻结、运行时未验证**：设计 #161 与状态修正 #172 已 `VERIFIED`，[deepseek-harness-agent-role-tools.md](design/deepseek-harness-agent-role-tools.md) 为 `FROZEN`；这只表示设计冻结，真实 DSH API、角色隔离与实机行为仍待 #163 / #167。
 - **身份与探测纠偏仍未冻结**：#170 为 `OPEN`（`bug`），可信底层模型身份来源、核验与失效规则未冻结；#174 为 `OPEN` / `status:blocked`，所有者已批准方案 1 方向，但设计未冻结、未派发、未实现。
-- **开放任务状态**：#150–#158、#162–#167、#177–#181、#185–#189、#192–#195 均为 `OPEN`；除 #162 / #174 的 `status:blocked` 外无状态标签，均按 `PLANNED` / 未 READY 登记。没有除 #197 之外的活动登记块或路径锁。
+- **开放任务状态**：#150–#158、#162–#167、#177–#181、#186–#189、#192–#195 均为 `OPEN`；除 #162 / #174 的 `status:blocked` 外无状态标签，均按 `PLANNED` / 未 READY 登记。没有除 #197 之外的活动登记块或路径锁。#185 已完成 / `VERIFIED` 并关闭，不再计入开放任务（见第 1 节与 §15.2.4）。
 - **Owner 最新排序决定（2026-10-28，覆盖早先“主动发行优先”的排序）**：在 #197 本计划任务收口之后，优先推进 AVE #184 的 [#185](https://github.com/ctrlshiftaltdel/AgentOrch/issues/185) → [#186](https://github.com/ctrlshiftaltdel/AgentOrch/issues/186)，完成这两步后再推进主动发行 #192–#195（[决定记录](https://github.com/ctrlshiftaltdel/AgentOrch/issues/197#issuecomment-6473530069)）。该决定只改变调度优先级，不新增硬依赖、不改变各 Epic 内部顺序、不取消发行工作；#185 只做真实测量审计，#186 只在只读 / shadow 模式运行，均不改变或跳过现行门禁；#188 仍须 A–C `VERIFIED` 后另行明确 Owner 授权，当前禁止切换生产门禁。
 
 ### 15.2 五组专项的真实阶段状态
@@ -501,7 +501,7 @@
 
 #### 15.2.4 自适应验证 AVE（Epic #184）
 
-**唯一来源**：Epic [#184](https://github.com/ctrlshiftaltdel/AgentOrch/issues/184)、提案 [#199](https://github.com/ctrlshiftaltdel/AgentOrch/issues/199) / PR [#190](https://github.com/ctrlshiftaltdel/AgentOrch/pull/190) 与 [adaptive-verification-and-quality-gates.md](design/adaptive-verification-and-quality-gates.md)。该文稿为 `PROPOSED` / `NOT IMPLEMENTED`；**现行 G1–G6、当前 head CI、合并后完整回归与测试强度不因本提案改变。**
+**唯一来源**：Epic [#184](https://github.com/ctrlshiftaltdel/AgentOrch/issues/184)、提案 [#199](https://github.com/ctrlshiftaltdel/AgentOrch/issues/199) / PR [#190](https://github.com/ctrlshiftaltdel/AgentOrch/pull/190) 与 [adaptive-verification-and-quality-gates.md](design/adaptive-verification-and-quality-gates.md)。该文稿为 `PROPOSED` / `NOT IMPLEMENTED`；**现行 G1–G6、当前 head CI、合并后完整回归与测试强度不因本提案改变。** 组内进度：#185 已完成 / `VERIFIED`；#186–#189 仍为 `OPEN` / `PLANNED`、未 READY。
 
 | Issue | 交付 | 真实状态 | 已有依赖 / 条件 |
 |---|---|---|---|
