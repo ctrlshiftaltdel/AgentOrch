@@ -413,6 +413,25 @@ class GateTests(unittest.TestCase):
         self.assertFalse(report.automatic_dispatch_allowed)
 
 
+    def test_refreshed_header_does_not_revive_an_expired_row(self):
+        record = support.capability_record(
+            probe_date=NOW,
+            overrides={'C1': support.capability('C1', probe_date=OLD_PROBE)})
+        gate = record.gate(now=NOW)
+        self.assertEqual(gate.status, 'BLOCKED')
+        self.assertTrue(gate.stale)
+        self.assertIn('C1', ' '.join(gate.reasons))
+        report = self.report_for(record)
+        self.assertFalse(report.executed)
+        self.assertFalse(report.automatic_dispatch_allowed)
+        execution = report.role(roles.ROLE_EXECUTION)
+        self.assertIsNone(execution.selected)
+        self.assertTrue(execution.manual_handoff)
+        # The stored evidence keeps its real dates: nothing is re-stamped.
+        self.assertEqual(record.probe_date, NOW)
+        self.assertEqual(record.get('C1').probe_date, OLD_PROBE)
+
+
 # --------------------------------------------------------------------------- #
 # Missing roles and empty discovery
 # --------------------------------------------------------------------------- #
