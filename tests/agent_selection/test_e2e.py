@@ -52,7 +52,7 @@ SCOPE_B = 'e2e-scope-b'
 # Synthetic fixtures: a temporary project root, a scope and a model batch
 # --------------------------------------------------------------------------- #
 def registry_details(*, agent_id, model_id, model_family, modalities, tools,
-                     capability_ref='cap-1', **extra):
+                     capability_ref='cap-1', identity=True, **extra):
     details = {
         'runtime_id': 'fixture-runtime', 'runtime_version': '1.0.0',
         'agent_id': agent_id, 'model_id': model_id,
@@ -60,6 +60,15 @@ def registry_details(*, agent_id, model_id, model_family, modalities, tools,
         'capability_ref': capability_ref, 'evidence_time': NOW,
         'source_class': 'OBSERVED',
     }
+    if identity:
+        # (#170) The operator's verified canonical identity for this agent: the
+        # model id resolves to itself, and no alias is claimed.
+        details.update({
+            'canonical_model_id': model_id,
+            'identity_verification': 'CONFIRMED',
+            'identity_verified_until': '2027-01-01T00:00:00Z',
+            'identity_evidence': 'fixture:model-identity-registry',
+        })
     details.update(extra)
     # The Markdown store refuses empty detail values; an absent key means the
     # same thing to the registry parser and keeps the record honest.
@@ -579,9 +588,9 @@ class HardFilterCompositionTests(StoreCase):
 # --------------------------------------------------------------------------- #
 class SourceTests(StoreCase):
     def discovered(self):
-        return discovery.discover_candidates(
-            adapter=support.FixtureAdapter(
-                support.ok_result(support.standard_candidates())))
+        # The fixture scope registry declares the identities; a runtime claim
+        # alone would be discarded at the discovery boundary (#170).
+        return support.discovery_with(support.standard_candidates())
 
     def test_auth_failed_source_is_unlinked_and_never_blank(self):
         report = self.select(self.discovered(), batch=failed_batch())

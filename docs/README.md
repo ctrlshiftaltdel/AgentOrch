@@ -361,6 +361,15 @@ Edit .orchestration/config.json to change retry_cap or local_dir; invalid values
 
 `.gitignore` 用 `.local/*` 忽略全部内容，只保留 `.local/README.md` 作为目录说明；该说明文件本身不得写任何个人信息、凭据或主机事实。分发包按 `validate_kit.py` 的文件清单打包，`.local/` 不在清单内，因此不会被发布。若修改 `local_dir`，必须同步更新 `.gitignore`，否则私有文件可能被提交。
 
+#### 6.3.1 模型身份的来源、核验与失效
+
+Reviewer 能否算“独立”，只认当前 scope 的 Agent 注册表（`.local/` 下该 scope 的 `agent-registry.md`）里**操作者自己写入**的规范身份声明：
+
+- **来源**：注册表记录的 `canonical_model_id`（底层模型）、`model_aliases`（解析到同一底层模型的其他 model_id）、`identity_verification`、`identity_verified_until`、`identity_evidence`。模型自述的 `model_id` / `model_family`、日期后缀、`latest`、预发布后缀或名称相似度都不作为同源 / 异源依据，也不接任何外部身份服务。
+- **谁核验**：项目操作者。只有把 `identity_verification` 写成 `CONFIRMED` 并填上 `identity_evidence`（你实际对照过的凭据 / 记录）才算核验过；本工具不代替你核验。
+- **何时失效**：到 `identity_verified_until`（UTC）为止，过期即失效，必须重新核验后改写该字段。没有默认有效期——缺这个字段的声明一律不可信。缺字段、`UNCONFIRMED`、同一 scope 内互相冲突或格式非法的映射都只作报告，不构成 Reviewer 独立性，也不产生自动资格；旧注册表没有这些字段仍可读取，但不会自动升级为可信独立。
+- **怎么对上 Agent**：运行时能枚举 Agent 时，枚举结果优先，但发现边界会先丢弃运行时自带的身份（Runtime 不能为底层模型作证），再按 `runtime_id` + `agent_id` + `model_id` 三者全等从注册表取得；对不上就没有身份，不做前缀、别名推断或名称相似度匹配。冲突按注册表声明本身判定，即使另一条声明所在的记录因无关字段非法而被跳过，相关身份也一律不可信；同一精确三元组的映射只在其中最短的核验截止时间之前算一致，过期按选择时刻重判。
+
 ### 6.4 并发策略
 
 不设固定并发数量。派发前观察 CPU、内存、磁盘与测试资源争用：只要任务之间依赖已满足、路径锁不冲突，且机器仍有余量，就可以并行；资源紧张时串行。同一 Worktree 同一时刻只允许一个测试进程，也不要让两个执行实例共享可写工作区。“本机实测可承载并发”只作为记录，不作为规则常量。

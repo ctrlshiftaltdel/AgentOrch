@@ -36,6 +36,7 @@ __all__ = [
     'GATING_CAPABILITIES',
     'VERDICTS',
     'EVIDENCE_CLASSES',
+    'CANONICAL_IDENTITY_STATUSES',
     'RECORD_STATUSES',
     'DISCOVERY_OUTCOMES',
     'DISCOVERY_MODES',
@@ -49,6 +50,7 @@ __all__ = [
     'SubagentGate',
     'PermissionScope',
     'RoleEvidence',
+    'CanonicalIdentity',
     'AgentCandidate',
     'RuntimeDescription',
     'DiscoveryResult',
@@ -82,6 +84,15 @@ ROLE_DIMENSIONS = {
     'reviewer': ('defect-detection', 'test-design', 'security-review'),
 }
 ROLE_GRADES = ('STRONG', 'MODERATE', 'WEAK', 'UNKNOWN')
+
+# (#170) A canonical model identity is the operator-declared underlying model
+# behind one or more model ids. Only ``CONFIRMED`` (the operator checked the
+# mapping in the current scope registry) is trusted, and only while its
+# ``verified_until`` has not passed; every other status is reported and never
+# promoted to reviewer-independence evidence. The token deliberately avoids the
+# task state machine's vocabulary so a selection report cannot be read as one.
+CANONICAL_IDENTITY_STATUSES = ('CONFIRMED', 'UNCONFIRMED', 'ABSENT', 'EXPIRED',
+                               'CONFLICT', 'INVALID')
 
 # The project interval after which a capability probe must be repeated. It is a
 # module constant so callers can pass a stricter value; it is never adapted per
@@ -610,6 +621,132 @@ class RoleEvidence:
 
 
 @dataclass(frozen=True)
+class CanonicalIdentity:
+    """The operator-declared underlying model identity behind one model id (#170).
+
+    ``canonical_id`` names the underlying model; ``aliases`` are the other model
+    ids that were confirmed to resolve to it. A declaration is *trusted* only
+    when it is ``CONFIRMED``, carries an ``evidence_ref`` and an unexpired
+    ``verified_until``: there is no default validity window, and no date
+    suffix, ``latest`` marker, prerelease tag or name similarity is ever used to
+    infer that two model ids are the same or different models.
+
+    ``status`` is decided at construction for format reasons. Expiry is decided
+    against the decision time by :meth:`trusted_at`, so a declaration that
+    expires between two runs cannot keep a stale ``CONFIRMED`` verdict.
+
+    In production only :func:`scripts.agent_selection.discovery
+    .registry_candidates_from_records` creates one, from the current scope's
+    ``agent-registry.md`` record. A runtime's own agent enumeration has no field
+    for it, so a runtime-discovered candidate stays ``None`` (``ABSENT``) until
+    an operator registers a verified mapping for it.
+    """
+
+    canonical_id: str | None = None
+    status: str = 'ABSENT'
+    detail: str = ''
+    aliases: tuple[str, ...] = ()
+    evidence_ref: str | None = None
+    verified_until: str | None = None
+    # Earliest ``verified_until`` shared by every declaration the same
+    # runtime_id + agent_id + model_id carries. The mapping is only as fresh as
+    # the shortest window on it, so a skipped record's deadline still governs at
+    # the decision time (#170).
+    agreement_until: str | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, 'aliases', tuple(self.aliases or ()))
+        if self.status not in CANONICAL_IDENTITY_STATUSES:
+            raise RuntimeAdapterError(
+                f'unknown canonical identity status {self.status!r}; expected '
+                f'one of {CANONICAL_IDENTITY_STATUSES}')
+        if self.canonical_id is not None:
+            if not isinstance(self.canonical_id, str) or not \
+                    self.canonical_id.strip():
+                raise RuntimeAdapterError(
+                    'canonical_id must be None or a non-empty string')
+            object.__setattr__(self, 'canonical_id', self.canonical_id.strip())
+        for alias in self.aliases:
+            if not isinstance(alias, str) or not alias.strip():
+                raise RuntimeAdapterError(
+                    'canonical identity aliases must be non-empty strings')
+        if self.status == 'CONFIRMED':
+            if self.canonical_id is None:
+                raise RuntimeAdapterError(
+                    'a CONFIRMED canonical identity needs a canonical_id')
+            if not self.evidence_ref or not str(self.evidence_ref).strip():
+                raise RuntimeAdapterError(
+                    'a CONFIRMED canonical identity needs an evidence '
+                    'reference; an unverifiable mapping cannot be trusted')
+            if self.verified_until is None:
+                raise RuntimeAdapterError(
+                    'a CONFIRMED canonical identity needs verified_until; no '
+                    'default validity window is invented')
+        if self.verified_until is not None:
+            parse_timestamp(self.verified_until)
+        if self.agreement_until is not None:
+            parse_timestamp(self.agreement_until)
+
+    @property
+    def known(self):
+        return self.canonical_id is not None
+
+    @property
+    def key(self):
+        """Comparison key: case-insensitive, otherwise literal."""
+        return self.canonical_id.casefold() if self.canonical_id else None
+
+    def alias_keys(self, model_id=None):
+        """Every model id this declaration claims, as comparison keys.
+
+        ``model_id`` is the id the candidate itself reports; a record about that
+        agent implicitly claims it, so a declaration need not repeat it.
+        """
+        keys = set()
+        if self.canonical_id:
+            keys.add(self.canonical_id.casefold())
+        for alias in self.aliases:
+            keys.add(alias.strip().casefold())
+        if model_id is not None and str(model_id).strip():
+            keys.add(str(model_id).strip().casefold())
+        return keys
+
+    def trusted_at(self, now=None):
+        """Return ``(trusted, status, detail)`` with expiry applied at *now*."""
+        if self.status != 'CONFIRMED':
+            return False, self.status, (
+                self.detail or f'canonical identity status is {self.status}')
+        if self.verified_until is None:  # cannot happen; fail closed anyway
+            return False, 'INVALID', ('a CONFIRMED canonical identity carries '
+                                      'no verified_until')
+        if _now(now) > parse_timestamp(self.verified_until):
+            return False, 'EXPIRED', (
+                f'canonical identity {self.canonical_id!r} was verified only '
+                f'until {self.verified_until}, which has passed; re-verify it '
+                'in the current scope agent registry')
+        if self.agreement_until is not None and \
+                _now(now) > parse_timestamp(self.agreement_until):
+            return False, 'CONFLICT', (
+                'another declaration for the same runtime_id, agent_id and '
+                f'model_id was verified only until {self.agreement_until}, '
+                'which has passed; the exact mapping is no longer consistent')
+        return True, 'CONFIRMED', (
+            f'canonical identity {self.canonical_id!r} confirmed against '
+            f'{self.evidence_ref} until {self.verified_until}')
+
+    def as_dict(self):
+        return {
+            'canonical_id': self.canonical_id,
+            'status': self.status,
+            'detail': self.detail,
+            'aliases': list(self.aliases),
+            'evidence_ref': self.evidence_ref,
+            'verified_until': self.verified_until,
+            'agreement_until': self.agreement_until,
+        }
+
+
+@dataclass(frozen=True)
 class AgentCandidate:
     """One callable candidate, with the facts that justify any selection.
 
@@ -635,6 +772,7 @@ class AgentCandidate:
     latency_ms: int | None = None
     role_evidence: tuple[RoleEvidence, ...] = ()
     notes: tuple[str, ...] = ()
+    canonical_identity: CanonicalIdentity | None = None
 
     def __post_init__(self):
         for name in ('runtime_id', 'runtime_version', 'agent_id'):
@@ -659,6 +797,11 @@ class AgentCandidate:
                    for value in values):
                 raise RuntimeAdapterError(
                     f'{name} entries must be non-empty strings')
+        if self.canonical_identity is not None and not isinstance(
+                self.canonical_identity, CanonicalIdentity):
+            raise RuntimeAdapterError(
+                'canonical_identity must be None or a CanonicalIdentity; a '
+                'model-id string is not an identity declaration')
         if self.capability_record is not None:
             if self.capability_record.runtime_id != self.runtime_id:
                 raise RuntimeAdapterError(
@@ -710,6 +853,9 @@ class AgentCandidate:
             'latency_ms': self.latency_ms,
             'role_evidence': [item.as_dict() for item in self.role_evidence],
             'notes': list(self.notes),
+            'canonical_identity': (self.canonical_identity.as_dict()
+                                   if self.canonical_identity is not None
+                                   else None),
         }
 
 
