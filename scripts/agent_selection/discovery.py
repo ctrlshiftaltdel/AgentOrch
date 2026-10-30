@@ -309,6 +309,54 @@ def disputed_identity_keys(records, *, now=None):
             disputed_exact)
 
 
+def _with_agreement_deadline(identity, deadlines, exact_key):
+    """Attach the triple's shortest verification window to a trusted identity."""
+    deadline = deadlines.get(exact_key)
+    if deadline is None or identity.status != 'CONFIRMED':
+        return identity
+    return replace(identity, agreement_until=deadline)
+
+
+def agreement_deadlines(records, *, now=None):
+    """Earliest verification deadline shared by one exact triple's declarations.
+
+    Every non-``SUPERSEDED`` record that carries identity fields and claims the
+    same ``runtime_id`` + ``agent_id`` + ``model_id`` must still be a confirmed
+    declaration for that triple to stay consistent. When they agree at ``now``,
+    the earliest ``verified_until`` is recorded so role matching can re-evaluate
+    the window at its own decision time: a record that was still open when the
+    registry was read (and may even have been skipped as a candidate) must not
+    silently outlive its deadline (#170 review).
+    """
+    per_key = {}
+    for record in records:
+        if record.status == 'SUPERSEDED':
+            continue
+        claim = _identity_claim(record)
+        if claim is None:
+            continue
+        identity, _model_id, exact = claim
+        if exact is None:
+            continue
+        per_key.setdefault(exact, []).append(identity)
+    deadlines = {}
+    for exact, declarations in per_key.items():
+        if len(declarations) < 2:
+            continue
+        canonicals = set()
+        consistent = True
+        for identity in declarations:
+            trusted, _status, _detail = identity.trusted_at(now)
+            if not trusted or identity.verified_until is None:
+                consistent = False
+                break
+            canonicals.add(identity.canonical_id.casefold())
+        if consistent and len(canonicals) == 1:
+            deadlines[exact] = min(item.verified_until
+                                   for item in declarations)
+    return deadlines
+
+
 def _conflict_identity(identity, disputed, *, model_id=None, exact_key=None,
                        disputed_exact=()):
     """Downgrade one declaration that contradicts another record, or return it."""
@@ -484,6 +532,7 @@ def registry_candidates_from_records(records, *, capability_records=None,
     # Identity contradictions are decided from the declarations themselves, so a
     # record rejected for an unrelated field cannot hide one side of a conflict.
     disputed, disputed_exact = disputed_identity_keys(records, now=now)
+    deadlines = agreement_deadlines(records, now=now)
     entries = []
     issues = []
     for record in records:
@@ -556,13 +605,18 @@ def registry_candidates_from_records(records, *, capability_records=None,
                 latency_ms=_optional_int(details.get('latency_ms'),
                                          'latency_ms'),
                 notes=(f'registry record {record.record_id}',),
-                canonical_identity=_conflict_identity(
-                    identity_from_details(details), disputed,
-                    model_id=str(details['model_id']).strip(),
-                    exact_key=(str(details['runtime_id']).strip(),
-                               str(details['agent_id']).strip(),
-                               str(details['model_id']).strip()),
-                    disputed_exact=disputed_exact),
+                canonical_identity=_with_agreement_deadline(
+                    _conflict_identity(
+                        identity_from_details(details), disputed,
+                        model_id=str(details['model_id']).strip(),
+                        exact_key=(str(details['runtime_id']).strip(),
+                                   str(details['agent_id']).strip(),
+                                   str(details['model_id']).strip()),
+                        disputed_exact=disputed_exact),
+                    deadlines,
+                    (str(details['runtime_id']).strip(),
+                     str(details['agent_id']).strip(),
+                     str(details['model_id']).strip())),
             )
         except (RegistryError, RuntimeAdapterError) as exc:
             issues.append(f'{label}: {exc}; skipped')

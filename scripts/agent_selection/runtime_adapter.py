@@ -648,6 +648,11 @@ class CanonicalIdentity:
     aliases: tuple[str, ...] = ()
     evidence_ref: str | None = None
     verified_until: str | None = None
+    # Earliest ``verified_until`` shared by every declaration the same
+    # runtime_id + agent_id + model_id carries. The mapping is only as fresh as
+    # the shortest window on it, so a skipped record's deadline still governs at
+    # the decision time (#170).
+    agreement_until: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, 'aliases', tuple(self.aliases or ()))
@@ -679,6 +684,8 @@ class CanonicalIdentity:
                     'default validity window is invented')
         if self.verified_until is not None:
             parse_timestamp(self.verified_until)
+        if self.agreement_until is not None:
+            parse_timestamp(self.agreement_until)
 
     @property
     def known(self):
@@ -717,6 +724,12 @@ class CanonicalIdentity:
                 f'canonical identity {self.canonical_id!r} was verified only '
                 f'until {self.verified_until}, which has passed; re-verify it '
                 'in the current scope agent registry')
+        if self.agreement_until is not None and \
+                _now(now) > parse_timestamp(self.agreement_until):
+            return False, 'CONFLICT', (
+                'another declaration for the same runtime_id, agent_id and '
+                f'model_id was verified only until {self.agreement_until}, '
+                'which has passed; the exact mapping is no longer consistent')
         return True, 'CONFIRMED', (
             f'canonical identity {self.canonical_id!r} confirmed against '
             f'{self.evidence_ref} until {self.verified_until}')
@@ -729,6 +742,7 @@ class CanonicalIdentity:
             'aliases': list(self.aliases),
             'evidence_ref': self.evidence_ref,
             'verified_until': self.verified_until,
+            'agreement_until': self.agreement_until,
         }
 
 

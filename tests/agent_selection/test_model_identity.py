@@ -588,6 +588,38 @@ class RegistryConflictTests(unittest.TestCase):
                          entries[0].canonical_identity)
         self.assertFalse(entries[0].canonical_identity.trusted_at(NOW)[0])
 
+    def test_a_skipped_twin_deadline_reaches_the_selection_time(self):
+        """A twin skipped as a candidate still governs when the mapping expires.
+
+        At parse time the twin's window is still open, so the two declarations
+        agree. At the selection time it has closed, so the exact mapping is no
+        longer consistent and the survivor must not be trusted.
+        """
+        parse_time = '2026-10-27T12:00:00Z'
+        select_time = '2026-10-27T12:00:02Z'
+        twin_until = '2026-10-27T12:00:01Z'
+        records = [
+            Record(registry_details(agent_id='review-1', model_id='model-b',
+                                    canonical_model_id='vendor/core-y',
+                                    model_aliases='', read_only='true',
+                                    write_paths='', tools='file-read')),
+            Record(registry_details(agent_id='review-1', model_id='model-b',
+                                    canonical_model_id='vendor/core-y',
+                                    model_aliases='',
+                                    identity_verified_until=twin_until,
+                                    read_only='maybe')),
+        ]
+        entries, _ = discovery.registry_candidates_from_records(
+            records, capability_records=capabilities(), now=parse_time)
+        identity = entries[0].canonical_identity
+        self.assertEqual(identity.status, 'CONFIRMED')
+        self.assertEqual(identity.agreement_until, twin_until)
+        self.assertTrue(identity.trusted_at(parse_time)[0])
+        trusted, status, detail = identity.trusted_at(select_time)
+        self.assertFalse(trusted)
+        self.assertEqual(status, 'CONFLICT')
+        self.assertIn(twin_until, detail)
+
     def test_two_records_for_one_exact_triple_with_the_same_identity_agree(self):
         records = [
             Record(registry_details(agent_id='review-1', model_id='model-b',
@@ -840,6 +872,46 @@ class RegistryToRoleTests(unittest.TestCase):
         self.assert_twin_blocks_the_reviewer(
             {'identity_verified_until': '2020-01-01T00:00:00Z',
              'read_only': 'maybe'})
+
+    def test_a_skipped_twin_deadline_blocks_the_reviewer_at_selection_time(self):
+        """End to end: the agreement window is judged at the selection time."""
+        parse_time = '2026-10-27T12:00:00Z'
+        select_time = '2026-10-27T12:00:02Z'
+        twin_until = '2026-10-27T12:00:01Z'
+        records = [
+            self.master_record(),
+            Record(registry_details(
+                agent_id='exec-1', model_id='model-a',
+                canonical_model_id='vendor/core-x', model_aliases='',
+                tools='file-read,file-write,command')),
+            Record(registry_details(
+                agent_id='review-1', model_id='model-b', model_family='family-b',
+                canonical_model_id='vendor/core-y', model_aliases='',
+                tools='file-read', write_paths='', read_only='true')),
+            Record(registry_details(
+                agent_id='review-1', model_id='model-b', model_family='family-b',
+                canonical_model_id='vendor/core-y', model_aliases='',
+                identity_verified_until=twin_until, read_only='maybe')),
+        ]
+        entries, _ = discovery.registry_candidates_from_records(
+            records, capability_records=capabilities(), now=parse_time)
+        for entry in entries:
+            if entry.agent_id == 'review-1':
+                self.assertEqual(entry.canonical_identity.status, 'CONFIRMED',
+                                 'the twin was still valid at parse time')
+        discovered = discovery.discover_candidates(
+            registry=discovery.ExplicitRegistry(entries=entries))
+        report = roles.select_roles(discovered, support.task_requirements(),
+                                    now=select_time)
+        selection = report.role(roles.ROLE_REVIEWER)
+        self.assertIsNone(selection.selected)
+        independence = independence_for(selection, 'review-1')
+        self.assertEqual(independence.status, 'UNKNOWN')
+        self.assertIn('CONFLICT', independence.detail)
+        self.assertIn(twin_until, independence.detail)
+        self.assertFalse(selection.auto_allowed)
+        self.assertFalse(report.automatic_dispatch_allowed)
+        self.assertFalse(report.executed)
 
     def test_two_confirmed_registry_identities_select_the_reviewer(self):
         records = [self.master_record(),

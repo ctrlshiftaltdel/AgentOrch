@@ -213,6 +213,7 @@ Reviewer 独立性需要一个**可追溯的底层模型身份**，而不只是�
 - **状态与模型级 / 家族级分开表达。** `ABSENT`（没有声明）、`UNCONFIRMED`、`CONFLICT`、`EXPIRED`、`INVALID` 都让 Reviewer 独立性成为 `UNKNOWN`，`auto_allowed=False`，以 `degradation` 说明原因；两个规范身份不同且都可信时才在模型级 `PASS`，家族差异只作自述报告，家族未知写 `UNKNOWN` 而不是“已观察到不同家族”。
 - **兼容。** 旧注册表没有这些字段时仍可读取，但该候选的规范身份是 `ABSENT`，不会自动升级为可信独立；要自动选 Reviewer 就必须补写声明。Runtime 的自述（`model_id` / `model_family`）不参与判定，选择器也不接外部身份服务。
 - **Runtime 枚举与注册表的对应。** 运行时能枚举 Agent 时，枚举结果照旧优先，但**发现边界先丢弃运行时自带的 `canonical_identity`**：Runtime 能枚举 Agent，不能为底层模型作证，它自报的“已核验”不是身份来源（原始自述仍保留在 `runtime_result` 里作为溯源，不作为证据）。丢弃后再按 `runtime_id` + `agent_id` + `model_id` 三者**全等**匹配当前 scope 的注册表记录并取得其身份声明。没有注册表、匹配不到 → 无身份（`ABSENT`）；两条精确匹配且声明不一致 → `CONFLICT`；三者都不允许 Reviewer 独立性 PASS 或自动资格。不做前缀、别名推断或名称相似度匹配，也不把注册表里别的 Agent 的记录挪过来用。
+- **一致性按选择时刻判定。** 精确三元组上所有声明（包括因无关字段被跳过、不会成为候选的那些）的 `identity_verified_until` 会随映射一起带到选择阶段：该映射只在其中最短的核验截止时间之前算一致。读注册表时还有效、到选择时已过期的孪生声明，会让该映射在那一刻降级为 `CONFLICT`；只在转换时看一次过期不够。
 - **冲突按声明本身判定。** 同一 model_id / alias 是否冲突，只看注册表记录里的身份声明，不看该记录其余字段是否通过校验：一条因 `read_only` 等无关字段非法而被跳过的记录，只要它声明了冲突的规范身份或别名，相关身份一律 `CONFLICT`，不能留下另一条 `CONFIRMED`。
 - **边界。** 该判定只影响选择报告的资格与自动资格，不派发 Agent、不改用户模型配置、不创建或授权 Subagent；`executed` 始终为 `False`。
 
