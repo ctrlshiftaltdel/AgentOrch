@@ -168,6 +168,81 @@ class CapabilityFailureTests(unittest.TestCase):
         self.assertFalse(report.automatic_dispatch_allowed)
 
 
+class CapabilityRowFreshnessTests(unittest.TestCase):
+    """#205: a re-dated record header never qualifies a stale gating row."""
+
+    def run_with_execution(self, execution):
+        master, _, reviewer = support.standard_candidates()
+        report = support.report_with((master, execution, reviewer))
+        return report.role('execution'), report
+
+    def execution_with_row(self, capability_id, probe_date, *, header=NOW):
+        _, execution, _ = support.standard_candidates()
+        record = support.capability_record(
+            probe_date=header,
+            overrides={capability_id: support.capability(
+                capability_id, probe_date=probe_date)})
+        return support.candidate(
+            execution.agent_id, model_id=execution.model_id,
+            model_family=execution.model_family,
+            modalities=execution.modalities, tools=execution.tools,
+            permission=execution.permissions,
+            capability_record_value=record,
+            role_evidence=execution.role_evidence)
+
+    def test_fresh_header_with_a_stale_row_keeps_execution_unqualified(self):
+        for capability_id in support.PASS_VERDICTS:
+            with self.subTest(capability_id=capability_id):
+                selection, report = self.run_with_execution(
+                    self.execution_with_row(capability_id, support.OLD_PROBE))
+                self.assertIsNone(selection.selected)
+                self.assertFalse(selection.auto_allowed)
+                self.assertTrue(selection.manual_handoff)
+                self.assertFalse(report.automatic_dispatch_allowed)
+                self.assertTrue(selection.excluded)
+                callable_filter = next(
+                    item for item in selection.excluded[0].filters
+                    if item.filter_id == 'callable')
+                self.assertEqual(callable_filter.status, 'FAIL')
+                self.assertIn(capability_id, callable_filter.detail)
+                self.assertIn('re-probe', callable_filter.detail)
+                self.assertIn('STALE', callable_filter.detail)
+
+    def test_fresh_header_and_fresh_rows_still_qualify(self):
+        selection, report = self.run_with_execution(
+            self.execution_with_row('C2', support.PROBE))
+        self.assertIsNotNone(selection.selected)
+        self.assertTrue(report.automatic_dispatch_allowed)
+
+    def test_future_row_is_reported_as_unverified_not_stale(self):
+        selection, report = self.run_with_execution(
+            self.execution_with_row('C3', '2026-10-28T12:00:00Z'))
+        self.assertIsNone(selection.selected)
+        self.assertFalse(report.automatic_dispatch_allowed)
+        self.assertTrue(selection.unverified)
+        callable_filter = next(
+            item for item in selection.unverified[0].filters
+            if item.filter_id == 'callable')
+        self.assertEqual(callable_filter.status, 'UNKNOWN')
+        self.assertIn('C3', callable_filter.detail)
+        self.assertIn('future', callable_filter.detail)
+
+    def test_explicit_max_age_days_applies_to_rows_in_the_report(self):
+        candidate = self.execution_with_row('C4', '2026-10-17T12:00:00Z')
+        at_limit = support.report_with(
+            (support.standard_candidates()[0], candidate,
+             support.standard_candidates()[2]))
+        self.assertTrue(at_limit.automatic_dispatch_allowed)
+        master, _, reviewer = support.standard_candidates()
+        stricter = roles.select_roles(
+            discovery.discover_candidates(
+                adapter=support.FixtureAdapter(
+                    support.ok_result((master, candidate, reviewer)))),
+            support.task_requirements(), now=NOW, max_age_days=9)
+        self.assertFalse(stricter.automatic_dispatch_allowed)
+        self.assertIsNone(stricter.role('execution').selected)
+
+
 class MissingRoleTests(unittest.TestCase):
     def test_missing_execution_gives_an_actionable_reminder(self):
         master, _, reviewer = support.standard_candidates()

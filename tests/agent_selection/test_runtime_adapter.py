@@ -116,6 +116,124 @@ class CapabilityGateTests(unittest.TestCase):
         self.assertTrue(gate.stale)
 
 
+class CapabilityRowFreshnessTests(unittest.TestCase):
+    """Every gating row is fresh on its own probe date, not the header's (#205).
+
+    A freshly re-dated capability *record* must not launder stale per-row
+    evidence. ``gate`` applies the same ``now``, the same default / explicit
+    ``max_age_days`` and a fail-closed future-date rule to the header and to
+    each of C1-C4.
+    """
+
+    HEADER = NOW
+
+    def record_with_row(self, capability_id, probe_date):
+        return support.capability_record(
+            probe_date=self.HEADER,
+            overrides={capability_id: support.capability(
+                capability_id, probe_date=probe_date)})
+
+    def assert_not_fresh(self, gate):
+        self.assertFalse(gate.passed)
+        self.assertNotEqual(gate.status, 'PASS')
+
+    def test_a_fresh_header_does_not_refresh_one_stale_row(self):
+        for capability_id in support.PASS_VERDICTS:
+            with self.subTest(capability_id=capability_id):
+                gate = self.record_with_row(
+                    capability_id, support.OLD_PROBE).gate(now=NOW,
+                                                           max_age_days=30)
+                self.assert_not_fresh(gate)
+                self.assertEqual(gate.status, 'BLOCKED')
+                self.assertTrue(gate.stale)
+                joined = ' '.join(gate.reasons)
+                self.assertIn(f'{capability_id}:', joined)
+                self.assertIn('re-probe', joined)
+
+    def test_a_fresh_header_does_not_refresh_all_stale_rows(self):
+        overrides = {capability_id: support.capability(
+            capability_id, probe_date=support.OLD_PROBE)
+            for capability_id in support.PASS_VERDICTS}
+        record = support.capability_record(probe_date=self.HEADER,
+                                           overrides=overrides)
+        gate = record.gate(now=NOW, max_age_days=30)
+        self.assert_not_fresh(gate)
+        self.assertEqual(gate.status, 'BLOCKED')
+        self.assertTrue(gate.stale)
+        joined = ' '.join(gate.reasons)
+        for capability_id in support.PASS_VERDICTS:
+            self.assertIn(f'{capability_id}:', joined)
+
+    def test_row_freshness_uses_the_same_explicit_max_age_days(self):
+        record = self.record_with_row('C2', '2026-10-17T12:00:00Z')  # 10 days
+        self.assertTrue(record.gate(now=NOW, max_age_days=10).passed)
+        gate = record.gate(now=NOW, max_age_days=9)
+        self.assert_not_fresh(gate)
+        self.assertEqual(gate.status, 'BLOCKED')
+        self.assertTrue(gate.stale)
+        self.assertIn('C2:', ' '.join(gate.reasons))
+
+    def test_row_freshness_boundary_matches_the_record_limit(self):
+        at_limit = self.record_with_row('C1', '2026-09-27T12:00:00Z')  # 30 days
+        self.assertTrue(at_limit.gate(now=NOW, max_age_days=30).passed)
+        past_limit = self.record_with_row('C1', '2026-09-27T11:59:59Z')
+        gate = past_limit.gate(now=NOW, max_age_days=30)
+        self.assert_not_fresh(gate)
+        self.assertEqual(gate.status, 'BLOCKED')
+        self.assertTrue(gate.stale)
+
+    def test_default_max_age_days_applies_to_rows(self):
+        record = self.record_with_row('C4', '2026-09-26T12:00:00Z')  # 31 days
+        gate = record.gate(now=NOW)
+        self.assert_not_fresh(gate)
+        self.assertEqual(gate.status, 'BLOCKED')
+        self.assertTrue(gate.stale)
+
+    def test_future_row_probe_date_is_not_trusted_as_fresh(self):
+        record = self.record_with_row('C3', '2026-10-28T12:00:00Z')
+        gate = record.gate(now=NOW)
+        self.assert_not_fresh(gate)
+        self.assertEqual(gate.status, 'UNKNOWN')
+        joined = ' '.join(gate.reasons)
+        self.assertIn('C3:', joined)
+        self.assertIn('future', joined)
+
+    def test_future_row_probe_date_is_untrusted_without_an_age_limit(self):
+        record = self.record_with_row('C2', '2026-10-28T12:00:00Z')
+        gate = record.gate(now=NOW, max_age_days=None)
+        self.assert_not_fresh(gate)
+        self.assertEqual(gate.status, 'UNKNOWN')
+
+    def test_a_pass_row_cannot_exist_without_a_probe_date(self):
+        with self.assertRaises(runtime_adapter.RuntimeAdapterError):
+            runtime_adapter.Capability(
+                'C1', 'PASS', source_class='OBSERVED', probe_date=None,
+                evidence_ref='probe:1')
+
+    def test_gate_fails_closed_on_a_row_built_outside_its_constructor(self):
+        # Defence in depth: a row materialised outside the validating
+        # constructor (for example by a future deserialiser) must still not be
+        # treated as fresh evidence.
+        class UncheckedCapability(runtime_adapter.Capability):
+            def __post_init__(self):
+                pass
+
+        row = UncheckedCapability('C1', 'PASS', source_class='OBSERVED',
+                                  probe_date=None, evidence_ref='probe:1')
+        record = support.capability_record(probe_date=self.HEADER,
+                                           overrides={'C1': row})
+        gate = record.gate(now=NOW)
+        self.assert_not_fresh(gate)
+        self.assertIn('C1:', ' '.join(gate.reasons))
+
+    def test_gate_does_not_rewrite_stored_row_probe_dates(self):
+        record = self.record_with_row('C1', support.OLD_PROBE)
+        before = record.as_dict()
+        record.gate(now=NOW)
+        self.assertEqual(record.as_dict(), before)
+        self.assertEqual(record.get('C1').probe_date, support.OLD_PROBE)
+
+
 class AdapterContractTests(unittest.TestCase):
     def test_host_opaque_adapter_reports_unsupported_and_no_candidates(self):
         adapter = runtime_adapter.HostOpaqueRuntimeAdapter(
