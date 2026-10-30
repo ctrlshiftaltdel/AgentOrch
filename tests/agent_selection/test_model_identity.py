@@ -755,6 +755,59 @@ class RegistryToRoleTests(unittest.TestCase):
         self.assertFalse(report.automatic_dispatch_allowed)
         self.assertFalse(report.executed)
 
+    def reviewer_independence(self, selection):
+        items = [next(item for item in evaluation.filters
+                      if item.filter_id == 'independence')
+                 for evaluation in evaluations(selection)
+                 if evaluation.candidate.agent_id == 'review-1']
+        self.assertTrue(items, 'the reviewer was not evaluated')
+        return items
+
+    def assert_twin_blocks_the_reviewer(self, twin_overrides):
+        records = [
+            self.master_record(),
+            Record(registry_details(
+                agent_id='exec-1', model_id='model-a',
+                canonical_model_id='vendor/core-x', model_aliases='',
+                tools='file-read,file-write,command')),
+            Record(registry_details(
+                agent_id='review-1', model_id='model-b', model_family='family-b',
+                canonical_model_id='vendor/core-y', model_aliases='',
+                tools='file-read', write_paths='', read_only='true')),
+            Record(registry_details(
+                agent_id='review-1', model_id='model-b', model_family='family-b',
+                canonical_model_id='vendor/core-y', **twin_overrides)),
+        ]
+        entries, _ = discovery.registry_candidates_from_records(
+            records, capability_records=capabilities())
+        reviewers = [entry for entry in entries if entry.agent_id == 'review-1']
+        self.assertTrue(reviewers, 'the reviewer records were dropped')
+        for entry in reviewers:
+            self.assertEqual(entry.canonical_identity.status, 'CONFLICT',
+                             entry.canonical_identity)
+        discovered = discovery.discover_candidates(
+            registry=discovery.ExplicitRegistry(entries=entries))
+        report = roles.select_roles(discovered, support.task_requirements(),
+                                    now=NOW)
+        selection = report.role(roles.ROLE_REVIEWER)
+        self.assertIsNone(selection.selected)
+        for independence in self.reviewer_independence(selection):
+            self.assertEqual(independence.status, 'UNKNOWN')
+            self.assertIn('CONFLICT', independence.detail)
+        self.assertFalse(selection.auto_allowed)
+        self.assertFalse(report.automatic_dispatch_allowed)
+        self.assertFalse(report.executed)
+
+    def test_a_twin_with_a_bad_alias_blocks_the_reviewer(self):
+        """Same canonical string, but the twin is not a usable declaration."""
+        self.assert_twin_blocks_the_reviewer({'model_aliases': 'bad alias',
+                                              'read_only': 'maybe'})
+
+    def test_an_unconfirmed_twin_blocks_the_reviewer(self):
+        """Same canonical string, but the twin was never confirmed."""
+        self.assert_twin_blocks_the_reviewer(
+            {'identity_verification': 'UNCONFIRMED'})
+
     def test_two_confirmed_registry_identities_select_the_reviewer(self):
         records = [self.master_record(),
             Record(registry_details(

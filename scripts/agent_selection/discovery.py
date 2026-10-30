@@ -262,8 +262,10 @@ def disputed_identity_keys(records):
     * ``alias_keys`` - model ids / aliases declared against more than one
       canonical id;
     * ``exact_triples`` - ``runtime_id`` + ``agent_id`` + ``model_id`` triples
-      that more than one record claims with a different result, including a
-      record whose identity could not be resolved at all.
+      that more than one record claims without agreeing on one *confirmed*
+      declaration. A twin whose canonical id happens to match still counts when
+      its own declaration is unusable (a malformed alias, a missing or invalid
+      field) or was never confirmed: matching the string is not enough.
 
     Both are computed on **every** non-``SUPERSEDED`` record before the rest of
     the record is validated, so a record rejected for an unrelated field (say an
@@ -285,10 +287,20 @@ def disputed_identity_keys(records):
                     identity.canonical_id.casefold())
         if exact is not None:
             exact_claims.setdefault(exact, set()).add(
-                identity.canonical_id.casefold()
-                if identity.canonical_id is not None else None)
+                (identity.status,
+                 identity.canonical_id.casefold()
+                 if identity.canonical_id is not None else None))
+    disputed_exact = set()
+    for exact, declarations in exact_claims.items():
+        if len(declarations) < 2:
+            # One record alone is governed by its own status, not by a twin.
+            continue
+        canonicals = {canonical for _, canonical in declarations}
+        if len(canonicals) > 1 or any(status != 'CONFIRMED'
+                                      for status, _ in declarations):
+            disputed_exact.add(exact)
     return ({key for key, targets in claims.items() if len(targets) > 1},
-            {key for key, targets in exact_claims.items() if len(targets) > 1})
+            disputed_exact)
 
 
 def _conflict_identity(identity, disputed, *, model_id=None, exact_key=None,
@@ -303,8 +315,8 @@ def _conflict_identity(identity, disputed, *, model_id=None, exact_key=None,
     if exact_key is not None and exact_key in disputed_exact:
         reasons.append(
             'another record matches this agent on runtime_id, agent_id and '
-            'model_id but declares a different or unresolvable canonical model '
-            'identity')
+            'model_id but is not the same confirmed identity declaration '
+            '(different, unresolvable, unconfirmed or invalid)')
     if not reasons:
         return identity
     return replace(identity, status='CONFLICT',
