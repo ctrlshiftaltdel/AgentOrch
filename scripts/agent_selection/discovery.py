@@ -16,11 +16,12 @@ recommendation: the candidates returned here are handed to
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .local_store import StoreError
 from .runtime_adapter import (
     AgentCandidate,
+    CanonicalIdentity,
     CapabilityRecord,
     CANDIDATE_SOURCES,
     DiscoveryResult,
@@ -39,10 +40,13 @@ __all__ = [
     'DISCOVERY_EMPTY',
     'DISCOVERY_ERROR',
     'REGISTRY_DETAIL_KEYS',
+    'IDENTITY_DETAIL_KEYS',
+    'IDENTITY_VERIFICATION_VALUES',
     'RegistryError',
     'ExplicitRegistry',
     'DiscoveryReport',
     'discover_candidates',
+    'identity_from_details',
     'registry_candidates_from_records',
 ]
 
@@ -64,9 +68,22 @@ REGISTRY_DETAIL_KEYS = (
     'modalities', 'tools', 'read_paths', 'write_paths', 'commands', 'network',
     'network_observed', 'read_only', 'context_tokens', 'cost_per_mtok',
     'latency_ms', 'capability_ref', 'evidence_time', 'source_class',
+    'canonical_model_id', 'model_aliases', 'identity_verification',
+    'identity_verified_until', 'identity_evidence',
 )
 REQUIRED_REGISTRY_KEYS = ('runtime_id', 'runtime_version', 'agent_id',
                           'model_id', 'evidence_time', 'source_class')
+
+# (#170) The canonical model identity declaration an operator writes into the
+# current scope's ``agent-registry.md``. It is the only place a mapping becomes
+# trustworthy: the record names the underlying model, the aliases that resolve
+# to it, who verified it, and until when that verification holds. Nothing here
+# is inferred from a model name, a date suffix, ``latest``, a prerelease tag or
+# a similarly spelled id.
+IDENTITY_DETAIL_KEYS = ('canonical_model_id', 'model_aliases',
+                        'identity_verification', 'identity_verified_until',
+                        'identity_evidence')
+IDENTITY_VERIFICATION_VALUES = ('CONFIRMED', 'UNCONFIRMED')
 
 
 class RegistryError(ValueError):
@@ -109,6 +126,127 @@ def _optional_float(value, key):
     if parsed < 0:
         raise RegistryError(f'{key} must not be negative')
     return parsed
+
+
+def _identity_token(value, key):
+    """One model id from an identity field; ``None`` when the field is blank."""
+    text = str(value).strip()
+    if not text:
+        return None
+    if ',' in text or any(char.isspace() for char in text):
+        raise RegistryError(
+            f'{key} must be a single model id without whitespace or commas, '
+            f'got {value!r}')
+    return text
+
+
+def identity_from_details(details):
+    """Parse the (#170) canonical identity declaration of one registry record.
+
+    The result is always a :class:`CanonicalIdentity`; a malformed, unverified
+    or incomplete declaration is reported with its own status instead of
+    raising, so the candidate stays readable while its independence claim is
+    refused. A record that carries none of the identity keys is ``ABSENT``: an
+    older registry stays readable, but nothing is upgraded to trusted
+    independence on its behalf.
+    """
+    raw = {key: str(details.get(key, '') or '').strip()
+           for key in IDENTITY_DETAIL_KEYS}
+    if not any(raw.values()):
+        return CanonicalIdentity(
+            status='ABSENT',
+            detail=('no canonical model identity is registered for this '
+                    'record; a different model id or family self-report is not '
+                    'evidence of a different underlying model'))
+    try:
+        canonical = _identity_token(raw['canonical_model_id'],
+                                    'canonical_model_id')
+        aliases = tuple(alias for alias in
+                        (_identity_token(part, 'model_aliases')
+                         for part in _csv(raw['model_aliases'])) if alias)
+    except RegistryError as exc:
+        return CanonicalIdentity(status='INVALID',
+                                 detail=f'{exc}; the mapping is not trusted')
+    verification = raw['identity_verification'].upper()
+    until = raw['identity_verified_until'] or None
+    evidence = raw['identity_evidence'] or None
+    if canonical is None:
+        return CanonicalIdentity(
+            status='INVALID', aliases=aliases, evidence_ref=evidence,
+            detail=('canonical_model_id is required when other identity fields '
+                    'are present; the mapping is not trusted'))
+    if verification not in IDENTITY_VERIFICATION_VALUES:
+        return CanonicalIdentity(
+            canonical_id=canonical, status='UNCONFIRMED', aliases=aliases,
+            evidence_ref=evidence,
+            detail=(f'identity_verification is '
+                    f'{verification or "absent"}; only an operator-confirmed '
+                    f'mapping ({", ".join(IDENTITY_VERIFICATION_VALUES)}) is '
+                    'trusted'))
+    if verification == 'UNCONFIRMED':
+        return CanonicalIdentity(
+            canonical_id=canonical, status='UNCONFIRMED', aliases=aliases,
+            evidence_ref=evidence,
+            detail=('the operator marked this mapping UNCONFIRMED; it is '
+                    'reported and not trusted'))
+    problems = []
+    if until is None:
+        problems.append('identity_verified_until is missing; no default '
+                        'validity window is invented')
+    else:
+        try:
+            parse_timestamp(until)
+        except RuntimeAdapterError:
+            problems.append(f'identity_verified_until {until!r} is not a UTC '
+                            'timestamp like 2026-10-30T00:00:00Z')
+    if evidence is None:
+        problems.append('identity_evidence is missing; a verified mapping must '
+                        'name the evidence an operator checked')
+    if problems:
+        return CanonicalIdentity(
+            canonical_id=canonical, status='INVALID', aliases=aliases,
+            evidence_ref=evidence,
+            detail='; '.join(problems) + '; the mapping is not trusted')
+    return CanonicalIdentity(
+        canonical_id=canonical, status='CONFIRMED', aliases=aliases,
+        evidence_ref=evidence, verified_until=until,
+        detail=f'confirmed against {evidence} until {until}')
+
+
+def _resolve_identity_conflicts(entries, label_of):
+    """Downgrade declarations that contradict another record in the scope.
+
+    Two records that claim the same model id (or alias) for different canonical
+    ids make the mapping unusable: neither side can be trusted, because the
+    registry itself does not say which one is right. Only a same-canonical
+    repeat is harmless.
+    """
+    claims = {}
+    for entry in entries:
+        identity = entry.canonical_identity
+        if identity is None or identity.canonical_id is None:
+            continue
+        for key in identity.alias_keys(entry.model_id):
+            claims.setdefault(key, set()).add(identity.canonical_id.casefold())
+    disputed = {key for key, targets in claims.items() if len(targets) > 1}
+    if not disputed:
+        return entries, ()
+    resolved = []
+    issues = []
+    for entry in entries:
+        identity = entry.canonical_identity
+        if identity is not None and identity.canonical_id is not None:
+            hit = sorted(identity.alias_keys(entry.model_id) & disputed)
+            if hit:
+                detail = (f'the canonical model identity mapping for '
+                          f'{", ".join(hit)} is declared against more than one '
+                          'canonical id in this scope; a conflicting mapping is '
+                          'not trusted')
+                issues.append(f'{label_of(entry)}: {detail}')
+                entry = replace(entry, canonical_identity=replace(
+                    identity, status='CONFLICT', detail=detail))
+        resolved.append(entry)
+    return tuple(resolved), tuple(issues)
 
 
 @dataclass(frozen=True)
@@ -164,6 +302,7 @@ def registry_candidates_from_records(records, *, capability_records=None):
     capabilities = dict(capability_records or {})
     entries = []
     issues = []
+    labels = {}
     for record in records:
         label = f'{REGISTRY_DOCUMENT} record {record.record_id!r}'
         if record.status == 'SUPERSEDED':
@@ -234,11 +373,17 @@ def registry_candidates_from_records(records, *, capability_records=None):
                 latency_ms=_optional_int(details.get('latency_ms'),
                                          'latency_ms'),
                 notes=(f'registry record {record.record_id}',),
+                canonical_identity=identity_from_details(details),
             )
         except (RegistryError, RuntimeAdapterError) as exc:
             issues.append(f'{label}: {exc}; skipped')
             continue
         entries.append(entry)
+        labels[entry.candidate_id] = f'{label} ({entry.candidate_id})'
+    entries, conflict_issues = _resolve_identity_conflicts(
+        entries, lambda entry: labels.get(entry.candidate_id,
+                                          entry.candidate_id))
+    issues.extend(conflict_issues)
     return tuple(entries), tuple(issues)
 
 

@@ -35,6 +35,7 @@ from .discovery import (
 )
 from .runtime_adapter import (
     AgentCandidate,
+    CanonicalIdentity,
     DEFAULT_MAX_EVIDENCE_AGE_DAYS,
     ROLE_DIMENSIONS,
     covers_command,
@@ -119,6 +120,7 @@ class RoleRequirement:
     excluded_model_ids: tuple[str, ...] = ()
     reference_model_id: str | None = None
     reference_model_family: str | None = None
+    reference_canonical_identity: CanonicalIdentity | None = None
     require_read_only: bool = False
     allow_manual_review: bool = False
 
@@ -149,6 +151,9 @@ class RoleRequirement:
             'excluded_model_ids': list(self.excluded_model_ids),
             'reference_model_id': self.reference_model_id,
             'reference_model_family': self.reference_model_family,
+            'reference_canonical_identity': (
+                self.reference_canonical_identity.as_dict()
+                if self.reference_canonical_identity is not None else None),
             'require_read_only': self.require_read_only,
             'allow_manual_review': self.allow_manual_review,
         }
@@ -180,8 +185,15 @@ def execution_requirement(*, read_paths, write_paths, **kwargs):
 
 
 def reviewer_requirement(*, execution_model_id, read_paths,
-                         execution_model_family=None, **kwargs):
-    """Reviewer: defects / tests / security, read-only, different model id."""
+                         execution_model_family=None,
+                         execution_canonical_identity=None, **kwargs):
+    """Reviewer: defects / tests / security, read-only, independent model.
+
+    Independence is judged on the *verified canonical* model identity
+    (:class:`~.runtime_adapter.CanonicalIdentity`, #170); the model id and family
+    are carried along for the report, but a different self-reported id or family
+    is not independence evidence on its own.
+    """
     if read_paths is None:
         raise ValueError('read_paths must be passed explicitly '
                          '(use () only when the task needs no file access)')
@@ -193,6 +205,8 @@ def reviewer_requirement(*, execution_model_id, read_paths,
         excluded = excluded + (execution_model_id,)
     kwargs.setdefault('reference_model_id', execution_model_id)
     kwargs.setdefault('reference_model_family', execution_model_family)
+    kwargs.setdefault('reference_canonical_identity',
+                      execution_canonical_identity)
     return RoleRequirement(role=ROLE_REVIEWER, read_paths=tuple(read_paths),
                            excluded_model_ids=excluded, **kwargs)
 
@@ -440,7 +454,26 @@ def _permissions_filter(candidate, requirement):
                  'network access')
 
 
-def _independence_filter(candidate, requirement):
+def _identity_verdict(identity, *, model_id, now):
+    """``(trusted, canonical_id, status, detail)`` for one declared identity.
+
+    Trust is decided here, not by the caller: a missing declaration is
+    ``ABSENT``, an unverified / conflicting / invalid one keeps its status, and
+    a ``CONFIRMED`` one that has expired is ``EXPIRED``. None of them is turned
+    into independence evidence.
+    """
+    if identity is None:
+        return (False, None, 'ABSENT',
+                f'no canonical model identity is registered for model id '
+                f'{model_id!r}, so the same underlying model cannot be told '
+                f'apart from a different one')
+    trusted, status, detail = identity.trusted_at(now)
+    if not trusted:
+        return False, None, status, detail
+    return True, identity.canonical_id, status, detail
+
+
+def _independence_filter(candidate, requirement, *, now=None):
     if requirement.role != ROLE_REVIEWER:
         return FilterResult('independence', 'NOT_APPLICABLE',
                             'only the Reviewer requires model independence')
@@ -461,16 +494,39 @@ def _independence_filter(candidate, requirement):
             f'model id {candidate.model_id!r} is the same as the selected '
             'Execution model; the same model with another name is not '
             'independent')
+    reviewer_trusted, reviewer_canonical, reviewer_status, reviewer_detail = (
+        _identity_verdict(candidate.canonical_identity,
+                          model_id=candidate.model_id, now=now))
+    execution_trusted, execution_canonical, execution_status, execution_detail = (
+        _identity_verdict(requirement.reference_canonical_identity,
+                          model_id=reference, now=now))
+    if not reviewer_trusted or not execution_trusted:
+        return FilterResult(
+            'independence', 'UNKNOWN',
+            f'Reviewer identity {reviewer_status}: {reviewer_detail}; '
+            f'Execution identity {execution_status}: {execution_detail}; '
+            'model-level independence cannot be established, so automatic '
+            'dispatch stays disabled')
+    if reviewer_canonical.casefold() == execution_canonical.casefold():
+        return FilterResult(
+            'independence', 'FAIL',
+            f'model id {candidate.model_id!r} is the same as the selected '
+            f'Execution model under verified canonical identity '
+            f'{reviewer_canonical!r}; the same underlying model under another '
+            'name or family is not independent')
+    detail = (f'model-level independence established from verified registry '
+              f'identities ({execution_canonical} vs {reviewer_canonical})')
     reference_family = requirement.reference_model_family
     if candidate.model_family is None or reference_family is None:
-        detail = ('model family UNKNOWN; family-level independence is '
-                  'reported as UNKNOWN and not claimed')
+        detail += ('; model family UNKNOWN; family-level independence is '
+                   'reported as UNKNOWN and not claimed')
     elif candidate.model_family.casefold() == reference_family.casefold():
-        detail = ('same model family as Execution; only model-id independence '
-                  'is established')
+        detail += ('; same model family as Execution; only model-level '
+                   'independence is established')
     else:
-        detail = (f'different model family observed '
-                  f'({candidate.model_family} vs {reference_family})')
+        detail += (f'; a different model family is self-declared '
+                   f'({candidate.model_family} vs {reference_family}) and is '
+                   'reported, not used as independence evidence')
     return FilterResult('independence', 'PASS', detail)
 
 
@@ -519,7 +575,7 @@ def evaluate_candidate(candidate, requirement, *, now=None,
         _tools_filter(candidate, requirement),
         _context_filter(candidate, requirement),
         _permissions_filter(candidate, requirement),
-        _independence_filter(candidate, requirement),
+        _independence_filter(candidate, requirement, now=now),
         _budget_filter(candidate, requirement),
     )
     return CandidateEvaluation(candidate=candidate, role=requirement.role,
@@ -580,12 +636,15 @@ def _reminder(role, requirement):
             'spawn / wait / collect path exists.')
     if role == ROLE_REVIEWER:
         return (
-            'No qualified Reviewer. Required: a different underlying model id '
-            'from Execution, an observed read-only boundary, and '
-            'defect-detection / test-design / security-review evidence. Keep '
-            'the task unreviewed; Execution self-review is not a substitute. '
-            'Register an independent reviewer in the current scope\'s '
-            'agent-registry.md. Human review is allowed only when the project '
+            'No qualified Reviewer. Required: a different underlying model '
+            'from Execution, proven by a verified canonical model identity in '
+            'the current scope\'s agent-registry.md (canonical_model_id, '
+            'identity_verification=CONFIRMED, identity_verified_until, '
+            'identity_evidence); an observed read-only boundary; and '
+            'defect-detection / test-design / security-review evidence. A '
+            'different model_id or model_family self-report is not '
+            'independence. Keep the task unreviewed; Execution self-review is '
+            'not a substitute. Human review is allowed only when the project '
             'configures it for this task class.')
     return (
         'Master text + image input is not verified. A process-local CLI cannot '
@@ -788,6 +847,9 @@ def select_roles(discovery, requirements, *, now=None,
                           if selected_execution is not None else None)
     execution_model_family = (selected_execution.candidate.model_family
                               if selected_execution is not None else None)
+    execution_canonical_identity = (
+        selected_execution.candidate.canonical_identity
+        if selected_execution is not None else None)
     excluded = tuple(dict.fromkeys(
         tuple(reviewer_requirement_value.excluded_model_ids)
         + ((execution_model_id,) if execution_model_id else ())))
@@ -795,7 +857,8 @@ def select_roles(discovery, requirements, *, now=None,
         reviewer_requirement_value,
         excluded_model_ids=excluded,
         reference_model_id=execution_model_id,
-        reference_model_family=execution_model_family)
+        reference_model_family=execution_model_family,
+        reference_canonical_identity=execution_canonical_identity)
     selections[ROLE_REVIEWER] = _selection(
         ROLE_REVIEWER, reviewer_requirement_value, candidates, now=now,
         max_age_days=max_age_days,
@@ -837,7 +900,9 @@ def select_roles(discovery, requirements, *, now=None,
         'capability PASS never grants a path, a command or network access; the '
         'task keeps its own allowed paths',
         'Reviewer independence was enforced against the selected Execution '
-        'model id (model family is reported, not assumed)',
+        'model\'s verified canonical identity in the current scope registry; a '
+        'different model id or model family self-report is reported, not '
+        'assumed',
     )
     return SelectionReport(
         discovery=discovery, selections=selections,

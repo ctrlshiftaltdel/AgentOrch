@@ -16,8 +16,25 @@ from scripts.agent_selection import discovery, roles, runtime_adapter  # noqa: E
 NOW = '2026-10-27T12:00:00Z'
 PROBE = '2026-10-26T12:00:00Z'
 OLD_PROBE = '2026-07-01T00:00:00Z'
+# A verification window that is still open at NOW, and one that closed before it.
+VERIFIED_UNTIL = '2027-01-01T00:00:00Z'
+EXPIRED_UNTIL = '2026-10-01T00:00:00Z'
 
 PASS_VERDICTS = ('C1', 'C2', 'C3', 'C4')
+
+
+def identity(canonical_id, *, aliases=(), status='CONFIRMED',
+             verified_until=VERIFIED_UNTIL,
+             evidence_ref='fixture:model-identity-registry'):
+    """A canonical identity declaration, as the scope registry would carry it."""
+    return runtime_adapter.CanonicalIdentity(
+        canonical_id=canonical_id, status=status, aliases=tuple(aliases),
+        evidence_ref=evidence_ref, verified_until=verified_until,
+        detail='fixture identity declaration')
+
+
+def absent_identity(detail='no canonical model identity was registered'):
+    return runtime_adapter.CanonicalIdentity(status='ABSENT', detail=detail)
 
 
 def capability(capability_id='C1', verdict='PASS', *,
@@ -75,7 +92,18 @@ def candidate(agent_id='agent-1', *, model_id='model-a', model_family='family-a'
               permission=None, capability_record_value='default',
               source='runtime-discovery', source_class='OBSERVED',
               evidence_time=NOW, context_tokens=200000,
-              cost_per_mtok=1.0, latency_ms=1000, role_evidence=()):
+              cost_per_mtok=1.0, latency_ms=1000, role_evidence=(),
+              canonical_identity='fixture'):
+    """One synthetic candidate.
+
+    ``canonical_identity='fixture'`` declares the same shape the scope registry
+    would carry: a verified mapping from this ``model_id`` to itself, because
+    most fixtures are about other hard filters. Pass
+    ``canonical_identity=None`` for "nothing was registered" or an explicit
+    :func:`identity` / :func:`absent_identity` value to exercise the #170 paths.
+    """
+    if canonical_identity == 'fixture':
+        canonical_identity = identity(model_id) if model_id is not None else None
     if capability_record_value == 'default':
         capability_record_value = capability_record(
             runtime_id=runtime_id, runtime_version=runtime_version)
@@ -89,7 +117,8 @@ def candidate(agent_id='agent-1', *, model_id='model-a', model_family='family-a'
         permissions=permission, capability_record=capability_record_value,
         source=source, source_class=source_class, evidence_time=evidence_time,
         context_tokens=context_tokens, cost_per_mtok=cost_per_mtok,
-        latency_ms=latency_ms, role_evidence=tuple(role_evidence))
+        latency_ms=latency_ms, role_evidence=tuple(role_evidence),
+        canonical_identity=canonical_identity)
 
 
 class FixtureAdapter(runtime_adapter.RuntimeAdapter):
