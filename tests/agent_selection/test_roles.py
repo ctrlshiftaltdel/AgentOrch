@@ -396,6 +396,93 @@ class PermissionAndModalityTests(unittest.TestCase):
         self.assertEqual(
             selection.requirement.as_dict()['task_write_paths'], ['src'])
 
+    def test_blank_runtime_paths_cannot_satisfy_a_private_path_requirement(self):
+        master, execution, reviewer = support.standard_candidates()
+        blank_scope = support.candidate(
+            'exec-1', model_id='model-a', model_family='family-a',
+            permission=support.permissions(read_paths=('',), write_paths=('',),
+                                           commands=('python',)),
+            role_evidence=execution.role_evidence)
+        requirement = support.task_requirements()
+        requirement[roles.ROLE_EXECUTION] = roles.execution_requirement(
+            read_paths=('private/secret.py',),
+            write_paths=('private/secret.py',),
+            required_commands=('python',))
+        report = support.report_with((master, blank_scope, reviewer),
+                                     requirements=requirement)
+        selection = report.role('execution')
+        self.assertIsNone(selection.selected)
+        self.assertFalse(report.automatic_dispatch_allowed)
+        evaluation = next(item for item in selection.excluded
+                          if item.candidate.agent_id == 'exec-1')
+        permissions = next(item for item in evaluation.filters
+                           if item.filter_id == 'permissions')
+        self.assertEqual(permissions.status, 'FAIL')
+        self.assertIn('read: NOT_COVERED (private/secret.py)',
+                      permissions.detail)
+        self.assertIn('write: NOT_COVERED (private/secret.py)',
+                      permissions.detail)
+
+    def test_parent_segment_requirement_is_not_covered_by_a_prefix(self):
+        master, execution, reviewer = support.standard_candidates()
+        prefix_scope = support.candidate(
+            'exec-1', model_id='model-a', model_family='family-a',
+            permission=support.permissions(read_paths=('docs',),
+                                           write_paths=('docs',),
+                                           commands=('python',)),
+            role_evidence=execution.role_evidence)
+        requirement = support.task_requirements()
+        requirement[roles.ROLE_EXECUTION] = roles.execution_requirement(
+            read_paths=('docs/../private/secret.py',),
+            write_paths=('docs/../private/secret.py',),
+            required_commands=('python',))
+        report = support.report_with((master, prefix_scope, reviewer),
+                                     requirements=requirement)
+        selection = report.role('execution')
+        self.assertIsNone(selection.selected)
+        self.assertFalse(report.automatic_dispatch_allowed)
+        permissions = next(item for item in next(
+            entry for entry in selection.excluded
+            if entry.candidate.agent_id == 'exec-1').filters
+            if item.filter_id == 'permissions')
+        self.assertEqual(permissions.status, 'FAIL')
+        self.assertIn('NOT_COVERED', permissions.detail)
+        self.assertIn('private/secret.py', permissions.detail)
+
+    def test_uncomparable_scope_forms_cannot_satisfy_a_path_requirement(self):
+        master, execution, reviewer = support.standard_candidates()
+        cases = (
+            (('*',), 's3://private/secret'),
+            (('*',), './C:/private/secret'),
+            (('docs ',), 'docs/private'),
+            ((' * ',), 'private/secret'),
+        )
+        for observed, needed in cases:
+            with self.subTest(observed=observed, needed=needed):
+                scoped = support.candidate(
+                    'exec-1', model_id='model-a', model_family='family-a',
+                    permission=support.permissions(
+                        read_paths=observed, write_paths=observed,
+                        commands=('python',)),
+                    role_evidence=execution.role_evidence)
+                requirement = support.task_requirements()
+                requirement[roles.ROLE_EXECUTION] = roles.execution_requirement(
+                    read_paths=(needed,), write_paths=(needed,),
+                    required_commands=('python',))
+                evaluation = roles.evaluate_candidate(
+                    scoped, requirement[roles.ROLE_EXECUTION], now=NOW)
+                self.assertFalse(evaluation.passed)
+                self.assertEqual(evaluation.status, 'FAIL')
+                permissions = next(item for item in evaluation.filters
+                                   if item.filter_id == 'permissions')
+                self.assertEqual(permissions.status, 'FAIL')
+                self.assertIn(f'NOT_COVERED ({needed})', permissions.detail)
+                report = support.report_with((master, scoped, reviewer),
+                                             requirements=requirement)
+                selection = report.role('execution')
+                self.assertIsNone(selection.selected)
+                self.assertFalse(report.automatic_dispatch_allowed)
+
     def test_read_scope_shortfall_excludes_candidate(self):
         master, execution, reviewer = support.standard_candidates()
         requirement = support.task_requirements()

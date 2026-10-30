@@ -534,6 +534,32 @@ class HardFilterCompositionTests(StoreCase):
         self.assertIn('exceeds the limit', budget.detail)
         self.assertFalse(report.automatic_allowed)
 
+    def test_blank_runtime_paths_never_unlock_a_private_path_requirement(self):
+        master, execution, reviewer = support.standard_candidates()
+        blank = replace(execution, permissions=support.permissions(
+            read_paths=('',), write_paths=('',), commands=('python',)))
+        requirements = support.task_requirements()
+        requirements[roles.ROLE_EXECUTION] = roles.execution_requirement(
+            read_paths=('private/secret.py',),
+            write_paths=('private/secret.py',),
+            required_commands=('python',))
+        report = model_selection.select_models(
+            fresh_batch(), self.discovered((master, blank, reviewer)),
+            requirements, links=LINKS, now=NOW)
+        selection = report.role(roles.ROLE_EXECUTION)
+        self.assertIsNone(selection.selected)
+        self.assertFalse(report.automatic_allowed)
+        self.assertFalse(report.executed)
+        permissions = next(item for item in next(
+            entry for entry in selection.excluded
+            if entry.candidate.agent_id == 'exec-1').filters
+            if item.filter_id == 'permissions')
+        self.assertEqual(permissions.status, 'FAIL')
+        self.assertIn('NOT_COVERED (private/secret.py)', permissions.detail)
+        self.assertEqual(
+            selection.requirement.as_dict()['task_write_paths'],
+            ['private/secret.py'])
+
     def test_text_only_master_is_rejected_by_the_modality_filter(self):
         master, execution, reviewer = support.standard_candidates()
         text_only = replace(master, modalities=('text',))

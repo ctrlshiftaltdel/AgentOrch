@@ -89,6 +89,12 @@ ROLE_GRADES = ('STRONG', 'MODERATE', 'WEAK', 'UNKNOWN')
 DEFAULT_MAX_EVIDENCE_AGE_DAYS = 30
 
 TIMESTAMP_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+# A drive-qualified path (C:/..., c:\...) names a host location; the virtual
+# project-relative namespace cannot compare it, so it is never coverage proof.
+_DRIVE_PATH_RE = re.compile(r'^[A-Za-z]:')
+# A URI scheme (s3://..., file://...) also names a location outside the
+# project-relative namespace.
+_SCHEME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9+.\-]*://')
 
 
 class RuntimeAdapterError(ValueError):
@@ -167,24 +173,82 @@ def _gating_row_freshness(capability, current, max_age_days):
 def covers_path(scope_paths, needed):
     """Whether one observed scope of *scope_paths* covers *needed*.
 
-    Prefix matching is component-aware so ``docs`` does not cover
-    ``docs-other``. The helper only compares strings: it never grants access.
+    Coverage is a purely lexical comparison inside the project-relative
+    virtual namespace a runtime reported. It is not a host filesystem or
+    symlink check, and ``True`` here never grants access to any path.
+
+    * ``''`` and whitespace-only entries are unusable observations, not
+      wildcards: they cover nothing. Only an exact ``'*'`` is a wildcard:
+      surrounding whitespace is never trimmed into one, and ``' * '`` or
+      ``'docs '`` are not comparable.
+    * ``'*'`` and the project-root spellings ``'.'`` / ``'./'`` cover every
+      comparable relative path.
+    * Matching is component-aware, so ``docs`` does not cover ``docs-other``.
+    * ``.`` segments, repeated separators and backslashes are resolved
+      lexically; a *needed* path may also resolve internal ``..`` segments. A
+      scope entry containing ``..`` is not proof of a boundary and is
+      discarded.
+    * Scheme URIs (``s3://...``), absolute paths, Windows drive paths (also
+      after a lexical ``./``) and any path that escapes the project root
+      cannot be compared here and are never covered - not even by an explicit
+      wildcard.
     """
-    candidate = _normalise_path(needed)
+    needed_kind, needed_parts = _normalise_path(needed, allow_parent=True)
+    if needed_kind not in ('root', 'path'):
+        return False
     for scope_path in scope_paths or ():
-        allowed = _normalise_path(scope_path)
-        if allowed in ('', '*'):
+        kind, parts = _normalise_path(scope_path, allow_parent=False)
+        if kind in ('wildcard', 'root'):
             return True
-        if candidate == allowed or candidate.startswith(allowed + '/'):
-            return True
+        if kind == 'path' and needed_kind == 'path':
+            if (len(parts) <= len(needed_parts)
+                    and needed_parts[:len(parts)] == parts):
+                return True
     return False
 
 
-def _normalise_path(value):
-    text = str(value).strip().replace('\\', '/')
-    while text.startswith('./'):
-        text = text[2:]
-    return text.rstrip('/')
+def _normalise_path(value, *, allow_parent):
+    """Classify one logical runtime path for comparison.
+
+    Returns ``(kind, components)`` where ``kind`` is ``'wildcard'`` (exact
+    ``*``), ``'root'`` (``.`` / ``./``), ``'path'`` (a relative path that stays
+    inside the project root) or ``'invalid'`` (blank, surrounding whitespace,
+    URI scheme, absolute, drive-qualified, non-string, or escaping the root).
+    Components are normalised lexically: backslashes become separators, empty
+    and ``.`` segments are dropped. With ``allow_parent=True`` a ``..`` segment
+    pops the previous segment; scope entries pass ``False`` because a reported
+    boundary containing ``..`` cannot be proven and must not become coverage.
+    """
+    if not isinstance(value, str):
+        return 'invalid', ()
+    text = value.replace('\\', '/')
+    if not text or text != text.strip():
+        return 'invalid', ()
+    if text == '*':
+        return 'wildcard', ()
+    probe = text
+    while probe.startswith('./'):
+        probe = probe[2:]
+    if not probe:
+        return 'root', ()
+    if (probe.startswith('/') or _DRIVE_PATH_RE.match(probe)
+            or _SCHEME_RE.match(probe)):
+        return 'invalid', ()
+    parts = []
+    for segment in probe.split('/'):
+        if segment in ('', '.'):
+            continue
+        if segment == '..':
+            if not allow_parent or not parts:
+                return 'invalid', ()
+            parts.pop()
+            continue
+        if _DRIVE_PATH_RE.match(segment):
+            return 'invalid', ()
+        parts.append(segment)
+    if not parts:
+        return 'root', ()
+    return 'path', tuple(parts)
 
 
 def covers_command(scope_commands, needed):
@@ -439,6 +503,10 @@ class PermissionScope:
     permission in that class was observed* — not "the candidate was observed to
     have none". ``network_observed`` carries the same distinction for network
     access: ``None`` is unobserved, ``False`` is observed as unavailable.
+    Blank or whitespace-only path entries are unusable observations too: they
+    cover nothing and are never read as an explicit ``*``. The same applies to
+    a path with surrounding whitespace, a URI scheme, an absolute path or a
+    Windows drive path: none of them is comparable in the virtual namespace.
     """
 
     read_paths: tuple[str, ...] = ()
