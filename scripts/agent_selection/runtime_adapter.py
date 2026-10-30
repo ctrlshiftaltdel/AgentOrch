@@ -124,6 +124,46 @@ def evidence_age_days(probe_date, now=None):
     return max(0.0, (_now(now) - observed).total_seconds() / 86400.0)
 
 
+def _gating_row_freshness(capability, current, max_age_days):
+    """Freshness of one gating capability row, dated by the row alone (#205).
+
+    The record header (:attr:`CapabilityRecord.probe_date`) is a coarse
+    pre-check; it never dates a C1-C4 row. Only the row's own ``probe_date``
+    says when that capability was observed, so a re-dated header cannot turn
+    old evidence into fresh evidence.
+
+    Returns ``(kind, detail)`` with ``kind`` one of:
+
+    * ``None`` - the row is fresh under ``max_age_days`` (or no limit is set);
+    * ``'STALE'`` - the row is older than ``max_age_days``; re-probe it;
+    * ``'UNKNOWN'`` - the row carries no usable timestamp: missing,
+      unparsable, or in the future. A future timestamp is not evidence of
+      freshness: :func:`evidence_age_days` clamps negative ages to ``0.0``, so
+      reusing it here would read "logged yesterday" as fresh. The clamp itself
+      is deliberately left unchanged because candidate evidence time shares it.
+    """
+    capability_id = capability.capability_id
+    if capability.probe_date is None:
+        return 'UNKNOWN', (f'{capability_id}: no probe date; freshness cannot '
+                           'be verified')
+    try:
+        observed = parse_timestamp(capability.probe_date)
+    except RuntimeAdapterError:
+        return 'UNKNOWN', (f'{capability_id}: probe date cannot be parsed; '
+                           'freshness cannot be verified')
+    if observed > current:
+        return 'UNKNOWN', (
+            f'{capability_id}: probe date {capability.probe_date} is in the '
+            'future; freshness cannot be verified, re-probe before use')
+    age = (current - observed).total_seconds() / 86400.0
+    if max_age_days is not None and age > max_age_days:
+        return 'STALE', (
+            f'{capability_id}: evidence is {age:.1f} days old '
+            f'(probe {capability.probe_date}, limit {max_age_days}); '
+            're-probe before use')
+    return None, None
+
+
 def covers_path(scope_paths, needed):
     """Whether one observed scope of *scope_paths* covers *needed*.
 
@@ -253,7 +293,14 @@ class CapabilityRecord:
 
     def gate(self, *, now=None,
              max_age_days=DEFAULT_MAX_EVIDENCE_AGE_DAYS) -> 'SubagentGate':
-        """Whether C1–C4 allow a real sub-agent dispatch from this record."""
+        """Whether C1–C4 allow a real sub-agent dispatch from this record.
+
+        Freshness is decided per gating row as well as for the record header:
+        each C1-C4 row is dated by its own ``probe_date`` under the same ``now``
+        and the same ``max_age_days``. A freshly re-dated header alone never
+        makes stale row evidence fresh.
+        """
+        current = _now(now)
         reasons = []
         if self.status == 'STALE':
             return SubagentGate(
@@ -264,7 +311,7 @@ class CapabilityRecord:
             reasons.append('capability record is PARTIAL; the sub-agent path '
                            'needs COMPLETE C1-C4 evidence')
 
-        age = evidence_age_days(self.probe_date, now)
+        age = evidence_age_days(self.probe_date, current)
         if age is None:
             reasons.append('capability probe date cannot be parsed')
         elif max_age_days is not None and age > max_age_days:
@@ -276,6 +323,7 @@ class CapabilityRecord:
 
         missing = []
         unknown = []
+        stale_rows = []
         for capability_id in GATING_CAPABILITIES:
             capability = self.get(capability_id)
             if capability is None:
@@ -288,6 +336,14 @@ class CapabilityRecord:
                     reasons=(f'{capability_id}: evidence is STALE',),
                     missing=tuple(GATING_CAPABILITIES))
             if capability.verdict == 'PASS':
+                kind, detail = _gating_row_freshness(
+                    capability, current, max_age_days)
+                if kind == 'STALE':
+                    stale_rows.append(capability_id)
+                    reasons.append(detail)
+                elif kind == 'UNKNOWN':
+                    unknown.append(capability_id)
+                    reasons.append(detail)
                 continue
             if capability.verdict == 'UNKNOWN':
                 unknown.append(capability_id)
@@ -297,6 +353,10 @@ class CapabilityRecord:
                     f'{capability_id}: {capability.verdict}; automatic dispatch '
                     'stays closed')
 
+        if stale_rows:
+            return SubagentGate(
+                status='BLOCKED', stale=True, reasons=tuple(reasons),
+                missing=tuple(stale_rows + missing + unknown))
         if missing or unknown:
             return SubagentGate(status='UNKNOWN', reasons=tuple(reasons),
                                 missing=tuple(missing + unknown))

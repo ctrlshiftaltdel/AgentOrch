@@ -190,6 +190,13 @@ class CapabilityRowFreshnessTests(unittest.TestCase):
             capability_record_value=record,
             role_evidence=execution.role_evidence)
 
+    def callable_filter(self, selection, agent_id):
+        evaluations = list(selection.excluded) + list(selection.unverified)
+        evaluation = next(item for item in evaluations
+                          if item.candidate.agent_id == agent_id)
+        return next(item for item in evaluation.filters
+                    if item.filter_id == 'callable')
+
     def test_fresh_header_with_a_stale_row_keeps_execution_unqualified(self):
         for capability_id in support.PASS_VERDICTS:
             with self.subTest(capability_id=capability_id):
@@ -199,10 +206,7 @@ class CapabilityRowFreshnessTests(unittest.TestCase):
                 self.assertFalse(selection.auto_allowed)
                 self.assertTrue(selection.manual_handoff)
                 self.assertFalse(report.automatic_dispatch_allowed)
-                self.assertTrue(selection.excluded)
-                callable_filter = next(
-                    item for item in selection.excluded[0].filters
-                    if item.filter_id == 'callable')
+                callable_filter = self.callable_filter(selection, 'exec-1')
                 self.assertEqual(callable_filter.status, 'FAIL')
                 self.assertIn(capability_id, callable_filter.detail)
                 self.assertIn('re-probe', callable_filter.detail)
@@ -219,10 +223,7 @@ class CapabilityRowFreshnessTests(unittest.TestCase):
             self.execution_with_row('C3', '2026-10-28T12:00:00Z'))
         self.assertIsNone(selection.selected)
         self.assertFalse(report.automatic_dispatch_allowed)
-        self.assertTrue(selection.unverified)
-        callable_filter = next(
-            item for item in selection.unverified[0].filters
-            if item.filter_id == 'callable')
+        callable_filter = self.callable_filter(selection, 'exec-1')
         self.assertEqual(callable_filter.status, 'UNKNOWN')
         self.assertIn('C3', callable_filter.detail)
         self.assertIn('future', callable_filter.detail)
