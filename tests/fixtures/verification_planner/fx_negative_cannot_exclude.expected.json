@@ -1,0 +1,36 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "floors": {
+    "path_floor": "L3",
+    "semantic_floor": "L0",
+    "uncertainty_floor": "L3",
+    "project_floor": "L0"
+  },
+  "level": "L3",
+  "required_rule_ids": [
+    "R-PATH-ORCHESTRATOR",
+    "R-HIGH-AFTER-MAX",
+    "R-NEGATIVE-NO-DOWNGRADE",
+    "R-UNVERIFIED-SOURCE",
+    "R-BASELINE-UNFROZEN"
+  ],
+  "forbidden_rule_ids": [],
+  "required_closure_reasons": [
+    "source_not_verified",
+    "mandatory_baseline_unfrozen",
+    "negative_self_report"
+  ],
+  "counterfactual_diff_empty": true,
+  "identity": {
+    "requirement": "not_required",
+    "assessment": "not_assessed"
+  },
+  "expected_edition": "local",
+  "expected_check_ids": [
+    "project.validate_kit",
+    "project.unittest",
+    "project.py_compile",
+    "project.backup"
+  ]
+}

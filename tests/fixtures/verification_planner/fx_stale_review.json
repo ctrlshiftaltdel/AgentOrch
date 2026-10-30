@@ -1,0 +1,61 @@
+{
+  "schema_version": "verification-planner-input/1",
+  "task_ref": "issue-186-fixture",
+  "edition": "local",
+  "base_sha": "1111111111111111111111111111111111111111",
+  "head_sha": "2222222222222222222222222222222222222222",
+  "acceptance": [
+    {
+      "ac_id": "AC1",
+      "text": "wording"
+    }
+  ],
+  "changed_paths": [
+    {
+      "path": "docs/charter.md",
+      "source_ref": "caller:diff/1"
+    }
+  ],
+  "semantic_signals": [],
+  "uncertainties": [],
+  "semantic_review": {
+    "reviewed_sha": "3333333333333333333333333333333333333333",
+    "stale": false
+  },
+  "profile": {
+    "profile_version": "caller-unfrozen",
+    "source_ref": "caller:profile/1",
+    "as_of_sha": "2222222222222222222222222222222222222222",
+    "checks": [
+      {
+        "check_id": "project.validate_kit",
+        "scope": "quick",
+        "source_ref": "docs/PROJECT.md#verification-commands"
+      },
+      {
+        "check_id": "project.unittest",
+        "scope": "full",
+        "source_ref": "docs/PROJECT.md#verification-commands"
+      },
+      {
+        "check_id": "project.py_compile",
+        "scope": "static",
+        "source_ref": "docs/PROJECT.md#verification-commands"
+      },
+      {
+        "check_id": "project.backup",
+        "scope": "post_merge",
+        "source_ref": "docs/PROJECT.md#verification-commands"
+      }
+    ]
+  },
+  "project_floor": "L0",
+  "requires_independent_reviewer": false,
+  "dynamic_dependencies": "not_applicable",
+  "non_probe_conditions": {
+    "call_failure_observed": false,
+    "permission_constraint": false,
+    "lock_constraint": false,
+    "security_constraint": false
+  }
+}

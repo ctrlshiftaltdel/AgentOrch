@@ -1,0 +1,13 @@
+{
+  "exit_code": 2,
+  "diagnostic_code": "forbidden_field",
+  "floors": null,
+  "level": null,
+  "required_rule_ids": [],
+  "forbidden_rule_ids": [],
+  "required_closure_reasons": [],
+  "counterfactual_diff_empty": true,
+  "identity": null,
+  "expected_edition": null,
+  "expected_check_ids": null
+}
