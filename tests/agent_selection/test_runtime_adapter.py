@@ -379,6 +379,26 @@ class PathAndEvidenceHelperTests(unittest.TestCase):
         self.assertFalse(runtime_adapter.covers_path((42,), 'docs/a.md'))
         self.assertFalse(runtime_adapter.covers_path(('docs',), None))
 
+    def test_uncomparable_path_forms_are_never_covered(self):
+        for scope in (('*',), ('.',), ('./',), ('docs',)):
+            for needed in (
+                    's3://private/secret', './C:/private/secret',
+                    'C:/private/secret', '/etc/passwd', 'file:///etc/passwd'):
+                with self.subTest(scope=scope, needed=needed):
+                    self.assertFalse(
+                        runtime_adapter.covers_path(scope, needed))
+
+    def test_surrounding_whitespace_is_not_silently_trimmed(self):
+        self.assertFalse(
+            runtime_adapter.covers_path((' * ',), 'private/secret'))
+        self.assertFalse(runtime_adapter.covers_path(('docs ',), 'docs/private'))
+        self.assertFalse(runtime_adapter.covers_path((' docs',), 'docs/private'))
+        self.assertFalse(
+            runtime_adapter.covers_path(('\tdocs',), 'docs/private'))
+        self.assertFalse(runtime_adapter.covers_path(('docs',), 'docs/private '))
+        self.assertFalse(
+            runtime_adapter.covers_path(('docs',), ' docs/private'))
+
     def test_scope_covers_the_same_path_and_real_subdirectories(self):
         self.assertTrue(runtime_adapter.covers_path(('docs',), 'docs'))
         self.assertTrue(runtime_adapter.covers_path(('docs',), 'docs/a/b.md'))
@@ -397,6 +417,7 @@ class PathAndEvidenceHelperTests(unittest.TestCase):
     def test_explicit_wildcard_still_covers_relative_paths(self):
         self.assertTrue(runtime_adapter.covers_path(('*',), 'private/secret.py'))
         self.assertTrue(runtime_adapter.covers_path(('*',), 'docs/a.md'))
+        self.assertTrue(runtime_adapter.covers_path(('*',), 'docs/file.py'))
 
     def test_project_root_still_covers_relative_paths(self):
         for scope in (('.',), ('./',), ('./.',)):

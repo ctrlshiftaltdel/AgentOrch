@@ -92,6 +92,9 @@ TIMESTAMP_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
 # A drive-qualified path (C:/..., c:\...) names a host location; the virtual
 # project-relative namespace cannot compare it, so it is never coverage proof.
 _DRIVE_PATH_RE = re.compile(r'^[A-Za-z]:')
+# A URI scheme (s3://..., file://...) also names a location outside the
+# project-relative namespace.
+_SCHEME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9+.\-]*://')
 
 
 class RuntimeAdapterError(ValueError):
@@ -175,16 +178,20 @@ def covers_path(scope_paths, needed):
     symlink check, and ``True`` here never grants access to any path.
 
     * ``''`` and whitespace-only entries are unusable observations, not
-      wildcards: they cover nothing.
+      wildcards: they cover nothing. Only an exact ``'*'`` is a wildcard:
+      surrounding whitespace is never trimmed into one, and ``' * '`` or
+      ``'docs '`` are not comparable.
     * ``'*'`` and the project-root spellings ``'.'`` / ``'./'`` cover every
       comparable relative path.
     * Matching is component-aware, so ``docs`` does not cover ``docs-other``.
     * ``.`` segments, repeated separators and backslashes are resolved
       lexically; a *needed* path may also resolve internal ``..`` segments. A
       scope entry containing ``..`` is not proof of a boundary and is
-      discarded. A path that escapes the project root (leading ``..``) or is
-      absolute / drive-qualified cannot be compared here and is never covered
-      - not even by an explicit wildcard.
+      discarded.
+    * Scheme URIs (``s3://...``), absolute paths, Windows drive paths (also
+      after a lexical ``./``) and any path that escapes the project root
+      cannot be compared here and are never covered - not even by an explicit
+      wildcard.
     """
     needed_kind, needed_parts = _normalise_path(needed, allow_parent=True)
     if needed_kind not in ('root', 'path'):
@@ -203,26 +210,32 @@ def covers_path(scope_paths, needed):
 def _normalise_path(value, *, allow_parent):
     """Classify one logical runtime path for comparison.
 
-    Returns ``(kind, components)`` where ``kind`` is ``'wildcard'`` (explicit
+    Returns ``(kind, components)`` where ``kind`` is ``'wildcard'`` (exact
     ``*``), ``'root'`` (``.`` / ``./``), ``'path'`` (a relative path that stays
-    inside the project root) or ``'invalid'`` (blank, absolute,
-    drive-qualified, non-string, or escaping the root). Components are
-    normalised lexically: backslashes become separators, empty and ``.``
-    segments are dropped. With ``allow_parent=True`` a ``..`` segment pops the
-    previous segment; scope entries pass ``False`` because a reported boundary
-    containing ``..`` cannot be proven and must not become coverage.
+    inside the project root) or ``'invalid'`` (blank, surrounding whitespace,
+    URI scheme, absolute, drive-qualified, non-string, or escaping the root).
+    Components are normalised lexically: backslashes become separators, empty
+    and ``.`` segments are dropped. With ``allow_parent=True`` a ``..`` segment
+    pops the previous segment; scope entries pass ``False`` because a reported
+    boundary containing ``..`` cannot be proven and must not become coverage.
     """
     if not isinstance(value, str):
         return 'invalid', ()
-    text = value.strip().replace('\\', '/')
-    if not text:
+    text = value.replace('\\', '/')
+    if not text or text != text.strip():
         return 'invalid', ()
     if text == '*':
         return 'wildcard', ()
-    if text.startswith('/') or _DRIVE_PATH_RE.match(text):
+    probe = text
+    while probe.startswith('./'):
+        probe = probe[2:]
+    if not probe:
+        return 'root', ()
+    if (probe.startswith('/') or _DRIVE_PATH_RE.match(probe)
+            or _SCHEME_RE.match(probe)):
         return 'invalid', ()
     parts = []
-    for segment in text.split('/'):
+    for segment in probe.split('/'):
         if segment in ('', '.'):
             continue
         if segment == '..':
@@ -230,6 +243,8 @@ def _normalise_path(value, *, allow_parent):
                 return 'invalid', ()
             parts.pop()
             continue
+        if _DRIVE_PATH_RE.match(segment):
+            return 'invalid', ()
         parts.append(segment)
     if not parts:
         return 'root', ()
@@ -489,7 +504,9 @@ class PermissionScope:
     have none". ``network_observed`` carries the same distinction for network
     access: ``None`` is unobserved, ``False`` is observed as unavailable.
     Blank or whitespace-only path entries are unusable observations too: they
-    cover nothing and are never read as an explicit ``*``.
+    cover nothing and are never read as an explicit ``*``. The same applies to
+    a path with surrounding whitespace, a URI scheme, an absolute path or a
+    Windows drive path: none of them is comparable in the virtual namespace.
     """
 
     read_paths: tuple[str, ...] = ()
