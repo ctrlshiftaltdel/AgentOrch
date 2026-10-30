@@ -215,40 +215,49 @@ def identity_from_details(details):
         detail=f'confirmed against {evidence} until {until}')
 
 
-def _resolve_identity_conflicts(entries, label_of):
-    """Downgrade declarations that contradict another record in the scope.
+def _identity_claim(record):
+    """The identity declaration a record makes, before any other validation."""
+    details = dict(record.details)
+    identity = identity_from_details(details)
+    if identity.canonical_id is None:
+        return None
+    model_id = str(details.get('model_id', '') or '').strip() or None
+    return identity, model_id
+
+
+def disputed_identity_keys(records):
+    """Model-id / alias keys this scope declares against more than one model.
 
     Two records that claim the same model id (or alias) for different canonical
-    ids make the mapping unusable: neither side can be trusted, because the
-    registry itself does not say which one is right. Only a same-canonical
-    repeat is harmless.
+    ids make the mapping unusable: the registry itself does not say which one is
+    right, so neither may be trusted. The claims are read from the declarations
+    themselves on **every** record, before the rest of the record is validated:
+    a record that is later rejected for an unrelated field (say an unparsable
+    ``read_only``) still contradicts the other one, and skipping it must not
+    leave the survivor ``CONFIRMED`` (#170 review).
     """
     claims = {}
-    for entry in entries:
-        identity = entry.canonical_identity
-        if identity is None or identity.canonical_id is None:
+    for record in records:
+        if record.status == 'SUPERSEDED':
             continue
-        for key in identity.alias_keys(entry.model_id):
+        claim = _identity_claim(record)
+        if claim is None:
+            continue
+        identity, model_id = claim
+        for key in identity.alias_keys(model_id):
             claims.setdefault(key, set()).add(identity.canonical_id.casefold())
-    disputed = {key for key, targets in claims.items() if len(targets) > 1}
-    if not disputed:
-        return entries, ()
-    resolved = []
-    issues = []
-    for entry in entries:
-        identity = entry.canonical_identity
-        if identity is not None and identity.canonical_id is not None:
-            hit = sorted(identity.alias_keys(entry.model_id) & disputed)
-            if hit:
-                detail = (f'the canonical model identity mapping for '
-                          f'{", ".join(hit)} is declared against more than one '
-                          'canonical id in this scope; a conflicting mapping is '
-                          'not trusted')
-                issues.append(f'{label_of(entry)}: {detail}')
-                entry = replace(entry, canonical_identity=replace(
-                    identity, status='CONFLICT', detail=detail))
-        resolved.append(entry)
-    return tuple(resolved), tuple(issues)
+    return {key for key, targets in claims.items() if len(targets) > 1}
+
+
+def _conflict_identity(identity, disputed, *, model_id=None):
+    """Downgrade one declaration that contradicts another record, or return it."""
+    hit = sorted(identity.alias_keys(model_id) & disputed)
+    if not hit:
+        return identity
+    detail = (f'the canonical model identity mapping for {", ".join(hit)} is '
+              'declared against more than one canonical id in this scope; a '
+              'conflicting mapping is not trusted')
+    return replace(identity, status='CONFLICT', detail=detail)
 
 
 def identity_match_key(candidate):
@@ -278,19 +287,20 @@ def _conflicting_identity():
 
 
 def attach_registered_identities(candidates, registry):
-    """Hand enumerated candidates the identity the current scope registered.
+    """Replace any runtime-supplied identity with the scope's declaration.
 
     A runtime can enumerate an agent but cannot vouch for the underlying model,
-    so its candidates start with no identity. This copies the declaration from
-    the matching ``agent-registry.md`` record and nothing else: an unmatched
-    candidate keeps ``None`` (no identity), and two exact matches that disagree
-    become ``CONFLICT`` instead of one of them being chosen. The candidate list
-    and every other fact stay exactly as the runtime reported them.
+    so whatever ``canonical_identity`` it put on a candidate is discarded at
+    this boundary before anything else happens (#170 review). What remains is
+    owned by the current scope's ``agent-registry.md``: a candidate only gets an
+    identity from the record that matches ``runtime_id`` + ``agent_id`` +
+    ``model_id`` exactly. No registry, no exact match, or two exact matches that
+    disagree all leave the candidate without a trusted identity, so Reviewer
+    independence stays UNKNOWN instead of PASS. Every other reported fact stays
+    exactly as the runtime reported it.
     """
     entries = tuple(getattr(registry, 'entries', ()) or ()) \
         if registry is not None else ()
-    if not entries:
-        return tuple(candidates), ()
     declarations = {}
     for entry in entries:
         identity = entry.canonical_identity
@@ -300,10 +310,17 @@ def attach_registered_identities(candidates, registry):
         declarations.setdefault(key, []).append(identity)
     attached = []
     notes = []
-    for candidate in candidates:
+    discarded = []
+    for original in candidates:
+        candidate = original
         if candidate.canonical_identity is not None:
-            attached.append(candidate)
-            continue
+            discarded.append(candidate.agent_id)
+            candidate = replace(
+                candidate, canonical_identity=None,
+                notes=tuple(candidate.notes) + (
+                    'the runtime-supplied canonical model identity was '
+                    'discarded at the discovery boundary; a runtime cannot '
+                    'vouch for the underlying model',))
         key = identity_match_key(candidate)
         matching = declarations.get(key, ()) if key is not None else ()
         distinct = {_declaration_signature(item) for item in matching}
@@ -324,6 +341,11 @@ def attach_registered_identities(candidates, registry):
             notes=tuple(candidate.notes) + (
                 'agent-registry.md has more than one exact match with '
                 'different identity declarations',)))
+    if discarded:
+        notes.append(
+            f'runtime-supplied canonical identity discarded for '
+            f'{", ".join(sorted(discarded))}: only the current scope '
+            'agent-registry.md can declare a trusted identity')
     notes.append(
         f'{len(attached)} runtime candidate(s) were checked against the '
         'current scope agent-registry.md; an identity is used only on an exact '
@@ -382,9 +404,12 @@ def registry_candidates_from_records(records, *, capability_records=None):
     so the selector can report the gap instead of guessing.
     """
     capabilities = dict(capability_records or {})
+    records = tuple(records)
+    # Identity contradictions are decided from the declarations themselves, so a
+    # record rejected for an unrelated field cannot hide one side of a conflict.
+    disputed = disputed_identity_keys(records)
     entries = []
     issues = []
-    labels = {}
     for record in records:
         label = f'{REGISTRY_DOCUMENT} record {record.record_id!r}'
         if record.status == 'SUPERSEDED':
@@ -455,17 +480,16 @@ def registry_candidates_from_records(records, *, capability_records=None):
                 latency_ms=_optional_int(details.get('latency_ms'),
                                          'latency_ms'),
                 notes=(f'registry record {record.record_id}',),
-                canonical_identity=identity_from_details(details),
+                canonical_identity=_conflict_identity(
+                    identity_from_details(details), disputed,
+                    model_id=str(details['model_id']).strip()),
             )
         except (RegistryError, RuntimeAdapterError) as exc:
             issues.append(f'{label}: {exc}; skipped')
             continue
+        if entry.canonical_identity.status == 'CONFLICT':
+            issues.append(f'{label}: {entry.canonical_identity.detail}')
         entries.append(entry)
-        labels[entry.candidate_id] = f'{label} ({entry.candidate_id})'
-    entries, conflict_issues = _resolve_identity_conflicts(
-        entries, lambda entry: labels.get(entry.candidate_id,
-                                          entry.candidate_id))
-    issues.extend(conflict_issues)
     return tuple(entries), tuple(issues)
 
 

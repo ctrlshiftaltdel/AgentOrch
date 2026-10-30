@@ -588,9 +588,9 @@ class HardFilterCompositionTests(StoreCase):
 # --------------------------------------------------------------------------- #
 class SourceTests(StoreCase):
     def discovered(self):
-        return discovery.discover_candidates(
-            adapter=support.FixtureAdapter(
-                support.ok_result(support.standard_candidates())))
+        # The fixture scope registry declares the identities; a runtime claim
+        # alone would be discarded at the discovery boundary (#170).
+        return support.discovery_with(support.standard_candidates())
 
     def test_auth_failed_source_is_unlinked_and_never_blank(self):
         report = self.select(self.discovered(), batch=failed_batch())

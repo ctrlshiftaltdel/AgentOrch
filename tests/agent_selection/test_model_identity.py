@@ -479,6 +479,46 @@ class RegistryConflictTests(unittest.TestCase):
         self.assertTrue(any('conflicting mapping' in issue for issue in issues),
                         issues)
 
+    def test_a_conflict_is_read_from_the_declaration_not_the_candidate(self):
+        """An unrelated invalid field must not hide one side of a conflict.
+
+        The second record cannot become a candidate (``read_only`` is not a
+        boolean), but it still declares ``model-a`` as a different canonical
+        model. The surviving record must therefore lose its CONFIRMED status.
+        """
+        records = [
+            Record(registry_details(agent_id='a', model_id='model-a',
+                                    canonical_model_id='vendor/core-x',
+                                    model_aliases='')),
+            Record(registry_details(agent_id='b', model_id='model-b',
+                                    canonical_model_id='vendor/core-y',
+                                    model_aliases='model-a',
+                                    read_only='maybe')),
+        ]
+        entries, issues = discovery.registry_candidates_from_records(
+            records, capability_records=capabilities())
+        self.assertEqual(len(entries), 1, 'the invalid record must be skipped')
+        self.assertIn('read_only', ' '.join(issues))
+        self.assertEqual(entries[0].canonical_identity.status, 'CONFLICT',
+                         entries[0].canonical_identity)
+        self.assertFalse(entries[0].canonical_identity.trusted_at(NOW)[0])
+        self.assertTrue(any('conflicting mapping' in issue for issue in issues),
+                        issues)
+
+    def test_an_invalid_record_alone_does_not_poison_a_valid_mapping(self):
+        records = [
+            Record(registry_details(agent_id='a', model_id='model-a',
+                                    canonical_model_id='vendor/core-x',
+                                    model_aliases='')),
+            Record(registry_details(agent_id='b', model_id='model-b',
+                                    canonical_model_id='vendor/core-y',
+                                    model_aliases='', read_only='maybe')),
+        ]
+        entries, _ = discovery.registry_candidates_from_records(
+            records, capability_records=capabilities())
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].canonical_identity.status, 'CONFIRMED')
+
     def test_the_same_canonical_identity_declared_twice_is_not_a_conflict(self):
         records = [
             Record(registry_details(agent_id='a', model_id='model-a',
@@ -689,6 +729,69 @@ class RuntimeEnrichmentTests(unittest.TestCase):
         independence = independence_for(selection, 'review-1')
         self.assertEqual(independence.status, 'UNKNOWN')
         self.assertIn('CONFLICT', independence.detail)
+        self.assertFalse(selection.auto_allowed)
+        self.assertFalse(report.automatic_dispatch_allowed)
+        self.assertFalse(report.executed)
+
+    def test_a_runtime_supplied_identity_is_discarded_without_a_registry(self):
+        # A runtime can enumerate the agent and claim CONFIRMED for itself; with
+        # no scope registry declaration that claim must not survive discovery.
+        master, execution, reviewer = pair(
+            execution_identity=support.identity('vendor/claimed-exec'),
+            reviewer_identity=support.identity('vendor/claimed-review'))
+        discovered = discovery.discover_candidates(
+            adapter=support.FixtureAdapter(
+                support.ok_result((master, execution, reviewer))))
+        for candidate in discovered.candidates:
+            self.assertIsNone(candidate.canonical_identity, candidate.agent_id)
+        self.assertTrue(any('discarded' in note for note in discovered.notes),
+                        discovered.notes)
+        # The runtime's raw claim stays visible as provenance, not as evidence.
+        raw = {item.agent_id: item.canonical_identity
+               for item in discovered.runtime_result.candidates}
+        self.assertEqual(raw['review-1'].canonical_id, 'vendor/claimed-review')
+        report = roles.select_roles(discovered, support.task_requirements(),
+                                    now=NOW)
+        selection = report.role(roles.ROLE_REVIEWER)
+        self.assertIsNone(selection.selected)
+        self.assertFalse(selection.auto_allowed)
+        self.assertFalse(report.automatic_dispatch_allowed)
+        self.assertFalse(report.executed)
+        self.assertIn('ABSENT', independence_for(selection, 'review-1').detail)
+
+    def test_a_runtime_claim_does_not_survive_a_registry_miss(self):
+        # The registry exists but says nothing about this agent, so the runtime's
+        # own claim is still worthless.
+        master, execution, reviewer = pair(
+            execution_identity=support.identity('vendor/claimed-exec'),
+            reviewer_identity=support.identity('vendor/claimed-review'))
+        entries = [self.registry_entry(execution,
+                                       identity=support.identity('vendor/other-exec'))]
+        discovered = self.discovery((master, execution, reviewer), entries)
+        by_agent = {item.agent_id: item for item in discovered.candidates}
+        self.assertIsNone(by_agent['review-1'].canonical_identity)
+        report = roles.select_roles(discovered, support.task_requirements(),
+                                    now=NOW)
+        self.assertIsNone(report.role(roles.ROLE_REVIEWER).selected)
+        self.assertFalse(report.automatic_dispatch_allowed)
+
+    def test_the_registered_declaration_replaces_the_runtime_claim(self):
+        # Same agent, same triple: the registry declaration wins, not the claim.
+        master, execution, reviewer = pair(
+            execution_identity=support.identity('vendor/claimed-exec'),
+            reviewer_identity=support.identity('vendor/claimed-review'))
+        entries = [self.registry_entry(execution,
+                                       identity=support.identity('vendor/real-exec')),
+                   self.registry_entry(reviewer,
+                                       identity=support.identity('vendor/real-review'))]
+        discovered = self.discovery((master, execution, reviewer), entries)
+        by_agent = {item.agent_id: item for item in discovered.candidates}
+        self.assertEqual(by_agent['review-1'].canonical_identity.canonical_id,
+                         'vendor/real-review')
+        report = roles.select_roles(discovered, support.task_requirements(),
+                                    now=NOW)
+        self.assertIsNotNone(report.role(roles.ROLE_REVIEWER).selected)
+        self.assertTrue(report.automatic_dispatch_allowed)
 
     def test_no_registry_leaves_every_runtime_candidate_unidentified(self):
         master, execution, reviewer = untrusted_pair()

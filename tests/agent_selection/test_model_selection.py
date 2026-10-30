@@ -84,8 +84,9 @@ def default_links():
 
 
 def make_discovery(candidates):
-    return discovery.discover_candidates(
-        adapter=support.FixtureAdapter(support.ok_result(candidates)))
+    # The fixture scope registry declares the identities; a runtime claim alone
+    # would be discarded at the discovery boundary (#170).
+    return support.discovery_with(candidates)
 
 
 def select(candidates=None, *, batch=None, links=None, policy=None,

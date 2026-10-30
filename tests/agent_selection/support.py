@@ -96,11 +96,13 @@ def candidate(agent_id='agent-1', *, model_id='model-a', model_family='family-a'
               canonical_identity='fixture'):
     """One synthetic candidate.
 
-    ``canonical_identity='fixture'`` declares the same shape the scope registry
-    would carry: a verified mapping from this ``model_id`` to itself, because
-    most fixtures are about other hard filters. Pass
-    ``canonical_identity=None`` for "nothing was registered" or an explicit
-    :func:`identity` / :func:`absent_identity` value to exercise the #170 paths.
+    ``canonical_identity='fixture'`` is the *declaration the fixture scope
+    registry would carry*: a confirmed mapping from this ``model_id`` to itself,
+    because most fixtures are about other hard filters. :func:`report_with`
+    moves it into the registry, so discovery discards any runtime claim and
+    re-attaches the registered one. Pass ``canonical_identity=None`` for
+    "nothing was registered" or an explicit :func:`identity` /
+    :func:`absent_identity` value to exercise the #170 paths.
     """
     if canonical_identity == 'fixture':
         canonical_identity = identity(model_id) if model_id is not None else None
@@ -184,8 +186,50 @@ def standard_candidates():
     return master, execution, reviewer
 
 
-def report_with(candidates, requirements=None, *, adapter=None):
+def registry_identity_entries(candidates):
+    """The identity declarations the fixture scope registry carries.
+
+    A fixture candidate that declares a canonical identity means "the operator
+    registered this agent in the scope's ``agent-registry.md`` with that
+    mapping". :func:`report_with` hands those declarations to discovery as
+    registry entries, so the identity a test sees always comes through the
+    registry path — a runtime's own claim is discarded at the boundary (#170).
+    """
+    entries = []
+    for candidate_value in candidates:
+        identity = candidate_value.canonical_identity
+        if identity is None or candidate_value.model_id is None:
+            continue
+        entries.append(runtime_adapter.AgentCandidate(
+            runtime_id=candidate_value.runtime_id,
+            runtime_version=candidate_value.runtime_version,
+            agent_id=candidate_value.agent_id,
+            model_id=candidate_value.model_id,
+            model_family=candidate_value.model_family,
+            source=runtime_adapter.CANDIDATE_SOURCES[1],
+            evidence_time=candidate_value.evidence_time,
+            canonical_identity=identity))
+    return entries
+
+
+def discovery_with(candidates, *, registered=True, adapter=None):
+    """Discover the fixture set through a scope registry that declares them.
+
+    ``registered=True`` (the default) models a scope whose ``agent-registry.md``
+    declares the fixture identities. Pass ``registered=False`` to model a
+    runtime that only enumerates agents: every identity then stays ABSENT, even
+    if a fixture candidate claims one.
+    """
     adapter = adapter or FixtureAdapter(ok_result(candidates))
-    discovered = discovery.discover_candidates(adapter=adapter)
+    entries = registry_identity_entries(candidates) if registered else ()
+    registry = (discovery.ExplicitRegistry(entries=tuple(entries))
+                if entries else None)
+    return discovery.discover_candidates(adapter=adapter, registry=registry)
+
+
+def report_with(candidates, requirements=None, *, adapter=None, registered=True):
+    """Select roles from a discovered fixture set."""
+    discovered = discovery_with(candidates, registered=registered,
+                                adapter=adapter)
     return roles.select_roles(discovered,
                               requirements or task_requirements(), now=NOW)
