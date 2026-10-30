@@ -98,6 +98,18 @@ def parse_stdout(proc):
     return json.loads(proc.stdout)
 
 
+def run_payload(payload):
+    """Run the CLI on an in-memory input via a temporary (non-project) file."""
+    with tempfile.TemporaryDirectory() as tmp:
+        input_path = Path(tmp) / "input.json"
+        input_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return run_cli(input_path=input_path)
+
+
+def base_payload(name="fx_l0_plain_doc"):
+    return load_json(FIXTURES / f"{name}.json")
+
+
 def walk(node, path="$"):
     yield path, node
     if isinstance(node, dict):
@@ -358,6 +370,95 @@ class PlannerInvariantTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 3, proc.stderr)
         after = snapshot()
         self.assertEqual(before, after, "planner wrote into the project tree")
+
+
+class PlannerReviewRegressionTests(unittest.TestCase):
+    """Regressions for the review of PR #214 (head bed59d3)."""
+
+    maxDiff = None
+
+    def assert_rejected(self, payload, code, path):
+        proc = run_payload(payload)
+        self.assertEqual(proc.returncode, 2, proc.stderr or proc.stdout)
+        self.assertEqual(proc.stderr, "", "stderr must stay empty")
+        document = parse_stdout(proc)
+        self.assertEqual(document["schema_version"], "verification-planner-diagnostic/1")
+        self.assertEqual(document["diagnostic"], {"code": code, "path": path})
+        for absent in ("classification", "checks", "gates", "ac_map", "identity"):
+            self.assertNotIn(absent, document)
+        assert_clean(self, document, proc.stdout)
+
+    def test_output_forbidden_word_in_task_ref_rejected(self):
+        payload = base_payload()
+        payload["task_ref"] = "PASS"
+        self.assert_rejected(payload, "schema_invalid", "$.task_ref")
+
+    def test_output_forbidden_word_in_check_source_ref_rejected(self):
+        payload = base_payload()
+        payload["profile"]["checks"][0]["source_ref"] = "ref/PASS"
+        self.assert_rejected(payload, "schema_invalid", "$.profile.checks[0].source_ref")
+
+    def test_output_forbidden_word_in_ac_id_rejected(self):
+        payload = base_payload()
+        payload["acceptance"][0]["ac_id"] = "PASS"
+        self.assert_rejected(payload, "schema_invalid", "$.acceptance[0].ac_id")
+
+    def test_output_forbidden_word_in_check_id_rejected(self):
+        payload = base_payload()
+        payload["profile"]["checks"][0]["check_id"] = "pass"
+        self.assert_rejected(payload, "schema_invalid", "$.profile.checks[0].check_id")
+
+    def test_output_forbidden_word_in_absence_evidence_rejected(self):
+        payload = base_payload()
+        payload["host_tool_absence_claims"] = [
+            {"probe_id": "C1", "evidence_ref": "ref/PASS"}
+        ]
+        self.assert_rejected(payload, "schema_invalid",
+                             "$.host_tool_absence_claims[0].evidence_ref")
+
+    def test_dot_segments_rejected_before_normalisation(self):
+        for path in ("docs/./charter.md", "./docs/charter.md",
+                     "docs/../charter.md", "docs/.", "docs/.."):
+            with self.subTest(path=path):
+                payload = base_payload()
+                payload["changed_paths"] = [{"path": path, "source_ref": "caller:diff/1"}]
+                self.assert_rejected(payload, "path_invalid", "$.changed_paths[0].path")
+
+    def test_r_local_survives_sibling_l3_path(self):
+        payload = base_payload()
+        payload["changed_paths"] = [
+            {"path": "scripts/orchestrator.py", "source_ref": "caller:diff/1"},
+            {"path": "scripts/foo.py", "source_ref": "caller:diff/2"},
+        ]
+        proc = run_payload(payload)
+        self.assertEqual(proc.returncode, 3, proc.stderr or proc.stdout)
+        self.assertEqual(proc.stderr, "")
+        document = parse_stdout(proc)
+        rules = document["classification"]["rule_ids"]
+        self.assertIn("R-PATH-ORCHESTRATOR", rules)
+        self.assertIn("R-LOCAL", rules)
+        self.assertEqual(document["classification"]["floors"]["path_floor"], "L3")
+        self.assertEqual(document["classification"]["level"], "L3")
+        caller = [item["check_id"] for item in document["checks"]["caller_snapshot"]]
+        shadow = [item["check_id"] for item in document["checks"]["shadow_candidates"]]
+        self.assertEqual(shadow, caller)
+        self.assertEqual(document["checks"]["counterfactual_diff"], [])
+        assert_clean(self, document, proc.stdout)
+
+    def test_single_l3_path_does_not_emit_r_local(self):
+        payload = base_payload()
+        payload["changed_paths"] = [
+            {"path": "scripts/orchestrator.py", "source_ref": "caller:diff/1"}
+        ]
+        document = parse_stdout(run_payload(payload))
+        self.assertIn("R-PATH-ORCHESTRATOR", document["classification"]["rule_ids"])
+        self.assertNotIn("R-LOCAL", document["classification"]["rule_ids"])
+
+    def test_doc_executable_stays_l0(self):
+        document = parse_stdout(run_cli(input_path=FIXTURES / "fx_doc_executable.json"))
+        self.assertEqual(document["classification"]["floors"]["path_floor"], "L0")
+        self.assertNotIn("R-DOC-PLAIN", document["classification"]["rule_ids"])
+        self.assertIn("R-DOC-EXECUTABLE", document["classification"]["rule_ids"])
 
 
 class PlannerReportingTests(unittest.TestCase):

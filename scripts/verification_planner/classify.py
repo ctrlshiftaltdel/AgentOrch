@@ -171,10 +171,21 @@ def banned_hits(payload):
     return hits
 
 
-def assert_clean_output(payload):
-    hits = banned_hits(payload)
-    if hits:
-        raise RuntimeError("output violates forbidden-word invariant: " + "; ".join(hits))
+def _has_banned_word(text):
+    return any(word.lower() in _BANNED_LOWER for word in _WORD_RE.findall(text))
+
+
+def _require_output_safe(value, pointer):
+    """Reject caller strings that could only be echoed as a forbidden word.
+
+    A plan may never contain a banned word (§5.1 item 3). Rather than turning the
+    final scan into an uncaught exception, values that would be echoed into the
+    document are rejected before a plan is built, with a normal exit-2
+    diagnostic.
+    """
+    if _has_banned_word(value):
+        raise PlannerError("schema_invalid", _pointer(pointer))
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -247,9 +258,13 @@ def normalize_path(raw, pointer):
     if not isinstance(raw, str):
         raise PlannerError("schema_invalid", _pointer(pointer))
     text = raw.replace("\\", "/").strip()
+    # Check raw segments before pathlib normalises ``.`` away. ``PurePosixPath``
+    # drops ``.`` components, so ``docs/./charter.md`` would otherwise pass.
+    raw_parts = text.split("/")
     posix = PurePosixPath(text)
     invalid = (
         not text
+        or any(part in (".", "..") for part in raw_parts)
         or posix.is_absolute()
         or re.match(r"^[A-Za-z]:/", text) is not None
         or any(part in ("..", ".") for part in posix.parts)
@@ -287,7 +302,8 @@ def parse_task(raw):
     if raw["schema_version"] != SCHEMA_VERSION:
         raise PlannerError("schema_invalid", "$.schema_version")
 
-    task_ref = _require_str(raw["task_ref"], ("task_ref",), maximum=200)
+    task_ref = _require_output_safe(
+        _require_str(raw["task_ref"], ("task_ref",), maximum=200), ("task_ref",))
 
     edition = raw["edition"]
     if edition not in ("local", "github"):
@@ -302,8 +318,10 @@ def parse_task(raw):
         item = _require_object(item, pointer)
         _require_exact_keys(item, ("ac_id", "text"), pointer)
         acceptance.append({
-            "ac_id": _require_str(item["ac_id"], pointer + ("ac_id",), maximum=64,
-                                  pattern=AC_RE),
+            "ac_id": _require_output_safe(
+                _require_str(item["ac_id"], pointer + ("ac_id",), maximum=64,
+                             pattern=AC_RE),
+                pointer + ("ac_id",)),
             "text": _require_str(item["text"], pointer + ("text",), maximum=500),
         })
 
@@ -368,11 +386,15 @@ def parse_task(raw):
         if scope not in ("quick", "full", "static", "post_merge", "ci", "doc"):
             raise PlannerError("schema_invalid", _pointer(pointer + ("scope",)))
         checks.append({
-            "check_id": _require_str(item["check_id"], pointer + ("check_id",),
-                                     maximum=64, pattern=CHECK_RE),
+            "check_id": _require_output_safe(
+                _require_str(item["check_id"], pointer + ("check_id",),
+                             maximum=64, pattern=CHECK_RE),
+                pointer + ("check_id",)),
             "scope": scope,
-            "source_ref": _require_str(item["source_ref"], pointer + ("source_ref",),
-                                       maximum=200, pattern=REF_RE),
+            "source_ref": _require_output_safe(
+                _require_str(item["source_ref"], pointer + ("source_ref",),
+                             maximum=200, pattern=REF_RE),
+                pointer + ("source_ref",)),
         })
 
     project_floor = raw["project_floor"]
@@ -421,8 +443,10 @@ def parse_task(raw):
                 raise PlannerError("schema_invalid", _pointer(pointer + ("probe_id",)))
             absence_claims.append({
                 "probe_id": probe_id,
-                "evidence_ref": _require_str(item["evidence_ref"], pointer + ("evidence_ref",),
-                                             maximum=200, pattern=REF_RE),
+                "evidence_ref": _require_output_safe(
+                    _require_str(item["evidence_ref"], pointer + ("evidence_ref",),
+                                 maximum=200, pattern=REF_RE),
+                    pointer + ("evidence_ref",)),
             })
 
     return {
@@ -500,6 +524,15 @@ def _classify(task):
             high_hit = True
             path_floor = max(path_floor, L3)
 
+    # A1 defines R-LOCAL by the existence of *some* path that misses every L3
+    # path rule; another path hitting L3 does not suppress it. The floor is the
+    # max of all matched rules, so this can only add a rule trace, never lower
+    # the classification.
+    non_l3_path_exists = any(
+        not any(predicate(path) for _, predicate in path_l3_rules)
+        for path in paths
+    )
+
     docs_only = bool(first_segments) and all(segment == "docs" for segment in first_segments)
     executable_signal = bool(signals & {"executable_example", "instruction"})
     plain_exclusion = executable_signal or bool(
@@ -511,7 +544,7 @@ def _classify(task):
     elif len(first_segments) >= 2:
         _add_rule(rule_ids, "R-CROSS-MODULE")
         path_floor = max(path_floor, L2)
-    elif len(first_segments) == 1 and first_segments[0] != "docs" and not l3_path_hit:
+    elif len(first_segments) == 1 and first_segments[0] != "docs" and non_l3_path_exists:
         _add_rule(rule_ids, "R-LOCAL")
         path_floor = max(path_floor, L1)
 
@@ -689,7 +722,6 @@ def build_plan(task):
             },
         },
     }
-    assert_clean_output(plan)
     return plan
 
 
@@ -699,7 +731,10 @@ def diagnostic(code, path="$"):
         "plan_usability": "not_a_verification_result",
         "diagnostic": {"code": code, "path": path},
     }
-    assert_clean_output(document)
+    if banned_hits(document):
+        # Defensive: a diagnostic must itself pass the §5.1 scan. Never raise
+        # from here, or the CLI would exit 1 with a traceback on stderr.
+        document["diagnostic"] = {"code": "schema_invalid", "path": "$"}
     return document
 
 
@@ -709,7 +744,13 @@ def build(raw):
         task = parse_task(raw)
     except PlannerError as error:
         return 2, diagnostic(error.code, error.path)
-    return 3, build_plan(task)
+    plan = build_plan(task)
+    if banned_hits(plan):
+        # The final scan must never become an uncaught exception. Caller strings
+        # that would be echoed as a forbidden word are already rejected during
+        # parsing; this is the last-resort guard.
+        return 2, diagnostic("schema_invalid", "$")
+    return 3, plan
 
 
 def loads(text):
