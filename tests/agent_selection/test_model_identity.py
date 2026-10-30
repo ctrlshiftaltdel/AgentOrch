@@ -373,7 +373,8 @@ def capabilities():
 
 def parse(details, **kwargs):
     entries, issues = discovery.registry_candidates_from_records(
-        [Record(details, **kwargs)], capability_records=capabilities())
+        [Record(details, **kwargs)], capability_records=capabilities(),
+        now=NOW)
     return entries, issues
 
 
@@ -470,7 +471,7 @@ class RegistryConflictTests(unittest.TestCase):
                                     )),
         ]
         entries, issues = discovery.registry_candidates_from_records(
-            records, capability_records=capabilities())
+            records, capability_records=capabilities(), now=NOW)
         self.assertEqual(len(entries), 2)
         for entry in entries:
             self.assertEqual(entry.canonical_identity.status, 'CONFLICT',
@@ -496,7 +497,7 @@ class RegistryConflictTests(unittest.TestCase):
                                     read_only='maybe')),
         ]
         entries, issues = discovery.registry_candidates_from_records(
-            records, capability_records=capabilities())
+            records, capability_records=capabilities(), now=NOW)
         self.assertEqual(len(entries), 1, 'the invalid record must be skipped')
         self.assertIn('read_only', ' '.join(issues))
         self.assertEqual(entries[0].canonical_identity.status, 'CONFLICT',
@@ -525,7 +526,7 @@ class RegistryConflictTests(unittest.TestCase):
                                     read_only='maybe')),
         ]
         entries, issues = discovery.registry_candidates_from_records(
-            records, capability_records=capabilities())
+            records, capability_records=capabilities(), now=NOW)
         self.assertEqual(len(entries), 1, 'the unusable record must be skipped')
         self.assertEqual(entries[0].canonical_identity.canonical_id,
                          'vendor/core-y')
@@ -552,7 +553,7 @@ class RegistryConflictTests(unittest.TestCase):
                                     model_aliases='', read_only='maybe')),
         ]
         entries, issues = discovery.registry_candidates_from_records(
-            records, capability_records=capabilities())
+            records, capability_records=capabilities(), now=NOW)
         self.assertEqual(len(entries), 1, 'the unusable record must be skipped')
         self.assertEqual(entries[0].canonical_identity.status, 'CONFLICT',
                          entries[0].canonical_identity)
@@ -560,6 +561,32 @@ class RegistryConflictTests(unittest.TestCase):
         self.assertTrue(any('model_id' in issue and 'cannot' in issue.lower()
                             or 'unresolvable' in issue.lower()
                             for issue in issues), issues)
+
+    def test_an_expired_twin_blocks_the_exact_key(self):
+        """Expiry is part of agreement: an expired verification is not confirmed.
+
+        The twin declares the same canonical id, but its window closed in 2020,
+        so it is not a confirmed declaration. The surviving, still-valid record
+        must not keep CONFIRMED for the same exact triple.
+        """
+        records = [
+            Record(registry_details(agent_id='review-1', model_id='model-b',
+                                    canonical_model_id='vendor/core-y',
+                                    model_aliases='', read_only='true',
+                                    write_paths='', tools='file-read')),
+            Record(registry_details(agent_id='review-1', model_id='model-b',
+                                    canonical_model_id='vendor/core-y',
+                                    model_aliases='',
+                                    identity_verified_until=(
+                                        '2020-01-01T00:00:00Z'),
+                                    read_only='maybe')),
+        ]
+        entries, _ = discovery.registry_candidates_from_records(
+            records, capability_records=capabilities(), now=NOW)
+        self.assertEqual(len(entries), 1, 'the unusable record must be skipped')
+        self.assertEqual(entries[0].canonical_identity.status, 'CONFLICT',
+                         entries[0].canonical_identity)
+        self.assertFalse(entries[0].canonical_identity.trusted_at(NOW)[0])
 
     def test_two_records_for_one_exact_triple_with_the_same_identity_agree(self):
         records = [
@@ -572,7 +599,7 @@ class RegistryConflictTests(unittest.TestCase):
                                     model_aliases='', read_only='maybe')),
         ]
         entries, _ = discovery.registry_candidates_from_records(
-            records, capability_records=capabilities())
+            records, capability_records=capabilities(), now=NOW)
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0].canonical_identity.status, 'CONFIRMED')
 
@@ -594,7 +621,7 @@ class RegistryConflictTests(unittest.TestCase):
                                     model_aliases='', read_only='maybe')),
         ]
         entries, _ = discovery.registry_candidates_from_records(
-            records, capability_records=capabilities())
+            records, capability_records=capabilities(), now=NOW)
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0].canonical_identity.status, 'CONFIRMED')
 
@@ -607,7 +634,7 @@ class RegistryConflictTests(unittest.TestCase):
                                     model_aliases='')),
         ]
         entries, issues = discovery.registry_candidates_from_records(
-            records, capability_records=capabilities())
+            records, capability_records=capabilities(), now=NOW)
         self.assertEqual(issues, ())
         self.assertEqual([entry.canonical_identity.status for entry in entries],
                          ['CONFIRMED', 'CONFIRMED'])
@@ -622,7 +649,7 @@ class RegistryConflictTests(unittest.TestCase):
                                     model_aliases='')),
         ]
         entries, _ = discovery.registry_candidates_from_records(
-            records, capability_records=capabilities())
+            records, capability_records=capabilities(), now=NOW)
         self.assertEqual([entry.canonical_identity.status for entry in entries],
                          ['CONFLICT', 'CONFLICT'])
 
@@ -640,7 +667,7 @@ class RegistryToRoleTests(unittest.TestCase):
 
     def report_from_records(self, records):
         entries, issues = discovery.registry_candidates_from_records(
-            records, capability_records=capabilities())
+            records, capability_records=capabilities(), now=NOW)
         self.assertEqual(issues, ())
         discovered = discovery.discover_candidates(
             registry=discovery.ExplicitRegistry(entries=entries))
@@ -708,7 +735,7 @@ class RegistryToRoleTests(unittest.TestCase):
                 read_only='maybe')),
         ]
         entries, issues = discovery.registry_candidates_from_records(
-            records, capability_records=capabilities())
+            records, capability_records=capabilities(), now=NOW)
         self.assertTrue(any('read_only' in issue for issue in issues), issues)
         discovered = discovery.discover_candidates(
             registry=discovery.ExplicitRegistry(entries=entries))
@@ -741,7 +768,7 @@ class RegistryToRoleTests(unittest.TestCase):
                 read_only='maybe')),
         ]
         entries, _ = discovery.registry_candidates_from_records(
-            records, capability_records=capabilities())
+            records, capability_records=capabilities(), now=NOW)
         discovered = discovery.discover_candidates(
             registry=discovery.ExplicitRegistry(entries=entries))
         report = roles.select_roles(discovered, support.task_requirements(),
@@ -779,7 +806,7 @@ class RegistryToRoleTests(unittest.TestCase):
                 canonical_model_id='vendor/core-y', **twin_overrides)),
         ]
         entries, _ = discovery.registry_candidates_from_records(
-            records, capability_records=capabilities())
+            records, capability_records=capabilities(), now=NOW)
         reviewers = [entry for entry in entries if entry.agent_id == 'review-1']
         self.assertTrue(reviewers, 'the reviewer records were dropped')
         for entry in reviewers:
@@ -807,6 +834,12 @@ class RegistryToRoleTests(unittest.TestCase):
         """Same canonical string, but the twin was never confirmed."""
         self.assert_twin_blocks_the_reviewer(
             {'identity_verification': 'UNCONFIRMED'})
+
+    def test_an_expired_twin_blocks_the_reviewer(self):
+        """Same canonical string and CONFIRMED status, but the window closed."""
+        self.assert_twin_blocks_the_reviewer(
+            {'identity_verified_until': '2020-01-01T00:00:00Z',
+             'read_only': 'maybe'})
 
     def test_two_confirmed_registry_identities_select_the_reviewer(self):
         records = [self.master_record(),

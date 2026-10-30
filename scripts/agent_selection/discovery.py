@@ -254,7 +254,7 @@ def _identity_claim(record):
     return identity, model_id, exact
 
 
-def disputed_identity_keys(records):
+def disputed_identity_keys(records, *, now=None):
     """What this scope's registry contradicts, read from the declarations alone.
 
     Returns ``(alias_keys, exact_triples)``:
@@ -265,7 +265,9 @@ def disputed_identity_keys(records):
       that more than one record claims without agreeing on one *confirmed*
       declaration. A twin whose canonical id happens to match still counts when
       its own declaration is unusable (a malformed alias, a missing or invalid
-      field) or was never confirmed: matching the string is not enough.
+      field), was never confirmed, or has **expired**: an expired verification
+      is not a confirmed declaration, so ``verified_until`` is judged at
+      ``now`` like any other freshness fact. Matching the string is not enough.
 
     Both are computed on **every** non-``SUPERSEDED`` record before the rest of
     the record is validated, so a record rejected for an unrelated field (say an
@@ -286,8 +288,12 @@ def disputed_identity_keys(records):
                 claims.setdefault(key, set()).add(
                     identity.canonical_id.casefold())
         if exact is not None:
+            # Expiry is part of "confirmed": trusted_at() reports EXPIRED once
+            # the verification window has passed, so an expired twin cannot
+            # stand in as agreement for the same exact triple.
+            _, status, _ = identity.trusted_at(now)
             exact_claims.setdefault(exact, set()).add(
-                (identity.status,
+                (status,
                  identity.canonical_id.casefold()
                  if identity.canonical_id is not None else None))
     disputed_exact = set()
@@ -449,29 +455,35 @@ class ExplicitRegistry:
                                candidates=tuple(self.entries), notes=notes)
 
     @classmethod
-    def from_store(cls, store, *, capability_records=None):
+    def from_store(cls, store, *, capability_records=None, now=None):
         """Read ``agent-registry.md`` from one initialized local scope."""
         try:
             records = store.read_records(REGISTRY_DOCUMENT)
         except StoreError as exc:
             return cls(entries=(), issues=(f'{REGISTRY_DOCUMENT}: {exc}',))
         entries, issues = registry_candidates_from_records(
-            records, capability_records=capability_records)
+            records, capability_records=capability_records, now=now)
         return cls(entries=entries, issues=issues)
 
 
-def registry_candidates_from_records(records, *, capability_records=None):
+def registry_candidates_from_records(records, *, capability_records=None,
+                                     now=None):
     """Convert Markdown registry records into candidates (or issues).
 
     A record that is ``SUPERSEDED`` is skipped: an old definition must not be
     resurrected. Every other unusable record yields an issue and no candidate,
     so the selector can report the gap instead of guessing.
+
+    ``now`` dates the identity-conflict scan only: a verification window that has
+    already closed at ``now`` (default: the current time) is not a confirmed
+    declaration. Role matching still re-evaluates expiry at its own decision
+    time.
     """
     capabilities = dict(capability_records or {})
     records = tuple(records)
     # Identity contradictions are decided from the declarations themselves, so a
     # record rejected for an unrelated field cannot hide one side of a conflict.
-    disputed, disputed_exact = disputed_identity_keys(records)
+    disputed, disputed_exact = disputed_identity_keys(records, now=now)
     entries = []
     issues = []
     for record in records:
