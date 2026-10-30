@@ -46,6 +46,8 @@ __all__ = [
     'ExplicitRegistry',
     'DiscoveryReport',
     'discover_candidates',
+    'attach_registered_identities',
+    'identity_match_key',
     'identity_from_details',
     'registry_candidates_from_records',
 ]
@@ -247,6 +249,86 @@ def _resolve_identity_conflicts(entries, label_of):
                     identity, status='CONFLICT', detail=detail))
         resolved.append(entry)
     return tuple(resolved), tuple(issues)
+
+
+def identity_match_key(candidate):
+    """The exact key that ties an enumerated agent to a registry record (#170).
+
+    ``runtime_id`` + ``agent_id`` + ``model_id``: three operator-writable facts,
+    compared literally. No prefix, family, alias or name-similarity match is
+    made here — an alias only counts once the registry *record* declares it.
+    """
+    model_id = candidate.model_id
+    if model_id is None or not str(model_id).strip():
+        return None
+    return (candidate.runtime_id, candidate.agent_id, str(model_id).strip())
+
+
+def _declaration_signature(identity):
+    return (identity.status, identity.key, identity.verified_until,
+            identity.evidence_ref, tuple(sorted(identity.aliases)))
+
+
+def _conflicting_identity():
+    return CanonicalIdentity(
+        status='CONFLICT',
+        detail=('two agent-registry.md records match this agent on '
+                'runtime_id, agent_id and model_id with different identity '
+                'declarations; a conflicting mapping is not trusted'))
+
+
+def attach_registered_identities(candidates, registry):
+    """Hand enumerated candidates the identity the current scope registered.
+
+    A runtime can enumerate an agent but cannot vouch for the underlying model,
+    so its candidates start with no identity. This copies the declaration from
+    the matching ``agent-registry.md`` record and nothing else: an unmatched
+    candidate keeps ``None`` (no identity), and two exact matches that disagree
+    become ``CONFLICT`` instead of one of them being chosen. The candidate list
+    and every other fact stay exactly as the runtime reported them.
+    """
+    entries = tuple(getattr(registry, 'entries', ()) or ()) \
+        if registry is not None else ()
+    if not entries:
+        return tuple(candidates), ()
+    declarations = {}
+    for entry in entries:
+        identity = entry.canonical_identity
+        key = identity_match_key(entry)
+        if identity is None or key is None:
+            continue
+        declarations.setdefault(key, []).append(identity)
+    attached = []
+    notes = []
+    for candidate in candidates:
+        if candidate.canonical_identity is not None:
+            attached.append(candidate)
+            continue
+        key = identity_match_key(candidate)
+        matching = declarations.get(key, ()) if key is not None else ()
+        distinct = {_declaration_signature(item) for item in matching}
+        if not distinct:
+            attached.append(candidate)
+            continue
+        if len(distinct) == 1:
+            identity = matching[0]
+            attached.append(replace(
+                candidate, canonical_identity=identity,
+                notes=tuple(candidate.notes) + (
+                    'canonical model identity taken from the current scope '
+                    'agent-registry.md record that matches runtime_id, '
+                    'agent_id and model_id exactly',)))
+            continue
+        attached.append(replace(
+            candidate, canonical_identity=_conflicting_identity(),
+            notes=tuple(candidate.notes) + (
+                'agent-registry.md has more than one exact match with '
+                'different identity declarations',)))
+    notes.append(
+        f'{len(attached)} runtime candidate(s) were checked against the '
+        'current scope agent-registry.md; an identity is used only on an exact '
+        'runtime_id + agent_id + model_id match')
+    return tuple(attached), tuple(notes)
 
 
 @dataclass(frozen=True)
@@ -466,10 +548,15 @@ def discover_candidates(adapter=None, registry=None) -> DiscoveryReport:
         notes.append(f'runtime discovery error: {runtime_result.error}')
 
     if runtime_result is not None and runtime_result.discovered:
+        # The runtime wins the enumeration; the scope registry still supplies the
+        # underlying-model identity for agents it matches exactly (#170).
+        identities, identity_notes = attach_registered_identities(
+            runtime_result.candidates, registry)
+        notes.extend(identity_notes)
         return DiscoveryReport(
             outcome=DISCOVERY_RUNTIME,
             runtime_result=runtime_result,
-            candidates=tuple(runtime_result.candidates),
+            candidates=identities,
             notes=tuple(notes))
 
     registry_result = registry.discover() if registry is not None else None

@@ -31,6 +31,10 @@ SEL_PROBE = '2026-10-26T12:00:00Z'
 SEL_OLD_PROBE = '2026-07-01T00:00:00Z'
 SEL_SCOPE_A = 'e2e-scope-a'
 SEL_SCOPE_B = 'e2e-scope-b'
+# (#170) The operator-written verification window and evidence reference the
+# fixtures use for the canonical model identity of a registered agent.
+SEL_IDENTITY_UNTIL = '2027-01-01T00:00:00Z'
+SEL_IDENTITY_EVIDENCE = 'fixture:model-identity-registry'
 SEL_MODULES = {}
 
 
@@ -151,8 +155,16 @@ def _sel_reviewer_candidate(model_id='model-b', model_family='family-b', **kwarg
 
 
 def _sel_discovery(candidates):
-    """A runtime adapter whose formal enumeration is fixed by the scenario."""
+    """A runtime adapter whose formal enumeration is fixed by the scenario.
+
+    The same agents are also registered in the scope's agent registry with an
+    operator-confirmed canonical identity, so discovery can attach it on an
+    exact runtime_id + agent_id + model_id match (#170). A Reviewer is only
+    independent because that mapping exists, never because the fixture says so.
+    """
     agent = _sel()
+    registry = agent.discovery.ExplicitRegistry(
+        entries=_sel_identity_entries(candidates))
 
     class _FixedAdapter(agent.runtime_adapter.RuntimeAdapter):
         def describe(self):
@@ -165,7 +177,36 @@ def _sel_discovery(candidates):
             return agent.runtime_adapter.DiscoveryResult(
                 outcome='OK', mode='runtime', candidates=tuple(candidates))
 
-    return agent.discovery.discover_candidates(adapter=_FixedAdapter())
+    return agent.discovery.discover_candidates(adapter=_FixedAdapter(),
+                                               registry=registry)
+
+
+def _sel_identity(model_id):
+    """The canonical identity an operator wrote for this fixture agent."""
+    agent = _sel()
+    return agent.runtime_adapter.CanonicalIdentity(
+        canonical_id=model_id, status='CONFIRMED',
+        evidence_ref=SEL_IDENTITY_EVIDENCE,
+        verified_until=SEL_IDENTITY_UNTIL,
+        detail='fixture operator-confirmed mapping')
+
+
+def _sel_identity_entries(candidates):
+    """Registry records carrying the fixture agents' confirmed identities."""
+    agent = _sel()
+    entries = []
+    for candidate in candidates:
+        if candidate.model_id is None or candidate.canonical_identity is not None:
+            continue
+        entries.append(agent.runtime_adapter.AgentCandidate(
+            runtime_id=candidate.runtime_id,
+            runtime_version=candidate.runtime_version,
+            agent_id=candidate.agent_id, model_id=candidate.model_id,
+            model_family=candidate.model_family,
+            source=agent.runtime_adapter.CANDIDATE_SOURCES[1],
+            evidence_time=SEL_NOW,
+            canonical_identity=_sel_identity(candidate.model_id)))
+    return tuple(entries)
 
 
 def _sel_empty_discovery():
@@ -276,7 +317,8 @@ def _sel_failed_fetch(status='AUTH_FAILED', *, http_status=401,
 
 
 def _sel_registry_details(*, agent_id, model_id, model_family, modalities,
-                          tools, capability_ref='cap-1', **extra):
+                          tools, capability_ref='cap-1', identity=True,
+                          **extra):
     details = {
         'runtime_id': 'fixture-runtime', 'runtime_version': '1.0.0',
         'agent_id': agent_id, 'model_id': model_id,
@@ -284,6 +326,15 @@ def _sel_registry_details(*, agent_id, model_id, model_family, modalities,
         'tools': tools, 'capability_ref': capability_ref,
         'evidence_time': SEL_NOW, 'source_class': 'OBSERVED',
     }
+    if identity:
+        # (#170) The operator-written canonical identity for this agent: this
+        # model id resolves to itself, and no alias is claimed here.
+        details.update({
+            'canonical_model_id': model_id,
+            'identity_verification': 'CONFIRMED',
+            'identity_verified_until': SEL_IDENTITY_UNTIL,
+            'identity_evidence': SEL_IDENTITY_EVIDENCE,
+        })
     details.update(extra)
     return {key: value for key, value in details.items() if value != ''}
 

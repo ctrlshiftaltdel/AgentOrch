@@ -94,6 +94,20 @@ def pair(*, execution_identity, reviewer_identity,
     return master, execution, reviewer
 
 
+def untrusted_pair():
+    """The three roles exactly as a runtime enumeration reports them."""
+    master, execution, reviewer = pair(execution_identity=None,
+                                       reviewer_identity=None)
+    master = support.candidate(
+        'master-1', model_id='model-master', model_family='family-master',
+        modalities=('text', 'image'), tools=('file-read',),
+        permission=support.permissions(), capability_record_value=None,
+        context_tokens=400000, canonical_identity=None,
+        role_evidence=(support.evidence('master', 'planning'),
+                       support.evidence('master', 'quality-judgement')))
+    return master, execution, reviewer
+
+
 def independence_of(evaluation):
     return next(item for item in evaluation.filters
                 if item.filter_id == 'independence')
@@ -576,6 +590,127 @@ class RegistryToRoleTests(unittest.TestCase):
         self.assertFalse(report.executed)
         self.assertEqual(
             independence_of(selection.selected).status, 'PASS')
+
+
+# --------------------------------------------------------------------------- #
+# AC-2 / AC-3 integration: the scope registry reaches a runtime enumeration
+# --------------------------------------------------------------------------- #
+class RuntimeEnrichmentTests(unittest.TestCase):
+    """Exact ``runtime_id`` + ``agent_id`` + ``model_id`` matching, nothing else."""
+
+    def discovery(self, candidates, registry_entries=None):
+        adapter = support.FixtureAdapter(support.ok_result(candidates))
+        registry = (discovery.ExplicitRegistry(entries=tuple(registry_entries))
+                    if registry_entries is not None else None)
+        return discovery.discover_candidates(adapter=adapter,
+                                             registry=registry)
+
+    def registry_entry(self, candidate, *, identity=None, **overrides):
+        values = dict(runtime_id=candidate.runtime_id,
+                      runtime_version=candidate.runtime_version,
+                      agent_id=candidate.agent_id,
+                      model_id=candidate.model_id,
+                      canonical_identity=(identity if identity is not None
+                                          else support.identity(
+                                              candidate.model_id)))
+        values.update(overrides)
+        return support.candidate(source='explicit-registry', **values)
+
+    def report(self, candidates, registry_entries=None):
+        return roles.select_roles(
+            self.discovery(candidates, registry_entries),
+            support.task_requirements(), now=NOW)
+
+    def test_an_exact_registry_match_gives_the_reviewer_a_trusted_identity(self):
+        master, execution, reviewer = untrusted_pair()
+        entries = [self.registry_entry(execution),
+                   self.registry_entry(reviewer)]
+        discovered = self.discovery((master, execution, reviewer), entries)
+        self.assertEqual(discovered.outcome, discovery.DISCOVERY_RUNTIME)
+        by_agent = {item.agent_id: item for item in discovered.candidates}
+        self.assertEqual(
+            by_agent['review-1'].canonical_identity.canonical_id,
+            'provider/model-alias-2')
+        self.assertTrue(any('exact' in note and 'agent-registry.md' in note
+                            for note in discovered.notes), discovered.notes)
+        report = roles.select_roles(discovered, support.task_requirements(),
+                                    now=NOW)
+        selection = report.role(roles.ROLE_REVIEWER)
+        self.assertIsNotNone(selection.selected)
+        self.assertTrue(report.automatic_dispatch_allowed)
+        self.assertFalse(report.executed)
+
+    def test_a_different_model_id_is_not_a_match(self):
+        master, execution, reviewer = untrusted_pair()
+        entries = [self.registry_entry(execution),
+                   self.registry_entry(
+                       reviewer, model_id='some/other-model',
+                       identity=support.identity('some/other-model'))]
+        report = self.report((master, execution, reviewer), entries)
+        selection = report.role(roles.ROLE_REVIEWER)
+        self.assertIsNone(selection.selected)
+        self.assertIn('ABSENT', independence_for(selection, 'review-1').detail)
+        self.assertFalse(report.automatic_dispatch_allowed)
+
+    def test_a_different_agent_id_is_not_a_match(self):
+        master, execution, reviewer = untrusted_pair()
+        entries = [self.registry_entry(execution),
+                   self.registry_entry(reviewer, agent_id='review-9')]
+        report = self.report((master, execution, reviewer), entries)
+        self.assertIsNone(report.role(roles.ROLE_REVIEWER).selected)
+
+    def test_a_different_runtime_is_not_a_match(self):
+        master, execution, reviewer = untrusted_pair()
+        entries = [self.registry_entry(execution),
+                   self.registry_entry(reviewer, runtime_id='other-runtime')]
+        report = self.report((master, execution, reviewer), entries)
+        self.assertIsNone(report.role(roles.ROLE_REVIEWER).selected)
+
+    def test_a_matching_record_without_an_identity_stays_absent(self):
+        master, execution, reviewer = untrusted_pair()
+        entries = [self.registry_entry(execution),
+                   self.registry_entry(reviewer,
+                                       identity=support.absent_identity())]
+        report = self.report((master, execution, reviewer), entries)
+        selection = report.role(roles.ROLE_REVIEWER)
+        self.assertIsNone(selection.selected)
+        self.assertIn('ABSENT', independence_for(selection, 'review-1').detail)
+
+    def test_two_exact_matches_that_disagree_become_a_conflict(self):
+        master, execution, reviewer = untrusted_pair()
+        entries = [self.registry_entry(execution),
+                   self.registry_entry(reviewer),
+                   self.registry_entry(
+                       reviewer,
+                       identity=support.identity('vendor/somewhere-else'))]
+        report = self.report((master, execution, reviewer), entries)
+        selection = report.role(roles.ROLE_REVIEWER)
+        self.assertIsNone(selection.selected)
+        independence = independence_for(selection, 'review-1')
+        self.assertEqual(independence.status, 'UNKNOWN')
+        self.assertIn('CONFLICT', independence.detail)
+
+    def test_no_registry_leaves_every_runtime_candidate_unidentified(self):
+        master, execution, reviewer = untrusted_pair()
+        discovered = self.discovery((master, execution, reviewer))
+        for candidate in discovered.candidates:
+            self.assertIsNone(candidate.canonical_identity)
+
+    def test_enrichment_does_not_change_any_other_reported_fact(self):
+        master, execution, reviewer = untrusted_pair()
+        baseline = self.discovery((master, execution, reviewer))
+        enriched = self.discovery((master, execution, reviewer),
+                                  [self.registry_entry(reviewer)])
+        before = {item.agent_id: item.as_dict()
+                  for item in baseline.candidates}
+        for candidate in enriched.candidates:
+            payload = candidate.as_dict()
+            payload.pop('canonical_identity')
+            payload.pop('notes')
+            original = dict(before[candidate.agent_id])
+            original.pop('canonical_identity')
+            original.pop('notes')
+            self.assertEqual(payload, original, candidate.agent_id)
 
 
 # --------------------------------------------------------------------------- #
