@@ -318,6 +318,94 @@ class PathAndEvidenceHelperTests(unittest.TestCase):
         self.assertFalse(runtime_adapter.covers_path(('docs',), 'src/a.py'))
         self.assertFalse(runtime_adapter.covers_path((), 'docs/a.md'))
 
+    def test_blank_scope_path_is_never_a_wildcard(self):
+        self.assertFalse(
+            runtime_adapter.covers_path(('',), 'private/secret.py'))
+        self.assertFalse(runtime_adapter.covers_path(('',), 'src/a.py'))
+        self.assertFalse(runtime_adapter.covers_path(('', ''), 'docs/a.md'))
+
+    def test_whitespace_scope_paths_are_never_a_wildcard(self):
+        for scope in (('   ',), ('\t',), ('  ', '\t')):
+            with self.subTest(scope=scope):
+                self.assertFalse(
+                    runtime_adapter.covers_path(scope, 'private/secret.py'))
+
+    def test_blank_paths_do_not_cover_through_permission_scope(self):
+        scope = runtime_adapter.PermissionScope(
+            read_paths=('',), write_paths=('   ',))
+        self.assertFalse(
+            runtime_adapter.covers_path(scope.read_paths, 'private/secret.py'))
+        self.assertFalse(
+            runtime_adapter.covers_path(scope.write_paths, 'private/secret.py'))
+
+    def test_parent_segment_traversal_leaves_the_scope(self):
+        self.assertFalse(
+            runtime_adapter.covers_path(
+                ('docs',), 'docs/../private/secret.py'))
+        self.assertFalse(
+            runtime_adapter.covers_path(
+                ('docs',), 'docs/../../private/secret.py'))
+        self.assertFalse(
+            runtime_adapter.covers_path(
+                ('docs/sub',), 'docs/sub/../../private/secret.py'))
+
+    def test_a_scope_that_escapes_the_project_root_covers_nothing(self):
+        self.assertFalse(runtime_adapter.covers_path(('../docs',), 'docs/a.md'))
+        self.assertFalse(runtime_adapter.covers_path(('..',), 'docs/a.md'))
+        self.assertFalse(runtime_adapter.covers_path(('docs',), '../docs/a.md'))
+
+    def test_scope_parent_segments_are_not_proof_of_a_boundary(self):
+        for scope in (('docs/..',), ('docs/sub/..',), ('docs/../docs',)):
+            with self.subTest(scope=scope):
+                self.assertFalse(
+                    runtime_adapter.covers_path(scope, 'docs/a.md'))
+                self.assertFalse(
+                    runtime_adapter.covers_path(scope, 'private/secret.py'))
+
+    def test_absolute_and_drive_paths_are_not_covered_without_proof(self):
+        for scope in (('*',), ('.',), ('./',), ('/',), ('docs',)):
+            with self.subTest(scope=scope):
+                self.assertFalse(
+                    runtime_adapter.covers_path(scope, '/etc/passwd'))
+                self.assertFalse(
+                    runtime_adapter.covers_path(scope, 'C:/project/a.py'))
+                self.assertFalse(
+                    runtime_adapter.covers_path(scope, 'c:\\project\\a.py'))
+        self.assertFalse(
+            runtime_adapter.covers_path(('C:/project',), 'C:/project/a.py'))
+
+    def test_non_string_scope_entries_are_not_evidence(self):
+        self.assertFalse(runtime_adapter.covers_path((None,), 'docs/a.md'))
+        self.assertFalse(runtime_adapter.covers_path((42,), 'docs/a.md'))
+        self.assertFalse(runtime_adapter.covers_path(('docs',), None))
+
+    def test_scope_covers_the_same_path_and_real_subdirectories(self):
+        self.assertTrue(runtime_adapter.covers_path(('docs',), 'docs'))
+        self.assertTrue(runtime_adapter.covers_path(('docs',), 'docs/a/b.md'))
+        self.assertTrue(
+            runtime_adapter.covers_path(('docs/a',), 'docs/a/b.md'))
+
+    def test_separator_and_dot_spellings_are_normalised(self):
+        self.assertTrue(runtime_adapter.covers_path(('docs\\a',), 'docs/a/b.md'))
+        self.assertTrue(runtime_adapter.covers_path(('docs//a',), 'docs/a/b.md'))
+        self.assertTrue(runtime_adapter.covers_path(('docs',), './docs//a.md'))
+        self.assertTrue(runtime_adapter.covers_path(('docs',), 'docs/./a.md'))
+        self.assertTrue(runtime_adapter.covers_path(('docs',), 'docs/a/../b.md'))
+        self.assertFalse(
+            runtime_adapter.covers_path(('docs',), './docs-other/a.md'))
+
+    def test_explicit_wildcard_still_covers_relative_paths(self):
+        self.assertTrue(runtime_adapter.covers_path(('*',), 'private/secret.py'))
+        self.assertTrue(runtime_adapter.covers_path(('*',), 'docs/a.md'))
+
+    def test_project_root_still_covers_relative_paths(self):
+        for scope in (('.',), ('./',), ('./.',)):
+            with self.subTest(scope=scope):
+                self.assertTrue(
+                    runtime_adapter.covers_path(scope, 'src/a.py'))
+                self.assertTrue(
+                    runtime_adapter.covers_path(scope, 'private/secret.py'))
+
     def test_covers_command_is_exact_or_explicit_wildcard(self):
         self.assertTrue(runtime_adapter.covers_command(('python',), 'python'))
         self.assertFalse(runtime_adapter.covers_command(('python',), 'python3'))
