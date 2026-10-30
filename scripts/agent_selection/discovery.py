@@ -233,48 +233,83 @@ def identity_from_details(details):
 
 
 def _identity_claim(record):
-    """The identity declaration a record makes, before any other validation."""
+    """The identity declaration a record makes, before any other validation.
+
+    A record that carries any identity field makes a claim even when the
+    declaration cannot be resolved (an unparsable ``canonical_model_id``, an
+    invalid alias): the registry still said something about this agent, and that
+    is exactly what makes a second declaration for the same agent unusable
+    (#170 review). ``None`` means the record declares no identity at all.
+    """
     details = dict(record.details)
-    identity = identity_from_details(details)
-    if identity.canonical_id is None:
+    if not any(str(details.get(key, '') or '').strip()
+               for key in IDENTITY_DETAIL_KEYS):
         return None
+    identity = identity_from_details(details)
     model_id = str(details.get('model_id', '') or '').strip() or None
-    return identity, model_id
+    runtime_id = str(details.get('runtime_id', '') or '').strip() or None
+    agent_id = str(details.get('agent_id', '') or '').strip() or None
+    exact = ((runtime_id, agent_id, model_id)
+             if runtime_id and agent_id and model_id else None)
+    return identity, model_id, exact
 
 
 def disputed_identity_keys(records):
-    """Model-id / alias keys this scope declares against more than one model.
+    """What this scope's registry contradicts, read from the declarations alone.
 
-    Two records that claim the same model id (or alias) for different canonical
-    ids make the mapping unusable: the registry itself does not say which one is
-    right, so neither may be trusted. The claims are read from the declarations
-    themselves on **every** record, before the rest of the record is validated:
-    a record that is later rejected for an unrelated field (say an unparsable
-    ``read_only``) still contradicts the other one, and skipping it must not
-    leave the survivor ``CONFIRMED`` (#170 review).
+    Returns ``(alias_keys, exact_triples)``:
+
+    * ``alias_keys`` - model ids / aliases declared against more than one
+      canonical id;
+    * ``exact_triples`` - ``runtime_id`` + ``agent_id`` + ``model_id`` triples
+      that more than one record claims with a different result, including a
+      record whose identity could not be resolved at all.
+
+    Both are computed on **every** non-``SUPERSEDED`` record before the rest of
+    the record is validated, so a record rejected for an unrelated field (say an
+    unparsable ``read_only``) still contradicts the other one, and skipping it
+    must not leave the survivor ``CONFIRMED`` (#170 review).
     """
     claims = {}
+    exact_claims = {}
     for record in records:
         if record.status == 'SUPERSEDED':
             continue
         claim = _identity_claim(record)
         if claim is None:
             continue
-        identity, model_id = claim
-        for key in identity.alias_keys(model_id):
-            claims.setdefault(key, set()).add(identity.canonical_id.casefold())
-    return {key for key, targets in claims.items() if len(targets) > 1}
+        identity, model_id, exact = claim
+        if identity.canonical_id is not None:
+            for key in identity.alias_keys(model_id):
+                claims.setdefault(key, set()).add(
+                    identity.canonical_id.casefold())
+        if exact is not None:
+            exact_claims.setdefault(exact, set()).add(
+                identity.canonical_id.casefold()
+                if identity.canonical_id is not None else None)
+    return ({key for key, targets in claims.items() if len(targets) > 1},
+            {key for key, targets in exact_claims.items() if len(targets) > 1})
 
 
-def _conflict_identity(identity, disputed, *, model_id=None):
+def _conflict_identity(identity, disputed, *, model_id=None, exact_key=None,
+                       disputed_exact=()):
     """Downgrade one declaration that contradicts another record, or return it."""
+    reasons = []
     hit = sorted(identity.alias_keys(model_id) & disputed)
-    if not hit:
+    if hit:
+        reasons.append(
+            f'the canonical model identity mapping for {", ".join(hit)} is '
+            'declared against more than one canonical id in this scope')
+    if exact_key is not None and exact_key in disputed_exact:
+        reasons.append(
+            'another record matches this agent on runtime_id, agent_id and '
+            'model_id but declares a different or unresolvable canonical model '
+            'identity')
+    if not reasons:
         return identity
-    detail = (f'the canonical model identity mapping for {", ".join(hit)} is '
-              'declared against more than one canonical id in this scope; a '
-              'conflicting mapping is not trusted')
-    return replace(identity, status='CONFLICT', detail=detail)
+    return replace(identity, status='CONFLICT',
+                   detail='; '.join(reasons) + '; a conflicting mapping is not '
+                                               'trusted')
 
 
 def identity_match_key(candidate):
@@ -424,7 +459,7 @@ def registry_candidates_from_records(records, *, capability_records=None):
     records = tuple(records)
     # Identity contradictions are decided from the declarations themselves, so a
     # record rejected for an unrelated field cannot hide one side of a conflict.
-    disputed = disputed_identity_keys(records)
+    disputed, disputed_exact = disputed_identity_keys(records)
     entries = []
     issues = []
     for record in records:
@@ -499,7 +534,11 @@ def registry_candidates_from_records(records, *, capability_records=None):
                 notes=(f'registry record {record.record_id}',),
                 canonical_identity=_conflict_identity(
                     identity_from_details(details), disputed,
-                    model_id=str(details['model_id']).strip()),
+                    model_id=str(details['model_id']).strip(),
+                    exact_key=(str(details['runtime_id']).strip(),
+                               str(details['agent_id']).strip(),
+                               str(details['model_id']).strip()),
+                    disputed_exact=disputed_exact),
             )
         except (RegistryError, RuntimeAdapterError) as exc:
             issues.append(f'{label}: {exc}; skipped')

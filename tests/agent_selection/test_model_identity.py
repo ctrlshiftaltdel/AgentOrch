@@ -533,6 +533,49 @@ class RegistryConflictTests(unittest.TestCase):
                          entries[0].canonical_identity)
         self.assertFalse(entries[0].canonical_identity.trusted_at(NOW)[0])
 
+    def test_an_unresolvable_canonical_still_claims_the_exact_triple(self):
+        """A record that names the same agent counts even if its id is garbage.
+
+        The second record matches on runtime_id + agent_id + model_id and carries
+        identity fields, but ``canonical_model_id`` cannot be parsed and
+        ``read_only`` is invalid. It is unusable as a candidate and resolves to no
+        canonical id — yet the registry still said something about this agent's
+        identity, so the surviving record must not stay CONFIRMED.
+        """
+        records = [
+            Record(registry_details(agent_id='review-1', model_id='model-b',
+                                    canonical_model_id='vendor/core-y',
+                                    model_aliases='', read_only='true',
+                                    write_paths='', tools='file-read')),
+            Record(registry_details(agent_id='review-1', model_id='model-b',
+                                    canonical_model_id='bad canonical',
+                                    model_aliases='', read_only='maybe')),
+        ]
+        entries, issues = discovery.registry_candidates_from_records(
+            records, capability_records=capabilities())
+        self.assertEqual(len(entries), 1, 'the unusable record must be skipped')
+        self.assertEqual(entries[0].canonical_identity.status, 'CONFLICT',
+                         entries[0].canonical_identity)
+        self.assertFalse(entries[0].canonical_identity.trusted_at(NOW)[0])
+        self.assertTrue(any('model_id' in issue and 'cannot' in issue.lower()
+                            or 'unresolvable' in issue.lower()
+                            for issue in issues), issues)
+
+    def test_two_records_for_one_exact_triple_with_the_same_identity_agree(self):
+        records = [
+            Record(registry_details(agent_id='review-1', model_id='model-b',
+                                    canonical_model_id='vendor/core-y',
+                                    model_aliases='', read_only='true',
+                                    write_paths='', tools='file-read')),
+            Record(registry_details(agent_id='review-1', model_id='model-b',
+                                    canonical_model_id='vendor/core-y',
+                                    model_aliases='', read_only='maybe')),
+        ]
+        entries, _ = discovery.registry_candidates_from_records(
+            records, capability_records=capabilities())
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].canonical_identity.status, 'CONFIRMED')
+
     def test_an_invalid_alias_alone_is_invalid_but_keeps_the_canonical_id(self):
         entries, _ = parse(registry_details(model_aliases='bad alias'))
         identity = entries[0].canonical_identity
@@ -667,6 +710,38 @@ class RegistryToRoleTests(unittest.TestCase):
         entries, issues = discovery.registry_candidates_from_records(
             records, capability_records=capabilities())
         self.assertTrue(any('read_only' in issue for issue in issues), issues)
+        discovered = discovery.discover_candidates(
+            registry=discovery.ExplicitRegistry(entries=entries))
+        report = roles.select_roles(discovered, support.task_requirements(),
+                                    now=NOW)
+        selection = report.role(roles.ROLE_REVIEWER)
+        self.assertIsNone(selection.selected)
+        independence = independence_for(selection, 'review-1')
+        self.assertEqual(independence.status, 'UNKNOWN')
+        self.assertIn('CONFLICT', independence.detail)
+        self.assertFalse(selection.auto_allowed)
+        self.assertFalse(report.automatic_dispatch_allowed)
+        self.assertFalse(report.executed)
+
+    def test_an_unresolvable_canonical_on_the_exact_triple_blocks_reviewer(self):
+        """End to end: an unconvertible canonical id on a twin record still counts."""
+        records = [
+            self.master_record(),
+            Record(registry_details(
+                agent_id='exec-1', model_id='model-a',
+                canonical_model_id='vendor/core-x', model_aliases='',
+                tools='file-read,file-write,command')),
+            Record(registry_details(
+                agent_id='review-1', model_id='model-b', model_family='family-b',
+                canonical_model_id='vendor/core-y', model_aliases='',
+                tools='file-read', write_paths='', read_only='true')),
+            Record(registry_details(
+                agent_id='review-1', model_id='model-b', model_family='family-b',
+                canonical_model_id='bad canonical', model_aliases='',
+                read_only='maybe')),
+        ]
+        entries, _ = discovery.registry_candidates_from_records(
+            records, capability_records=capabilities())
         discovered = discovery.discover_candidates(
             registry=discovery.ExplicitRegistry(entries=entries))
         report = roles.select_roles(discovered, support.task_requirements(),
