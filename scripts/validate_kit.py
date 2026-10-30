@@ -75,6 +75,8 @@ REQUIRED = [
     'tests/agent_selection/test_discovery.py',
     'tests/agent_selection/test_roles.py',
     'tests/agent_selection/test_model_selection.py',
+    'tests/agent_selection/test_model_identity.py',
+    'tests/agent_selection/test_module_registry.py',
     'tests/agent_selection/test_feedback.py',
     'tests/agent_selection/test_e2e.py',
     'tests/agent_selection/model_sources/__init__.py',
