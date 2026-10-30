@@ -226,6 +226,57 @@ class CapabilityRowFreshnessTests(unittest.TestCase):
         self.assert_not_fresh(gate)
         self.assertIn('C1:', ' '.join(gate.reasons))
 
+    def test_an_invalid_row_probe_date_is_rejected_at_construction(self):
+        with self.assertRaises(runtime_adapter.RuntimeAdapterError):
+            runtime_adapter.Capability(
+                'C2', 'PASS', source_class='OBSERVED',
+                probe_date='2026-13-01T00:00:00Z', evidence_ref='probe:1')
+        with self.assertRaises(runtime_adapter.RuntimeAdapterError):
+            runtime_adapter.Capability(
+                'C2', 'PASS', source_class='OBSERVED',
+                probe_date='not-a-timestamp', evidence_ref='probe:1')
+
+    def test_gate_fails_closed_on_an_invalid_row_date_built_outside_its_constructor(
+            self):
+        class UncheckedCapability(runtime_adapter.Capability):
+            def __post_init__(self):
+                pass
+
+        row = UncheckedCapability('C3', 'PASS', source_class='OBSERVED',
+                                  probe_date='not-a-timestamp',
+                                  evidence_ref='probe:1')
+        record = support.capability_record(probe_date=self.HEADER,
+                                           overrides={'C3': row})
+        gate = record.gate(now=NOW)
+        self.assert_not_fresh(gate)
+        self.assertEqual(gate.status, 'UNKNOWN')
+        joined = ' '.join(gate.reasons)
+        self.assertIn('C3:', joined)
+        self.assertIn('cannot be parsed', joined)
+
+    def test_a_future_record_header_is_not_trusted_as_fresh(self):
+        record = support.capability_record(probe_date='2026-10-28T12:00:00Z')
+        gate = record.gate(now=NOW, max_age_days=30)
+        self.assert_not_fresh(gate)
+        self.assertEqual(gate.status, 'UNKNOWN')
+        self.assertFalse(gate.stale)
+        joined = ' '.join(gate.reasons)
+        self.assertIn('future', joined)
+        self.assertIn('capability probe date', joined)
+
+    def test_a_future_record_header_is_untrusted_without_an_age_limit(self):
+        record = support.capability_record(probe_date='2026-10-28T12:00:00Z')
+        gate = record.gate(now=NOW, max_age_days=None)
+        self.assert_not_fresh(gate)
+        self.assertEqual(gate.status, 'UNKNOWN')
+
+    def test_a_past_record_header_still_uses_the_age_limit(self):
+        record = support.capability_record(probe_date=support.OLD_PROBE)
+        gate = record.gate(now=NOW, max_age_days=30)
+        self.assertEqual(gate.status, 'BLOCKED')
+        self.assertTrue(gate.stale)
+        self.assertIn('re-probe', ' '.join(gate.reasons))
+
     def test_gate_does_not_rewrite_stored_row_probe_dates(self):
         record = self.record_with_row('C1', support.OLD_PROBE)
         before = record.as_dict()

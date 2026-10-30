@@ -228,6 +228,25 @@ class CapabilityRowFreshnessTests(unittest.TestCase):
         self.assertIn('C3', callable_filter.detail)
         self.assertIn('future', callable_filter.detail)
 
+    def test_future_record_header_never_qualifies_execution(self):
+        record = support.capability_record(probe_date='2026-10-28T12:00:00Z')
+        _, execution, _ = support.standard_candidates()
+        candidate = support.candidate(
+            execution.agent_id, model_id=execution.model_id,
+            model_family=execution.model_family,
+            modalities=execution.modalities, tools=execution.tools,
+            permission=execution.permissions,
+            capability_record_value=record,
+            role_evidence=execution.role_evidence)
+        selection, report = self.run_with_execution(candidate)
+        self.assertIsNone(selection.selected)
+        self.assertFalse(selection.auto_allowed)
+        self.assertTrue(selection.manual_handoff)
+        self.assertFalse(report.automatic_dispatch_allowed)
+        callable_filter = self.callable_filter(selection, 'exec-1')
+        self.assertEqual(callable_filter.status, 'UNKNOWN')
+        self.assertIn('future', callable_filter.detail)
+
     def test_explicit_max_age_days_applies_to_rows_in_the_report(self):
         candidate = self.execution_with_row('C4', '2026-10-17T12:00:00Z')
         at_limit = support.report_with(

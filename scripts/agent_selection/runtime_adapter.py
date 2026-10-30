@@ -295,10 +295,11 @@ class CapabilityRecord:
              max_age_days=DEFAULT_MAX_EVIDENCE_AGE_DAYS) -> 'SubagentGate':
         """Whether C1–C4 allow a real sub-agent dispatch from this record.
 
-        Freshness is decided per gating row as well as for the record header:
-        each C1-C4 row is dated by its own ``probe_date`` under the same ``now``
-        and the same ``max_age_days``. A freshly re-dated header alone never
-        makes stale row evidence fresh.
+        Freshness is decided per gating row as well as for the record header,
+        with the same ``now``, the same ``max_age_days`` and the same rules: a
+        future-dated header or row is unverifiable evidence (``UNKNOWN``), not
+        the freshest evidence, even when ``max_age_days`` is ``None``. A
+        freshly re-dated header alone never makes stale row evidence fresh.
         """
         current = _now(now)
         reasons = []
@@ -311,15 +312,33 @@ class CapabilityRecord:
             reasons.append('capability record is PARTIAL; the sub-agent path '
                            'needs COMPLETE C1-C4 evidence')
 
-        age = evidence_age_days(self.probe_date, current)
-        if age is None:
-            reasons.append('capability probe date cannot be parsed')
-        elif max_age_days is not None and age > max_age_days:
-            return SubagentGate(
-                status='BLOCKED', stale=True,
-                reasons=(f'capability evidence is {age:.1f} days old '
-                         f'(limit {max_age_days}); re-probe before use',),
-                missing=tuple(GATING_CAPABILITIES))
+        # The header is dated here, by the same rule as each gating row, rather
+        # than through evidence_age_days(): that helper clamps a future date to
+        # 0.0 days (candidate evidence time shares the clamp), so a record
+        # stamped in the future would otherwise read as the freshest possible
+        # evidence.
+        header_unverified = False
+        try:
+            header_probe = parse_timestamp(self.probe_date)
+        except RuntimeAdapterError:
+            header_probe = None
+        if header_probe is None:
+            header_unverified = True
+            reasons.append('capability probe date cannot be parsed; freshness '
+                           'cannot be verified')
+        elif header_probe > current:
+            header_unverified = True
+            reasons.append(
+                f'capability probe date {self.probe_date} is in the future; '
+                'freshness cannot be verified, re-probe before use')
+        else:
+            age = (current - header_probe).total_seconds() / 86400.0
+            if max_age_days is not None and age > max_age_days:
+                return SubagentGate(
+                    status='BLOCKED', stale=True,
+                    reasons=(f'capability evidence is {age:.1f} days old '
+                             f'(limit {max_age_days}); re-probe before use',),
+                    missing=tuple(GATING_CAPABILITIES))
 
         missing = []
         unknown = []
@@ -357,7 +376,7 @@ class CapabilityRecord:
             return SubagentGate(
                 status='BLOCKED', stale=True, reasons=tuple(reasons),
                 missing=tuple(stale_rows + missing + unknown))
-        if missing or unknown:
+        if missing or unknown or header_unverified:
             return SubagentGate(status='UNKNOWN', reasons=tuple(reasons),
                                 missing=tuple(missing + unknown))
         if reasons:
