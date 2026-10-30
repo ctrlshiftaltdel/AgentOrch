@@ -505,6 +505,42 @@ class RegistryConflictTests(unittest.TestCase):
         self.assertTrue(any('conflicting mapping' in issue for issue in issues),
                         issues)
 
+    def test_an_invalid_alias_still_claims_the_canonical_identity(self):
+        """A bad alias must not erase the canonical id the record did declare.
+
+        The second record is unusable twice over (``read_only`` is not a boolean,
+        and ``model_aliases`` contains a token with a space), but it still says
+        that ``model-b`` is ``vendor/core-x``. The surviving record says
+        ``model-b`` is ``vendor/core-y``, so the mapping is contradictory and
+        neither may stay CONFIRMED.
+        """
+        records = [
+            Record(registry_details(agent_id='review-1', model_id='model-b',
+                                    canonical_model_id='vendor/core-y',
+                                    model_aliases='', read_only='true',
+                                    write_paths='', tools='file-read')),
+            Record(registry_details(agent_id='review-1', model_id='model-b',
+                                    canonical_model_id='vendor/core-x',
+                                    model_aliases='bad alias',
+                                    read_only='maybe')),
+        ]
+        entries, issues = discovery.registry_candidates_from_records(
+            records, capability_records=capabilities())
+        self.assertEqual(len(entries), 1, 'the unusable record must be skipped')
+        self.assertEqual(entries[0].canonical_identity.canonical_id,
+                         'vendor/core-y')
+        self.assertEqual(entries[0].canonical_identity.status, 'CONFLICT',
+                         entries[0].canonical_identity)
+        self.assertFalse(entries[0].canonical_identity.trusted_at(NOW)[0])
+
+    def test_an_invalid_alias_alone_is_invalid_but_keeps_the_canonical_id(self):
+        entries, _ = parse(registry_details(model_aliases='bad alias'))
+        identity = entries[0].canonical_identity
+        self.assertEqual(identity.status, 'INVALID')
+        self.assertEqual(identity.canonical_id, 'vendor/core-x')
+        self.assertFalse(identity.trusted_at(NOW)[0])
+        self.assertIn('model_aliases', identity.detail)
+
     def test_an_invalid_record_alone_does_not_poison_a_valid_mapping(self):
         records = [
             Record(registry_details(agent_id='a', model_id='model-a',
@@ -608,6 +644,39 @@ class RegistryToRoleTests(unittest.TestCase):
         self.assertIsNone(selection.selected)
         self.assertIn('ABSENT',
                       independence_for(selection, 'review-1').detail)
+        self.assertFalse(report.automatic_dispatch_allowed)
+        self.assertFalse(report.executed)
+
+    def test_a_conflicting_invalid_alias_record_blocks_the_reviewer(self):
+        """End to end: the survivor must not be selected on a poisoned mapping."""
+        records = [
+            self.master_record(),
+            Record(registry_details(
+                agent_id='exec-1', model_id='model-a',
+                canonical_model_id='vendor/core-x', model_aliases='',
+                tools='file-read,file-write,command')),
+            Record(registry_details(
+                agent_id='review-1', model_id='model-b', model_family='family-b',
+                canonical_model_id='vendor/core-y', model_aliases='',
+                tools='file-read', write_paths='', read_only='true')),
+            Record(registry_details(
+                agent_id='review-1', model_id='model-b', model_family='family-b',
+                canonical_model_id='vendor/core-x', model_aliases='bad alias',
+                read_only='maybe')),
+        ]
+        entries, issues = discovery.registry_candidates_from_records(
+            records, capability_records=capabilities())
+        self.assertTrue(any('read_only' in issue for issue in issues), issues)
+        discovered = discovery.discover_candidates(
+            registry=discovery.ExplicitRegistry(entries=entries))
+        report = roles.select_roles(discovered, support.task_requirements(),
+                                    now=NOW)
+        selection = report.role(roles.ROLE_REVIEWER)
+        self.assertIsNone(selection.selected)
+        independence = independence_for(selection, 'review-1')
+        self.assertEqual(independence.status, 'UNKNOWN')
+        self.assertIn('CONFLICT', independence.detail)
+        self.assertFalse(selection.auto_allowed)
         self.assertFalse(report.automatic_dispatch_allowed)
         self.assertFalse(report.executed)
 

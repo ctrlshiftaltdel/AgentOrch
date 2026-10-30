@@ -160,15 +160,27 @@ def identity_from_details(details):
             detail=('no canonical model identity is registered for this '
                     'record; a different model id or family self-report is not '
                     'evidence of a different underlying model'))
+    # A malformed field must not erase the parts of the declaration that did
+    # parse. The canonical id (and its model id) is what the conflict scan reads
+    # (#170 review), so a bad alias keeps the canonical id and only loses trust.
+    problems = []
     try:
         canonical = _identity_token(raw['canonical_model_id'],
                                     'canonical_model_id')
-        aliases = tuple(alias for alias in
-                        (_identity_token(part, 'model_aliases')
-                         for part in _csv(raw['model_aliases'])) if alias)
     except RegistryError as exc:
-        return CanonicalIdentity(status='INVALID',
-                                 detail=f'{exc}; the mapping is not trusted')
+        canonical = None
+        problems.append(str(exc))
+    aliases = []
+    for part in _csv(raw['model_aliases']):
+        try:
+            aliases.append(_identity_token(part, 'model_aliases'))
+        except RegistryError as exc:
+            problems.append(str(exc))
+    aliases = tuple(aliases)
+    if canonical is None and problems:
+        return CanonicalIdentity(
+            status='INVALID', aliases=aliases,
+            detail=f'{"; ".join(problems)}; the mapping is not trusted')
     verification = raw['identity_verification'].upper()
     until = raw['identity_verified_until'] or None
     evidence = raw['identity_evidence'] or None
@@ -177,6 +189,11 @@ def identity_from_details(details):
             status='INVALID', aliases=aliases, evidence_ref=evidence,
             detail=('canonical_model_id is required when other identity fields '
                     'are present; the mapping is not trusted'))
+    if problems:
+        return CanonicalIdentity(
+            canonical_id=canonical, status='INVALID', aliases=aliases,
+            evidence_ref=evidence,
+            detail=f'{"; ".join(problems)}; the mapping is not trusted')
     if verification not in IDENTITY_VERIFICATION_VALUES:
         return CanonicalIdentity(
             canonical_id=canonical, status='UNCONFIRMED', aliases=aliases,
