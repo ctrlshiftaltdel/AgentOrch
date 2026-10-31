@@ -1,0 +1,34 @@
+{
+  "exit_code": 3,
+  "status": "no_release",
+  "bump": null,
+  "next_version": null,
+  "trigger": null,
+  "urgent_ids": [],
+  "reason": "empty_release_not_allowed",
+  "edition": "github",
+  "tag_form": "three_part",
+  "eligible_count": 0,
+  "excluded": [
+    [
+      "PR-261",
+      "not_verified"
+    ],
+    [
+      "PR-262",
+      "blocked"
+    ],
+    [
+      "PR-263",
+      "reverted"
+    ],
+    [
+      "PR-264",
+      "not_merged"
+    ]
+  ],
+  "duplicate_ids": [],
+  "blocked_reasons": [],
+  "diagnostic_code": null,
+  "diagnostic_path": null
+}

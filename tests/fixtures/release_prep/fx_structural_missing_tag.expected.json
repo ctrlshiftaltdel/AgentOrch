@@ -1,0 +1,17 @@
+{
+  "exit_code": 2,
+  "status": null,
+  "bump": null,
+  "next_version": null,
+  "trigger": null,
+  "urgent_ids": [],
+  "reason": null,
+  "edition": "github",
+  "tag_form": "three_part",
+  "eligible_count": 0,
+  "excluded": [],
+  "duplicate_ids": [],
+  "blocked_reasons": [],
+  "diagnostic_code": "schema_invalid",
+  "diagnostic_path": "$.latest_published_tag"
+}

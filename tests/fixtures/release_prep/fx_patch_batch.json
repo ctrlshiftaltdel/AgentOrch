@@ -1,0 +1,34 @@
+{
+  "schema_version": "release-prep-input/1",
+  "edition": "github",
+  "latest_published_tag": "v1.7.0",
+  "items": [
+    {
+      "id": "PR-201",
+      "kind": "patch",
+      "state": "merged_verified",
+      "urgent": false,
+      "summary": "fix empty tag crash in update entry",
+      "risks": [
+        "low: update entry only"
+      ],
+      "dependencies": [
+        "#193"
+      ]
+    },
+    {
+      "id": "PR-202",
+      "kind": "patch",
+      "state": "merged_verified",
+      "urgent": false,
+      "summary": "fix CRLF handling in packaged tests"
+    }
+  ],
+  "release_version_record": "1.7.0",
+  "evidence": {
+    "identity": "reliable",
+    "ci": "reliable",
+    "permissions": "reliable",
+    "assets": "reliable"
+  }
+}

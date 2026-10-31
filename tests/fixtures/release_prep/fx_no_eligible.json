@@ -1,0 +1,42 @@
+{
+  "schema_version": "release-prep-input/1",
+  "edition": "github",
+  "latest_published_tag": "v1.7.0",
+  "items": [
+    {
+      "id": "PR-261",
+      "kind": "patch",
+      "state": "merged_unverified",
+      "urgent": false,
+      "summary": "waiting on review"
+    },
+    {
+      "id": "PR-262",
+      "kind": "minor",
+      "state": "blocked",
+      "urgent": false,
+      "summary": "blocked on dependency"
+    },
+    {
+      "id": "PR-263",
+      "kind": "patch",
+      "state": "reverted",
+      "urgent": false,
+      "summary": "reverted after regression"
+    },
+    {
+      "id": "PR-264",
+      "kind": "patch",
+      "state": "unmerged",
+      "urgent": false,
+      "summary": "still on a branch"
+    }
+  ],
+  "release_version_record": "1.7.0",
+  "evidence": {
+    "identity": "reliable",
+    "ci": "reliable",
+    "permissions": "reliable",
+    "assets": "reliable"
+  }
+}

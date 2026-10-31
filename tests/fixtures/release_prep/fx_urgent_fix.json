@@ -1,0 +1,28 @@
+{
+  "schema_version": "release-prep-input/1",
+  "edition": "github",
+  "latest_published_tag": "v1.7.0",
+  "items": [
+    {
+      "id": "PR-241",
+      "kind": "patch",
+      "state": "merged_verified",
+      "urgent": true,
+      "summary": "fix data loss on backup"
+    },
+    {
+      "id": "PR-242",
+      "kind": "patch",
+      "state": "merged_verified",
+      "urgent": false,
+      "summary": "fix log wording"
+    }
+  ],
+  "release_version_record": "1.7.0",
+  "evidence": {
+    "identity": "reliable",
+    "ci": "reliable",
+    "permissions": "reliable",
+    "assets": "reliable"
+  }
+}

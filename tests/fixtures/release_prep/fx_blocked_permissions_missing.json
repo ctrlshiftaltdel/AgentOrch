@@ -1,0 +1,21 @@
+{
+  "schema_version": "release-prep-input/1",
+  "edition": "github",
+  "latest_published_tag": "v1.7.0",
+  "items": [
+    {
+      "id": "PR-281",
+      "kind": "patch",
+      "state": "merged_verified",
+      "urgent": false,
+      "summary": "eligible fix"
+    }
+  ],
+  "release_version_record": "1.7.0",
+  "evidence": {
+    "identity": "reliable",
+    "ci": "reliable",
+    "permissions": "missing",
+    "assets": "reliable"
+  }
+}

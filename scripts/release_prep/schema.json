@@ -1,0 +1,562 @@
+{
+  "input": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "release-prep-input/1",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "schema_version",
+      "edition",
+      "latest_published_tag",
+      "items"
+    ],
+    "properties": {
+      "schema_version": {
+        "const": "release-prep-input/1"
+      },
+      "edition": {
+        "enum": [
+          "local",
+          "github"
+        ]
+      },
+      "latest_published_tag": {
+        "type": "string",
+        "pattern": "^v[0-9]+\\.[0-9]+(\\.[0-9]+)?$"
+      },
+      "release_version_record": {
+        "type": "string",
+        "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+      },
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "kind",
+            "state",
+            "summary"
+          ],
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.:/#-]{1,200}$"
+            },
+            "kind": {
+              "enum": [
+                "patch",
+                "minor",
+                "major"
+              ]
+            },
+            "state": {
+              "enum": [
+                "merged_verified",
+                "merged_unverified",
+                "unmerged",
+                "blocked",
+                "reverted"
+              ]
+            },
+            "summary": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            },
+            "urgent": {
+              "type": "boolean"
+            },
+            "risks": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              }
+            },
+            "dependencies": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              }
+            }
+          }
+        }
+      },
+      "evidence": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "identity": {
+            "enum": [
+              "reliable",
+              "missing",
+              "unreliable"
+            ]
+          },
+          "ci": {
+            "enum": [
+              "reliable",
+              "missing",
+              "unreliable"
+            ]
+          },
+          "permissions": {
+            "enum": [
+              "reliable",
+              "missing",
+              "unreliable"
+            ]
+          },
+          "assets": {
+            "enum": [
+              "reliable",
+              "missing",
+              "unreliable"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "report": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "release-prep-report/1",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "schema_version",
+      "tool_version",
+      "plan_usability",
+      "release_authorized",
+      "mode",
+      "persistent_background_service",
+      "edition",
+      "edition_role",
+      "baseline",
+      "status",
+      "blocked_reasons",
+      "changes",
+      "recommendation",
+      "evidence",
+      "authorization",
+      "release_verification",
+      "actions"
+    ],
+    "properties": {
+      "schema_version": {
+        "const": "release-prep-report/1"
+      },
+      "tool_version": {
+        "const": "194-draft-1"
+      },
+      "plan_usability": {
+        "const": "not_a_release"
+      },
+      "release_authorized": {
+        "const": false
+      },
+      "mode": {
+        "const": "on_demand_read_only"
+      },
+      "persistent_background_service": {
+        "const": false
+      },
+      "edition": {
+        "enum": [
+          "local",
+          "github"
+        ]
+      },
+      "edition_role": {
+        "const": "snapshot_only"
+      },
+      "baseline": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "published_tag",
+          "normalized_tag",
+          "version",
+          "tag_form",
+          "release_version_record",
+          "consistent"
+        ],
+        "properties": {
+          "published_tag": {
+            "type": "string"
+          },
+          "normalized_tag": {
+            "type": "string",
+            "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+          },
+          "tag_form": {
+            "enum": [
+              "three_part",
+              "two_part"
+            ]
+          },
+          "release_version_record": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "consistent": {
+            "type": "boolean"
+          }
+        }
+      },
+      "status": {
+        "enum": [
+          "candidate",
+          "no_release",
+          "blocked"
+        ]
+      },
+      "blocked_reasons": {
+        "type": "array",
+        "items": {
+          "enum": [
+            "identity_missing",
+            "identity_unreliable",
+            "ci_missing",
+            "ci_unreliable",
+            "permissions_missing",
+            "permissions_unreliable",
+            "assets_missing",
+            "assets_unreliable",
+            "version_record_missing",
+            "version_baseline_mismatch"
+          ]
+        }
+      },
+      "changes": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "received",
+          "unique",
+          "duplicate_ids",
+          "duplicate_occurrences",
+          "eligible",
+          "excluded"
+        ],
+        "properties": {
+          "received": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "unique": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "duplicate_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "duplicate_occurrences": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "eligible": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "kind",
+                "urgent",
+                "summary",
+                "risks",
+                "dependencies"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "patch",
+                    "minor",
+                    "major"
+                  ]
+                },
+                "urgent": {
+                  "type": "boolean"
+                },
+                "summary": {
+                  "type": "string"
+                },
+                "risks": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "dependencies": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "excluded": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "reason"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "reason": {
+                  "enum": [
+                    "not_verified",
+                    "not_merged",
+                    "blocked",
+                    "reverted"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "recommendation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "bump",
+          "next_version",
+          "tag",
+          "trigger",
+          "urgent_ids",
+          "single_candidate",
+          "reason"
+        ],
+        "properties": {
+          "bump": {
+            "enum": [
+              "patch",
+              "minor",
+              "major",
+              null
+            ]
+          },
+          "next_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+          },
+          "tag": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+          },
+          "trigger": {
+            "enum": [
+              "batch",
+              "urgent_fix",
+              null
+            ]
+          },
+          "urgent_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "single_candidate": {
+            "const": true
+          },
+          "reason": {
+            "enum": [
+              "max_bump_of_eligible_changes",
+              "empty_release_not_allowed",
+              "blocked_evidence",
+              "version_baseline_mismatch",
+              "version_record_missing",
+              null
+            ]
+          }
+        }
+      },
+      "evidence": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "identity",
+          "ci",
+          "permissions",
+          "assets"
+        ],
+        "properties": {
+          "identity": {
+            "$ref": "#/definitions/evidenceStatus"
+          },
+          "ci": {
+            "$ref": "#/definitions/evidenceStatus"
+          },
+          "permissions": {
+            "$ref": "#/definitions/evidenceStatus"
+          },
+          "assets": {
+            "$ref": "#/definitions/evidenceStatus"
+          }
+        }
+      },
+      "authorization": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "owner_authorization_required",
+          "standing_authorization",
+          "bypasses_owner_authorization"
+        ],
+        "properties": {
+          "owner_authorization_required": {
+            "const": true
+          },
+          "standing_authorization": {
+            "const": "empty"
+          },
+          "bypasses_owner_authorization": {
+            "const": false
+          }
+        }
+      },
+      "release_verification": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "executed_by_tool",
+          "commands"
+        ],
+        "properties": {
+          "executed_by_tool": {
+            "const": false
+          },
+          "commands": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "actions": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "creates_tag",
+          "creates_release",
+          "writes_project_files",
+          "accesses_network"
+        ],
+        "properties": {
+          "creates_tag": {
+            "const": false
+          },
+          "creates_release": {
+            "const": false
+          },
+          "writes_project_files": {
+            "const": false
+          },
+          "accesses_network": {
+            "const": false
+          }
+        }
+      }
+    },
+    "definitions": {
+      "evidenceStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "status",
+          "reliable"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "reliable",
+              "missing",
+              "unreliable"
+            ]
+          },
+          "reliable": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  },
+  "diagnostic": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "release-prep-diagnostic/1",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "schema_version",
+      "plan_usability",
+      "release_authorized",
+      "diagnostic"
+    ],
+    "properties": {
+      "schema_version": {
+        "const": "release-prep-diagnostic/1"
+      },
+      "plan_usability": {
+        "const": "not_a_release"
+      },
+      "release_authorized": {
+        "const": false
+      },
+      "diagnostic": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "path"
+        ],
+        "properties": {
+          "code": {
+            "enum": [
+              "schema_invalid",
+              "tag_invalid",
+              "edition_invalid",
+              "unknown_field",
+              "usage"
+            ]
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
