@@ -1,0 +1,26 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "risk_level": "high",
+  "selection_status": "MANUAL_HANDOFF",
+  "selected_topology": null,
+  "candidate_eligibility": {
+    "T0": false,
+    "T1": true,
+    "T2": false,
+    "T3": false,
+    "T4": true
+  },
+  "required_substrings": [
+    "signal:permission_model",
+    "caller_claim_lower_than_signals",
+    "topology_high_risk"
+  ],
+  "forbidden_substrings": [
+    "reviewer_identity_unproven",
+    "capability_C1_"
+  ],
+  "required_human_decision_ids": [
+    "topology_high_risk"
+  ]
+}

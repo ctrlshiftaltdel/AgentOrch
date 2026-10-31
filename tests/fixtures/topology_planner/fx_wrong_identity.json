@@ -1,0 +1,66 @@
+{
+  "schema_version": "topology-planner-input/1",
+  "task_ref": "issue-178-wrong-identity",
+  "edition": "github",
+  "acceptance": [
+    {
+      "ac_id": "AC-1",
+      "text": "a self reported reviewer identity is not independent evidence"
+    }
+  ],
+  "changed_paths": [
+    {
+      "path": "scripts/topology_planner/cli.py",
+      "source_ref": "caller:diff/1"
+    }
+  ],
+  "risk": {
+    "signals": [],
+    "claimed_level": null
+  },
+  "ambiguities": [],
+  "dependencies": [
+    {
+      "dep_id": "#177",
+      "state": "verified"
+    }
+  ],
+  "context": {
+    "load": "medium",
+    "isolation_required": false,
+    "parallelizable": false,
+    "subtask_count": 1
+  },
+  "tools": {
+    "required": [
+      "read_file",
+      "write_file"
+    ],
+    "available": [
+      "read_file",
+      "write_file"
+    ]
+  },
+  "capabilities": {
+    "C1": "pass",
+    "C2": "pass",
+    "C3": "pass",
+    "C4": "pass"
+  },
+  "reviewer": {
+    "required": true,
+    "claims": {
+      "model_family": "other-family",
+      "model_alias": "reviewer-x",
+      "registry_status": "confirmed"
+    }
+  },
+  "implementation": {
+    "required": true,
+    "master_exception": false
+  },
+  "locks": {
+    "path_conflicts": [],
+    "resource_conflicts": []
+  }
+}

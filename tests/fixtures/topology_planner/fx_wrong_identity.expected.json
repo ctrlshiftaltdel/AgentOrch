@@ -1,0 +1,28 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "risk_level": "low",
+  "selection_status": "MANUAL_HANDOFF",
+  "selected_topology": null,
+  "candidate_eligibility": {
+    "T0": false,
+    "T1": false,
+    "T2": false,
+    "T3": false,
+    "T4": true
+  },
+  "required_substrings": [
+    "reviewer_identity_unproven",
+    "model_family",
+    "model_alias",
+    "registry_status",
+    "reviewer_independence_unproven"
+  ],
+  "forbidden_substrings": [
+    "\"verified_by_this_tool\": true",
+    "\"assessment\": \"proven\""
+  ],
+  "required_human_decision_ids": [
+    "reviewer_independence_unproven"
+  ]
+}
