@@ -56,6 +56,7 @@ __all__ = [
     'DiscoveryResult',
     'RuntimeAdapter',
     'HostOpaqueRuntimeAdapter',
+    'TokenUsage',
     'parse_timestamp',
     'evidence_age_days',
     'covers_path',
@@ -110,6 +111,79 @@ _SCHEME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9+.\-]*://')
 
 class RuntimeAdapterError(ValueError):
     """A runtime fact was constructed in a way the contract cannot accept."""
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    """Token counts one Runtime / provider actually reported for one call.
+
+    ``total_tokens`` is the source-reported call total; the input / output /
+    cached / reasoning fields are explanatory only. Cached and reasoning tokens
+    are frequently a subset of the input / output counts, and providers use
+    different units for them, so they are never added to the total. Nothing is
+    derived from prompt length, character counts or a model's context window:
+    a call with no reported total is *not usable* (``usable`` is ``False``) and
+    the caller must report ``UNKNOWN`` instead of a number.
+
+    ``complete`` is the source's own completeness statement: ``None`` means the
+    source did not say, ``False`` means the count is explicitly partial and is
+    therefore not trusted as a total.
+    """
+
+    total_tokens: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cached_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    source: str = 'UNKNOWN'
+    complete: bool | None = None
+
+    def __post_init__(self):
+        for name in ('total_tokens', 'input_tokens', 'output_tokens',
+                     'cached_tokens', 'reasoning_tokens'):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) \
+                    or value < 0:
+                raise RuntimeAdapterError(
+                    f'{name} must be a non-negative integer or None, got '
+                    f'{value!r}')
+        if not isinstance(self.source, str) or not self.source.strip():
+            raise RuntimeAdapterError(
+                'token usage needs a non-empty source such as '
+                '"runtime:opencode" or "provider:api"')
+        if len(self.source) > 64 or any(char in self.source
+                                        for char in '\r\n|;'):
+            raise RuntimeAdapterError(
+                'token usage source must be a single short line without "|" '
+                'or ";"')
+        if self.complete not in (True, False, None):
+            raise RuntimeAdapterError(
+                'complete must be True, False or None (not reported)')
+
+    @property
+    def usable(self):
+        """Whether the source really reported a trustworthy call total."""
+        return (self.total_tokens is not None
+                and self.source.strip().upper() != 'UNKNOWN'
+                and self.complete is not False)
+
+    @property
+    def observed_total(self):
+        return self.total_tokens if self.usable else None
+
+    def as_dict(self):
+        return {
+            'total_tokens': self.total_tokens,
+            'input_tokens': self.input_tokens,
+            'output_tokens': self.output_tokens,
+            'cached_tokens': self.cached_tokens,
+            'reasoning_tokens': self.reasoning_tokens,
+            'source': self.source,
+            'complete': self.complete,
+            'usable': self.usable,
+        }
 
 
 def parse_timestamp(value):

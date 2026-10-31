@@ -24,6 +24,11 @@ The module deliberately has a narrow surface:
   Different task categories, benchmark data, price currencies or price units are
   never added together, and a cohort whose identity differs from the identity
   currently in use is ``IDENTITY_CHANGED`` instead of "carried forward".
+* the Effective Token Rate (design §7) uses only source-reported Token totals.
+  ``UNRATED`` calls stay outside the scored fraction, missing telemetry is
+  ``UNKNOWN`` and a zero denominator is ``NO_DATA``; token coverage is a
+  separate figure, sub-fields are never added to the total, and the 50%
+  cold-start prior is stored apart from every measured rate.
 * output is advisory. :class:`FeedbackReport` is structurally
   ``applied_automatically=False`` / ``changes_configuration=False``, keeps no
   permanent "best role", and refuses a ranking while the samples, the identity
@@ -46,6 +51,7 @@ from .roles import (
     ROLE_MASTER,
     ROLE_REVIEWER,
 )
+from .runtime_adapter import TokenUsage
 
 __all__ = [
     'FEEDBACK_DOCUMENT',
@@ -60,6 +66,14 @@ __all__ = [
     'METRIC_DIRECTIONS',
     'METRICS_BY_ROLE',
     'MASTER_SIGNAL_FOR_METRIC',
+    'TokenUsage',
+    'CONTRIBUTIONS',
+    'CONTRIBUTION_WEIGHTS',
+    'ETR_STATUSES',
+    'ETR_EVIDENCE_STATUSES',
+    'ETR_GATE_STATUSES',
+    'NEUTRAL_PRIOR_ETR',
+    'contribution_weight',
     'FeedbackError',
     'FeedbackScopeError',
     'FeedbackEvidenceError',
@@ -71,6 +85,10 @@ __all__ = [
     'ReviewerOutcome',
     'MasterOutcome',
     'FeedbackPolicy',
+    'EtrPolicy',
+    'TokenBreakdown',
+    'EtrResult',
+    'NeutralPrior',
     'Metric',
     'Cohort',
     'Comparison',
@@ -102,6 +120,22 @@ INSUFFICIENT_EVIDENCE_KINDS = ('chat_memory', 'self_assessment',
 
 METRIC_STATUSES = ('OK', 'NO_DATA', 'INSUFFICIENT_SAMPLE', 'NO_COMPARATOR',
                    'IDENTITY_CHANGED', 'NOT_COMPARABLE', 'STALE')
+
+# ETR (design §7). A contribution is a verified judgement about what a call
+# actually produced; ``UNRATED`` is explicit "not judged yet" and is never
+# folded into the scored numerator or denominator.
+CONTRIBUTIONS = ('EFFECTIVE', 'PARTIAL', 'INEFFECTIVE', 'UNRATED')
+CONTRIBUTION_WEIGHTS = {'EFFECTIVE': 1.0, 'PARTIAL': 0.5, 'INEFFECTIVE': 0.0}
+# ``UNKNOWN`` is missing / untrusted telemetry; ``NO_DATA`` is a zero
+# denominator. They are different facts and neither is a number.
+ETR_STATUSES = ('OK', 'UNKNOWN', 'NO_DATA')
+ETR_EVIDENCE_STATUSES = ('CURRENT', 'STALE', 'IDENTITY_CHANGED',
+                         'UNKNOWN_IDENTITY')
+ETR_GATE_STATUSES = ('NO_GATE', 'PROVISIONAL', 'PAUSE_AUTO_SELECTION',
+                     'RAISE_PRIORITY')
+# The initial cold-start prior (design §7.3). It is stored and reported apart
+# from every measured ETR and never replaces one.
+NEUTRAL_PRIOR_ETR = 50.0
 
 # Which direction is "better". Only rates and means are compared, never a
 # composite score; a role is never declared permanently best.
@@ -206,6 +240,34 @@ def _optional_bool(value, label):
     if value is None or isinstance(value, bool):
         return value
     raise FeedbackError(f'{label} must be True, False or None, got {value!r}')
+
+
+def contribution_weight(status):
+    """The frozen initial weight for one contribution status.
+
+    ``UNRATED`` returns ``None`` because it is not a zero: an unjudged call is
+    outside the scored numerator and denominator until the evaluation finishes.
+    """
+    if status not in CONTRIBUTIONS:
+        raise FeedbackError(
+            f'unknown contribution status {status!r}; expected one of '
+            f'{CONTRIBUTIONS}')
+    return CONTRIBUTION_WEIGHTS.get(status)
+
+
+def _contribution(value):
+    if value not in CONTRIBUTIONS:
+        raise FeedbackError(
+            f'contribution must be one of {CONTRIBUTIONS}, got {value!r}')
+    return value
+
+
+def _token_usage_value(value):
+    if value is None or isinstance(value, TokenUsage):
+        return value
+    raise FeedbackError(
+        'token_usage must be a runtime-reported TokenUsage or None, got '
+        f'{value!r}; character counts and estimates are not telemetry')
 
 
 def _evidence_tuple(evidence):
@@ -348,6 +410,9 @@ class ExecutionOutcome:
     duration_seconds: int | None = None
     cost: Cost | None = None
     scope_id: str = ''
+    token_usage: TokenUsage | None = None
+    contribution: str = 'UNRATED'
+    agent_alias: str = UNKNOWN
 
     role = ROLE_EXECUTION
 
@@ -364,6 +429,11 @@ class ExecutionOutcome:
             object.__setattr__(self, name, _count(getattr(self, name), name))
         if self.cost is not None and not isinstance(self.cost, Cost):
             raise FeedbackError('cost must be a Cost or None')
+        object.__setattr__(self, 'token_usage',
+                           _token_usage_value(self.token_usage))
+        object.__setattr__(self, 'contribution', _contribution(self.contribution))
+        object.__setattr__(self, 'agent_alias',
+                           _token(self.agent_alias, 'agent_alias'))
 
     @property
     def summary(self):
@@ -389,6 +459,8 @@ class ExecutionOutcome:
             'cost_currency': (self.cost.currency if self.cost is not None else UNKNOWN),
             'cost_unit': (self.cost.unit if self.cost is not None else UNKNOWN),
         }
+        details.update(_render_token_fields(
+            self.token_usage, self.contribution, self.agent_alias))
         details.update(_render_evidence(self.evidence))
         return details
 
@@ -409,6 +481,9 @@ class ReviewerOutcome:
     baseline: EvidenceRef | None = None
     blocked_regression: bool | None = None
     scope_id: str = ''
+    token_usage: TokenUsage | None = None
+    contribution: str = 'UNRATED'
+    agent_alias: str = UNKNOWN
 
     role = ROLE_REVIEWER
 
@@ -429,6 +504,11 @@ class ReviewerOutcome:
             raise FeedbackError(
                 'missed_issues needs an independent comparison baseline; without '
                 'one the missed-issue rate is not computable (use None)')
+        object.__setattr__(self, 'token_usage',
+                           _token_usage_value(self.token_usage))
+        object.__setattr__(self, 'contribution', _contribution(self.contribution))
+        object.__setattr__(self, 'agent_alias',
+                           _token(self.agent_alias, 'agent_alias'))
 
     @property
     def summary(self):
@@ -455,6 +535,8 @@ class ReviewerOutcome:
                              else UNKNOWN),
             'blocked_regression': _render_optional_bool(self.blocked_regression),
         }
+        details.update(_render_token_fields(
+            self.token_usage, self.contribution, self.agent_alias))
         details.update(_render_evidence(self.evidence))
         return details
 
@@ -470,6 +552,9 @@ class MasterOutcome:
     signals: tuple = ()
     evidence: tuple = ()
     scope_id: str = ''
+    token_usage: TokenUsage | None = None
+    contribution: str = 'UNRATED'
+    agent_alias: str = UNKNOWN
 
     role = ROLE_MASTER
 
@@ -478,6 +563,11 @@ class MasterOutcome:
         object.__setattr__(self, 'observed_at', _validate_outcome(
             self.category, self.identity, self.observed_at, self.evidence))
         object.__setattr__(self, 'evidence', _evidence_tuple(self.evidence))
+        object.__setattr__(self, 'token_usage',
+                           _token_usage_value(self.token_usage))
+        object.__setattr__(self, 'contribution', _contribution(self.contribution))
+        object.__setattr__(self, 'agent_alias',
+                           _token(self.agent_alias, 'agent_alias'))
         seen = set()
         for name, count, ref in self.signals:
             if name not in MASTER_SIGNALS:
@@ -514,6 +604,8 @@ class MasterOutcome:
         for index, (name, count, ref) in enumerate(self.signals, start=1):
             details[f'signal_{index}'] = (
                 f'{name}|{_render_optional(count)}|{ref.encode()}')
+        details.update(_render_token_fields(
+            self.token_usage, self.contribution, self.agent_alias))
         details.update(_render_evidence(self.evidence))
         return details
 
@@ -524,6 +616,41 @@ def _render_optional(value):
 
 def _render_optional_bool(value):
     return UNKNOWN if value is None else str(bool(value)).lower()
+
+
+def _render_token_fields(usage, contribution, agent_alias):
+    """Render real Token telemetry; every absent field is written ``UNKNOWN``.
+
+    The total is the source-reported call total. Sub-fields are stored beside
+    it for explanation only and are never added together into a second total.
+    """
+    if usage is None:
+        rendered = {
+            'token_total': UNKNOWN,
+            'token_input': UNKNOWN,
+            'token_output': UNKNOWN,
+            'token_cached': UNKNOWN,
+            'token_reasoning': UNKNOWN,
+            'token_source': UNKNOWN,
+            'token_complete': UNKNOWN,
+        }
+    else:
+        rendered = {
+            'token_total': _render_optional(usage.total_tokens),
+            'token_input': _render_optional(usage.input_tokens),
+            'token_output': _render_optional(usage.output_tokens),
+            'token_cached': _render_optional(usage.cached_tokens),
+            'token_reasoning': _render_optional(usage.reasoning_tokens),
+            'token_source': usage.source,
+            'token_complete': _render_optional_bool(usage.complete),
+        }
+    weight = contribution_weight(contribution)
+    rendered.update({
+        'agent_alias': agent_alias,
+        'contribution': contribution,
+        'contribution_weight': UNKNOWN if weight is None else str(weight),
+    })
+    return rendered
 
 
 def _render_evidence(evidence):
@@ -558,6 +685,207 @@ class FeedbackPolicy:
     def as_dict(self):
         return {'min_samples': self.min_samples, 'window_days': self.window_days,
                 'allow_ranking': self.allow_ranking}
+
+
+@dataclass(frozen=True)
+class EtrPolicy:
+    """The initial, explicitly provisional ETR thresholds (design §7.3).
+
+    The values are policy placeholders, not statistically proven cut-offs:
+    they must be calibrated with real data before they are treated as settled.
+    """
+
+    low_threshold: float = 40.0
+    high_threshold: float = 80.0
+    min_scored_tasks: int = 20
+    min_token_coverage: float = 80.0
+    neutral_prior: float = NEUTRAL_PRIOR_ETR
+
+    def __post_init__(self):
+        for name in ('low_threshold', 'high_threshold', 'min_token_coverage',
+                     'neutral_prior'):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise FeedbackError(f'{name} must be a number, got {value!r}')
+        if not 0.0 <= self.low_threshold < self.high_threshold <= 100.0:
+            raise FeedbackError(
+                'ETR thresholds must satisfy 0 <= low < high <= 100, got '
+                f'low={self.low_threshold!r} high={self.high_threshold!r}')
+        if isinstance(self.min_scored_tasks, bool) \
+                or not isinstance(self.min_scored_tasks, int) \
+                or self.min_scored_tasks < 1:
+            raise FeedbackError('min_scored_tasks must be an integer >= 1')
+        if not 0.0 < self.min_token_coverage <= 100.0:
+            raise FeedbackError(
+                'min_token_coverage must be a percentage in (0, 100]')
+        if not 0.0 <= self.neutral_prior <= 100.0:
+            raise FeedbackError('neutral_prior must be a percentage in [0, 100]')
+
+    def as_dict(self):
+        return {
+            'low_threshold': self.low_threshold,
+            'high_threshold': self.high_threshold,
+            'min_scored_tasks': self.min_scored_tasks,
+            'min_token_coverage': self.min_token_coverage,
+            'neutral_prior': self.neutral_prior,
+            'calibrated': False,
+            'note': ('initial provisional thresholds; they require real-data '
+                     'calibration and are not a proven cut-off'),
+        }
+
+
+@dataclass(frozen=True)
+class TokenBreakdown:
+    """Observed Token sub-totals, reported only where the source exposed them.
+
+    The sums are separate explanations. They are never added to the call total
+    and never to each other, because cached and reasoning tokens are often a
+    subset of input / output counts.
+    """
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cached_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    input_reported: int = 0
+    output_reported: int = 0
+    cached_reported: int = 0
+    reasoning_reported: int = 0
+
+    def as_dict(self):
+        return {
+            'input_tokens': self.input_tokens,
+            'output_tokens': self.output_tokens,
+            'cached_tokens': self.cached_tokens,
+            'reasoning_tokens': self.reasoning_tokens,
+            'input_reported': self.input_reported,
+            'output_reported': self.output_reported,
+            'cached_reported': self.cached_reported,
+            'reasoning_reported': self.reasoning_reported,
+            'note': ('sub-totals are explanatory; cached / reasoning tokens are '
+                     'never added to the call total'),
+        }
+
+
+@dataclass(frozen=True)
+class EtrResult:
+    """One ``model id × role × task category`` Effective Token Rate.
+
+    ``value`` and ``token_coverage`` are percentages and are ``None`` whenever
+    the corresponding status is not ``OK``. ``UNKNOWN`` means telemetry is
+    missing / untrusted; ``NO_DATA`` means a zero denominator. Neither is 0.
+    """
+
+    role: str
+    category: str
+    identity: ModelIdentity
+    value_status: str = 'NO_DATA'
+    value: float | None = None
+    token_coverage_status: str = 'NO_DATA'
+    token_coverage: float | None = None
+    observed_tokens: int | None = None
+    scored_tokens: int | None = None
+    total_tasks: int = 0
+    rated_tasks: int = 0
+    unrated_tasks: int = 0
+    breakdown: TokenBreakdown = field(default_factory=TokenBreakdown)
+    sources: tuple = ()
+    agent_aliases: tuple = ()
+    evidence_status: str = 'CURRENT'
+    gate_status: str = 'NO_GATE'
+    gate_reasons: tuple = ()
+    threshold_low: float = 40.0
+    threshold_high: float = 80.0
+    min_scored_tasks: int = 20
+    min_token_coverage: float = 80.0
+    window_start: str = ''
+    window_end: str = ''
+    notes: tuple = ()
+
+    unit = 'percent'
+
+    def __post_init__(self):
+        if self.value_status not in ETR_STATUSES:
+            raise FeedbackError(f'unknown ETR value status {self.value_status!r}')
+        if self.token_coverage_status not in ETR_STATUSES:
+            raise FeedbackError(
+                'unknown token coverage status '
+                f'{self.token_coverage_status!r}')
+        if self.evidence_status not in ETR_EVIDENCE_STATUSES:
+            raise FeedbackError(
+                f'unknown ETR evidence status {self.evidence_status!r}')
+        if self.gate_status not in ETR_GATE_STATUSES:
+            raise FeedbackError(f'unknown ETR gate status {self.gate_status!r}')
+        for name in ('value', 'token_coverage'):
+            number = getattr(self, name)
+            if number is not None and not 0.0 <= number <= 100.0:
+                raise FeedbackError(f'{name} must be a percentage in [0, 100]')
+
+    @property
+    def ok(self):
+        return self.value_status == 'OK'
+
+    @property
+    def applies_automatically(self):
+        # Even PAUSE_AUTO_SELECTION is a suggestion: no candidate is deleted,
+        # no permission changes and manual use stays available.
+        return False
+
+    @property
+    def manual_path_preserved(self):
+        return True
+
+    @property
+    def prior_applied(self):
+        return False
+
+    def as_dict(self):
+        return {
+            'role': self.role,
+            'category': self.category,
+            'identity': self.identity.as_dict(),
+            'value_status': self.value_status,
+            'value': self.value,
+            'unit': self.unit,
+            'token_coverage_status': self.token_coverage_status,
+            'token_coverage': self.token_coverage,
+            'observed_tokens': self.observed_tokens,
+            'scored_tokens': self.scored_tokens,
+            'total_tasks': self.total_tasks,
+            'rated_tasks': self.rated_tasks,
+            'unrated_tasks': self.unrated_tasks,
+            'breakdown': self.breakdown.as_dict(),
+            'sources': list(self.sources),
+            'agent_aliases': list(self.agent_aliases),
+            'evidence_status': self.evidence_status,
+            'gate_status': self.gate_status,
+            'gate_reasons': list(self.gate_reasons),
+            'threshold_low': self.threshold_low,
+            'threshold_high': self.threshold_high,
+            'min_scored_tasks': self.min_scored_tasks,
+            'min_token_coverage': self.min_token_coverage,
+            'window_start': self.window_start,
+            'window_end': self.window_end,
+            'applies_automatically': self.applies_automatically,
+            'manual_path_preserved': self.manual_path_preserved,
+            'prior_applied': self.prior_applied,
+            'notes': list(self.notes),
+        }
+
+
+@dataclass(frozen=True)
+class NeutralPrior:
+    """The 50% cold-start value, stored and reported apart from measured ETR."""
+
+    value: float = NEUTRAL_PRIOR_ETR
+    status: str = 'PROVISIONAL'
+    measured: bool = False
+    note: str = ('cold-start prior only; it is never added to a measured ETR '
+                 'and never overrides one')
+
+    def as_dict(self):
+        return {'value': self.value, 'status': self.status,
+                'measured': self.measured, 'note': self.note}
 
 
 # --- metrics -----------------------------------------------------------------
@@ -662,6 +990,7 @@ class Cohort:
     severity_counts: tuple = ()
     window_start: str = ''
     window_end: str = ''
+    etr: EtrResult | None = None
 
     @property
     def sample_size(self):
@@ -680,6 +1009,7 @@ class Cohort:
             'severity_counts': [{'severity': name, 'count': count}
                                 for name, count in self.severity_counts],
             'metrics': {name: metric.as_dict() for name, metric in self.metrics.items()},
+            'etr': self.etr.as_dict() if self.etr is not None else None,
         }
 
 
@@ -799,6 +1129,52 @@ def _parse_bool(value, label):
     return value == 'true'
 
 
+def _parse_token_usage(details):
+    """Read source telemetry; a missing field stays missing, never zero."""
+    keys = ('token_total', 'token_input', 'token_output', 'token_cached',
+            'token_reasoning', 'token_source', 'token_complete')
+    if not any(key in details for key in keys):
+        return None
+    try:
+        return TokenUsage(
+            total_tokens=_parse_int(
+                details.get('token_total', UNKNOWN), 'token_total'),
+            input_tokens=_parse_int(
+                details.get('token_input', UNKNOWN), 'token_input'),
+            output_tokens=_parse_int(
+                details.get('token_output', UNKNOWN), 'token_output'),
+            cached_tokens=_parse_int(
+                details.get('token_cached', UNKNOWN), 'token_cached'),
+            reasoning_tokens=_parse_int(
+                details.get('token_reasoning', UNKNOWN), 'token_reasoning'),
+            source=details.get('token_source', UNKNOWN),
+            complete=_parse_bool(
+                details.get('token_complete', UNKNOWN), 'token_complete'))
+    except ValueError as exc:
+        raise FeedbackError(f'unreadable token usage: {exc}') from exc
+
+
+def _parse_contribution(details):
+    contribution = _contribution(details.get('contribution', 'UNRATED'))
+    expected = contribution_weight(contribution)
+    stored = details.get('contribution_weight', UNKNOWN)
+    if stored in (UNKNOWN, ''):
+        return contribution
+    try:
+        parsed = float(stored)
+    except (TypeError, ValueError) as exc:
+        raise FeedbackError(
+            f'contribution_weight is not a number: {stored!r}') from exc
+    if expected is None:
+        raise FeedbackError(
+            'an UNRATED contribution must not carry a numeric weight')
+    if abs(parsed - expected) > 1e-9:
+        raise FeedbackError(
+            f'contribution_weight {parsed!r} does not match '
+            f'{contribution}={expected!r}')
+    return contribution
+
+
 def _parse_cost(details):
     amount = details.get('cost_amount', UNKNOWN)
     if amount == UNKNOWN:
@@ -876,6 +1252,9 @@ def _parse_record(record):
     identity = _identity_from(details)
     observed_at = details.get('observed_at', '')
     evidence = _parse_evidence(details)
+    token_usage = _parse_token_usage(details)
+    contribution = _parse_contribution(details)
+    agent_alias = details.get('agent_alias', UNKNOWN)
     if role == ROLE_EXECUTION:
         return ExecutionOutcome(
             task_id=details.get('task_id', ''),
@@ -889,7 +1268,8 @@ def _parse_record(record):
                 details.get('regression_defects'), 'regression_defects'),
             duration_seconds=_parse_int(
                 details.get('duration_seconds'), 'duration_seconds'),
-            cost=_parse_cost(details))
+            cost=_parse_cost(details), token_usage=token_usage,
+            contribution=contribution, agent_alias=agent_alias)
     if role == ROLE_REVIEWER:
         missed = _parse_int(details.get('missed_issues'), 'missed_issues')
         baseline = _parse_baseline(details)
@@ -911,7 +1291,9 @@ def _parse_record(record):
             missed_issues=missed,
             baseline=baseline,
             blocked_regression=_parse_bool(
-                details.get('blocked_regression'), 'blocked_regression'))
+                details.get('blocked_regression'), 'blocked_regression'),
+            token_usage=token_usage, contribution=contribution,
+            agent_alias=agent_alias)
     if role == ROLE_MASTER:
         return MasterOutcome(
             cycle_id=details.get('task_id', ''),
@@ -919,7 +1301,8 @@ def _parse_record(record):
             identity=identity,
             observed_at=observed_at,
             signals=_parse_signals(details),
-            evidence=evidence)
+            evidence=evidence, token_usage=token_usage,
+            contribution=contribution, agent_alias=agent_alias)
     raise FeedbackError(f'unknown role {role!r} in a feedback record')
 
 
@@ -963,6 +1346,8 @@ class FeedbackReport:
     window_start: str
     window_end: str
     policy: FeedbackPolicy
+    etr_policy: EtrPolicy = field(default_factory=EtrPolicy)
+    neutral_prior: NeutralPrior = field(default_factory=NeutralPrior)
     cohorts: tuple = ()
     recommendations: tuple = ()
     degradations: tuple = ()
@@ -1024,6 +1409,8 @@ class FeedbackReport:
             'scope_id': self.scope_id,
             'window': {'start': self.window_start, 'end': self.window_end},
             'policy': self.policy.as_dict(),
+            'etr_policy': self.etr_policy.as_dict(),
+            'neutral_prior': self.neutral_prior.as_dict(),
             'cohorts': [item.as_dict() for item in self.cohorts],
             'recommendations': [item.as_dict() for item in self.recommendations],
             'degradations': list(self.degradations),
@@ -1040,6 +1427,9 @@ class FeedbackReport:
             f'scope: {self.scope_id}',
             f'window: {self.window_start} .. {self.window_end} '
             f'min_samples={self.policy.min_samples}',
+            f'neutral_prior={self.neutral_prior.value} '
+            f'status={self.neutral_prior.status} '
+            f'measured={self.neutral_prior.measured}',
         ]
         for item in self.cohorts:
             lines.append(
@@ -1052,6 +1442,17 @@ class FeedbackReport:
                     f'  {metric.name}={rendered} unit={metric.unit} '
                     f'samples={metric.sample_size} missing={metric.missing} '
                     f'coverage={metric.coverage}')
+            if item.etr is not None:
+                etr = item.etr
+                value = etr.value if etr.ok else etr.value_status
+                coverage = (etr.token_coverage
+                            if etr.token_coverage is not None
+                            else etr.token_coverage_status)
+                lines.append(
+                    f'  etr={value} unit=percent coverage={coverage} '
+                    f'rated={etr.rated_tasks}/{etr.total_tasks} '
+                    f'observed_tokens={etr.observed_tokens} '
+                    f'gate={etr.gate_status} evidence={etr.evidence_status}')
         for recommendation in self.recommendations:
             lines.append(f'recommendation[{recommendation.status}]: '
                          f'{recommendation.statement}')
@@ -1067,8 +1468,149 @@ def _group_key(outcome):
     return (outcome.role, outcome.category, outcome.identity.key)
 
 
+def _sum_token_field(entries, attribute):
+    values = [getattr(entry.token_usage, attribute) for entry in entries
+              if entry.token_usage is not None
+              and getattr(entry.token_usage, attribute) is not None]
+    if not values:
+        return None, 0
+    return sum(values), len(values)
+
+
+def _token_breakdown(entries):
+    input_tokens, input_reported = _sum_token_field(entries, 'input_tokens')
+    output_tokens, output_reported = _sum_token_field(entries, 'output_tokens')
+    cached_tokens, cached_reported = _sum_token_field(entries, 'cached_tokens')
+    reasoning_tokens, reasoning_reported = _sum_token_field(
+        entries, 'reasoning_tokens')
+    return TokenBreakdown(
+        input_tokens=input_tokens, output_tokens=output_tokens,
+        cached_tokens=cached_tokens, reasoning_tokens=reasoning_tokens,
+        input_reported=input_reported, output_reported=output_reported,
+        cached_reported=cached_reported,
+        reasoning_reported=reasoning_reported)
+
+
+def _etr_gate(value, coverage, rated_tasks, evidence_status, policy):
+    """The §7.3 action for a measured ETR; every action stays advisory."""
+    if evidence_status == 'IDENTITY_CHANGED':
+        return 'NO_GATE', (
+            'the recorded model / runtime identity differs from the one now in '
+            'use; the history is marked for re-evaluation and is not carried '
+            'forward',)
+    if evidence_status == 'UNKNOWN_IDENTITY':
+        return 'NO_GATE', (
+            'the model / runtime identity is UNKNOWN, so no threshold action '
+            'is attributable',)
+    if coverage < policy.min_token_coverage:
+        return 'PROVISIONAL', (
+            f'token coverage {coverage}% < {policy.min_token_coverage}%; the '
+            'measured ETR is reported but no threshold action is allowed',)
+    if rated_tasks < policy.min_scored_tasks:
+        return 'PROVISIONAL', (
+            f'{rated_tasks} rated task(s) < {policy.min_scored_tasks}; the '
+            'measured ETR is reported but no threshold action is allowed',)
+    if value < policy.low_threshold:
+        return 'PAUSE_AUTO_SELECTION', (
+            f'ETR {value}% is below the provisional {policy.low_threshold}% '
+            'low line; pause automatic selection only, keep the candidate and '
+            'the manual path',)
+    if value > policy.high_threshold:
+        return 'RAISE_PRIORITY', (
+            f'ETR {value}% is above the provisional {policy.high_threshold}% '
+            'high line; only raise priority among candidates that already pass '
+            'the hard constraints and quality requirements',)
+    return 'NO_GATE', (
+        f'measured ETR is inside the {policy.low_threshold}-'
+        f'{policy.high_threshold} band, so no threshold action applies',)
+
+
+def _build_etr(role, category, identity, fresh, *, window, policy,
+               evidence_status):
+    breakdown = _token_breakdown(fresh)
+    rated = [entry for entry in fresh if entry.contribution != 'UNRATED']
+    common = dict(
+        role=role, category=category, identity=identity,
+        window_start=window[0], window_end=window[1],
+        threshold_low=policy.low_threshold,
+        threshold_high=policy.high_threshold,
+        min_scored_tasks=policy.min_scored_tasks,
+        min_token_coverage=policy.min_token_coverage,
+        total_tasks=len(fresh), rated_tasks=len(rated),
+        unrated_tasks=len(fresh) - len(rated), breakdown=breakdown,
+        sources=tuple(sorted({entry.token_usage.source for entry in fresh
+                              if entry.token_usage is not None})),
+        agent_aliases=tuple(sorted({entry.agent_alias for entry in fresh})),
+        evidence_status=evidence_status,
+        notes=(
+            'ETR is a percentage over observed Token in rated calls; UNRATED '
+            'Token is outside the scored fraction',
+            'Token coverage is a separate percentage over all observed Token',
+            'input / output / cached / reasoning sub-totals are explanatory; '
+            'they are never added to the call total',
+            'missing telemetry is UNKNOWN and a zero denominator is NO_DATA; '
+            'neither is 0 and neither triggers a threshold action',
+            'input Token includes prompt, context and tool-chain overhead; the '
+            'figure is only compared inside the same role / category / runtime '
+            'cohort',
+            'the 50% neutral prior is stored separately and is never applied '
+            'to a measured ETR',
+        ))
+    if not fresh:
+        return EtrResult(
+            value_status='NO_DATA', value=None,
+            token_coverage_status='NO_DATA', token_coverage=None,
+            observed_tokens=None, scored_tokens=None, gate_status='NO_GATE',
+            gate_reasons=(f'no fresh record inside the {window[0]} .. '
+                          f'{window[1]} window',), **common)
+    untrusted = [entry for entry in fresh
+                 if entry.token_usage is None or not entry.token_usage.usable]
+    if untrusted:
+        return EtrResult(
+            value_status='UNKNOWN', value=None,
+            token_coverage_status='UNKNOWN', token_coverage=None,
+            observed_tokens=None, scored_tokens=None, gate_status='NO_GATE',
+            gate_reasons=(
+                f'Token telemetry is missing or untrusted for {len(untrusted)} '
+                f'of {len(fresh)} call(s); the observed total cannot be '
+                'confirmed, so ETR stays UNKNOWN instead of an estimate',),
+            **common)
+    observed = sum(entry.token_usage.total_tokens for entry in fresh)
+    scored = sum(entry.token_usage.total_tokens for entry in rated)
+    if observed == 0:
+        return EtrResult(
+            value_status='NO_DATA', value=None,
+            token_coverage_status='NO_DATA', token_coverage=None,
+            observed_tokens=0, scored_tokens=0, gate_status='NO_GATE',
+            gate_reasons=(
+                'telemetry exists but every call reported 0 Token; both ratios '
+                'have a zero denominator, which is not 0% or 100%',),
+            **common)
+    coverage = round(100.0 * scored / observed, 3)
+    if scored == 0:
+        return EtrResult(
+            value_status='NO_DATA', value=None, token_coverage_status='OK',
+            token_coverage=0.0, observed_tokens=observed, scored_tokens=0,
+            gate_status='NO_GATE',
+            gate_reasons=(
+                'no rated call has observed Token; ETR has a zero denominator '
+                'while coverage is a real 0%',),
+            **common)
+    value = round(100.0 * sum(
+        entry.token_usage.total_tokens * contribution_weight(entry.contribution)
+        for entry in rated) / scored, 3)
+    gate_status, gate_reasons = _etr_gate(
+        value, coverage, len(rated), evidence_status, policy)
+    return EtrResult(
+        value_status='OK', value=value, token_coverage_status='OK',
+        token_coverage=coverage, observed_tokens=observed,
+        scored_tokens=scored, gate_status=gate_status,
+        gate_reasons=gate_reasons, **common)
+
+
 def _build_cohort(role, category, identity, entries, *, window, policy,
-                  current_identity=None):
+                  current_identity=None, etr_policy=None):
+    etr_policy = etr_policy or EtrPolicy()
     fresh = [entry for entry in entries
              if _parse_utc(entry.observed_at) >= _parse_utc(window[0])]
     stale = len(entries) - len(fresh)
@@ -1079,16 +1621,21 @@ def _build_cohort(role, category, identity, entries, *, window, policy,
                 name, role, category, entries, [], unit='UNKNOWN', window=window,
                 policy=policy, status_override='STALE',
                 note='every record in this cohort is older than the window')
+        etr = _build_etr(role, category, identity, fresh, window=window,
+                         policy=etr_policy, evidence_status='STALE')
         return Cohort(role=role, category=category, identity=identity,
                       entries=tuple(entries), metrics=metrics,
                       stale_entries=stale, window_start=window[0],
-                      window_end=window[1])
+                      window_end=window[1], etr=etr)
 
     identity_note = ''
+    evidence_status = 'CURRENT'
     if not identity.known:
+        evidence_status = 'UNKNOWN_IDENTITY'
         identity_note = ('model / runtime identity is UNKNOWN, so this evidence '
                          'cannot be attributed to a model')
     elif current_identity is not None and current_identity.key != identity.key:
+        evidence_status = 'IDENTITY_CHANGED'
         identity_note = (
             f'recorded identity {identity.key} differs from the identity now in '
             f'use ({current_identity.key}); no evaluation is carried forward')
@@ -1194,10 +1741,12 @@ def _build_cohort(role, category, identity, entries, *, window, policy,
                 status_override='IDENTITY_CHANGED' if identity_note else None,
                 note=identity_note or 'planning signals confirmed by task '
                                       'evidence; a single cycle is an anecdote')
+    etr = _build_etr(role, category, identity, fresh, window=window,
+                     policy=etr_policy, evidence_status=evidence_status)
     return Cohort(role=role, category=category, identity=identity,
                   entries=tuple(entries), metrics=metrics, stale_entries=stale,
                   severity_counts=severity_counts, window_start=window[0],
-                  window_end=window[1])
+                  window_end=window[1], etr=etr)
 
 
 def _cost_metric(role, category, entries, window, policy, identity_note):
@@ -1311,7 +1860,7 @@ def _recommendations_for(cohort, policy):
     return recommendations
 
 
-def build_report(store, *, now=None, policy=None, outcomes=None,
+def build_report(store, *, now=None, policy=None, etr_policy=None, outcomes=None,
                  current_identities=None):
     """Build one scope's advisory report from real records only.
 
@@ -1320,6 +1869,7 @@ def build_report(store, *, now=None, policy=None, outcomes=None,
     against ``store.scope_id`` before they can influence a number.
     """
     policy = policy or FeedbackPolicy()
+    etr_policy = etr_policy or EtrPolicy()
     end = _timestamp(now, 'now') if now is not None else local_store.utc_timestamp()
     window = (local_store.utc_timestamp(
         _parse_utc(end) - timedelta(days=policy.window_days)), end)
@@ -1350,7 +1900,8 @@ def build_report(store, *, now=None, policy=None, outcomes=None,
         current = (current_identities or {}).get(role)
         cohort = _build_cohort(role, category, identity, entries,
                                window=window, policy=policy,
-                               current_identity=current)
+                               current_identity=current,
+                               etr_policy=etr_policy)
         cohorts.append(cohort)
         for metric in cohort.metrics.values():
             if metric.status != 'OK':
@@ -1358,6 +1909,11 @@ def build_report(store, *, now=None, policy=None, outcomes=None,
                     f'{role}/{category}: {metric.name}={metric.status} '
                     f'(samples={metric.sample_size}, missing={metric.missing}, '
                     f'coverage={metric.coverage})')
+        if cohort.etr is not None and cohort.etr.value_status != 'OK':
+            degradations.append(
+                f'{role}/{category}: etr={cohort.etr.value_status} '
+                f'coverage={cohort.etr.token_coverage_status} '
+                f'(rated={cohort.etr.rated_tasks}/{cohort.etr.total_tasks})')
         recommendations.extend(_recommendations_for(cohort, policy))
 
     if not cohorts:
@@ -1379,10 +1935,18 @@ def build_report(store, *, now=None, policy=None, outcomes=None,
         'cohorts are keyed by role + task category + exact model / runtime '
         'identity; external benchmark indices are never pooled into these '
         'project-internal numbers',
+        'ETR uses only real source-reported Token totals; UNRATED calls stay '
+        'outside the scored fraction, and token coverage is reported separately',
+        'the 50% neutral prior is a PROVISIONAL cold-start value kept apart '
+        'from measured ETR; it never overrides a measured score',
+        'ETR never replaces correctness, Reviewer independence, permissions or '
+        'task acceptance, and no threshold action changes configuration',
     ]
     return FeedbackReport(
         scope_id=store.scope_id, window_start=window[0], window_end=window[1],
-        policy=policy, cohorts=tuple(cohorts),
+        policy=policy, etr_policy=etr_policy,
+        neutral_prior=NeutralPrior(value=etr_policy.neutral_prior),
+        cohorts=tuple(cohorts),
         recommendations=tuple(recommendations),
         degradations=tuple(degradations), diagnostics=tuple(diagnostics),
         stale_entries=stale, ignored_records=ignored, notes=tuple(notes))
