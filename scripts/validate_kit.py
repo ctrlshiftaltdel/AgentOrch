@@ -43,6 +43,7 @@ REQUIRED = [
     'scripts/agent_selection/discovery.py', 'scripts/agent_selection/roles.py',
     'scripts/agent_selection/model_selection.py',
     'scripts/agent_selection/feedback.py',
+    'scripts/agent_selection/peer_review.py',
     'scripts/agent_selection/model_sources/__init__.py',
     'scripts/agent_selection/model_sources/snapshot.py',
     'scripts/agent_selection/model_sources/artificial_analysis.py',
