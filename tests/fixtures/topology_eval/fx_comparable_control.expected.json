@@ -1,0 +1,37 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "recommendation": "COST_REVIEW_CANDIDATE",
+  "safety_status": "CLEAR",
+  "quality": {
+    "hard_constraints": "PASS",
+    "goal_attainment": "PASS",
+    "adjacent_regression": "PASS"
+  },
+  "sample_sufficient": true,
+  "candidate_statuses": {
+    "T0": "NO_DATA",
+    "T1": "COST_REVIEW_CANDIDATE",
+    "T2": "BASELINE",
+    "T3": "NO_DATA",
+    "T4": "NO_DATA"
+  },
+  "rollback_required": false,
+  "required_human_decision_ids": [
+    "cost_review_requires_owner_decision"
+  ],
+  "required_substrings": [
+    "COST_REVIEW_CANDIDATE",
+    "\"savings_claimed\": false",
+    "\"efficiency_proven\": false",
+    "\"release_status\": \"not_released\""
+  ],
+  "forbidden_substrings": [
+    "\"savings_claimed\": true",
+    "\"efficiency_proven\": true",
+    "\"release_status\": \"released\"",
+    "\"released\": true",
+    "\"published\": true",
+    "\"deployed\": true"
+  ]
+}

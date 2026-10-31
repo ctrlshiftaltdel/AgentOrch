@@ -1,0 +1,34 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "recommendation": "HOLD_FULL_PROCESS",
+  "safety_status": "CLEAR",
+  "quality": {
+    "hard_constraints": "FAIL",
+    "goal_attainment": "DEGRADED",
+    "adjacent_regression": "PASS"
+  },
+  "sample_sufficient": true,
+  "candidate_statuses": {
+    "T0": "NO_DATA",
+    "T1": "QUALITY_DEGRADED",
+    "T2": "BASELINE",
+    "T3": "NO_DATA",
+    "T4": "NO_DATA"
+  },
+  "rollback_required": false,
+  "required_human_decision_ids": [
+    "quality_regression"
+  ],
+  "required_substrings": [
+    "HOLD_FULL_PROCESS",
+    "quality_constraints_fail",
+    "goal_attainment_degraded",
+    "traj:issue-180/fail-1"
+  ],
+  "forbidden_substrings": [
+    "\"recommendation\": \"COST_REVIEW_CANDIDATE\"",
+    "\"savings_claimed\": true",
+    "\"efficiency_proven\": true"
+  ]
+}
