@@ -104,6 +104,8 @@ def classify_upstream(path: str) -> str:
         return 'template'
     if path in PROFILE_PATHS:
         return 'project-profile'
+    # Everything else is core, including docs/orchestration.md: the contract is
+    # kit-owned even though it lives under docs/ (see migrate.py).
     return 'core'
 
 

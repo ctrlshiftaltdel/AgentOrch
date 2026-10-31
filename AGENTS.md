@@ -1,15 +1,15 @@
-每次会话开始，先执行 kit/orchestration.md 的入口流程恢复状态并路由。
+每次会话开始，先执行 docs/orchestration.md 的入口流程恢复状态并路由。
 
 # AGENTS.md — Agent Collaboration Contract
 
-本文件是仓库内所有 Agent 的唯一权威核心契约，与底座（edition）无关。每次接手先读本文件、`docs/PROJECT.md` 与 `kit/orchestration.md` 的第一、二部分，再读 `editions/<edition>/master.md` 和当前底座的提示词；`kit/orchestration.md` 第三部分按需读，口径见下段。有分歧时，以项目所有者最近一次明确决定为最高约束，其次是本文件，再到 `kit/orchestration.md`、底座手册与提示词；发现冲突必须登记为任务，不能自行发明权限。
+本文件是仓库内所有 Agent 的唯一权威核心契约，与底座（edition）无关。每次接手先读本文件、`docs/PROJECT.md` 与 `docs/orchestration.md` 的第一、二部分，再读 `editions/<edition>/master.md` 和当前底座的提示词；`docs/orchestration.md` 第三部分按需读，口径见下段。有分歧时，以项目所有者最近一次明确决定为最高约束，其次是本文件，再到 `docs/orchestration.md`、底座手册与提示词；发现冲突必须登记为任务，不能自行发明权限。
 
-**阅读口径（唯一权威）**：其他入口——`kit/orchestration.md` 第一部分与 `editions/<edition>/master.md` 的「每次接手」——只回指本段，不另立一套。三处列出的必读集合必须相同，列举顺序允许保留各自既有顺序。
+**阅读口径（唯一权威）**：其他入口——`docs/orchestration.md` 第一部分与 `editions/<edition>/master.md` 的「每次接手」——只回指本段，不另立一套。三处列出的必读集合必须相同，列举顺序允许保留各自既有顺序。
 
-- **必读集合**：`AGENTS.md`（本文件）、`docs/PROJECT.md`、`kit/orchestration.md` 第一部分（会话入口）与第二部分（状态机与合并门）。
+- **必读集合**：`AGENTS.md`（本文件）、`docs/PROJECT.md`、`docs/orchestration.md` 第一部分（会话入口）与第二部分（状态机与合并门）。
 - **随底座读**：按 `docs/PROJECT.md` 的 `edition` 再读 `editions/<edition>/master.md` 与当前底座的提示词；这是入口流程的一部分，不改变必读集合的定义。
-- **章程不并入必读集合**：`docs/charter.md` 由 `kit/orchestration.md` 第一部分第三步的路由读取（缺失或仍含 `FILL_IN` 时先补章程），不因不在必读集合里而跳过。
-- **按需读**：`kit/orchestration.md` 第三部分（通用验收程序）**不在必读集合内**，只在既有触发条件满足时执行——每次首次接入、变更调度器 / 提示词，或更换 Agent 运行时后执行。触发条件只由 `kit/orchestration.md` 第三部分开头那段定义，本段不新增、不删减既有触发项；触发条件未满足时，缺少该部分的逐段引用不构成验收缺失。
+- **章程不并入必读集合**：`docs/charter.md` 由 `docs/orchestration.md` 第一部分第三步的路由读取（缺失或仍含 `FILL_IN` 时先补章程），不因不在必读集合里而跳过。
+- **按需读**：`docs/orchestration.md` 第三部分（通用验收程序）**不在必读集合内**，只在既有触发条件满足时执行——每次首次接入、变更调度器 / 提示词，或更换 Agent 运行时后执行。触发条件只由 `docs/orchestration.md` 第三部分开头那段定义，本段不新增、不删减既有触发项；触发条件未满足时，缺少该部分的逐段引用不构成验收缺失。
 
 ## 0. 底座（Edition）
 
@@ -22,7 +22,7 @@
 
 - 底座由 `docs/PROJECT.md` 的 `edition` 决定，取值只能是 `local` 或 `github`。缺失或非法时，停止调度并明确报告，**不得猜测或按默认值继续**。
 - 角色权限、审查门、禁改路径、证据标准、测试强度在两个底座完全一致；底座不得成为降低标准的理由。
-- **禁止在一个项目里混用两种底座**：路径锁与 Issue 登记块不能互相替代，也不能双写。迁移只能按 `kit/orchestration.md` 的“底座切换”单向执行，切换点前后的任务状态分别由各自底座记录。
+- **禁止在一个项目里混用两种底座**：路径锁与 Issue 登记块不能互相替代，也不能双写。迁移只能按 `docs/orchestration.md` 的“底座切换”单向执行，切换点前后的任务状态分别由各自底座记录。
 
 ## 1. 基本约定
 
@@ -53,7 +53,7 @@
 1. 唯一 ID 与单一目标。
 2. 背景和用户可感知的结果。
 3. 可改路径与禁改路径。
-4. 明确的逐条验收标准，并映射到 `kit/orchestration.md` 4.1 节定义的验收证据矩阵（每条 AC 至少一条 evidence item）。
+4. 明确的逐条验收标准，并映射到 `docs/orchestration.md` 4.1 节定义的验收证据矩阵（每条 AC 至少一条 evidence item）。
 5. 依赖任务及其完成状态。
 6. 要运行的检查命令；未知命令标为待探测，不可伪造。
 7. 风险、产品决策和回退要求。
@@ -61,7 +61,7 @@
 
 任务包字段在两个底座必须一一对应：`local` 写入任务库，`github` 写入 Issue（见 `editions/github/issue-template.md`）。缺任一字段不得进入 `READY`。
 
-证据矩阵与五个结构化场景字段（`invariants`、`negative_cases`、`migration_cases`、`integration_paths`、`unverified_assumptions`）的字段名、取值与判定规则只在 `kit/orchestration.md` 4.1 节定义，本文件与模板只引用不重述。小任务的场景字段填 `N/A: <理由>`，不得只写 `N/A`。该要求是增量补充：既有任务的验收语义与状态流转不变，兼容策略见 4.1 节。
+证据矩阵与五个结构化场景字段（`invariants`、`negative_cases`、`migration_cases`、`integration_paths`、`unverified_assumptions`）的字段名、取值与判定规则只在 `docs/orchestration.md` 4.1 节定义，本文件与模板只引用不重述。小任务的场景字段填 `N/A: <理由>`，不得只写 `N/A`。该要求是增量补充：既有任务的验收语义与状态流转不变，兼容策略见 4.1 节。
 
 ## 4. Git 和实现纪律
 

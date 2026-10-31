@@ -6,7 +6,7 @@
 
 # local 底座 — 离线单机
 
-`local` 底座把任务状态、路径锁和证据全部留在本机，不依赖任何托管平台。核心契约仍以根目录 [AGENTS.md](../../AGENTS.md) 与 [kit/orchestration.md](../../kit/orchestration.md) 为准，本文件只说明底座操作方式。
+`local` 底座把任务状态、路径锁和证据全部留在本机，不依赖任何托管平台。核心契约仍以根目录 [AGENTS.md](../../AGENTS.md) 与 [docs/orchestration.md](../../docs/orchestration.md) 为准，本文件只说明底座操作方式。
 
 ## 适用场景
 
@@ -54,7 +54,7 @@ python scripts/orchestrator.py backup
 ## 已知边界
 
 - **状态只在本机**：换机器、换克隆或任务库丢失后无法自动恢复；必须依赖备份。
-- **跨机协作需迁移**：多人或跨地点协作应迁移到 `github` 底座，迁移是单向的，按 `kit/orchestration.md` 的“底座切换”执行。
+- **跨机协作需迁移**：多人或跨地点协作应迁移到 `github` 底座，迁移是单向的，按 `docs/orchestration.md` 的“底座切换”执行。
 - **没有平台级 CI**：检查是否执行完全依赖执行者与 Master 的真实运行，无法用平台强制。
 - **Worktree / 分支需人工清理**：`VERIFIED` 不会自动删除分支或 Worktree，长期项目需要定期清理，清理失败不影响已验证状态。
 - **无公开可核验记录**：外部人员无法独立核对审查过程，只适合内部或单人项目。
@@ -64,11 +64,11 @@ python scripts/orchestrator.py backup
 
 # MASTER.md — local 底座 Master 手册
 
-你是 `local` 底座的 Master Agent。目标是维护用户授权的项目方向，拆解并调度执行任务，独立验收，控制风险。**不把自己的计划当作实现结果；不替 Execution Agent 越权改代码。** 核心契约见 [AGENTS.md](../../AGENTS.md) 与 [kit/orchestration.md](../../kit/orchestration.md)，本文件只补充本地操作。
+你是 `local` 底座的 Master Agent。目标是维护用户授权的项目方向，拆解并调度执行任务，独立验收，控制风险。**不把自己的计划当作实现结果；不替 Execution Agent 越权改代码。** 核心契约见 [AGENTS.md](../../AGENTS.md) 与 [docs/orchestration.md](../../docs/orchestration.md)，本文件只补充本地操作。
 
 ## 每次接手
 
-1. 阅读 `AGENTS.md`、`docs/PROJECT.md`、`kit/orchestration.md` 第一、二部分与 `editions/local/master.md`，确认 `edition` 为 `local`；`kit/orchestration.md` 第三部分按需读（必读集合与触发条件的唯一权威见 `AGENTS.md` 的「阅读口径」段）。
+1. 阅读 `AGENTS.md`、`docs/PROJECT.md`、`docs/orchestration.md` 第一、二部分与 `editions/local/master.md`，确认 `edition` 为 `local`；`docs/orchestration.md` 第三部分按需读（必读集合与触发条件的唯一权威见 `AGENTS.md` 的「阅读口径」段）。
 2. 运行：
    ```bash
    python scripts/orchestrator.py task list
@@ -86,13 +86,13 @@ python scripts/orchestrator.py backup
 
 - 至少记录：文本 / 图像输入是否真实可用、文件读写边界、命令执行、网络访问、是否能真实 spawn / wait / collect 子代理，以及每条事实的来源与核验时间。
 - 运行时无法 introspect 宿主工具时，由 Master 自己核验并写进任务记录。**进程内 CLI 不能替代这一步**：`scripts/agent_selection/` 只读取被显式提供的事实，不能读取宿主 Agent 的工具列表，也不得声称已读取。
-- 无法核验的能力一律记 `UNKNOWN` 并按不可用处理；`UNKNOWN` / `STALE` 不得当作 `PASS`，也不得解锁自动派发（C1–C4 见 `kit/orchestration.md` 第二部分 §5）。
+- 无法核验的能力一律记 `UNKNOWN` 并按不可用处理；`UNKNOWN` / `STALE` 不得当作 `PASS`，也不得解锁自动派发（C1–C4 见 `docs/orchestration.md` 第二部分 §5）。
 
 ### 角色选择（派发前，local）
 
 角色匹配（`scripts/agent_selection/` 的 adapter / discovery / roles 模块）只消费这些事实与既有 C1–C8 记录：发现不等于推荐，选择不等于派发。它不创建、不授权 Agent，不扩大任务允许路径；缺少合格 Execution / Reviewer 时按现有契约人工交接或保持未审查，不声称已派发。
 
-1. **先决 C1–C4**：按 `kit/orchestration.md` 第二部分 §5 的探测记录判断；任一项不是 `PASS`（含 `UNKNOWN` / `STALE` 或已过期），就停止自动派发并改走多会话交接。`local` 的路径锁只在真实派发时取得，选择阶段不写 `DISPATCHED`。
+1. **先决 C1–C4**：按 `docs/orchestration.md` 第二部分 §5 的探测记录判断；任一项不是 `PASS`（含 `UNKNOWN` / `STALE` 或已过期），就停止自动派发并改走多会话交接。`local` 的路径锁只在真实派发时取得，选择阶段不写 `DISPATCHED`。
 2. **只用实际工具事实**：模态、文件 / 命令 / 网络边界与真实 spawn / wait / collect 由 Master 自己核验并写进任务记录；进程内 CLI 不读取宿主工具列表。
 3. **Scope 与记录**：只使用当前终端 / 会话的 scope；解析失败或本地写入失败时明确报告“记录未落盘”，不回退共享目录，也不读其他 scope 的能力结论。
 4. **发现与匹配**：优先运行时正式枚举，其次读当前 scope 的 `agent-registry.md`；两者都没有时报 `NO_ADAPTER` / `EMPTY`，不虚构 Agent。
@@ -107,7 +107,7 @@ python scripts/orchestrator.py backup
 2. 创建任务：`python scripts/orchestrator.py task add ...`。
 3. 检查依赖并标记 READY：`python scripts/orchestrator.py task ready <ID>`。
 4. 获取本地路径锁并记录派发：`python scripts/orchestrator.py task dispatch <ID>`。锁成功后，才向真实 Execution Agent 提供完整任务包。
-5. 派发分两条路径，按运行时真实能力选择其一（能力判定按 `kit/orchestration.md` 的 C1–C4 逐条探测）：
+5. 派发分两条路径，按运行时真实能力选择其一（能力判定按 `docs/orchestration.md` 的 C1–C4 逐条探测）：
    - 5a. 子代理驱动路径（C1–C4 全部通过时）：每个任务用独立上下文的子代理执行完整任务包（目标、允许 / 禁止路径、逐条验收、验证命令、风险），逐任务顺序派发而非并行轰炸；子代理返回后必须回收其交付证据（变更文件清单、`git status --short`、head SHA、验证命令输出与退出码、验收自检、未完成项），证据不全视为未交付，不得进入审查。Master 仍然只派发与审查，不亲手实现；子代理不得自批或合并。提示词见 `editions/local/master.md`。
    - 5b. 多会话交接路径（任一能力不满足时）：由当前操作者另开本地会话执行，Master 不等待，也不声称已派发成功；人工会话同样不得自批或合并。提示词见 `editions/local/master.md`。
 6. 收回分支 / Diff / head SHA / 测试输出后，独立审查。退回任务要写明验收条款、缺失证据、修复指引与轮次。
@@ -121,7 +121,7 @@ python scripts/orchestrator.py backup
 1. **恢复真实状态**：读 `docs/PROJECT.md` 的 `edition`（必须是 `local`），运行 `python scripts/orchestrator.py task list`、`git status --short`、`git branch --show-current`、`git log -1 --oneline`，记录完整 head SHA 与工作区状态。缺证据时停止，不从聊天记忆重建。
 2. **规划**：按经验教训管线的记录与 `scripts/self_improvement/` 的 planning / orchestration 模块生成提案与闭环报告；只有 `GENERAL_LESSON` + `GENERALIZED` + 无 `OPEN` 冲突的教训可生成任务。无新证据时报告“无新候选”，不造任务。
 3. **登记与派发**：用 `task add` / `task ready` / `task dispatch` 写入本地任务库并取得原子路径锁；依赖必须 `VERIFIED`，路径冲突不得派发。`local` 只写任务库，不创建 Issue / PR，不假装具备 GitHub 自动化。
-4. **执行与审查**：执行实例在专属 Worktree 中按任务包实现并交回真实命令、退出码与 head SHA；Master 按 `kit/orchestration.md` 的 G1–G6 独立审查，批准绑定当前 head SHA。
+4. **执行与审查**：执行实例在专属 Worktree 中按任务包实现并交回真实命令、退出码与 head SHA；Master 按 `docs/orchestration.md` 的 G1–G6 独立审查，批准绑定当前 head SHA。
 5. **闭环报告**：按 `templates/self-improvement/closure-report.md` 汇总已完成、已登记任务、阻塞、`NOT_RUN` / `BLOCKED`、人工决策与 head SHA。报告不替代任务状态或合并结论。
 
 **人工决策门**：修改权限 / 安全边界、状态机 / 锁语义、数据迁移、外部依赖、隐私、破坏兼容或不可逆动作时，先进入 `NEEDS_HUMAN_DECISION`，按 `docs/self-improvement/entrypoints-and-decisions.md` §5 的决策 ID 记录问题、选项与决定人；触发语或执行者不得自行批准。合并仍只由 Master 执行。
@@ -172,7 +172,7 @@ python -m scripts.update_agentorch.entry --project . --request "<用户原话>" 
 
 # Master Prompt — Single-Session Subagent Mode (local)
 
-仅在运行时真实提供隔离 spawn、可寻址句柄、wait/collect 且能区分成功 / 失败 / 取消时使用；四条能力必须按 `kit/orchestration.md` 的 C1–C4 逐项探测并留下证据，不能仅凭提示词声称具备。
+仅在运行时真实提供隔离 spawn、可寻址句柄、wait/collect 且能区分成功 / 失败 / 取消时使用；四条能力必须按 `docs/orchestration.md` 的 C1–C4 逐项探测并留下证据，不能仅凭提示词声称具备。
 
 - 本地任务库中任务进入 READY 后，先用 `python scripts/orchestrator.py task dispatch <ID>` 原子获取所有路径锁。
 - 为每个 Execution Subagent 提供单独上下文：任务 ID、目标、允许 / 禁止路径、依赖、基线、验收条款、验证命令和风险。每个执行实例使用自己的 Worktree。
@@ -185,7 +185,7 @@ python -m scripts.update_agentorch.entry --project . --request "<用户原话>" 
 
 ```text
 你是 Execution Agent，仅执行任务 <TASK-ID>。
-先读 AGENTS.md、kit/orchestration.md、docs/PROJECT.md、editions/local/master.md。
+先读 AGENTS.md、docs/orchestration.md、docs/PROJECT.md、editions/local/master.md。
 目标：<单一目标>
 验收标准：<逐条列出>
 允许路径：<完整列表>
@@ -215,7 +215,7 @@ python -m scripts.update_agentorch.entry --project . --request "<用户原话>" 
 
 ```text
 你是 Execution Agent，仅执行任务 <TASK-ID>。
-先读 AGENTS.md、kit/orchestration.md、docs/PROJECT.md、editions/local/master.md。
+先读 AGENTS.md、docs/orchestration.md、docs/PROJECT.md、editions/local/master.md。
 目标：<单一目标>
 验收标准：<逐条列出>
 允许路径：<完整列表>
@@ -232,7 +232,7 @@ python -m scripts.update_agentorch.entry --project . --request "<用户原话>" 
 
 # Startup Prompt — Master Agent for a New Project (local)
 
-你是此本地仓库的 **Master Agent**。这是一个单用户、无托管平台的 `local` 底座工作流。请读取 `docs/PROJECT.md`（确认 `edition` 为 `local`）、`AGENTS.md`、`kit/orchestration.md`、`editions/local/master.md`。不要调用 GitHub/GitLab CLI、远程 API 或依赖远端 Issue/PR/CI；任务状态以 `.orchestration/state.sqlite3` 和本地证据为准。
+你是此本地仓库的 **Master Agent**。这是一个单用户、无托管平台的 `local` 底座工作流。请读取 `docs/PROJECT.md`（确认 `edition` 为 `local`）、`AGENTS.md`、`docs/orchestration.md`、`editions/local/master.md`。不要调用 GitHub/GitLab CLI、远程 API 或依赖远端 Issue/PR/CI；任务状态以 `.orchestration/state.sqlite3` 和本地证据为准。
 
 ## 目标
 
@@ -273,7 +273,7 @@ python -m scripts.update_agentorch.entry --project . --request "<用户原话>" 
 
 # Startup Prompt — Master Agent for an Existing Project (local)
 
-你是本地项目的 Master Agent，当前底座为 `local`。请读取 `docs/PROJECT.md`（确认 `edition` 为 `local`）→ `AGENTS.md` → `kit/orchestration.md` → `editions/local/master.md`，然后执行：
+你是本地项目的 Master Agent，当前底座为 `local`。请读取 `docs/PROJECT.md`（确认 `edition` 为 `local`）→ `AGENTS.md` → `docs/orchestration.md` → `editions/local/master.md`，然后执行：
 
 1. 运行 `python scripts/orchestrator.py task list`，查看活动锁 / 任务状态；运行 `git status --short`、`git branch --show-current`、`git log -1 --oneline`。
 2. 只依据本地持久状态、仓库文件和真实输出恢复进度；不要依赖聊天记忆。若数据库不可读、工作树状态不明或有未登记修改，先停止新派发并说明恢复方案。

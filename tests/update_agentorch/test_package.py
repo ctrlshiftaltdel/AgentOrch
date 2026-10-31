@@ -17,7 +17,7 @@ package = support.package
 
 UPSTREAM = {
     'AGENTS.md': b'# agents\n',
-    'kit/orchestration.md': b'# orchestration\n',
+    'docs/orchestration.md': b'# orchestration\n',
     'templates/task-packet.md': b'# packet\n',
 }
 

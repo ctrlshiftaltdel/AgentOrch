@@ -1,6 +1,6 @@
 # AgentMgr 经验 → Architecture Contract 规则（AGM-1…AGM-6）
 
-> **定位**：本文件把六条经验落成 Architecture Contract 里**可检查的规则形式**与 **Reviewer 清单**。字段名、枚举与判定规则仍只由 [architecture-contract.md](architecture-contract.md) 与 [schema](../contracts/schemas/architecture-contract.schema.json) 定义（#47 冻结，本任务未修改 schema、未新增 `kind`、未新增 `params`）；任务状态机、路径 / 资源锁、证据矩阵与合并门 G1–G6 **只在** [kit/orchestration.md](../../kit/orchestration.md) 定义，本文件只引用，不复制、不改写。
+> **定位**：本文件把六条经验落成 Architecture Contract 里**可检查的规则形式**与 **Reviewer 清单**。字段名、枚举与判定规则仍只由 [architecture-contract.md](architecture-contract.md) 与 [schema](../contracts/schemas/architecture-contract.schema.json) 定义（#47 冻结，本任务未修改 schema、未新增 `kind`、未新增 `params`）；任务状态机、路径 / 资源锁、证据矩阵与合并门 G1–G6 **只在** [docs/orchestration.md](../orchestration.md) 定义，本文件只引用，不复制、不改写。
 > **证据来源**：下游项目的公开 Issue / PR，逐条映射见 [agentmgr-lessons.md](../self-improvement/agentmgr-lessons.md)。本文件只引用公开链接与自行撰写的泛化摘要，不复制其代码、业务模型、目录结构、Profile 路径或凭据；所有 fixture 都是合成数据。
 > **不强制统一目录 / 框架**：本文件不规定目录名、语言、框架、模块数量或分层叫法。`module_id` 与 `paths` 由项目自己声明；检查器不猜测模块边界，没有契约的项目保持只读诊断（AGM-6 与 §6 的限制同样适用）。
 
@@ -9,7 +9,7 @@
 1. **契约是项目自有的可选文件**。未配置时检查器等价 `OFF`：只输出只读盘点，不产生硬失败，也不从代码里推断模块划分。六条规则不是默认规则集。
 2. **按项目自己的边界选择 2–4 条**写成契约规则（`rules[]` + `dependencies.forbidden[]` + `modules[].private_paths`）。`severity` 与 `enforcement_mode` 决定是否阻断：只有 `ERROR` 级、`ENFORCE` 且未被有效豁免的发现才会让 CI 失败。
 3. **每条规则有三层证据**：静态层（检查器能证明什么）、语义层（项目自己的共用契约测试）、Reviewer 清单。**标 `Reviewer 判定` 的条目没有自动检查**，不得写成“已被静态分析覆盖”。
-4. 任务包 / Issue 的 `invariants`、`negative_cases`、`integration_paths` 按 [4.1 节](../../kit/orchestration.md)填写；本文件只说明这些表面在架构维度应覆盖什么，不新增字段。
+4. 任务包 / Issue 的 `invariants`、`negative_cases`、`integration_paths` 按 [4.1 节](../orchestration.md)填写；本文件只说明这些表面在架构维度应覆盖什么，不新增字段。
 
 ## 2. 六条规则总表
 
@@ -70,7 +70,7 @@
 - **可判定的语义规则**（场景 C17 的合成实现）：`PASS` 必须带证据（`probe_id`、`probed_at`、`environment`），证据类型必须匹配被声明的能力（`STARTUP_OK` / `DESIGN_DOC` 不是隔离证据），`scope` 不能是整仓通配 `*`，探针覆盖的能力必须等于声明能力；非 `PASS` 的声明**不得被升级**为通过。
 - **`Reviewer 判定`**：证据是否真实（探针可以伪造，静态检查无能为力）；能力记录的探测时间 / 环境 / 证据引用是否齐全；`PASS` 是否被表述成“已获得权限”（能力记录不授予权限）。
 - **负向案例**：`PASS` 无任何探测；用“启动成功”证明隔离；`scope: *`；探针测的是 A 能力却声明 B；把过期或换版本前的证据继续当作当前结论。
-- **限制**：只能判定“声明是否越级、结构是否完整”，不能判定“证据是否真实”；真实能力探测仍按 [kit/orchestration.md](../../kit/orchestration.md) 第 5 节的 C1–C4 流程执行并留证。
+- **限制**：只能判定“声明是否越级、结构是否完整”，不能判定“证据是否真实”；真实能力探测仍按 [docs/orchestration.md](../orchestration.md) 第 5 节的 C1–C4 流程执行并留证。
 
 ### AGM-6 失败 / 状态未知是稳定契约
 

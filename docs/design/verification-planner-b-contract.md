@@ -3,7 +3,7 @@
 > **状态：FROZEN / 已冻结。** 本文是 Issue #186 的 B 阶段子契约定稿，由项目所有者书面冻结并落地实现。
 > 冻结来源：[Issue #186 评论 6486678110](https://github.com/ctrlshiftaltdel/AgentOrch/issues/186#issuecomment-6486678110)。
 > 实现范围只有 plan-only 影子 CLI；父级提案 [adaptive-verification-and-quality-gates.md](adaptive-verification-and-quality-gates.md) 仍是 `PROPOSED / NOT IMPLEMENTED`，本文不改写它。
-> 本文件不复制 G1–G6 的通过条件；门语义的唯一权威是 `kit/orchestration.md`（#151 未 `VERIFIED` 前，见第 7 节）。
+> 本文件不复制 G1–G6 的通过条件；门语义的唯一权威是 `docs/orchestration.md`（#151 未 `VERIFIED` 前，见第 7 节）。
 > 输出不是 PASS、不是审批、不是 READY、不是 `VERIFIED`、不是授权、不是跳过指令。
 
 本文件落地审查报告六条冻结清单（B1–B3、M4、M3/M1、M5/M6），并吸收 M2 与 N1–N5。上一版中「可复核来源证明已覆盖相关高危检查、即可排除 L3」的分支已删除。
@@ -28,7 +28,7 @@
 
 三轮修复上限只作为现行规则被保留。本 Planner 不实现该上限，也不改对应代码。
 
-shadow 输出的固定标记是 `plan_usability: not_a_verification_result` 与 `mode: shadow_only`。该输出不是审批、不是 READY、不是 `VERIFIED`、不是授权、不是跳过指令。本工具不改变 Required Checks、CI、`docs/PROJECT.md` 的现行验证命令、`kit/orchestration.md` 或 `scripts/orchestrator.py` 的门禁行为，不写任务状态。
+shadow 输出的固定标记是 `plan_usability: not_a_verification_result` 与 `mode: shadow_only`。该输出不是审批、不是 READY、不是 `VERIFIED`、不是授权、不是跳过指令。本工具不改变 Required Checks、CI、`docs/PROJECT.md` 的现行验证命令、`docs/orchestration.md` 或 `scripts/orchestrator.py` 的门禁行为，不写任务状态。
 
 生产门禁切换仍属于 #188，须 A–C `VERIFIED` 之后另行取得 Owner 明确授权。#187 承担影响面测试选择、旧 SHA 等价性与证据复用。#176 承担拓扑推荐与 Agent 派发。本 Planner 不选角色、不派发。
 
@@ -159,7 +159,7 @@ Owner 澄清保留如下，并落到字段上。
 Owner 澄清里的两句话同时保留，并且落在不同层上。
 
 - 区分：探针缺失、`UNKNOWN`、`STALE`，或未证明宿主工具客观不存在的探针 `FAIL`，按所有者已批准的未来方向只作告警。本工具不单凭这些探针状态输出「禁止尝试」或「允许尝试」。真实调用失败、权限、锁、安全与 G1–G6 另行判定（第 3.4 节）。
-- 现行契约：在 #174 那项独立变更落地之前，自动派发仍按现行规则执行。`kit/orchestration.md` 角色选择入口第 1 步，以及 `editions/local/master.md` 与 `editions/github/master.md` 的「先决 C1–C4」，仍然是：C1–C4 任一项不是 `PASS`，或记录为 `UNKNOWN` / `STALE` 或已过期，就停止自动派发，改走人工交接。`docs/implementation-plan.md` §14.4、§15.2.6 与 §15.5 写明 #174 的「以风险提示为主」尚未生效。本契约不把该未来方向写成现行派发规则，也不把「不单凭探针状态禁止获授权尝试」写成影子输出里的许可字段。
+- 现行契约：在 #174 那项独立变更落地之前，自动派发仍按现行规则执行。`docs/orchestration.md` 角色选择入口第 1 步，以及 `editions/local/master.md` 与 `editions/github/master.md` 的「先决 C1–C4」，仍然是：C1–C4 任一项不是 `PASS`，或记录为 `UNKNOWN` / `STALE` 或已过期，就停止自动派发，改走人工交接。`docs/implementation-plan.md` §14.4、§15.2.6 与 §15.5 写明 #174 的「以风险提示为主」尚未生效。本契约不把该未来方向写成现行派发规则，也不把「不单凭探针状态禁止获授权尝试」写成影子输出里的许可字段。
 
 本工具对探针的唯一动作是观察。禁止尝试与允许尝试都由本工具之外的现行规则处理；影子 JSON 里两边都不出现。
 
@@ -216,7 +216,7 @@ Planner 读取一份版本化 JSON 快照（只读文件参数）。调用者 / 
 
 除此之外的未知字段，退出码 2。
 
-输出中的检查列表字段名是 `checks.caller_snapshot`。每项只含白名单字段。对象带常量 `authority: unverified_snapshot`，表示「调用者快照，未经本工具核验为项目权威」。本契约不内置 #185 的基线条数。基线缺失时不得把该快照叫作现行必需检查，也不得声称已经与 `docs/PROJECT.md` 或 `kit/orchestration.md` 核对过。快照比将来的基线更短时，处理方式已经由「基线未冻结 → 一律 `mandatory_baseline_unfrozen` + `closure: open`」覆盖：本阶段没有基线数字可用来补齐条目，禁止编造缺失的 `check_id`。
+输出中的检查列表字段名是 `checks.caller_snapshot`。每项只含白名单字段。对象带常量 `authority: unverified_snapshot`，表示「调用者快照，未经本工具核验为项目权威」。本契约不内置 #185 的基线条数。基线缺失时不得把该快照叫作现行必需检查，也不得声称已经与 `docs/PROJECT.md` 或 `docs/orchestration.md` 核对过。快照比将来的基线更短时，处理方式已经由「基线未冻结 → 一律 `mandatory_baseline_unfrozen` + `closure: open`」覆盖：本阶段没有基线数字可用来补齐条目，禁止编造缺失的 `check_id`。
 
 双底座：只改变 `edition` 时，`classification.level`、`rule_ids` 与 `unknown_items` 必须相同。`local` 与 `github` 各自展示自己输入里的 `caller_snapshot`，不能用一边削减另一边。`edition` 本身不参与 floor。
 
@@ -231,7 +231,7 @@ Planner 读取一份版本化 JSON 快照（只读文件参数）。调用者 / 
 1. 顶层 `plan_usability` 恒为 `not_a_verification_result`。
 2. 计划对象的任何字段都不得表示检查、AC、门或身份已合格。
 3. 整份 JSON 的键名，以及任意字符串值里的完整词（大小写不敏感），不得是下列词：`PASS`、`FAIL`、`NOT_RUN`、`UNKNOWN`、`BLOCKED`、`NOT_APPLICABLE`、`PASS_EXECUTED`、`PASS_EQUIVALENCE_ATTESTED`、`approved`、`ready`、`verified`、`may_merge`、`ok`、`passed`、`qualified`、`success`、`green`、`attempt_allowed`、`dispatch_ok`、`may_dispatch`、`skip`、`identity_ok`、`declared_risk_level`。测试对整份输出做该扫描。
-4. 证据矩阵五个 `status` 的唯一权威仍是 `kit/orchestration.md` 4.1。`UNKNOWN` 在现行契约中用于能力记录，不在这五个值里。本工具既不输出这五个值，也不输出 `UNKNOWN`，从而不建立第二套矩阵状态。
+4. 证据矩阵五个 `status` 的唯一权威仍是 `docs/orchestration.md` 4.1。`UNKNOWN` 在现行契约中用于能力记录，不在这五个值里。本工具既不输出这五个值，也不输出 `UNKNOWN`，从而不建立第二套矩阵状态。
 5. Owner 要求的 `FAIL`、`NOT_RUN`、`UNKNOWN`、`BLOCKED`，以及证据缺失，不得以退出码 0、同义词或回显 `status` 表示合格。本 CLI **不使用退出码 0**。退出码 0 在本契约中没有「计划已产出」或「合格」的含义。
 6. `not_applied` 只允许出现在尚未生效的对照说明中；当前 schema 把 `counterfactual_diff` 限制为空，因此输出里不出现移除行。空差异在证据矩阵中的含义是「没有一条可被拿去少跑的检查」，不是一条新的 `status`。
 7. `ac_map` 的允许字段只有 `ac_id`、`matched_rule_ids`、`gate_ids`、`check_ids`。没有通过类字段。`gate_ids` 恒为 G1–G6 六项。`check_ids` 只复制调用者快照中的 id。
@@ -286,7 +286,7 @@ python scripts/verification_planner/cli.py --input PATH
 
 门的唯一语义来源是当时有效的编排契约路径。本工具只保存稳定门 ID（G1、G2、G3、G4、G5、G6）和来源路径。
 
-- #151 未 `VERIFIED` 之前，来源路径保持 `kit/orchestration.md`。仓库 HEAD 的 `docs/implementation-plan.md` §15.2.4 把 #151 登记为 `OPEN` / `PLANNED` / 未 READY，目标路径是 `docs/orchestration.md`。
+- #151 未 `VERIFIED` 之前，来源路径保持 `docs/orchestration.md`。仓库 HEAD 的 `docs/implementation-plan.md` §15.2.4 把 #151 登记为 `OPEN` / `PLANNED` / 未 READY，目标路径是 `docs/orchestration.md`。
 - #151 迁移合并并且其状态在 GitHub 与 `docs/implementation-plan.md` 上都成为 `VERIFIED` 之后，只更新本契约里的引用路径。本工具不重写门语义，运行时也不自动切换路径。
 - 禁止在 Planner 源码、`scripts/verification_planner/schema.json`、子契约定稿 `docs/design/verification-planner-b-contract.md`、测试夹具里复制门的通过条件。夹具只断言 `gate_id` 与 `source_path`。
 - #150 仍未 `VERIFIED`（同一节登记为 `OPEN` / `PLANNED`）。本子契约不宣称自己是文件责任地图、门禁权威或阶段状态权威。
@@ -322,7 +322,7 @@ python scripts/verification_planner/cli.py --input PATH
 
 `docs/PROJECT.md` 与 `docs/implementation-plan.md` 默认都不在本任务路径里。前者若只为新目录追加允许路径，仍会改到 G2 所读的项目范围文本；本阶段不改。新文件的任务允许路径以本节为准，不自动成为项目常设允许路径。后者见第 1.1 节：计划文本与 GitHub 不一致时停下，而不是在本任务里改状态行。
 
-不改 `kit/orchestration.md`、`scripts/orchestrator.py`、`.github/workflows/` 下的工作流、Required Checks、状态机、锁、权限或生产 gate。#188 仍需独立 Owner 授权。
+不改 `docs/orchestration.md`、`scripts/orchestrator.py`、`.github/workflows/` 下的工作流、Required Checks、状态机、锁、权限或生产 gate。#188 仍需独立 Owner 授权。
 
 ### 8.2 写集合
 
@@ -833,7 +833,7 @@ Owner 尚未书面确认任何「按级别减少检查」的对照之前，每�
 - `mode` = `shadow_only`
 - `closure` = `open`
 - `authority` = `unverified_snapshot`
-- `gates` 六项且 `source_path` 都是 `kit/orchestration.md`，顺序 G1–G6
+- `gates` 六项且 `source_path` 都是 `docs/orchestration.md`，顺序 G1–G6
 - `counterfactual_diff` = `[]`
 - `shadow_candidates` 的 `check_id` 序列等于该夹具自己的 `caller_snapshot`
 - `unknown_items` 至少含 `source_not_verified` 与 `mandatory_baseline_unfrozen`（对应 `closure_reasons` 同名）
@@ -869,7 +869,7 @@ Owner 尚未书面确认任何「按级别减少检查」的对照之前，每�
 | `fx_edition_local` | 与 `fx_l0_plain_doc` 相同 | 3 | 作为 github 孪生夹具的对照 |
 | `fx_edition_github` | 仅 `edition: github` | 3 | `level`、`rule_ids`、`unknown_items` 与 `fx_edition_local` 相同；`edition=github`；快照仍是输入的四项，不是从 local 夹具删减来的另一套 |
 | `fx_short_snapshot` | `profile.checks` 只保留 `project.validate_kit` | 3 | `authority=unverified_snapshot`；含 `mandatory_baseline_unfrozen`；候选长度是 1，等于该快照，不短于它；差异为空；输出不把该快照标成已核对的现行集合 |
-| `fx_gates_present` | 与 `fx_l0_plain_doc` 相同 | 3 | `gates` 长度 6；`gate_id` 集合为 G1–G6；每项 `source_path` 为 `kit/orchestration.md`；门对象没有通过条件字段 |
+| `fx_gates_present` | 与 `fx_l0_plain_doc` 相同 | 3 | `gates` 长度 6；`gate_id` 集合为 G1–G6；每项 `source_path` 为 `docs/orchestration.md`；门对象没有通过条件字段 |
 
 `test_classification_consistency_report`：对上表每一行生成内存报告。退出码 3 的行 `actual_level` 等于表中 `level`（未单列 `level` 时为 L3）。退出码 2 的行 `has_classification=false`。报告本身通过第 5.1 节禁用词扫描。
 

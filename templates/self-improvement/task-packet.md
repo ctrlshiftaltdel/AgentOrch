@@ -3,7 +3,7 @@
 > A task created by the self-improvement loop uses the same packet as any other task.
 > `local` writes it to the task database, `github` writes it to an Issue — never both.
 > The evidence item fields, `status` values and the G1–G6 rules are defined only in
-> `kit/orchestration.md` 4.1; this template carries the fields and does not restate them.
+> `docs/orchestration.md` 4.1; this template carries the fields and does not restate them.
 > Small tasks write `N/A: <reason>` in a scenario field; a bare `N/A` is a missing field.
 
 - **Task ID / Issue:**

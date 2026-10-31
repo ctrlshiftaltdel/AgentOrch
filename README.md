@@ -44,7 +44,7 @@
 - **角色发现与匹配（Phase D S2）**：优先使用运行时正式枚举，无法枚举时读取显式注册表；按硬筛选（可调用性、模态、工具、权限、Reviewer 独立性）后接可解释排序，给出 Master / Execution / Reviewer 建议。能力 `UNKNOWN` / `STALE` 或缺少角色时降级人工交接，不自动创建或授权 Agent，选择不等于派发。
 - **模型评测与角色专项选型（Phase D S3）**：可选接入 Artificial Analysis 官方 Data API，把官方返回映射为带来源、索引版本、查询时间与新鲜度的供应商无关快照；外部数据只在 S2 硬筛选之后补充角色相关证据与排序。API Key 只从受保护环境变量读取，离线时基础治理不受影响；Reviewer 没有专项证据时标 `UNKNOWN`，不用通用总分冒充。
 - **本机角色表现反馈与可解释校准（Phase D S4）**：把 Master / Execution / Reviewer 在**当前 scope** 内的真实任务表现（任务类别、首次验收、返工轮次、合并后回归缺陷、真实可采集的耗时 / 成本；Reviewer 的确认问题、误报与需要独立对照的漏报；Master 的计划遗漏与拆分返工）追加记录到 `.local/agent-orch/<scope-id>/observed-performance.md`。报告只给可解释建议：每项指标带样本量、窗口、任务类别、缺失值与 coverage；样本不足、模型 / Runtime 身份变化或证据过期时标 `UNKNOWN` / `STALE` 且不排名；不自动改提示词、权限或模型配置，也不把聊天记忆、自评、合并成功或 CI 绿灯当质量证据。
-- **会话入口接线与端到端回归（Phase D S5）**：`kit/orchestration.md` 的会话入口按「C1–C4 先决 → 实际工具事实 → scope / 记录 → 发现与匹配 → 可选模型数据 → 可选本机反馈」串起 S1–S4，两个底座的 Master / Execution 手册同步同一套角色约束与结果语义；缺少角色、不能真实 spawn、数据过期或本地写入失败时输出具体原因并降级，任何选择都不读作“已派发”。合成回归新增 E 组（E1 正向 + E2–E13 负向），全部使用模拟 Runtime、固定模型目录与临时目录，不访问真实网络 / Key / `.local`。
+- **会话入口接线与端到端回归（Phase D S5）**：`docs/orchestration.md` 的会话入口按「C1–C4 先决 → 实际工具事实 → scope / 记录 → 发现与匹配 → 可选模型数据 → 可选本机反馈」串起 S1–S4，两个底座的 Master / Execution 手册同步同一套角色约束与结果语义；缺少角色、不能真实 spawn、数据过期或本地写入失败时输出具体原因并降级，任何选择都不读作“已派发”。合成回归新增 E 组（E1 正向 + E2–E13 负向），全部使用模拟 Runtime、固定模型目录与临时目录，不访问真实网络 / Key / `.local`。
 
 ## 两种协作底座
 
@@ -89,7 +89,7 @@ AgentOrch 的自我完善不等于“让模型自由修改仓库”。它有明�
 
 1. **新项目**：将发行包解压到项目根目录，按实际情况填写 <code>docs/PROJECT.md</code>，尤其是 <code>edition</code>、允许 / 禁改路径和验证命令。
 2. **选择底座**：将 <code>edition</code> 设为 <code>local</code> 或 <code>github</code>，只能有一个权威值。
-3. **恢复规则**：先阅读 <code>AGENTS.md</code> 和 <code>kit/orchestration.md</code>，然后使用对应底座的 Master 手册开始工作。
+3. **恢复规则**：先阅读 <code>AGENTS.md</code> 和 <code>docs/orchestration.md</code>，然后使用对应底座的 Master 手册开始工作。
 4. **已有项目**：不要直接把发行包解压覆盖到现有仓库；先在项目外解压、盘点同名文件冲突，再按需引入。
 
 完整安装步骤、Agent 话术与命令对照、既有项目接入流程见 **[完整上手指南](docs/README.md)**。
@@ -109,7 +109,7 @@ uv run python scripts/run_delivery_scenarios.py --json</code></pre>
 | 需要了解 | 文档 |
 | --- | --- |
 | 权限、角色、Git 纪律与公开仓库安全规则 | [AGENTS.md](AGENTS.md) |
-| 状态机、证据矩阵、合并门与会话入口 | [核心编排契约](kit/orchestration.md) |
+| 状态机、证据矩阵、合并门与会话入口 | [核心编排契约](docs/orchestration.md) |
 | 快速上手、底座选择与已有项目接入 | [完整用户指南](docs/README.md) |
 | 设计目标与原则 | [设计目标](docs/PLAN.md) |
 | 阶段计划与当前项目状态 | [阶段计划](docs/implementation-plan.md) |

@@ -198,7 +198,7 @@ value = sha256(canonical).hexdigest()   # 64 位小写十六进制
 
 只有 `GENERAL_LESSON` 且状态为 `GENERALIZED` 才允许生成改进任务；任务本身遵守核心契约：
 
-- 任务包 / Issue 必须含目标、允许 / 禁路径、逐条验收、负向场景、依赖与验证命令（字段定义见 `kit/orchestration.md` 4.1 与 `templates/task-packet.md`）。
+- 任务包 / Issue 必须含目标、允许 / 禁路径、逐条验收、负向场景、依赖与验证命令（字段定义见 `docs/orchestration.md` 4.1 与 `templates/task-packet.md`）。
 - 任务优先级与依赖由 Master 决定；Lesson 不直接创建 PR，也不自动合并。
 - 同一指纹的重复 Lesson 不生成第二个任务；已有覆盖机制时只补测试证据。
 - `IMPLEMENTED` 只在对应任务合并并由核心门验收后记录；Lesson 状态不能替代任务状态。

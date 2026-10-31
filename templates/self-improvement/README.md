@@ -134,7 +134,7 @@ start it.
 
 Templates: [`proposal.md`](proposal.md), [`task-packet.md`](task-packet.md),
 [`closure-report.md`](closure-report.md). Field meanings and the G1–G6 gates are
-defined only in `kit/orchestration.md` section 4.1 and are not restated here.
+defined only in `docs/orchestration.md` section 4.1 and are not restated here.
 
 ## 4. Boundaries
 

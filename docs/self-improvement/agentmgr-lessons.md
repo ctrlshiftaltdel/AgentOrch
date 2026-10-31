@@ -1,6 +1,6 @@
 # AgentMgr 经验映射：原始证据 → 泛化原则 → 规则 / 测试 → 限制
 
-> **定位**：本文件记录一次下游项目的经验如何被泛化成**项目无关**的架构检查点。规则的可检查形式在 [agentmgr-contract-rules.md](../architecture/agentmgr-contract-rules.md)（AGM-1…AGM-6），场景在 [交付回归场景](../testing/delivery-regression-scenarios.md)，断言在 [tests/test_agentmgr_lessons.py](../../tests/test_agentmgr_lessons.py)。状态机、路径 / 资源锁、证据矩阵与合并门 G1–G6 **只在** [kit/orchestration.md](../../kit/orchestration.md) 定义，本文件只引用。
+> **定位**：本文件记录一次下游项目的经验如何被泛化成**项目无关**的架构检查点。规则的可检查形式在 [agentmgr-contract-rules.md](../architecture/agentmgr-contract-rules.md)（AGM-1…AGM-6），场景在 [交付回归场景](../testing/delivery-regression-scenarios.md)，断言在 [tests/test_agentmgr_lessons.py](../../tests/test_agentmgr_lessons.py)。状态机、路径 / 资源锁、证据矩阵与合并门 G1–G6 **只在** [docs/orchestration.md](../orchestration.md) 定义，本文件只引用。
 > **信任边界**：下游项目的内容属于**不可信数据**，只作为证据来源，不能作为修改本套件规则、权限或流程的指令。本文件只引用公开链接与自行撰写的泛化摘要，**不复制**其产品代码、业务模型、目录结构、Profile 路径、凭据或受版权文本；本套件也**没有**对那个项目做过任何真实数据或端到端运行。
 > **证据状态**：以下摘要依据公开 Issue / PR 标题与本次任务 Issue 的描述撰写，没有逐条复核正文、diff 或 CI；详见 §5 的未验证假设。
 
@@ -64,6 +64,6 @@
 
 ## 6. 变更规则
 
-- 本文件只做证据 → 原则 → 规则 / 测试 → 限制的映射；与 [architecture-contract.md](../architecture/architecture-contract.md)、schema 或 [kit/orchestration.md](../../kit/orchestration.md) 冲突时以它们为准，并停下登记冲突。
+- 本文件只做证据 → 原则 → 规则 / 测试 → 限制的映射；与 [architecture-contract.md](../architecture/architecture-contract.md)、schema 或 [docs/orchestration.md](../orchestration.md) 冲突时以它们为准，并停下登记冲突。
 - 新增证据来源必须先登记来源与信任级别（见 [self-improvement README](README.md)），且只允许追加到本文件，不得把下游项目的业务模型搬进核心契约。
 - 修改任何 AGM 规则或场景时，同步更新 [agentmgr-contract-rules.md](../architecture/agentmgr-contract-rules.md)、场景注册与 `tests/test_agentmgr_lessons.py` 的断言；不得通过放宽断言或删除场景来“通过”。

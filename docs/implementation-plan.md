@@ -1,7 +1,7 @@
 # AgentOrch 阶段计划（2026-10）
 
 > 本文件是**阶段目标与执行路径的唯一权威**：阶段划分、每阶段的交付与出口、任务顺序与依赖、当前状态都在这里。
-> 设计目标（为什么做、做到什么程度、原则与边界）只在 [PLAN.md](PLAN.md)（1.4 起位于 `docs/`）；字段、状态取值与合并门语义只在 [kit/orchestration.md](../kit/orchestration.md) 4.1 与第 5 节，本文件只引用不重述。
+> 设计目标（为什么做、做到什么程度、原则与边界）只在 [PLAN.md](PLAN.md)（1.4 起位于 `docs/`）；字段、状态取值与合并门语义只在 [docs/orchestration.md](orchestration.md) 4.1 与第 5 节，本文件只引用不重述。
 > 本文件只经任务分支 + PR 修改。与 `PLAN.md` 的设计目标冲突时，以设计目标为准并停下对齐，不得各写一套。
 
 - 版本：v4.7（Issue #162 登记 DSH 角色工具适配与独立发行包阶段 §16，并刷新 #162 / #207 的真实状态；上一版 v4.6 由 Issue #207 登记 Owner 2026-10-29 效率优先 S0–S4 排序，显式覆盖 #197 的旧建议「#185→#186 后立即主动发行」；再上一版 v4.5 登记 #185 VERIFIED / #186 依赖已满足但仍未 READY；再上一版 v4.4 登记跨专项任务顺序与任务驱动分配 #197，含 Owner 2026-10-28「AVE 先行」排序更新；更早 v4.3 登记 Epic #146 新阶段、#169 维护完成事实与 #174 待设计纠偏；更早 v4.2 记录 Release 1.7.0 已发布 / Format 1.7、Phase D 完成；v4.1 记录 Phase D 完成，v4.0 记录 S5 进行中，v3.9 记录 S4 已完成 / `VERIFIED` 与 S5 `READY`，v3.8 记录 S4 进行中，更早的 v3.7 记录 S3 已完成 / `VERIFIED` 与 S4 `READY`，v3.6 记录 S3 进行中，v3.5 记录 S2 已完成 / `VERIFIED` 与 S3 `READY`，v3.4 记录 S2 进行中，v3.3 记录 S2 `READY`，v3.2 记录 S1 进行中（PR #127），v3.1 / v3.0 记录 Phase D 阶段计划登记、#99–#104 收口与 1.6.3 发布事实、真实 `1.6.2 → 1.6.3` 升级 `APPLIED`）
@@ -16,7 +16,7 @@
 
 | 任务 | 交付重点 | 依赖 | 状态 | 依据 |
 |---|---|---|---|---|
-| [#2](https://github.com/ctrlshiftaltdel/AgentOrch/issues/2) 结构化验收证据矩阵 | 任务字段、证据映射、负向 / 迁移场景、结构测试 | Epic [#1](https://github.com/ctrlshiftaltdel/AgentOrch/issues/1) | 已完成 | Issue 已关闭；字段契约落在 `kit/orchestration.md` 4.1 |
+| [#2](https://github.com/ctrlshiftaltdel/AgentOrch/issues/2) 结构化验收证据矩阵 | 任务字段、证据映射、负向 / 迁移场景、结构测试 | Epic [#1](https://github.com/ctrlshiftaltdel/AgentOrch/issues/1) | 已完成 | Issue 已关闭；字段契约落在 `docs/orchestration.md` 4.1 |
 | [#4](https://github.com/ctrlshiftaltdel/AgentOrch/issues/4) edition 权威来源与 fail-closed | 区分项目底座与 CLI 配置、合法 / 非法 / 损坏配置测试 | Epic #1 | 已完成 | Issue 已关闭；`docs/PROJECT.md` 的 `edition` 为唯一权威 |
 | [#14](https://github.com/ctrlshiftaltdel/AgentOrch/issues/14) GitHub Actions 接入 | PR 上跑规则包校验、单元测试与语法检查 | Epic #1 | 已完成 | Issue 已关闭；`.github/workflows/ci.yml` |
 | [#15](https://github.com/ctrlshiftaltdel/AgentOrch/issues/15) 根 `PLAN.md` 与 `init` 初始化 | `init` 生成设计目标文件；阶段目标与执行路径由 #19 拆分到本文件 | #2 | 已完成 | PR #18 已合并；`init` 冒烟与单元测试 |
@@ -104,7 +104,7 @@ Owner 于 2026-10-29 明确要求“按项目规则发送整改 issues（不用�
 - 不设固定并发数；共享 `docs/implementation-plan.md`、`runtime_adapter.py`、测试目录、设计文件或父子路径一律按实际锁串行。各 Issue 允许范围含 `docs/README.md` 时，#150 等任务也可能与整改相交，必须重新检查，不能照表直接并行。
 - 计划文件路径序 **#202 / PR #203 → #207 → #162 → #151 → #152**，代码共享路径序 **#205 → #206 → #170**。两者都是路径队列，不是新的功能依赖；临时路径冲突不永久化为功能依赖。
 - 没有任务包、真实执行实例与路径冲突检查，不标 `READY` 或 `DISPATCHED`；不得复用旧 SHA 的 `PASS` 冒充当前 head，也不得为提效取消完整回归、降低 Reviewer 独立性或删减测试。
-- #151 未 `VERIFIED` 前，编排契约（含本文件对字段 / 状态 / 合并门的引用）仍指向 [kit/orchestration.md](../kit/orchestration.md)。
+- #151 未 `VERIFIED` 前，编排契约（含本文件对字段 / 状态 / 合并门的引用）的权威路径是 [docs/orchestration.md](orchestration.md)；不得据此宣称迁移已验收。
 
 ## 2. 为什么要分阶段
 
@@ -191,7 +191,7 @@ Owner 于 2026-10-29 明确要求“按项目规则发送整改 issues（不用�
 
 并行与路径规则：
 
-- #2 与 #4 的锁定路径在 `scripts/validate_kit.py`、`tests/`、`kit/orchestration.md` 上相交，按路径锁规则**串行**完成，并非并行完成的先例。跨文件并行的前提是锁定路径不相交；不得用“计划上允许并行”代替实际的冲突检查。
+- #2 与 #4 的锁定路径在 `scripts/validate_kit.py`、`tests/`、`docs/orchestration.md` 上相交，按路径锁规则**串行**完成，并非并行完成的先例。跨文件并行的前提是锁定路径不相交；不得用“计划上允许并行”代替实际的冲突检查。
 - #3 的模板可先起草；与任务模板共用路径时必须协调所有权，不能并行编辑同一 Worktree 或同一文件。
 - #5 是设计冻结任务；#6 不得在 #5 验收前开始实现锁语义。
 - #7 与 #8 可并行，但须分配不重叠路径；变更发行清单 / 校验器的任务独占相关路径。
@@ -227,7 +227,7 @@ Owner 于 2026-10-29 明确要求“按项目规则发送整改 issues（不用�
 
 缺口按三类处理：`BLOCKING`（阶段不得标为完成）、`NON_BLOCKING_HARDENING`（可继续，但须写明风险、跟踪任务与接受依据）、`NEEDS_HUMAN_DECISION`（保留阻塞，不代替所有者做决定）。
 
-单个任务的验收字段、证据条目格式与合并门判定，直接在 `kit/orchestration.md` 4.1 与第 5 节执行；本文件不复制这些定义，也不替它们做解释。
+单个任务的验收字段、证据条目格式与合并门判定，直接在 `docs/orchestration.md` 4.1 与第 5 节执行；本文件不复制这些定义，也不替它们做解释。
 
 ## 8. 回退与风险处理
 
@@ -258,7 +258,7 @@ Owner 于 2026-10-29 明确要求“按项目规则发送整改 issues（不用�
 - **只经 PR 修改**：本文件的任何变更都要走任务分支 + PR + 独立审查；不在会话里口头改计划而不落文件。
 - **状态只写第 1 节**：任务状态、当前阶段与“下一步”只改第 1 节；设计目标改动才动 `PLAN.md`。
 - **先计划后登记**：新任务先写进第 1 节与第 5 节顺序，再登记为 Issue / 任务；关闭或取消的任务保留行并注明结果，不删除历史。
-- **不复制定义**：字段、状态与门禁语义始终引用 `kit/orchestration.md`；发现本文件与核心文档口径不一致，先停下对齐，不在两处各写一套。
+- **不复制定义**：字段、状态与门禁语义始终引用 `docs/orchestration.md`；发现本文件与核心文档口径不一致，先停下对齐，不在两处各写一套。
 - **冲突处理**：与本文件的设计目标来源 `PLAN.md` 冲突时，以设计目标为准并停下对齐。
 
 
@@ -349,7 +349,7 @@ Owner 于 2026-10-29 明确要求“按项目规则发送整改 issues（不用�
 
 **目标**：在真实运行时能力、候选 Agent / 模型证据与本机私有记录的基础上，为每个任务选择 Execution 与 Reviewer；能力缺失、数据过期或来源不可用时安全降级并如实报告。设计冻结见 [agent-role-discovery-and-model-selection.md](design/agent-role-discovery-and-model-selection.md)。
 
-本阶段是增量能力：不改变任务状态机、路径 / 资源锁、G1–G6 合并门，也不改变 C1–C4 / C1–C8 的能力语义。这些定义仍只在 [kit/orchestration.md](../kit/orchestration.md) 与 [templates/runtime-capability.md](../templates/runtime-capability.md) 中，本节只引用不重述。
+本阶段是增量能力：不改变任务状态机、路径 / 资源锁、G1–G6 合并门，也不改变 C1–C4 / C1–C8 的能力语义。这些定义仍只在 [docs/orchestration.md](orchestration.md) 与 [templates/runtime-capability.md](../templates/runtime-capability.md) 中，本节只引用不重述。
 
 ### 13.1 阶段顺序、交付与出口条件
 
@@ -472,7 +472,7 @@ Owner 于 2026-10-29 明确要求“按项目规则发送整改 issues（不用�
 
 ## 15. 跨专项任务顺序与任务驱动分配（Issue #197，2026-10-28；2026-10-29 效率优先排序见 §15.8）
 
-**登记边界**：本节只记录执行时的真实状态、已有依赖、条件边、路径 / 资源串行与建议顺序，供 Master 调度。它不新增任务、不改变任何 Issue / PR 的状态、依赖、正文或 registry、不授予 `READY`、不改变 `docs/PLAN.md`、核心契约、G1–G6、C1–C4 / C1–C8、路径 / 资源锁或发行授权。任务状态仍以第 1 节与 Issue / PR 载体为准；字段、状态取值和证据定义仍只在 [kit/orchestration.md](../kit/orchestration.md) 4.1 与第 5 节。
+**登记边界**：本节只记录执行时的真实状态、已有依赖、条件边、路径 / 资源串行与建议顺序，供 Master 调度。它不新增任务、不改变任何 Issue / PR 的状态、依赖、正文或 registry、不授予 `READY`、不改变 `docs/PLAN.md`、核心契约、G1–G6、C1–C4 / C1–C8、路径 / 资源锁或发行授权。任务状态仍以第 1 节与 Issue / PR 载体为准；字段、状态取值和证据定义仍只在 [docs/orchestration.md](orchestration.md) 4.1 与第 5 节。
 
 ### 15.1 实时基线与提案状态
 
@@ -651,7 +651,7 @@ Owner 2026-10-28 排序决定覆盖更早“主动发行优先”的顺序：**#
 
 **现行默认规则、临时授权与未来方向必须分开**：
 
-1. **现行默认规则（当前生效）**：[kit/orchestration.md](../kit/orchestration.md) 第一部分“角色选择入口”与第二部分 §5 规定，C1–C4 任一项不是 `PASS`（包括 `UNKNOWN` / `STALE` / 已过期）时，**停止自动派发并转人工交接**。`UNKNOWN` / `FAIL` 一律不等于 `PASS`；没有真实证据就不能推进依赖该能力的状态。
+1. **现行默认规则（当前生效）**：[docs/orchestration.md](orchestration.md) 第一部分“角色选择入口”与第二部分 §5 规定，C1–C4 任一项不是 `PASS`（包括 `UNKNOWN` / `STALE` / 已过期）时，**停止自动派发并转人工交接**。`UNKNOWN` / `FAIL` 一律不等于 `PASS`；没有真实证据就不能推进依赖该能力的状态。
 2. **#146 临时授权（原文范围为“本轮相关任务”）**：[#146 评论 6468103536](https://github.com/ctrlshiftaltdel/AgentOrch/issues/146#issuecomment-6468103536) 的原文只写“本轮相关任务”，**该评论没有枚举具体 Issue ID**。因此不得把未列出的清单说成已经明确，也不得自行推断它覆盖哪些 future task；**某个任务是否适用，须以 Owner 对该任务的明确授权 / 确认记录为准**。它不是长期政策，也不构成能力 `PASS`、上下文隔离或 Reviewer 身份证明。
 3. **#174 未来方向（尚未生效）**：[#174 评论 6468107357](https://github.com/ctrlshiftaltdel/AgentOrch/issues/174#issuecomment-6468107357) 的“能力探测缺失 / `UNKNOWN` / `STALE` / 未证明客观缺失的 `FAIL` 以风险提示为主、而非默认阻断”仍是待设计冻结、实现与回归的目标方向，**当前不生效**，不得据草稿扩写成新政策。
 
@@ -677,7 +677,7 @@ Owner 2026-10-28 排序决定覆盖更早“主动发行优先”的顺序：**#
 
 ### 15.8 Owner 2026-10-29 效率优先排序与路径队列（Issue #207）
 
-**登记边界**：本节只登记 Owner 2026-10-29 的最新排序、优先理由、放行条件与路径队列，供 Master 调度。它不新增任务、不改变任何 Issue / PR 的状态、依赖、正文或 registry，不授予 `READY` / `DISPATCHED`，也不改变 `docs/PLAN.md`、核心契约、G1–G6、C1–C4 / C1–C8、路径 / 资源锁或发行授权。状态权威仍在第 1 节与各任务载体；字段、状态取值与证据语义仍只引用 [kit/orchestration.md](../kit/orchestration.md) 4.1 与第 5 节，本文件不另立第二套。
+**登记边界**：本节只登记 Owner 2026-10-29 的最新排序、优先理由、放行条件与路径队列，供 Master 调度。它不新增任务、不改变任何 Issue / PR 的状态、依赖、正文或 registry，不授予 `READY` / `DISPATCHED`，也不改变 `docs/PLAN.md`、核心契约、G1–G6、C1–C4 / C1–C8、路径 / 资源锁或发行授权。状态权威仍在第 1 节与各任务载体；字段、状态取值与证据语义仍只引用 [docs/orchestration.md](orchestration.md) 4.1 与第 5 节，本文件不另立第二套。
 
 **覆盖关系**：Owner 2026-10-29 的排序显式覆盖 #197 / PR #200 的旧建议「#185→#186 后立即主动发行」（[#197 旧记录](https://github.com/ctrlshiftaltdel/AgentOrch/issues/197#issuecomment-6473530069)；§15.1 / §15.3.4 保留历史原文）。覆盖只作用于调度优先级；§15.3.1 的功能硬依赖、设计冻结、`READY` 门，以及发布 / 生产门禁的专属授权继续有效，不得因排序变化被视为已满足或已取消。
 
@@ -712,7 +712,7 @@ Owner 2026-10-28 排序决定覆盖更早“主动发行优先”的顺序：**#
 - **#188**：仍须 A–C `VERIFIED` 后由 Owner 单独明确授权；本轮“提效”指令不代替该授权，#189 随之。
 - **#170**：仍是身份来源 / 核验 / 失效规则未冻结的 `OPEN` / `bug`；S0-2 只是路径队列，不能写成已修复或已独立。
 - **#205 / #206 / #170**：以 #207 合并并 `VERIFIED` 作为就绪治理门；未满足前不标 `READY` 或 `DISPATCHED`。
-- **#151 契约指向**：#151 未 `VERIFIED` 前，编排契约、字段语义与合并门仍引用 [kit/orchestration.md](../kit/orchestration.md)，不得提前改写引用或复制第二份状态表。
+- **#151 契约指向**：编排契约、字段语义与合并门的唯一权威路径是 [docs/orchestration.md](orchestration.md)（迁移前为 `kit/orchestration.md`，不再分发）；#151 未 `VERIFIED` 前不得宣称迁移已验收，也不得复制第二份状态表。
 - **通用**：没有任务包、真实执行实例与路径冲突检查，不标 `READY` 或 `DISPATCHED`；优先级不是 `PASS`、完成或授权。
 
 **本登记任务的证据**：#207 只改本文件；其 changed paths、命令 / 退出码、九列 AC 矩阵与四平台 CI 记录在对应 PR 正文或评论与当前 head，不在本节预写 `PASS`。
@@ -726,7 +726,7 @@ Owner 2026-10-28 排序决定覆盖更早“主动发行优先”的顺序：**#
 **基线事实与本阶段目标必须分开**：
 
 - **已发布基线**：`v1.7.0` / Format 1.7 是当前主线最新发布（§12.1），Kit 包为 117 个 `REQUIRED` 文件加 `MANIFEST.json`；Phase D（#120–#124）已完成并应增量复用。
-- **当前核心契约仍是** [kit/orchestration.md](../kit/orchestration.md)；`docs/orchestration.md` 是 [#151](https://github.com/ctrlshiftaltdel/AgentOrch/issues/151) 的目标，**尚未 `VERIFIED`**，不得写成现行事实。
+- **当前核心契约是** [docs/orchestration.md](orchestration.md)（#151 路径迁移；迁移前为 `kit/orchestration.md`，不再分发）；[#151](https://github.com/ctrlshiftaltdel/AgentOrch/issues/151) **尚未 `VERIFIED`**，不得据此宣称迁移已验收。
 - **下游 `agentorch/` 隔离布局**是 [#153](https://github.com/ctrlshiftaltdel/AgentOrch/issues/153) 的目标，**尚未 `VERIFIED`**；#164 / #167 只能按已实测布局限定范围，或把该布局写成依赖 / 目标。
 - **DSH 运行时能力**：公开 API、per-agent 工具隔离、调用上下文、bundle 加载与安装行为均待 #163 / [#167](https://github.com/ctrlshiftaltdel/AgentOrch/issues/167) 实测；未实测项记 `UNKNOWN` / `NOT_RUN`，不得由 stub 或静态 YAML 测试代替。
 - **edition**：本仓库为 `github`；DSH 适配不得用本地 SQLite 冒充 GitHub 任务载体。
@@ -776,6 +776,6 @@ Owner 2026-10-28 排序决定覆盖更早“主动发行优先”的顺序：**#
 
 - 不改任务状态机、路径 / 资源锁、G1–G6、C1–C4 / C1–C8、edition 语义或 Kit 的 `REQUIRED` / `MANIFEST.json`；不新增第四种角色，不自动创建 / 授权 subagent，不自动切换 Master 模型，不自动打 tag / 建 Release / 上传资产。
 - DSH 官方 Release 条目会变化：设计文稿 §2.1 的快照带查询时间，只是历史事实；#163 必须在固定版本上重新查询并记录新的时间戳与 tag，不能把预发布条目当作已兼容。
-- #151 / #153 未 `VERIFIED` 前，只能支持已实测的现行布局；`docs/orchestration.md` 与 `agentorch/` 布局只能写为目标 / 依赖，不能写成已完成。
+- #153 未 `VERIFIED` 前，只能支持已实测的现行布局；`agentorch/` 布局只能写为目标 / 依赖，不能写成已完成。#151 的契约路径迁移在 `VERIFIED` 前也不得写成已验收。
 - 任何未在当前 head 真实执行的平台、profile 或 engine 版本记 `NOT_RUN` / `UNKNOWN`；Node 单测、mock registry 或 YAML 结构检查不能证明真实 DSH 加载与角色隔离。
 - 本节只登记阶段目标、顺序、依赖与出口；接口契约、字段、错误码、安全模型与发布步骤以设计文稿和各子 Issue 正文为准，本文件不复制。

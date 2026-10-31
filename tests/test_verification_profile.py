@@ -189,7 +189,7 @@ class EvidenceFallbackTests(ProjectFixture):
     def test_restricted_paths_keep_full_regression(self):
         restricted = (
             'scripts/orchestrator.py',
-            'kit/orchestration.md',
+            'docs/orchestration.md',
             '.github/workflows/ci.yml',
             'docs/PROJECT.md',
             'docs/PLAN.md',

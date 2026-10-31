@@ -37,7 +37,7 @@ SUITE = 'Agent-Orchestration Starter Kit'
 FORMAT = '1.7'
 
 TREE_FILES = {
-    'kit/orchestration.md': '# core contract\n',
+    'docs/orchestration.md': '# core contract\n',
     'editions/local/master.md': '# local edition\n',
     'docs/PROJECT.md': '- `edition`: `local`\n',
 }
@@ -93,7 +93,7 @@ def run_cli(*args, cwd=None):
 
 class ManifestGenerationTests(unittest.TestCase):
     def test_entries_are_sorted_and_carry_the_contract_fields(self):
-        files = {'editions/local/master.md': b'e', 'kit/orchestration.md': b'c',
+        files = {'editions/local/master.md': b'e', 'docs/orchestration.md': b'c',
                  'templates/plan.md': b't', 'docs/PROJECT.md': b'p'}
         manifest = drift.build_manifest(files, SUITE, FORMAT)
         self.assertEqual(sorted(manifest), ['files', 'format_version', 'schema_version', 'suite'])
@@ -108,7 +108,7 @@ class ManifestGenerationTests(unittest.TestCase):
             self.assertRegex(entry['sha256'], r'^[0-9a-f]{64}$')
 
     def test_manifest_has_no_timestamp_and_is_byte_stable(self):
-        files = {'kit/orchestration.md': b'# core\n', 'kit/orchestration.md': b'# boot\n'}
+        files = {'docs/orchestration.md': b'# core\n', 'docs/orchestration.md': b'# boot\n'}
         first = drift.dumps_manifest(drift.build_manifest(files, SUITE, FORMAT))
         second = drift.dumps_manifest(drift.build_manifest(files, SUITE, FORMAT))
         self.assertEqual(first, second)
@@ -117,7 +117,7 @@ class ManifestGenerationTests(unittest.TestCase):
             self.assertNotIn(key, payload)
 
     def test_hash_and_size_follow_lf_normalization(self):
-        manifest = drift.build_manifest({'kit/orchestration.md': b'# a\r\n# b\r\n'},
+        manifest = drift.build_manifest({'docs/orchestration.md': b'# a\r\n# b\r\n'},
                                         SUITE, FORMAT)
         entry = manifest['files'][0]
         self.assertEqual(entry['size'], len(b'# a\n# b\n'))
@@ -155,7 +155,7 @@ class ManifestGenerationTests(unittest.TestCase):
     def test_two_archives_of_one_tree_are_byte_identical(self):
         builder = load('build_release_under_test', BUILD)
         files = {
-            'kit/orchestration.md': b'# core\n',
+            'docs/orchestration.md': b'# core\n',
             'editions/local/master.md': b'# edition\n',
             'docs/PROJECT.md': b'# project\n',
         }
@@ -229,7 +229,7 @@ class ReleaseAssetNamingTests(unittest.TestCase):
 
     def test_archive_follows_the_release_stem_and_keeps_the_format_version(self):
         files = {
-            'kit/orchestration.md': b'# core\n',
+            'docs/orchestration.md': b'# core\n',
             'editions/local/master.md': b'# edition\n',
         }
         manifest = drift.build_manifest(files, SUITE, FORMAT)
@@ -252,7 +252,7 @@ class ReleaseAssetNamingTests(unittest.TestCase):
     def test_patch_archive_keeps_the_format_version_and_is_reproducible(self):
         """1.7.0 is a release number: the top dir follows it, the Format does not."""
         files = {
-            'kit/orchestration.md': b'# core\n',
+            'docs/orchestration.md': b'# core\n',
             'editions/local/master.md': b'# edition\n',
         }
         suite, format_version = drift.read_version(ROOT)
@@ -375,7 +375,7 @@ class ManifestValidationTests(unittest.TestCase):
         self.assertTrue(any('missing on disk' in e for e in errors), errors)
 
     def test_hash_mismatch_is_reported(self):
-        self.tree.write('kit/orchestration.md', '# tampered\n')
+        self.tree.write('docs/orchestration.md', '# tampered\n')
         errors = drift.validate_manifest(self.tree.root, self.manifest)
         self.assertTrue(any('sha256 does not match' in e for e in errors), errors)
 
@@ -419,10 +419,10 @@ class ManifestValidationTests(unittest.TestCase):
         self.assertTrue(any('must not contain' in e for e in errors), errors)
 
     def test_manifest_does_not_list_itself(self):
-        files = {'kit/orchestration.md': b'c', drift.MANIFEST_NAME: b'{}'}
+        files = {'docs/orchestration.md': b'c', drift.MANIFEST_NAME: b'{}'}
         manifest = drift.build_manifest(files, SUITE, FORMAT)
         self.assertEqual([entry['path'] for entry in manifest['files']],
-                         ['kit/orchestration.md'])
+                         ['docs/orchestration.md'])
 
     def test_schema_newer_than_supported_is_not_a_structure_error(self):
         manifest = json.loads(drift.dumps_manifest(self.manifest))
@@ -451,11 +451,11 @@ class DiagnosisTests(unittest.TestCase):
             self.assertEqual(report['findings'][key], [])
 
     def test_modified_core_file_is_drift(self):
-        self.tree.write('kit/orchestration.md', '# changed contract\n')
+        self.tree.write('docs/orchestration.md', '# changed contract\n')
         report = drift.diagnose(self.tree.root)
         self.assertEqual(report['status'], 'drift')
         self.assertEqual(report['exit_code'], 2)
-        self.assertEqual(self.paths(report, 'modified'), ['kit/orchestration.md'])
+        self.assertEqual(self.paths(report, 'modified'), ['docs/orchestration.md'])
         item = report['findings']['modified'][0]
         self.assertEqual(item['category'], 'core')
         self.assertNotEqual(item['expected_sha256'], item['actual_sha256'])
@@ -512,7 +512,7 @@ class DiagnosisTests(unittest.TestCase):
         self.assertTrue(any('outside this tool' in note for note in report['notes']))
 
     def test_crlf_checkout_is_not_reported_as_modified(self):
-        path = self.tree.root / 'kit/orchestration.md'
+        path = self.tree.root / 'docs/orchestration.md'
         path.write_bytes(b'# core contract\r\n')
         report = drift.diagnose(self.tree.root)
         self.assertEqual(report['findings']['modified'], [])
@@ -534,7 +534,7 @@ class DiagnosisTests(unittest.TestCase):
         self.assertIn('does not exist', result.stderr)
 
     def test_file_as_root_is_a_tool_error(self):
-        result = run_cli(str(self.tree.root / 'kit/orchestration.md'))
+        result = run_cli(str(self.tree.root / 'docs/orchestration.md'))
         self.assertEqual(result.returncode, 1)
         self.assertIn('not a directory', result.stderr)
 
@@ -611,7 +611,7 @@ class CliContractTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_json_mode_prints_only_json_on_stdout(self):
-        self.tree.write('kit/orchestration.md', '# changed\n')
+        self.tree.write('docs/orchestration.md', '# changed\n')
         result = run_cli(str(self.tree.root), '--json')
         self.assertEqual(result.returncode, 2, result.stderr)
         report = json.loads(result.stdout)
@@ -619,7 +619,7 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(report['exit_code'], 2)
         self.assertEqual(report['report_schema_version'], drift.REPORT_SCHEMA_VERSION)
         self.assertEqual(set(report), self.REPORT_KEYS)
-        self.assertEqual(report['findings']['modified'][0]['path'], 'kit/orchestration.md')
+        self.assertEqual(report['findings']['modified'][0]['path'], 'docs/orchestration.md')
         self.assertIn('status: drift', result.stderr)
 
     def test_json_mode_reports_clean_with_exit_zero(self):
@@ -675,6 +675,36 @@ class ValidateKitManifestTests(unittest.TestCase):
         self.assertNotIn(drift.MANIFEST_NAME, validate.REQUIRED)
         self.assertIn('scripts/check_drift.py', validate.REQUIRED)
         self.assertIn('tests/test_release_drift.py', validate.REQUIRED)
+
+
+@unittest.skipUnless(BUILD.is_file(), 'build_release.py is repository-only')
+class PackagedDocRuleTests(unittest.TestCase):
+    """Only the core contract may reach the package from docs/.
+
+    The contract now lives under docs/, so the old blanket "no docs/ segment"
+    rule cannot simply be relaxed: it has to become a single-file allowlist, or
+    every design draft and plan in docs/ would ride along in the release.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.builder = load('build_release_doc_rule_under_test', BUILD)
+
+    def test_allowlist_is_exactly_the_core_contract(self):
+        self.assertEqual(self.builder.PACKAGE_DOC_PATHS, {validate.CORE_DOC})
+        self.assertNotIn('docs', self.builder.FORBIDDEN_SEGMENTS)
+
+    def test_the_real_package_ships_only_the_contract_from_docs(self):
+        files = self.builder.collect_sources(validate.REQUIRED)
+        shipped_docs = sorted(path for path in files if 'docs' in path.split('/'))
+        self.assertEqual(shipped_docs, [validate.CORE_DOC])
+        self.assertIn(validate.CORE_DOC, files)
+
+    def test_any_other_docs_source_is_a_build_error(self):
+        for rel in ('docs/design/resource-locks.md', 'docs/README.md',
+                    'docs/implementation-plan.md'):
+            with self.subTest(rel=rel), self.assertRaises(SystemExit):
+                self.builder.collect_sources([rel])
 
 
 if __name__ == '__main__':

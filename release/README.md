@@ -15,7 +15,7 @@
 
 ## 2. 包内容规范
 
-- 只含通用可复用产出；不得包含本仓库特有的演进决策、任务记录或个人环境信息。
+- 只含通用可复用产出；不得包含本仓库特有的演进决策、任务记录或个人环境信息。`docs/` 下**只有**核心契约 `docs/orchestration.md` 随包分发，其余 `docs/` 路径一律拒绝（`build_release.py` 的 `PACKAGE_DOC_PATHS` 白名单）。
 - 包内文件集合 == `scripts/validate_kit.py` 中的 `REQUIRED` 列表 **+ 构建时生成的 `MANIFEST.json`**（数量与名称都一致，即 `len(REQUIRED) + 1` 个文件）。`REQUIRED` 是分发内容的唯一来源，构建脚本直接解析它，不再维护第二份清单；`MANIFEST.json` 是唯一不来自 `REQUIRED` 的成员。
 - **`MANIFEST.json`（机器可读清单）**：由 `scripts/check_drift.py` 生成，构建脚本导入该模块而不另写一份规则，因此分类只有一处实现。字段固定为：
   - 顶层 `schema_version`（清单格式版本）、`suite`（套件名，取自 `VERSION.md`）、`format_version`（套件格式版本，当前 `1.7`）、`files[]`；
@@ -74,14 +74,14 @@
 
 ### 3.2 包内自检在三种树下的行为
 
-自检 b / d 在**解压后的纯净包**里执行：没有 `docs/`，因此 `validate_kit.py` 跳过仓库专属文档，`MANIFEST.json` 的 SHA-256 与大小严格比较。这是发布物本身的证据，不受下游用法影响。
+自检 b / d 在**解压后的纯净包**里执行：包内 `docs/` 只有随包分发的 `docs/orchestration.md`，没有 `docs/PROJECT.md` / `docs/upgrade.md`，因此 `validate_kit.py` 判定为纯净包并跳过仓库专属文档，`MANIFEST.json` 的 SHA-256 与大小严格比较。这是发布物本身的证据，不受下游用法影响。
 
 同一个 `validate_kit.py` 会按树切换模式（汇总行打印 `tree mode`）：
 
 | 树 | 判定依据 | 仓库文档 | `MANIFEST.json` |
 | --- | --- | --- | --- |
-| 纯净包 | 没有 `docs/` | 跳过 | 结构 + 分类 + 路径 + `REQUIRED` 集合 + SHA-256 / 大小 |
-| 下游项目 | 有 `docs/`，没有 `docs/upgrade.md` | 只要求 `docs/PROJECT.md` 与 `docs/PLAN.md` | 结构 + 分类 + 路径 + `REQUIRED` 集合 + 列出文件存在；不比较哈希 |
+| 纯净包 | `docs/` 不存在，或只含随包分发的 `REQUIRED` 文件（当前只有 `docs/orchestration.md`） | 跳过 | 结构 + 分类 + 路径 + `REQUIRED` 集合 + SHA-256 / 大小 |
+| 下游项目 | 有 `docs/PROJECT.md`，没有 `docs/upgrade.md` | 只要求 `docs/PROJECT.md` 与 `docs/PLAN.md` | 结构 + 分类 + 路径 + `REQUIRED` 集合 + 列出文件存在；不比较哈希 |
 | 上游 checkout | 有 `docs/upgrade.md` | 全部仓库文档 | 结构 + 分类 + 路径 + `REQUIRED` 集合 + SHA-256 / 大小 |
 
 - 下游项目解压后补上自己的 `docs/PROJECT.md` 与 `docs/PLAN.md` 即可通过 `validate_kit.py` 与包内 `unittest`；本地修改由 `check_drift.py` 报告，不阻断校验。

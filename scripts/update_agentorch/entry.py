@@ -267,7 +267,7 @@ def _issue_body(environment, report, applied, kept):
         '', '## 边界', '',
         '- 本 Issue 由入口生成，不代表已批准、已合并或已验证。',
         '- 不覆盖项目自有配置 / 业务代码；冲突逐文件保留。',
-        '- 证据矩阵与 G1–G6 判定仍由 `kit/orchestration.md` 与其 4.1 节定义。',
+        '- 证据矩阵与 G1–G6 判定仍由 `docs/orchestration.md` 与其 4.1 节定义。',
     ])
     return '\n'.join(lines) + '\n'
 

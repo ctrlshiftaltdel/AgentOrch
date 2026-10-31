@@ -13,7 +13,7 @@
 
 ## 范围与安全
 
-- 允许改动路径：`AGENTS.md`、`LICENSE.md`、`VERSION.md`、`kit/`、`editions/`、`templates/`、`docs/`、`README.md`（docs 内）、`scripts/validate_kit.py`、`scripts/build_release.py`、`scripts/check_drift.py`、`scripts/report_metrics.py`、`scripts/run_delivery_scenarios.py`、`tests/`、`.github/`、`release/README.md`（`release/*.zip` 除外）
+- 允许改动路径：`AGENTS.md`、`LICENSE.md`、`VERSION.md`、`docs/orchestration.md`、`editions/`、`templates/`、`docs/`、`README.md`（docs 内）、`scripts/validate_kit.py`、`scripts/build_release.py`、`scripts/check_drift.py`、`scripts/report_metrics.py`、`scripts/run_delivery_scenarios.py`、`tests/`、`.github/`、`release/README.md`（`release/*.zip` 除外）
 - 永远禁止改动路径 / 文件：`LICENSE.md`。`.orchestration/` 不是可提交源码：禁止手工编辑、替换或删除其中的状态库、配置与备份；禁止绕过 `scripts/orchestrator.py` 写任务状态；禁止把该目录提交或打进发行包。唯一受控例外是下方「维护写入边界」。未经授权不得改动 `scripts/orchestrator.py` 的状态机与锁语义。
 - 授权记录（2026-10-12）：授权人=项目所有者；授权范围=该轮质量修复；限缩说明=本次授权仅覆盖当轮，不改变后续任务的默认边界。
 - 秘密与隐私文件模式：`.env*`、`*token*`、`*secret*`、个人绝对路径
@@ -33,7 +33,7 @@
 - 手工 / UI 冒烟检查：按新提示词走一遍空目录启动冒烟
 - 合并后必须执行：快速测试 + 完整回归 + `python scripts/orchestrator.py backup` + 静态检查。`backup` 只按「维护写入边界」执行；该边界未出现在合并目标 `main` 上时，不得用待合并文本给当次合并授权。
 - 合并后验证 profile（2026-10-31 项目所有者授权，Issue #188）：每个 HEAD 的 CI 全套仍必须真实通过；默认集合仍是快速测试 + 完整回归 + `backup` + 静态检查。唯一授权减项仅当 `verification_profile` 精确等于 `risk_pilot` 且调用者用 `python scripts/verification_profile.py --evidence <json>` 显式证明变更为 L0 时生效：此时合并后集合可以不含 `python -m unittest discover -s tests`，但仍必须含 `python scripts/validate_kit.py`、`python -m py_compile scripts/orchestrator.py scripts/validate_kit.py` 与 `python scripts/orchestrator.py backup`。
-- 上述减项的关闭条件：证明缺失或不可判定、`executable_doc` / `policy` / `contract` / `uncertainty_l3` 任一为真，或任一路径命中 `scripts/orchestrator.py`、`kit/`、`.github/workflows/`、`docs/PROJECT.md`、`docs/PLAN.md`、`AGENTS.md`、`editions/`、`scripts/`、`release/`、`templates/`、`VERSION.md` 时，仍执行完整回归。L1 / L2 / L3、发布、安全、权限、身份、迁移、锁与状态机相关检查一律不减。
+- 上述减项的关闭条件：证明缺失或不可判定、`executable_doc` / `policy` / `contract` / `uncertainty_l3` 任一为真，或任一路径命中 `scripts/orchestrator.py`、`docs/orchestration.md`、`.github/workflows/`、`docs/PROJECT.md`、`docs/PLAN.md`、`AGENTS.md`、`editions/`、`scripts/`、`release/`、`templates/`、`VERSION.md` 时，仍执行完整回归。L1 / L2 / L3、发布、安全、权限、身份、迁移、锁与状态机相关检查一律不减。
 - 回退：把 `verification_profile` 改回 `strict`（或删除该键）即恢复唯一的默认完整集合，不需要改代码。
 
 ## 运行配置

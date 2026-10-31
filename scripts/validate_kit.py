@@ -12,11 +12,14 @@ MANIFEST_DOC = 'MANIFEST.json'
 #   2. the file manifest of the release package built by scripts/build_release.py.
 # scripts/build_release.py parses THIS list to decide what to package, so there is
 # no second manifest to maintain. Keep it in sync whenever a versioned artifact is
-# added or removed. Files that must not ship (docs/, release/, the release builder
-# itself, .orchestration/, .worktrees/, .workbuddy/) are simply not listed here.
+# added or removed. Files that must not ship (the rest of docs/, release/, the
+# release builder itself, .orchestration/, .worktrees/, .workbuddy/) are simply not
+# listed here. `docs/orchestration.md` is the one deliberate exception: the core
+# contract lives in docs/ but still ships, because a package without the contract
+# would be unusable.
 REQUIRED = [
     'AGENTS.md', 'LICENSE.md', 'VERSION.md',
-    'kit/orchestration.md',
+    'docs/orchestration.md',
     'editions/github/active-task-registry.md', 'editions/github/issue-template.md',
     'editions/github/execution.md', 'editions/github/master.md',
     'editions/github/pr-template.md',
@@ -66,6 +69,7 @@ REQUIRED = [
     'scripts/update_agentorch/__init__.py', 'scripts/update_agentorch/__main__.py',
     'scripts/update_agentorch/classify.py', 'scripts/update_agentorch/cli.py',
     'scripts/update_agentorch/engine.py', 'scripts/update_agentorch/entry.py',
+    'scripts/update_agentorch/migrate.py',
     'scripts/update_agentorch/package.py', 'scripts/update_agentorch/report.py',
     'scripts/update_agentorch/sources.py', 'scripts/update_agentorch/versions.py',
     'scripts/update_agentorch/workspace.py',
@@ -101,6 +105,7 @@ REQUIRED = [
     'tests/test_update_entry.py', 'tests/test_validate_kit.py',
     'tests/update_agentorch/__init__.py', 'tests/update_agentorch/support.py',
     'tests/update_agentorch/test_classification.py',
+    'tests/update_agentorch/test_contract_migration.py',
     'tests/update_agentorch/test_dependencies.py',
     'tests/update_agentorch/test_engine.py',
     'tests/update_agentorch/test_entry_release.py',
@@ -110,9 +115,9 @@ REQUIRED = [
 
 # --- Repository-only required documents --------------------------------------
 # These files are required in a checkout but must NOT be added to REQUIRED:
-# scripts/build_release.py refuses to package any path containing a `docs`
-# segment (FORBIDDEN_SEGMENTS), so listing them above would turn every release
-# self-check red. They are still required artifacts — a missing file or a
+# scripts/build_release.py refuses every `docs` path except the shipped core
+# contract (docs/orchestration.md), so listing any of them above would turn every
+# release self-check red. They are still required artifacts — a missing file or a
 # deleted section fails validate_kit on a checkout.
 #
 # `tests/update_agentorch/test_report.py` is repository-only for the same
@@ -131,8 +136,10 @@ REQUIRED = [
 #
 # `docs/upgrade.md` is the upstream marker: it is repository-only, so its
 # presence means "this is an upstream checkout" and the full set is enforced.
-# A `docs/` directory without it is a downstream project tree; no `docs/` at all
-# is a pristine release package. A downstream project must not create its own
+# A docs/ directory holding a project config (`docs/PROJECT.md`) is a downstream
+# project tree; a docs/ directory holding nothing but the shipped contents of
+# REQUIRED (today just docs/orchestration.md) is a pristine release package. See
+# `tree_mode` for the exact rule. A downstream project must not create its own
 # `docs/upgrade.md` — that would switch the tree to upstream mode.
 PROJECT_DOCS = {
     'docs/PROJECT.md': (),
@@ -229,11 +236,11 @@ EXTERNAL_LINK_PREFIXES = ('http://', 'https://', 'mailto:', '#')
 
 # --- Evidence matrix contract -------------------------------------------------
 # The field names, the status enum and the G1 rules are defined once, in
-# kit/orchestration.md 4.1. This module reads that definition back (it does not
+# docs/orchestration.md 4.1. This module reads that definition back (it does not
 # restate it) and enforces it on the local/github task templates. If the doc drifts
 # away from the contract floor below, validation fails instead of silently
 # accepting a second definition.
-CORE_DOC = 'kit/orchestration.md'
+CORE_DOC = 'docs/orchestration.md'
 TASK_PACKET_DOC = 'templates/task-packet.md'
 ISSUE_TEMPLATE_DOC = 'editions/github/issue-template.md'
 EVIDENCE_FIELD_ANCHOR = '证据条目（evidence item）字段'
@@ -247,7 +254,7 @@ NOT_RUN_MARKERS = re.compile(
     r'\bnot[ _-]?run\b|\bnot executed\b|\bnot verified\b|未执行|未运行|未验证|blocked by|被阻塞', re.I)
 SHA_RE = re.compile(r'^[0-9a-f]{40}$')
 # Fields every task packet must carry, on top of the structured scenario fields
-# read from kit/orchestration.md. Names are the template labels, lower-cased.
+# read from docs/orchestration.md. Names are the template labels, lower-cased.
 PACKET_REQUIRED_FIELDS = (
     'task id', 'title', 'goal / user-visible result', 'context', 'allowed paths',
     'forbidden paths', 'dependencies (must be verified)', 'acceptance criteria',
@@ -480,16 +487,29 @@ def audit_conclusion_errors(text, label='milestone audit'):
 def tree_mode(root=ROOT):
     """Which of the three supported trees *root* is.
 
-    `package`    - a pristine release package: no `docs/` at all.
-    `downstream` - a project tree: `docs/` exists, `docs/upgrade.md` does not.
+    `package`    - a pristine release package: its `docs/` holds nothing but the
+                   shipped files of REQUIRED (today only docs/orchestration.md).
+    `downstream` - a project tree: `docs/PROJECT.md` exists, `docs/upgrade.md`
+                   does not.
     `upstream`   - this repository: `docs/upgrade.md` marks an upstream checkout.
+
+    The contract now lives at docs/orchestration.md, so "has a docs/ directory"
+    no longer distinguishes a package from a project. The project config
+    (docs/PROJECT.md) does; a docs/ tree without it is only a package while every
+    file under it is shipped. Anything else is treated as a downstream project,
+    which fails closed on a missing docs/PROJECT.md instead of silently skipping
+    the document checks.
     """
     root = Path(root)
-    if not (root / 'docs').is_dir():
-        return TREE_PACKAGE
     if (root / UPSTREAM_MARKER_DOC).is_file():
         return TREE_UPSTREAM
-    return TREE_DOWNSTREAM
+    if (root / 'docs' / 'PROJECT.md').is_file():
+        return TREE_DOWNSTREAM
+    docs = root / 'docs'
+    if not docs.is_dir():
+        return TREE_PACKAGE
+    shipped = {path.relative_to(root).as_posix() for path in docs.rglob('*') if path.is_file()}
+    return TREE_PACKAGE if shipped <= set(REQUIRED) else TREE_DOWNSTREAM
 
 
 def required_doc_errors(root=ROOT):
@@ -937,7 +957,7 @@ def validate_kit(root=ROOT, project_ready=False):
     if project_ready:
         cfg_path = root / 'docs' / 'PROJECT.md'
         if not cfg_path.is_file():
-            errors.append('docs/PROJECT.md is missing: copy kit/templates/project.md and replace '
+            errors.append('docs/PROJECT.md is missing: copy templates/project.md and replace '
                           'every FILL_IN placeholder (edition, allowed paths, verification commands)')
         else:
             cfg = cfg_path.read_text(encoding='utf-8')

@@ -1,10 +1,10 @@
 # orchestration.md — 会话入口 · 状态机与合并门 · 通用验收程序
 
-> 本文件由 1.4 及之前的 `kit/orchestration.md`、`kit/orchestration.md`、`kit/orchestration.md` 三份合并而来（1.5 起唯一权威）。
+> 本文件由 1.4 及之前的 bootstrap / orchestration / acceptance 三份入口文档合并而来，1.5 起为唯一权威。路径迁移（`kit/orchestration.md` → `docs/orchestration.md`）后仍只有这一份可编辑权威，不保留第二份副本。
 
-# 第一部分：会话入口（原 kit/orchestration.md）
+# 第一部分：会话入口
 
-# kit/orchestration.md — 会话自动引导入口
+# 会话自动引导入口
 
 本文件定义每次 Agent 会话开始的确定性入口。无论会话由谁发起、上下文是否丢失，都要按本流程恢复状态并自动路由，不依赖聊天记忆或人工提醒。
 
@@ -16,7 +16,7 @@
 
 1. `docs/PROJECT.md` — 读取 `edition`，取值必须是 `local` 或 `github`。
 2. `AGENTS.md` — 核心协作契约（edition-neutral），含「阅读口径（唯一权威）」段。
-3. `kit/orchestration.md` 第一部分（会话入口）与第二部分（状态机、合并门与能力契约）——**必读**；第三部分（通用验收程序）按需读，见下。
+3. `docs/orchestration.md` 第一部分（会话入口）与第二部分（状态机、合并门与能力契约）——**必读**；第三部分（通用验收程序）按需读，见下。
 4. `editions/<edition>/master.md` — 当前底座的 Master 手册。
 
 **阅读口径（只回指，不另立一套）**：必读集合与「第三部分按需」规则以 [AGENTS.md](../AGENTS.md) 的「阅读口径（唯一权威）」段为唯一权威。落到本文件：第一、二部分属必读集合；第三部分**按需读**，触发条件与本文件第三部分开头一致（每次首次接入、变更调度器 / 提示词，或更换 Agent 运行时后执行），本节不新增触发项、不缩小既有触发项；触发条件未满足时，缺少该部分的逐段引用不构成验收缺失。
@@ -119,9 +119,9 @@ Master 在把任务推进到 `DISPATCHED` 或交给执行实例**之前**，或�
 - 底座不一致（例如项目声明 `github` 但只有本地任务库）属于阻断问题：停止派发，报告实际观察与所需决定，不得自行迁移或双写。
 
 
-# 第二部分：状态机与合并门（原 kit/orchestration.md）
+# 第二部分：状态机与合并门
 
-# kit/orchestration.md — 核心编排细则（Edition-Neutral）
+# 核心编排细则（Edition-Neutral）
 
 本文件定义两个底座共用的编排契约：状态机、任务锁、合并门、运行时能力探测与切换规则。任务载体和证据来源由 `docs/PROJECT.md` 的 `edition` 决定：`local` 使用 SQLite 任务库与原子路径锁，`github` 使用 Issue 任务单、Draft PR 与 CI。若某项能力依赖运行时支持而当前环境并不具备，必须降级并记录依据，不得假装执行。
 
@@ -254,7 +254,7 @@ PLANNED → READY → DISPATCHED → IN_PROGRESS → [PR_OPEN] → REVIEW_READY 
 - `APPROVED` 必须带当前完整 commit SHA。工作树或提交头有任何变化，批准立即失效，需重新审查。
 - 只有 Master 执行合并（`local` 例如 `git merge --no-ff <branch>`，`github` 例如平台合并按钮 / `gh pr merge`；具体策略由项目配置决定）。执行者不能自批自合。
 - 合并前备份或确认可恢复；遇到冲突不自动覆盖他人 / 主分支内容。
-- 合并后运行 `docs/PROJECT.md` 指定的验证命令，保存日志与退出码；全部通过后转 `VERIFIED`。默认集合是快速测试 + 完整回归 + `backup` + 静态检查；只有 `verification_profile` 精确为 `risk_pilot` 且调用者显式证明变更为 L0 时，才可以省略完整回归，`validate_kit`、`py_compile` 与 `backup` 仍必须执行。证明缺失、语义标记为真或路径命中编排器 / `kit/` / CI / `PROJECT.md` / `PLAN.md` / `AGENTS.md` / `editions/` / `scripts/` / `release/` / `templates/` 时不得省略。
+- 合并后运行 `docs/PROJECT.md` 指定的验证命令，保存日志与退出码；全部通过后转 `VERIFIED`。默认集合是快速测试 + 完整回归 + `backup` + 静态检查；只有 `verification_profile` 精确为 `risk_pilot` 且调用者显式证明变更为 L0 时，才可以省略完整回归，`validate_kit`、`py_compile` 与 `backup` 仍必须执行。证明缺失、语义标记为真或路径命中编排器 / `docs/orchestration.md` / CI / `PROJECT.md` / `PLAN.md` / `AGENTS.md` / `editions/` / `scripts/` / `release/` / `templates/` 时不得省略。
 - 合并成功与分支清理分开记账。清理失败不能触发重复合并。
 - 默认最多 3 轮审查—修复往返；达到上限仍未通过 → `BLOCKED`，由项目所有者决定拆分、扩大范围或取消。
 
@@ -365,9 +365,9 @@ G1 的“逐条验收”以**证据矩阵**记账：每条验收标准（AC）�
 交付质量指标的口径**只在** [templates/metrics.md](../templates/metrics.md) 定义，报告由 `python scripts/report_metrics.py`（`local` 任务库或事件样本，`--json` 输出稳定字段）从任务库事件与证据引用只读计算。任何统计值必须同时给出样本量、统计窗口与缺失率；缺数据记 `unknown` / coverage，不从聊天记录或估算补齐，也不得当作没有上下文的 Agent 排名。指标不改变状态机、门禁或 `VERIFIED` 的语义。
 
 
-# 第三部分：通用验收程序（原 kit/orchestration.md）
+# 第三部分：通用验收程序
 
-# kit/orchestration.md — 通用验收程序
+# 通用验收程序
 
 每次首次接入、变更调度器 / 提示词，或更换 Agent 运行时后执行。证据必须来自真实命令和当前提交；不能将空模板、历史记录或 CI 绿灯当成已验收。本程序对两个底座通用，底座特有的检查项在标题中标注。修改核心契约、证据字段、模板、校验器、状态机 / 锁语义或发行流程时，除本程序对应段落外，还必须执行 **I 段（合成回归场景）**。
 
@@ -407,7 +407,7 @@ G1 的“逐条验收”以**证据矩阵**记账：每条验收标准（AC）�
 ## C. 合并门 G1–G6
 
 - [ ] G1 每条验收标准都有独立依据；没有“部分通过即通过”。
-- [ ] G1 的依据以 `kit/orchestration.md` 4.1 节的证据矩阵记账：每条 AC 至少一条 evidence item，九个字段齐全，`actual` / `commit_sha` 在 `NOT_APPLICABLE` 之外不为空。
+- [ ] G1 的依据以 `docs/orchestration.md` 4.1 节的证据矩阵记账：每条 AC 至少一条 evidence item，九个字段齐全，`actual` / `commit_sha` 在 `NOT_APPLICABLE` 之外不为空。
 - [ ] G1 没有把 `NOT_RUN` / `BLOCKED` / `NOT_APPLICABLE` 折算为通过；带这类行的 AC 未被标记为通过。
 - [ ] G1 证据行的 `commit_sha` 与矩阵声明的 head SHA 一致；head 变化后已在新 head 上重新取证。
 - [ ] `python scripts/validate_kit.py` 通过；`--task-packet` 对合法样例判定通过、对缺字段 / 空 AC / 无证据映射 / `NOT_RUN` 冒充通过 / SHA 不一致判定失败。
@@ -453,7 +453,7 @@ G1 的“逐条验收”以**证据矩阵**记账：每条验收标准（AC）�
 - [ ] 存在任一 `BLOCKING` 或 `NEEDS_HUMAN_DECISION` 时，阶段没有被标记为完成，也没有在计划、任务载体或交付报告里宣称已交付。
 - [ ] 冻结契约与阶段审计对同一不变量给出一致结论；契约的任何改动都有 `templates/contract-decision-log.md` 记录（ID、日期、决定人、影响任务、变更前后、理由、状态、证据链接）。
 - [ ] 已冻结、未决、后续可变更三类决策分别可查；未决项在收口结论里体现为 `NEEDS_HUMAN_DECISION`，没有被当成默认值。
-- [ ] 审计没有复制 `kit/orchestration.md` 的状态机或 G1–G6 定义，只引用；局部任务审查清单的结果没有被当作阶段收口证据。
+- [ ] 审计没有复制 `docs/orchestration.md` 的状态机或 G1–G6 定义，只引用；局部任务审查清单的结果没有被当作阶段收口证据。
 
 ## G. 证据模板
 
@@ -504,7 +504,7 @@ D 段只回答“C1–C4 是否通过”。本节回答“这些结论记在哪�
 
 ## I. 合成回归场景（套件重大变更必跑）
 
-修改 `AGENTS.md` / `kit/orchestration.md` 的核心条款、4.1 证据字段、模板结构、`scripts/validate_kit.py`、状态机或锁语义、发行流程时，必须执行本节。场景目录、注入的缺陷与预期拦截门只在 `docs/testing/delivery-regression-scenarios.md`，本节只列验收动作。
+修改 `AGENTS.md` / `docs/orchestration.md` 的核心条款、4.1 证据字段、模板结构、`scripts/validate_kit.py`、状态机或锁语义、发行流程时，必须执行本节。场景目录、注入的缺陷与预期拦截门只在 `docs/testing/delivery-regression-scenarios.md`，本节只列验收动作。
 
 - [ ] `python scripts/run_delivery_scenarios.py --json` 退出码为 `0`；退出码 `1`（有场景失败）与 `2`（运行器未能开跑）不得当作通过。
 - [ ] `totals.negative_passed` 等于 `totals.negative`：负向组“通过”表示拦截真的发生了，不是任务真的失败了。至少一个正向控制组为 `PASS`，否则不能排除“所有任务都失败”。

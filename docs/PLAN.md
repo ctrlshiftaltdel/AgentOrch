@@ -3,7 +3,7 @@
 > 本文件是项目的**设计目标权威**：回答“为什么做、做到什么程度、边界在哪”。
 > 阶段目标、任务顺序与状态不写在这里，见 [docs/implementation-plan.md](implementation-plan.md)。
 > 两者冲突时，以本文件的设计目标为准，停下对齐，不得各写一套。
-> 字段、状态与合并门的定义只在 [kit/orchestration.md](../kit/orchestration.md)；本文件不重述规则。
+> 字段、状态与合并门的定义只在 [docs/orchestration.md](orchestration.md)；本文件不重述规则。
 
 ## 1. 问题与目标用户
 
@@ -86,4 +86,4 @@
 - **章程与演进背景**：[PROJECT-CHARTER.md](charter.md)
 - **新项目复制源**：本设计目标用 `templates/plan.md`（1.4 起 `init` 在 `docs/PLAN.md` 缺失时自动复制到 `docs/PLAN.md`；存在 1.3 之前的根 `PLAN.md` 时不会生成，改为提示迁移）；需要阶段计划时把 `templates/implementation-plan.md` 复制到项目的 `docs/`，`init` 不自动创建该文件。
 - **配图约定**：图放 `docs/images/`，正文中以相对路径引用（如 `![图 1](images/xxx.png)`）；Agent 只按正文指引查看图片、不批量读取；设计意图必须文字自足，图是补充（规则见 `../AGENTS.md`）。
-- **规则定义**：[AGENTS.md](../AGENTS.md)（协作契约）、[kit/orchestration.md](../kit/orchestration.md)（状态机与合并门）。
+- **规则定义**：[AGENTS.md](../AGENTS.md)（协作契约）、[docs/orchestration.md](orchestration.md)（状态机与合并门）。

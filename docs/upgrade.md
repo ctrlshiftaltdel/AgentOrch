@@ -1,6 +1,6 @@
 # 从旧版升级到 1.3（2026-10）
 
-> 本文件是**仓库文档**，不随发行包发布（`docs/` 不在打包清单内）。发行包使用者看 [README.md](README.md) 第 10 节「从旧版升级（1.1 → 1.3）」，那一节已经包含四条路径的最小可复制步骤；本文是它的完整版：分步清单、报错原文、退出码含义与回退。
+> 本文件是**仓库文档**，不随发行包发布（`docs/` 下只有随包分发的核心契约 `docs/orchestration.md` 在打包清单内）。发行包使用者看 [README.md](README.md) 第 10 节「从旧版升级（1.1 → 1.3）」，那一节已经包含四条路径的最小可复制步骤；本文是它的完整版：分步清单、报错原文、退出码含义与回退。
 > 本文只写「旧文件长什么样、命令怎么改、自检看到什么」，**不重述契约**：
 >
 > - `edition` 的权威来源、合法值与失败关闭：[README.md](README.md) 6.1 / 6.2
@@ -108,7 +108,7 @@ ERROR: docs/PROJECT.md: missing required key `edition` in <项目根>\docs/PROJE
 规则只有四条：**一行**、**以 `-` 或 `*` 开头**、**冒号后只写取值**、**不加引号 / 括号 / 斜杠 / 大小写变体**（`LOCAL`、`Local` 都不合法）。
 
 - 同时把 `.orchestration/config.json` 里残留的 `edition` 删掉（不删也不影响，但会多一行 `legacy key is ignored`）。
-- `github` 底座写 ``- `edition`: github``；底座切换是单向、一次性动作，切换规则见 [kit/orchestration.md](../kit/orchestration.md) 第 6 节，**不要**为了升级把 `local` 项目写成 `github`。
+- `github` 底座写 ``- `edition`: github``；底座切换是单向、一次性动作，切换规则见 [docs/orchestration.md](orchestration.md) 第 6 节，**不要**为了升级把 `local` 项目写成 `github`。
 
 ### 3.5 自检
 
@@ -451,7 +451,7 @@ checked: 47 manifest file(s); missing 0, modified 1, unknown 0, project-profile 
 
 任务库层面的回退（以下**未实测**，属人工操作，动手前先停止派发）：`python scripts/orchestrator.py backup` 生成的 `.orchestration/backups/state-<时间戳>.sqlite3`，在确认没有其它会话在用任务库后，用它替换 `.orchestration/state.sqlite3` 即可回到备份时刻。
 
-**回退的硬边界**：任何回退都不得造成双写——同一个任务不能同时在 `local` 任务库和 GitHub Issue 里维护状态。底座切换与回退规则见 [kit/orchestration.md](../kit/orchestration.md) 第 6 节。
+**回退的硬边界**：任何回退都不得造成双写——同一个任务不能同时在 `local` 任务库和 GitHub Issue 里维护状态。底座切换与回退规则见 [docs/orchestration.md](orchestration.md) 第 6 节。
 
 ## 9. 本轮实测记录
 
@@ -690,8 +690,8 @@ python3 scripts/build_release.py
 
 | 树 | 判定依据 | 仓库文档 | `MANIFEST.json` |
 | --- | --- | --- | --- |
-| 纯净包 | 没有 `docs/` | 跳过 | 结构 + 分类 + 路径 + `REQUIRED` 集合 + SHA-256 / 大小 |
-| 下游项目 | 有 `docs/`，没有 `docs/upgrade.md` | 只要求 `docs/PROJECT.md` 与 `docs/PLAN.md`（后者仍需“设计目标”章节） | 结构 + 分类 + 路径 + `REQUIRED` 集合 + 列出文件存在；**不比较哈希** |
+| 纯净包 | `docs/` 不存在，或只含随包分发的 `REQUIRED` 文件（当前只有 `docs/orchestration.md`） | 跳过 | 结构 + 分类 + 路径 + `REQUIRED` 集合 + SHA-256 / 大小 |
+| 下游项目 | 有 `docs/PROJECT.md`，没有 `docs/upgrade.md` | 只要求 `docs/PROJECT.md` 与 `docs/PLAN.md`（后者仍需“设计目标”章节） | 结构 + 分类 + 路径 + `REQUIRED` 集合 + 列出文件存在；**不比较哈希** |
 | 上游 checkout | 有 `docs/upgrade.md` | 全部仓库文档 | 结构 + 分类 + 路径 + `REQUIRED` 集合 + SHA-256 / 大小 |
 
 - **`docs/upgrade.md` 是上游标记**：它只存在于上游仓库，不随包发布。下游项目**不要**创建同名文件；一旦出现，`validate_kit.py` 会按上游 checkout 要求全部仓库文档，并把本地修改当哈希漂移报错。
@@ -814,3 +814,28 @@ APPLY 后的可核对事实：
 | 2 | 已发布 v1.7.0 代码（正控） | `v1.7.1` + `1.7` | `PLANNED` | `PASS` | 零写入 |
 
 **范围与未验证项**：目标包是合成的，运行方式是 `PLAN` + 内存 Release 源，不是旧客户端到真实 `v1.8.0` Release 的完整 CLI / 网络升级；它也**不是**“旧客户端安装桥接包后成功升级”的证据。桥接发行需要自身仍满足旧规则（同 Format），本任务只实现与测试桥接、**不发布桥接包**，因此“旧客户端安装桥接 → 新更新器升级不升 Format MINOR”的端到端为 `NOT_RUN`。真实旧客户端对不升 Format MINOR 的拒绝已由第 1 行实测。
+
+## 15. 迁移八（本次新增）：核心编排契约从 `kit/` 迁到 `docs/`
+
+- **变了什么**：`kit/orchestration.md` 移到 `docs/orchestration.md`，仍是**唯一可编辑权威**；`kit/` 目录随之消失，发行包里不再有 `kit/`。契约正文的语义（会话入口、状态机、合并门 G1–G6、C1–C4 / C1–C8、证据矩阵）不变，只改位置与指向它的引用。发行包从此只包含 `docs/` 下的这一个文件；其余 `docs/` 内容（设计稿、阶段计划、本文件）仍不打包。
+- **怎么改**（下游项目；本套件自身的同一迁移已在本任务执行，全部为 `git mv` + `rmdir kit`）：
+
+  ```bash
+  # 1. 先确认旧契约没有本地修改；有修改就先合并 / 备份，不要直接删
+  git diff -- kit/orchestration.md
+  git rm kit/orchestration.md
+  # 2. 重新运行更新入口；引擎随后写入 docs/orchestration.md
+  uv run python -m scripts.update_agentorch.entry --project . \
+    --request "更新 AgentOrch" --mode APPLY
+  ```
+
+- **更新引擎会怎么做**：旧副本还在时，入口以 `STOPPED_CONFLICT` + `HD-09` 停止并零写入，不会把新旧两份并排写出来；`docs/orchestration.md` 已存在且与包内不一致时以 `HD-10` 停止，不覆盖本地文件。旧副本即使未被本地修改也不会被静默删除——删除是明确的人工动作。
+- **怎么自检**：
+
+  ```bash
+  uv run python scripts/validate_kit.py    # 0：核心契约在 docs/orchestration.md
+  test ! -e kit/orchestration.md           # 0：旧路径已不存在
+  uv run python scripts/build_release.py   # 0：包内只有 docs/orchestration.md 一个 docs/ 文件
+  ```
+
+- **不要这样做**：同时保留 `kit/orchestration.md` 与 `docs/orchestration.md`（两个权威）；把整棵 `docs/` 当成随包内容；只复制旧文件到新路径而不改引用（`validate_kit.py` 的链接扫描会逐个指出断链）。

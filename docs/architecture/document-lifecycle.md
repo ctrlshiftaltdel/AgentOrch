@@ -1,6 +1,6 @@
 # 文档生命周期规则
 
-> **状态：`ACTIVE`。** 本文件是仓库文件生命周期状态、状态转换，以及新增 / 修改 / 弃用 / 迁移 / 归档 / 删除规则的唯一权威；文件职责、用途标签与分发范围的当前盘点在 [repository-map.md](repository-map.md)。生命周期不改变任务状态机、合并门、锁或证据矩阵——那些规则只在 [`kit/orchestration.md`](../../kit/orchestration.md) 与 [`AGENTS.md`](../../AGENTS.md) 定义。
+> **状态：`ACTIVE`。** 本文件是仓库文件生命周期状态、状态转换，以及新增 / 修改 / 弃用 / 迁移 / 归档 / 删除规则的唯一权威；文件职责、用途标签与分发范围的当前盘点在 [repository-map.md](repository-map.md)。生命周期不改变任务状态机、合并门、锁或证据矩阵——那些规则只在 [`docs/orchestration.md`](../orchestration.md) 与 [`AGENTS.md`](../../AGENTS.md) 定义。
 >
 > 本文件不重述设计 Issue #147 的字段定义；在需要文档影响记录时引用该设计的 §2.3，而不是另写一套字段。
 
@@ -57,7 +57,7 @@
 ## 5. 修改文件
 
 1. **先改权威位置，再改引用。** 规则变更只改唯一权威文件；其它文件只更新链接、示例或说明，不复制新规则。
-2. **检查影响面。** 至少检查：`AGENTS.md`、`kit/orchestration.md`、两个 `editions/`、相关 `templates/`、`docs/PROJECT.md`、`docs/PLAN.md`、`docs/implementation-plan.md`、`docs/README.md`、发行清单 / 构建 / 更新引擎。实际受影响项写入文档影响记录。
+2. **检查影响面。** 至少检查：`AGENTS.md`、`docs/orchestration.md`、两个 `editions/`、相关 `templates/`、`docs/PROJECT.md`、`docs/PLAN.md`、`docs/implementation-plan.md`、`docs/README.md`、发行清单 / 构建 / 更新引擎。实际受影响项写入文档影响记录。
 3. **保持分发边界。** 修改 `REQUIRED`、禁止路径、构建脚本或包内自检时，必须同时验证发行包文件集合与下游更新行为；不得只改文档。
 4. **更新地图。** 如果职责、权威归属、用途标签、生命周期或分发范围发生变化，同步更新 [repository-map.md](repository-map.md)。
 5. **不得夹带无关重排。** 文档修改与任务目标一致；不顺手移动、删除或格式化无关文件。
@@ -139,7 +139,7 @@
 
 ## 11. 与任务载体、分发的关系
 
-- 生命周期是**文件治理**，不是任务状态机。任务状态、锁、合并门与 `VERIFIED` 语义只在 [`kit/orchestration.md`](../../kit/orchestration.md) 与 [`AGENTS.md`](../../AGENTS.md) 定义；本文件不新增、不改写任何状态或门禁。
+- 生命周期是**文件治理**，不是任务状态机。任务状态、锁、合并门与 `VERIFIED` 语义只在 [`docs/orchestration.md`](../orchestration.md) 与 [`AGENTS.md`](../../AGENTS.md) 定义；本文件不新增、不改写任何状态或门禁。
 - 文件的 `ACTIVE` / `IMPLEMENTED` / `ARCHIVED` 不等于任务已批准、已合并或已验证；证据仍必须绑定当前 head SHA。
 - 分发范围以 [`scripts/validate_kit.py`](../../scripts/validate_kit.py) 的 `REQUIRED` 为单一来源；`scripts/build_release.py` 解析它，`scripts/check_drift.py` 生成清单。生命周期变化若影响分发，必须同时更新这条链并通过发布自检。
 - 本文件与 [repository-map.md](repository-map.md) 均属于 `docs/`，`仅仓库`，不随发行包发布；它们不放宽任何现有禁改路径或任务权限。

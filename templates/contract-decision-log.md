@@ -2,7 +2,7 @@
 
 > One append-mostly log per project (or per milestone) that records every change to a frozen contract. The contract itself is [DESIGN.md](design.md); the closeout review that consumes these records is [MILESTONE-AUDIT.md](milestone-audit.md).
 >
-> A decision log answers three questions that a design document alone cannot: what is frozen, what is still undecided, and what is expected to change later. It is not a task list — execution state lives on the task carrier and follows the lifecycle in [kit/orchestration.md](../kit/orchestration.md), which this file does not restate.
+> A decision log answers three questions that a design document alone cannot: what is frozen, what is still undecided, and what is expected to change later. It is not a task list — execution state lives on the task carrier and follows the lifecycle in [docs/orchestration.md](../docs/orchestration.md), which this file does not restate.
 
 ## When to use
 

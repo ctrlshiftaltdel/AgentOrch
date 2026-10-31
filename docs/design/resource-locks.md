@@ -1,13 +1,13 @@
 # RESOURCE-LOCKS.md — 共享资源锁契约（v1，冻结）
 
 > 状态：**已冻结（v1）**，冻结载体 Issue #5；实现任务 #6 只能按本契约实现，不得自行修改语义。
-> 权威范围：本文件只定义**具名资源锁**（named resource lock）。任务状态机、任务锁取得条件、合并门 G1–G6、运行时能力 C1–C4 与证据矩阵的定义仍在 `kit/orchestration.md`，本文件**只引用、不复制、不改写**。
+> 权威范围：本文件只定义**具名资源锁**（named resource lock）。任务状态机、任务锁取得条件、合并门 G1–G6、运行时能力 C1–C4 与证据矩阵的定义仍在 `docs/orchestration.md`，本文件**只引用、不复制、不改写**。
 > 变更方式：任何语义改动必须新开 Issue 重新冻结为 v2，并在 PR 中说明兼容影响；不得在实现 PR 里顺手改契约。
 
 相关文件（本文只引用，不复制其中定义）：
 
-- 状态机、活动任务锁、合并门 G1–G6、证据矩阵：[kit/orchestration.md](../../kit/orchestration.md)
-- 阶段收口检查项：[kit/orchestration.md](../../kit/orchestration.md)
+- 状态机、活动任务锁、合并门 G1–G6、证据矩阵：[docs/orchestration.md](../orchestration.md)
+- 阶段收口检查项：[docs/orchestration.md](../orchestration.md)
 - 设计文档需回答的资源锁问题：[templates/design.md](../../templates/design.md)
 - 任务包字段定义（本 Issue 不改）：[templates/task-packet.md](../../templates/task-packet.md)
 - `github` 底座活动任务登记块：[editions/github/active-task-registry.md](../../editions/github/active-task-registry.md)
@@ -320,7 +320,7 @@ RELEASED --(任何)--> 拒绝，写 LOCK_TRANSITION_REJECTED
 
 ### 7.3 混合与迁移
 
-- 同一任务的活动锁只能记在一个底座上（与 `kit/orchestration.md` 第 6 节“不允许双写”一致）。
+- 同一任务的活动锁只能记在一个底座上（与 `docs/orchestration.md` 第 6 节“不允许双写”一致）。
 - 底座切换时，资源锁必须按 §8.4 重新登记，不能把 `local` 的原子性结论带入 `github`。
 
 ## 8. 迁移与兼容
@@ -349,7 +349,7 @@ RELEASED --(任何)--> 拒绝，写 LOCK_TRANSITION_REJECTED
 
 ### 8.4 底座迁移时的重新登记
 
-`local → github` 切换（按 `kit/orchestration.md` 第 6 节）时：把非 `RELEASED` 资源锁逐条写入 Issue 的 `locked_resources`，标注“迁移前 `local` 登记 + 迁移时间”，并在 PR / Issue 说明其不再具有原子性保证；`github → local` 由项目所有者单独立项，不做自动回退。
+`local → github` 切换（按 `docs/orchestration.md` 第 6 节）时：把非 `RELEASED` 资源锁逐条写入 Issue 的 `locked_resources`，标注“迁移前 `local` 登记 + 迁移时间”，并在 PR / Issue 说明其不再具有原子性保证；`github → local` 由项目所有者单独立项，不做自动回退。
 
 ## 9. 故障场景与演练
 

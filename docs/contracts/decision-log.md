@@ -1,6 +1,6 @@
 # 契约决策记录（AgentOrch）
 
-> 本文件记录本仓库冻结契约的决策与变更。契约语义权威仍是 [`docs/self-improvement/`](../self-improvement/) 与 `schemas/*.schema.json`；本文件只回答“何时、由谁、基于什么证据冻结或改了什么”，不复制状态机、锁或任务生命周期（见 [`kit/orchestration.md`](../../kit/orchestration.md)）。
+> 本文件记录本仓库冻结契约的决策与变更。契约语义权威仍是 [`docs/self-improvement/`](../self-improvement/) 与 `schemas/*.schema.json`；本文件只回答“何时、由谁、基于什么证据冻结或改了什么”，不复制状态机、锁或任务生命周期（见 [`docs/orchestration.md`](../orchestration.md)）。
 > 记录格式参考 [`templates/contract-decision-log.md`](../../templates/contract-decision-log.md)。ID 沿用 Issue 决策的 `HD-<issue>-<option>` 形式（模板中的 `DC-<n>` 只是格式示例），全局唯一、不复用。
 
 ## 状态取值

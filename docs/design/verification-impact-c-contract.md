@@ -71,7 +71,7 @@
 - 模型家族自述、别名、温度、Prompt 哈希，以及 #170 注册表字段，都不是本工具的证据；这些字段按禁止字段拒绝（退出码 `2`）。
 - 要求独立 Reviewer 时，`identity.requirement=required` 且 `identity.assessment=unproven`；审查包记 `identity:reviewer_unproven`。
 - 不导入 `scripts/agent_selection/`，不改 `scripts/verification_planner/`。
-- 本工具不改写 G1–G6、Required Checks、CI、`docs/PROJECT.md` 的现行验证命令、`kit/orchestration.md` 或 `scripts/orchestrator.py` 的门禁行为。#188 的生产门禁切换仍须单独授权。
+- 本工具不改写 G1–G6、Required Checks、CI、`docs/PROJECT.md` 的现行验证命令、`docs/orchestration.md` 或 `scripts/orchestrator.py` 的门禁行为。#188 的生产门禁切换仍须单独授权。
 
 ## 6. 允许路径与最低夹具
 

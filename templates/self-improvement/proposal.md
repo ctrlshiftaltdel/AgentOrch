@@ -4,7 +4,7 @@
 > it must pass; it is not a task, an approval or an Issue.
 > The task packet fields that a later task must carry (`invariants`, `negative_cases`,
 > `migration_cases`, `integration_paths`, `unverified_assumptions`) and the evidence
-> rules are defined only in `kit/orchestration.md` 4.1. This template does not restate
+> rules are defined only in `docs/orchestration.md` 4.1. This template does not restate
 > them; write `N/A: <reason>` when a surface truly does not apply.
 
 ## 1. Identity

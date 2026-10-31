@@ -147,7 +147,7 @@ python3 -m scripts.update_agentorch --project <项目根> --mode PLAN --edition 
 - 目录前缀：`.github/`、`.local/`、`.orchestration/`、`.worktrees/`、`.workbuddy/`、
   `docs/`、`src/`、`release/`
 
-`scripts/`、`tests/`、`kit/`、`templates/`、`editions/` **不是**整体项目自有：旧清单中的文件
+`scripts/`、`tests/`、`docs/orchestration.md`、`templates/`、`editions/` **不是**整体项目自有：旧清单中的文件
 按上述规则分类，不在旧清单中的同名路径按 `UNKNOWN_FILE` 保留并报告（符合 §5“无法判定时按
 `UNKNOWN_FILE` 处理”）。
 

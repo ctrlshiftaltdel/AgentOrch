@@ -29,7 +29,7 @@ AgentOrch 与 DeepSeek Harness（DSH）的集成应采用**独立的角色工具
 
 - AgentOrch 当前已发布版本为 **v1.7.0 / Format 1.7**，Kit 包有 117 个 REQUIRED 文件，另加生成的 MANIFEST.json。
 - Phase D 的 #120–#124 已完成，已有 per-terminal scope、Markdown 私有 store、Runtime / Agent 发现、角色匹配、模型数据源、基础反馈和 E2E；本项目应增量复用，不重建平行系统。
-- AgentOrch 当前核心契约文件仍是 kit/orchestration.md，且在 scripts/validate_kit.py 的 REQUIRED 中。#151 所规划的迁移目标 docs/orchestration.md 不能在迁移完成前被描述为现行事实。
+- AgentOrch 当前核心契约文件仍是 docs/orchestration.md，且在 scripts/validate_kit.py 的 REQUIRED 中。#151 所规划的迁移目标 docs/orchestration.md 不能在迁移完成前被描述为现行事实。
 - 当前仓库的 docs/PROJECT.md 将 edition 设为 github。现有 scripts/orchestrator.py 是本地 CLI / 任务库工具，并明确不启动 Agent、不合并 Git 分支；github edition 下不能用它写本地 SQLite 来冒充 GitHub 任务载体。
 - #147 / #148、#149、#151、#153、#154 等治理工作仍需以各自 Issue、PR、head SHA 和验证记录重新核验。本设计仅声明对它们的依赖，不将未来的契约路径或 agentorch/ 下游布局提前写成已交付功能。
 - **DSH 官方 Release 快照（历史事实，带查询时间）：** 对 `deepseek-ai/deepseek-harness` 的 GitHub Releases API 查询发生在 **2026-10-28T07:37:16Z（UTC）**，当时返回的最新发布条目为 `dsh-v0.2.2-alpha.2`（published `2026-10-28T02:50:54Z`，`prerelease=true`），其下一条为 `dsh-v0.2.1-rc.4`（published `2026-10-28T02:49:58Z`，同样为预发布）。本执行实例于 2026-10-28T07:40:20Z 按同一 API 复核，前两条结果相同。
@@ -300,4 +300,4 @@ Node 单测、mock tool registry 或 YAML 结构检查不能证明真实 DSH 能
 - docs/implementation-plan.md：由 #162 更新；本设计 PR 不修改。
 - README.md / docs/README.md / release/README.md：待 #166 依据已实现行为与真实测试结果更新。
 - scripts/validate_kit.py、scripts/build_release.py、VERSION.md：本设计 PR 不修改。
-- docs/PLAN.md、AGENTS.md、kit/orchestration.md：本设计 PR 不修改。
+- docs/PLAN.md、AGENTS.md、docs/orchestration.md：本设计 PR 不修改。

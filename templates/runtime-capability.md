@@ -2,7 +2,7 @@
 
 > Filled in **after** a real probe of one runtime, one version, one edition and one execution mode. One record per probed combination: a runtime upgrade, a different edition, or a different delivery mode is a different record.
 >
-> **Contract:** C1–C4 are defined once in [kit/orchestration.md](../kit/orchestration.md) §5. This template records **what was measured** for that contract plus the finer boundaries a scheduler actually depends on. It does not redefine C1–C4 and does not replace them.
+> **Contract:** C1–C4 are defined once in [docs/orchestration.md](../docs/orchestration.md) §5. This template records **what was measured** for that contract plus the finer boundaries a scheduler actually depends on. It does not redefine C1–C4 and does not replace them.
 >
 > **UNKNOWN is a valid answer.** A capability that was not probed, whose evidence expired, or whose evidence cannot be located is written as `UNKNOWN`. `UNKNOWN` never means "probably works", and it never unlocks the sub-agent path. Only `PASS` on C1–C4 does.
 >

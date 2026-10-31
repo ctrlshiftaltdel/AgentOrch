@@ -6,7 +6,7 @@
 
 ## 1. 怎么用这张地图
 
-1. **先定位规则类型，再看权威文件。** 任务状态机、合并门、证据矩阵只在 [`kit/orchestration.md`](../../kit/orchestration.md) 与 [`AGENTS.md`](../../AGENTS.md) 定义；`edition`、路径边界与验证命令只在 [`docs/PROJECT.md`](../PROJECT.md) 定义；设计目标只在 [`docs/PLAN.md`](../PLAN.md) 定义；阶段状态只在 [`docs/implementation-plan.md`](../implementation-plan.md) 定义。
+1. **先定位规则类型，再看权威文件。** 任务状态机、合并门、证据矩阵只在 [`docs/orchestration.md`](../orchestration.md) 与 [`AGENTS.md`](../../AGENTS.md) 定义；`edition`、路径边界与验证命令只在 [`docs/PROJECT.md`](../PROJECT.md) 定义；设计目标只在 [`docs/PLAN.md`](../PLAN.md) 定义；阶段状态只在 [`docs/implementation-plan.md`](../implementation-plan.md) 定义。
 2. **这里只登记“文件是什么、归谁、发不发”。** 需要具体规则时，点进权威文件；不要从本文件转述出第二套规则。
 3. **用途标签不等于生命周期。** 同一文件可以既是 `reference` 又是 `ACTIVE`；也可以是 `reference` 但已 `ARCHIVED`。标签和状态分开读。
 4. **没有为每个源文件另建说明文档。** 下表按目录与关键文件登记；测试夹具、schema 同类文件按组登记。只有无法由目录或自动检查表达的特殊约束，才在对应文件顶部或本文件“例外登记”中说明。
@@ -30,7 +30,7 @@
 | 路径 | 用途 | 生命周期 | 分发 | 唯一职责 / 权威位置 |
 |---|---|---|---|---|
 | [`AGENTS.md`](../../AGENTS.md) | `authoritative` | `ACTIVE` | 发行包 | 协作契约：角色权限、Git 纪律、证据标准、阅读口径。 |
-| [`kit/orchestration.md`](../../kit/orchestration.md) | `authoritative` | `ACTIVE` | 发行包 | 核心编排：会话入口、任务状态机、锁、合并门 G1–G6、能力契约 C1–C4、验收程序。 |
+| [`docs/orchestration.md`](../orchestration.md) | `authoritative` | `ACTIVE` | 发行包 | 核心编排：会话入口、任务状态机、锁、合并门 G1–G6、能力契约 C1–C4、验收程序。 |
 | [`editions/local/`](../../editions/local/)（`master.md`、`execution.md`） | `authoritative` | `ACTIVE` | 发行包 | `local` 底座的命令、路径锁与启动 / 执行增量；不得定义另一套核心语义。 |
 | [`editions/github/`](../../editions/github/)（`master.md`、`execution.md`、`issue-template.md`、`pr-template.md`、`active-task-registry.md`） | `authoritative` | `ACTIVE` | 发行包 | `github` 底座的 Issue / PR / 登记块与启动 / 执行增量；不得定义另一套核心语义。 |
 | [`templates/`](../../templates/) | `reference` | `ACTIVE` | 发行包 | 可复制模板与起始结构（项目配置、计划、任务包、设计契约、审计、审查、能力、指标、架构、自我完善）。模板只提供结构，不是规则权威。 |
@@ -60,7 +60,7 @@
 
 | 路径 | 用途 | 生命周期 | 唯一职责 / 权威位置 |
 |---|---|---|---|
-| [`docs/README.md`](../README.md) | `reference` | `ACTIVE` | 完整用户手册、安装 / 升级 / 排错与文档导航。规则以 `AGENTS.md`、`kit/orchestration.md` 为准，本文件不弱化。 |
+| [`docs/README.md`](../README.md) | `reference` | `ACTIVE` | 完整用户手册、安装 / 升级 / 排错与文档导航。规则以 `AGENTS.md`、`docs/orchestration.md` 为准，本文件不弱化。 |
 | [`docs/PROJECT.md`](../PROJECT.md) | `authoritative` | `ACTIVE` | 本项目适配配置：`edition` 唯一权威、允许 / 禁改路径、验证命令、并发与本地工作流。 |
 | [`docs/PLAN.md`](../PLAN.md) | `authoritative` | `ACTIVE` | 设计目标权威：为什么做、做到什么程度、原则与边界。 |
 | [`docs/implementation-plan.md`](../implementation-plan.md) | `authoritative` | `ACTIVE` | 阶段目标、任务顺序、依赖与当前状态的唯一落点。 |
@@ -86,7 +86,7 @@
 
 | 路径 | 用途 | 生命周期 | 唯一职责 / 权威位置 |
 |---|---|---|---|
-| [`docs/design/resource-locks.md`](../design/resource-locks.md) | `authoritative` | `ACTIVE` | 具名资源锁 v1 冻结契约；状态机与 G1–G6 仍只引用 `kit/orchestration.md`。 |
+| [`docs/design/resource-locks.md`](../design/resource-locks.md) | `authoritative` | `ACTIVE` | 具名资源锁 v1 冻结契约；状态机与 G1–G6 仍只引用 `docs/orchestration.md`。 |
 | [`docs/design/agent-role-discovery-and-model-selection.md`](../design/agent-role-discovery-and-model-selection.md) | `authoritative` | `ACTIVE` | Phase D 角色发现、Subagent 能力考核与动态模型选择的设计（#117 / PR #118 合并后冻结）；实现记录见 `scripts/agent_selection/`。 |
 | [`docs/design/deepseek-harness-agent-role-tools.md`](../design/deepseek-harness-agent-role-tools.md) | `authoritative` | `ACTIVE` | DSH 角色工具适配的 `FROZEN` 设计；只冻结适配层，不表示运行时已验证。 |
 | [`docs/design/next-phase-governance-and-agent-performance.md`](../design/next-phase-governance-and-agent-performance.md) | `authoritative` | `ACTIVE`（依据 #147 `VERIFIED`；文件头仍写 `PROPOSED`，见 §9.3） | 下一阶段治理、旧项目接入、ETR 与三角色评价的设计依据；阶段状态仍以 `docs/implementation-plan.md` 为准。 |
@@ -128,17 +128,17 @@
 | 文件 | 负责什么 | 不负责什么 |
 |---|---|---|
 | [`README.md`](../../README.md) | GitHub 首页：产品定位、核心能力、快速开始与完整上手指南入口。 | 不定义协作契约、状态机、门禁、配置字段或发布标准；不随发行包发布。 |
-| [`docs/README.md`](../README.md) | 完整用户手册：安装、底座选择、命令、三条落地路径、配置、自检、发布、升级与治理导航。 | 不替代 `AGENTS.md` / `kit/orchestration.md` 的规则；不定义状态机、G1–G6、C1–C4。 |
+| [`docs/README.md`](../README.md) | 完整用户手册：安装、底座选择、命令、三条落地路径、配置、自检、发布、升级与治理导航。 | 不替代 `AGENTS.md` / `docs/orchestration.md` 的规则；不定义状态机、G1–G6、C1–C4。 |
 | [`docs/PLAN.md`](../PLAN.md) | 设计目标、原则、范围与非目标、全局验收方向。 | 不写阶段顺序、任务状态、门禁定义或能力字段。 |
 | [`docs/implementation-plan.md`](../implementation-plan.md) | 阶段目标、任务依赖、未完成工作、阻塞、下一步与状态表。 | 不写设计目标、状态机、G1–G6、字段或证据矩阵定义；历史详情由 Issue / PR 承载。 |
 | [`docs/PROJECT.md`](../PROJECT.md) | 本项目适配：`edition` 唯一权威、允许 / 禁改路径、验证命令、并发与本地工作流。 | 不定义核心契约；不把下游项目特例写进上游规则。 |
-| [`AGENTS.md`](../../AGENTS.md) | 与底座无关的协作契约：角色权限、阅读口径、Git 纪律、证据标准、安全边界。 | 不写具体载体命令；不重复 `kit/orchestration.md` 的状态机细节。 |
-| [`kit/orchestration.md`](../../kit/orchestration.md) | 核心编排契约：会话入口、状态机、锁、合并门、能力探测与通用验收程序。 | 不写项目配置、阶段状态或个人环境事实；底座手册只能细化，不能另写一套。 |
+| [`AGENTS.md`](../../AGENTS.md) | 与底座无关的协作契约：角色权限、阅读口径、Git 纪律、证据标准、安全边界。 | 不写具体载体命令；不重复 `docs/orchestration.md` 的状态机细节。 |
+| [`docs/orchestration.md`](../orchestration.md) | 核心编排契约：会话入口、状态机、锁、合并门、能力探测与通用验收程序。 | 不写项目配置、阶段状态或个人环境事实；底座手册只能细化，不能另写一套。 |
 
 ## 6. 核心依赖方向
 
 ```text
-AGENTS.md + kit/orchestration.md
+AGENTS.md + docs/orchestration.md
         │  （核心语义，唯一权威）
         ├── editions/<edition>/       底座命令与载体细化
         ├── templates/                任务包 / 设计 / 审计 / 审查结构
@@ -165,8 +165,8 @@ docs/README.md ─────┘  面向人的导航与使用说明
 | 读者 / 场景 | 先读 | 再读 |
 |---|---|---|
 | 人类第一次了解项目 | [`README.md`](../../README.md) | [`docs/README.md`](../README.md) |
-| Agent 每次会话开始 | [`AGENTS.md`](../../AGENTS.md) | [`kit/orchestration.md`](../../kit/orchestration.md) 第一部分、第二部分；按需第三部分；当前底座 `editions/<edition>/master.md` |
-| 派发 / 审查 / 合并 | [`kit/orchestration.md`](../../kit/orchestration.md) 第二部分 | 当前底座目录（[`editions/`](../../editions/)）下的 `execution.md` / `master.md`、[`templates/review-checklist.md`](../../templates/review-checklist.md) |
+| Agent 每次会话开始 | [`AGENTS.md`](../../AGENTS.md) | [`docs/orchestration.md`](../orchestration.md) 第一部分、第二部分；按需第三部分；当前底座 `editions/<edition>/master.md` |
+| 派发 / 审查 / 合并 | [`docs/orchestration.md`](../orchestration.md) 第二部分 | 当前底座目录（[`editions/`](../../editions/)）下的 `execution.md` / `master.md`、[`templates/review-checklist.md`](../../templates/review-checklist.md) |
 | 判断项目方向 | [`docs/PLAN.md`](../PLAN.md) | [`docs/implementation-plan.md`](../implementation-plan.md) |
 | 调整项目配置 | [`docs/PROJECT.md`](../PROJECT.md) | [`templates/project.md`](../../templates/project.md) |
 | 判断文件归属 / 是否过期 | 本文件 §2–§4 | [document-lifecycle.md](document-lifecycle.md) |
@@ -177,11 +177,11 @@ docs/README.md ─────┘  面向人的导航与使用说明
 
 | 范围 | 判定 | 包含 | 不包含 / 规则 |
 |---|---|---|---|
-| `发行包` | 路径在 `REQUIRED` 中 | `AGENTS.md`、`VERSION.md`、`LICENSE.md`、`kit/`、`editions/`、`templates/`、大部分 `scripts/` 与随包 `tests/`；构建时另加 `MANIFEST.json`。 | 包内文件集合 == `REQUIRED` + `MANIFEST.json`；不维护第二份清单。 |
-| `仅仓库` | 不在 `REQUIRED` 中，或位于禁止路径段 | `README.md`、`docs/`、`assets/`、`release/`、`.github/`、`.local/README.md`、`.gitignore`、`.gitattributes`、`scripts/build_release.py`、AVE 影子工具及其仓库测试、仓库夹具。 | `docs`、`release`、`.orchestration`、`.worktrees`、`.workbuddy` 等路径段禁止进入发行包。 |
+| `发行包` | 路径在 `REQUIRED` 中 | `AGENTS.md`、`VERSION.md`、`LICENSE.md`、`docs/orchestration.md`、`editions/`、`templates/`、大部分 `scripts/` 与随包 `tests/`；构建时另加 `MANIFEST.json`。 | 包内文件集合 == `REQUIRED` + `MANIFEST.json`；不维护第二份清单。 |
+| `仅仓库` | 不在 `REQUIRED` 中，或位于禁止路径段 | `README.md`、`docs/`（核心契约除外）、`assets/`、`release/`、`.github/`、`.local/README.md`、`.gitignore`、`.gitattributes`、`scripts/build_release.py`、AVE 影子工具及其仓库测试、仓库夹具。 | `release`、`.orchestration`、`.worktrees`、`.workbuddy` 等路径段禁止进入发行包；`docs/` 只允许 `docs/orchestration.md`（`build_release.py` 的 `PACKAGE_DOC_PATHS`）。 |
 | `仅本机` | `.local/` 下除 `README.md` 外的内容，以及运行时状态 | 凭据、机器信息、发布扫描规则、scope 记录、任务库、缓存与 Worktree。 | 永不入库、永不上传、永不打包；读取与写入边界服从 `AGENTS.md` 与 `docs/PROJECT.md`。 |
 
-下游项目拿到的是 `templates/project.md` 作为待填配置起点，不是本仓库的 `docs/PROJECT.md`；发行包不包含 `docs/`。发布前自检与包内文件集合以 [`release/README.md`](../../release/README.md) 与 [`scripts/build_release.py`](../../scripts/build_release.py) 为准。
+下游项目拿到的是 `templates/project.md` 作为待填配置起点，不是本仓库的 `docs/PROJECT.md`；发行包的 `docs/` 只有核心契约 `docs/orchestration.md`。发布前自检与包内文件集合以 [`release/README.md`](../../release/README.md) 与 [`scripts/build_release.py`](../../scripts/build_release.py) 为准。
 
 ## 9. 一次性计划、历史材料与过期候选
 
@@ -202,13 +202,13 @@ docs/README.md ─────┘  面向人的导航与使用说明
 |---|---|---|---|
 | [`docs/design/next-phase-governance-and-agent-performance.md`](../design/next-phase-governance-and-agent-performance.md) 文件头 | 文件仍写 `PROPOSED` 且要求“合并并 `VERIFIED` 前保持 `PROPOSED`”；但 #147 已被登记为已完成 / `VERIFIED`。 | [`docs/implementation-plan.md`](../implementation-plan.md) §1 的 #147 行（PR [#148](https://github.com/ctrlshiftaltdel/AgentOrch/pull/148) 合并 `3528e3ff5a8e868f92b8b2a36c523823cfe9ad6e`）；所有者在本 Issue 的说明 [comment 6544993213](https://github.com/ctrlshiftaltdel/AgentOrch/issues/150#issuecomment-6544993213)。 | 读者可能误以为设计尚未冻结。**不得**用本任务或评论直接改写设计冻结语义；建议由 Master / Owner 决定单独的“设计状态同步”任务，并保留本行作为差异记录。 |
 | [`docs/self-improvement-and-update-plan.md`](../self-improvement-and-update-plan.md) 文件头 | 文件头仍称“当前没有任何检查器、更新脚本或运行时”，与 #47–#53 已完成的事实不一致。 | [`docs/implementation-plan.md`](../implementation-plan.md) §11 的 #47–#53 行；`scripts/self_improvement/`、`scripts/update_agentorch/` 与对应测试已存在。 | 文件整体仍有设计追溯价值，故不标 `outdated`。建议后续文档任务修正状态段落，或由所有者确认是否转为 `SUPERSEDED`；替代候选是 [`docs/self-improvement/README.md`](../self-improvement/README.md) 与 [`docs/contracts/README.md`](../contracts/README.md)，但替代关系尚未经任务载体批准。 |
-| [`docs/README.md`](../README.md) §5 目录结构 | 目录树中 `kit/orchestration.md` 被重复列三次并分别标注“核心编排 / 通用验收程序 / 会话入口”；同时列出当前仓库不存在的 `prompts/`。 | 实际跟踪文件见仓库 `git ls-files`；`kit/orchestration.md` 已是合并后的单份文件，`prompts/` 已在 1.5 迁移中并入模板（见 [`docs/upgrade.md`](../upgrade.md) §12）。 | 属于导航残留，不是规则冲突。建议由后续导航清理任务（引用本文件与生命周期规范）修正；本任务只新增导航链接，不重排该节。 |
+| [`docs/README.md`](../README.md) §5 目录结构 | 目录树曾把核心契约重复列三次并分别标注“核心编排 / 通用验收程序 / 会话入口”，还列出仓库中不存在的 `prompts/`；#151 路径迁移已改为单一 `docs/orchestration.md` 条目并删除 `prompts/` 行。 | 实际跟踪文件见仓库 `git ls-files`；核心契约是合并后的单份 [`docs/orchestration.md`](../orchestration.md)，`prompts/` 已在 1.5 迁移中并入模板（见 [`docs/upgrade.md`](../upgrade.md) §12）。 | 已随 #151 路径迁移收口，保留本行作为差异记录。 |
 | [`docs/upgrade.md`](../upgrade.md) 标题 | 标题写“从旧版升级到 1.3（2026-10）”，正文已包含 1.4 的 `docs/PLAN.md` 迁移与当前更新入口等内容。 | 文件自身 §10.6 与 §13；[`docs/README.md`](../README.md) 第 10 节。 | 标题范围落后于内容，容易让读者误判适用版本。建议后续文档任务调整标题 / 适用范围；本任务不改写升级语义。 |
 
 ### 9.4 例外登记
 
-- `docs/architecture/repository-map.md` 与 `docs/architecture/document-lifecycle.md` 是本任务新增的文件责任 / 生命周期权威；它们不改变任何现有规则文件，也不把 `docs/` 带入发行包。
-- 设计文稿中的 `docs/orchestration.md` 是 **GOV-2 迁移目标**，当前尚未存在；当前核心契约仍是 [`kit/orchestration.md`](../../kit/orchestration.md)，在 #151 `VERIFIED` 前不得按目标路径读取。
+- `docs/architecture/repository-map.md` 与 `docs/architecture/document-lifecycle.md` 是本任务新增的文件责任 / 生命周期权威；它们不改变任何现有规则文件，也不把 `docs/` 除核心契约外的内容带入发行包。
+- 核心契约的唯一权威版本是 [`docs/orchestration.md`](../orchestration.md)（#151 路径迁移；旧 `kit/orchestration.md` 不再分发，也不得作为第二个权威）。迁移本身不改变状态机、G1–G6、C1–C4 / C1–C8 的语义。
 
 ## 10. 维护规则
 
