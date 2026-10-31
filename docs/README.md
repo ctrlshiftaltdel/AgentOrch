@@ -82,6 +82,7 @@
 | 看版本兼容与从旧版升级 | 第 9、10 节 |
 | 冻结设计契约、做阶段收口审计 | 第 11 节 |
 | 了解角色发现、Subagent 能力考核、模型动态选型及终端私有记录 | [角色发现与模型选择设计](design/agent-role-discovery-and-model-selection.md) |
+| 让 ETR / 评价可信度参与 Execution / Reviewer 候选排序，并确认 Master 仍手动 | [下一阶段治理与 Agent 性能设计 §7–§9](design/next-phase-governance-and-agent-performance.md) |
 | 找各治理文档入口 | 第 12 节 |
 
 ## 2. 两种底座怎么选
