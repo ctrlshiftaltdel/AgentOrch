@@ -60,8 +60,10 @@
 `outdated` 不是无限期囤积的许可：每个过时文件都必须指定替代文件或决定、归档理由、是否仍有审计 / 兼容价值，以及最终保留或删除决定。若无追溯价值且依赖已消失，应删除而不是永久归档。
 
 拟新增：
-- `docs/architecture/repository-map.md`：目录地图、关键文件责任、权威来源、引用关系、是否进入发行包、当前状态和首要阅读入口。
-- `docs/architecture/document-lifecycle.md`：新增、更新、弃用、迁移、归档 / 删除和过时文件退出流程。
+- [docs/architecture/repository-map.md](../architecture/repository-map.md)：目录地图、关键文件责任、权威来源、引用关系、是否进入发行包、当前状态和首要阅读入口。
+- [docs/architecture/document-lifecycle.md](../architecture/document-lifecycle.md)：新增、更新、弃用、迁移、归档 / 删除和过时文件退出流程。
+
+这两份文件的当前盘点、用途标签与生命周期规则以链接目标为准；本节只保留设计意图，不复制其规则。
 
 无需为每一个源码文件制造独立说明文档。中央地图负责关键责任；只有特殊约束无法从目录 / 自动检查表达时，才在单文件顶部登记例外。
 
@@ -397,7 +399,7 @@ Master 因具有产品目标理解、整体计划、冲突裁决和最终交付�
 - `docs/PROJECT.md`：只有 AgentOrch 上游仓库自身的适配配置 / 根路径语义有变化时更新，不将下游项目特例写入上游配置。
 - `AGENTS.md`：协作契约或入口路径变化时更新；旧项目接入的合并区块规则必须是增量、幂等、可检测冲突，不得覆盖宿主规则。
 - `docs/orchestration.md`：核心状态、入口 / 门禁定义的唯一权威，**仅在 #151 迁移完成后生效**；迁移前 `kit/orchestration.md` 仍是当前唯一权威（见 §2.1、§3.1）。
-- `repository-map.md` 与 `document-lifecycle.md`：文件职责、路径与生命周期规则的权威定义位置。
+- [repository-map.md](../architecture/repository-map.md) 与 [document-lifecycle.md](../architecture/document-lifecycle.md)：文件职责、路径与生命周期规则的权威定义位置。
 - 发布清单 / 升级文档 / 包内自检：任何文件路径、发行内容或迁移行为变化都必须影响分析。
 
 每个任务必须报告变更文档和未变更文档的理由，避免 README、用户手册、设计稿和阶段计划中出现互相矛盾的功能状态。

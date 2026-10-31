@@ -75,6 +75,7 @@
 | 看话术对应哪些命令、每条命令的完整输出 | 第 3 节 |
 | 空目录从零开始 / 接入已有仓库 / 迁到 GitHub | 第 4 节 |
 | 看目录里每个文件是干什么的 | 第 5 节 |
+| 判断文件职责、权威来源、分发范围与生命周期 | [仓库文件责任地图](architecture/repository-map.md) / [文档生命周期](architecture/document-lifecycle.md) |
 | 配置底座、重试上限、资源锁 TTL、私有目录、并发 | 第 6 节 |
 | 跑测试、用 CI、跑合成回归场景 | 第 7 节 |
 | 打包发布、给下游做漂移诊断 | 第 8 节 |
@@ -764,6 +765,8 @@ uv run python -m scripts.update_agentorch.entry --project . \
 | [AGENTS.md](../AGENTS.md) | 每次接手项目、写代码或做审查之前 | 确认角色权限、Git 纪律、证据标准与安全边界 |
 | [kit/orchestration.md](../kit/orchestration.md) | 派发任务、改状态、审查合并、迁移底座之前 | 对照状态机、G1–G6、C1–C4 执行 |
 | [kit/orchestration.md](../kit/orchestration.md) | 每次会话开始时 | 判定底座、恢复真实状态、路由到对应流程 |
+| [docs/architecture/repository-map.md](architecture/repository-map.md) | 判断某个文件 / 目录归谁负责、是否随包发布、当前是否权威 | 按地图定位权威文件；承担规则时回到对应权威位置 |
+| [docs/architecture/document-lifecycle.md](architecture/document-lifecycle.md) | 新增、修改、弃用、迁移、归档或删除文档之前 | 按状态转换与 `outdated` 条件登记；不凭印象改状态 |
 | [docs/PROJECT.md](PROJECT.md) | 初始化项目或调整范围 / 验证命令时 | 填好 `edition`、路径边界、验证命令与并发策略 |
 | [editions/local/master.md](../editions/local/master.md) / [editions/github/master.md](../editions/github/master.md) | 当前底座的日常操作 | 按底座手册创建、派发、审查、合并任务 |
 | [editions/github/issue-template.md](../editions/github/issue-template.md) | 在 `github` 底座创建任务单时 | 按五节写 Issue，缺一节不得进入 `READY` |
