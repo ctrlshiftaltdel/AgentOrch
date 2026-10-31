@@ -90,6 +90,8 @@
 
 ## 4. 发布流程
 
+发起任何发行前，先按 5.3 完成版本分类与只读发行评估；常设自动发版授权范围当前为空，因此每次真实发行都需要 Owner 明确授权。
+
 1. 在任务载体登记发布任务（唯一 ID、单一目标、允许路径与验收）。
 2. 从最新主分支创建独立分支 / Worktree；不在共享工作区直接构建。
 3. 构建：正式 Release 用 `uv run python scripts/build_release.py --release-version 1.6` 生成 `release/AgentOrch-1.6.zip`（补丁发行写全版本号，如 `--release-version 1.6.1` → `release/AgentOrch-1.6.1.zip`）；日期构建仍用 `uv run python scripts/build_release.py`（或 `--date YYYYMMDD`）生成 `release/agentorch-{YYYYMMDD}.zip`。
@@ -107,7 +109,7 @@
 - 只有格式真的变化（例如 1.2 → 1.3 新增资源锁载体字段、1.4 → 1.5 根目录瘦身与文件合并、1.5 → 1.6 新增自我完善与安全更新资产）才升 `Format version`，并同步模板、校验清单与 `docs/upgrade.md` 的迁移说明。
 - 只增加能力、不改包格式时，`Format version` 保持不变，只升对外 Release 版本。
 - `scripts/check_drift.py` 只解析 `VERSION.md` 的 `Format version:` 一行来生成 `MANIFEST.json` 的 `format_version`；`VERSION.md` 里的 `Release version` 行仅作记录，**不参与** Format 解析。本轮两者数值相同（都是 `1.6`），但解析口径不依赖 Release 行，未来也不会因此合并。
-- 下游判断兼容性看 `MANIFEST.json` 的 `format_version` 与 Release tag；下载安装看 Release 资产名。更新引擎的 `VERSION_MATCH` 要求 tag 的 major.minor 与 `format_version` 一致——这正是 1.6 同时升 Format 的原因（见 5.2）。
+- 下游判断兼容性看 `MANIFEST.json` 的 `format_version` 与 Release tag；下载安装看 Release 资产名。更新引擎的 `VERSION_MATCH` 要求 tag 的 major.minor 与 `format_version` 一致——这正是 1.6 同时升 Format 的原因（见 5.2）；当前耦合仍存在，分类与授权边界见 5.3。
 
 ### 5.1 发行记录：Release 1.6
 
@@ -220,6 +222,27 @@
   - **`MANIFEST.json` 与 `check_drift.py`**：包内新增机器可读清单（自检 a 的校验对象），分类与清单生成下移到 `scripts/check_drift.py` 并由构建脚本导入，同时随包提供下游只读漂移诊断。
   - **CI 打包自检**：打包自检纳入 CI（见 3.1），并新增 `scripts/check_drift.py` 的 `py_compile` 语法检查；本文件与 README 的发布说明同步改为"包内容 == `REQUIRED` + `MANIFEST.json`"。
 - **1.2**：包内新增 `MANIFEST.json` 与 `scripts/check_drift.py`（本次 1.3 记录将其约束补齐为可执行的清单校验）。
+
+### 5.3 发行分类与授权边界（#192 冻结）
+
+本节是 [主动式 SemVer 发行策略](../docs/design/semver-proactive-release-policy.md) 第 1、2 节的可执行口径，由 #192 冻结。它只冻结**分类规则与授权边界**，不授权任何 tag / Release，也不改变第 3 节自检、第 4 节发布步骤或现行 G1–G6 门禁。
+
+- **判定依据是对外兼容性，不是工程量或文件数**。以最新**已发布** tag 为基准（`git tag --sort=-v:refname` 的第一个），按三档分类：
+
+| 类别 | 对外兼容性 | 例（基于 v1.7.0） |
+|---|---|---|
+| PATCH | 修复错误、测试 / 文档 / 兼容性修正；公开行为无对外不兼容变化 | v1.7.1 |
+| MINOR | 向后兼容的新能力或对外行为扩展 | v1.8.0 |
+| MAJOR | 破坏性 API / 套件入口、配置、数据 / 格式、授权语义或升级路径变化 | v2.0.0 |
+
+- **混合变更取最大 bump**：同一发行含多类改动时按 MAJOR > MINOR > PATCH 取最高一级，不得拆成多次低级别发行来规避等级。
+- **空发布不允许**：自最新已发布 tag 以来没有已合并且已验证、用户可感知的变更时不得发版，不得为“走流程”创建空 Release。
+- **版本基准与一致性检查**：候选版本号相对最新已发布 tag 计算；若该 tag 与 `VERSION.md` 的 `Release version:` 不一致（tag 领先、落后或缺失），停止发行并核对，不得按任一来源擅自推定，也不得重打、改名或覆盖历史 tag。
+- **批次边界**：按实际用户可用成果与高风险门禁决定，不是每个 PR 必发；多个改动同时发行时取最高级别 bump。提案中的数量、天数等数值只是建议默认值，不构成门禁。
+- **只读发行评估**：Master 在会话恢复、重要 PR 合并后、阶段完成时执行只读评估，列出最新已发布 tag 之后的已合并已验证项、每项兼容性分类、建议 bump、被阻塞或回滚的项。只读表示**不修改 `VERSION.md`、不打 tag、不建 Release、不上传资产**。
+- **离线或无权限**：只能产出报告（建议版本、分类依据、缺口、待授权项），如实标 `NOT_RUN` / `BLOCKED`，不得声明已发布，也不得用本地构建冒充 Release。
+- **常设自动发版授权范围：空**。当前没有任何 PATCH / MINOR 处于“无需逐次确认即可发版”的常设授权内。没有 Owner 另一次明确授权（写明批次、版本级别与范围）时，**不得打 tag 或创建 Release**；“无需逐次提醒”的意图不折算为授权。MAJOR、破坏性迁移、无法回退或安全授权变化即使获得常规授权，仍须单独提交 Owner 决策。执行代理永远不得自行发版。
+- **现行 Release / Format 耦合仍然存在**：`scripts/update_agentorch/versions.py` 的 `tag_matches_format()` 要求 tag 的 major.minor 等于 `MANIFEST.json` 的 `format_version`。因此在当前实现下，“升 MINOR 但不升 Format”（如 `v1.8.0` + Format `1.7`）会被升级器拒绝；要么按 v1.7.0 的先例同步处理 Format，要么等解耦落地，具体取舍属于每次发行的独立决定，不由本节授权。**解耦实现与旧客户端 `VERSION_MATCH` 桥接验证归 #193**；#192 不修改 `scripts/update_agentorch/`，本节也不声称已解耦。
 
 ## 6. 声明
 
