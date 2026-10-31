@@ -49,6 +49,7 @@ REQUIRED = [
     'scripts/check_drift.py', 'scripts/check_scope.py', 'scripts/orchestrator.py',
     'scripts/report_metrics.py',
     'scripts/run_delivery_scenarios.py', 'scripts/validate_kit.py',
+    'scripts/verification_profile.py',
     'scripts/delivery_scenarios/__init__.py',
     'scripts/delivery_scenarios/common.py',
     'scripts/delivery_scenarios/group_a.py',
