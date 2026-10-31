@@ -460,3 +460,47 @@ PR 编号按运行的 `head_branch` 与 GitHub PR 记录核对。本环境 `GET 
 | `docs/PLAN.md`（§6 全局验收） | blob `9b8aadec409aa3185c9be8dd04a4dccb70a4e6ee` |
 
 回退动作仅限「revert 本任务文档 PR 的合并提交」：没有数据迁移、没有运行时状态、没有锁、没有 tag / Release、没有凭据或权限变更。若后续任务要改变任何 required check 或指标定义，必须另立任务并按现行 G6 / Owner 授权流程执行；本节不提供该授权。
+
+## 8. Effective Token Rate（ETR，Issue #155）
+
+本节定义 ETR 与 Token coverage 的**观测口径**。它不修改 [templates/metrics.md](../templates/metrics.md) 中 M1–M7 七个交付指标的既有定义：M1–M7 的 coverage 仍是不可空的 `0.0`，而 ETR 的零分母状态保持非数值。ETR 也不替代正确性、Reviewer 独立性、权限或任务验收。
+
+### 8.1 定义
+
+对已完成评价的调用，令 `T_i` 为来源真实报告的该次调用 Token 总量，`w_i` 为有效贡献权重：
+
+```
+ETR            = 100% × Σ(T_i × w_i) / Σ(T_i)        # 仅已评分的调用
+Token Coverage = 100% × Σ(已评分调用的 T_i) / Σ(全部已观测的 T_i)
+```
+
+| 评价状态 | 权重 | 说明 |
+| --- | ---: | --- |
+| `EFFECTIVE` | 1.0 | 贡献经任务结果或独立证据验证 |
+| `PARTIAL` | 0.5 | 只有部分贡献可验证，或经显著修改后才可用 |
+| `INEFFECTIVE` | 0.0 | 有证据显示没有有效贡献 |
+| `UNRATED` | 不参与 | 评价未完成；不进入已评分分子 / 分母，也不是 0 |
+
+`T_i` 只取 Runtime / 供应商报告的真实总量。input / output / cached / reasoning 分项仅用于解释，**不加进总量**：cached 与 reasoning 常常是 input / output 的子集，按来源口径重复相加会虚增分母。没有真实来源、没有总量字段、来源明确标记不完整或无法归一计时，telemetry 视为不可信。
+
+### 8.2 非数值状态
+
+| 情形 | 全部已观测 Token | 已评分 Token | ETR | Token Coverage |
+| --- | --- | --- | --- | --- |
+| T1 telemetry 缺失 / 不可信 | 无法确认 | 无法确认 | `UNKNOWN` | `UNKNOWN` |
+| T2 telemetry 存在但总量为 0 | 0 | 0 | `NO_DATA` | `NO_DATA` |
+| T3 有观测 Token，但没有已评分 Token | > 0 | 0 | `NO_DATA` | `0%` |
+| T4 有已评分 Token | > 0 | > 0 | 公式计算 | 公式计算 |
+
+`UNKNOWN`（没有观测）与 `NO_DATA`（分母为 0）都不是 `0`，不得用 `0` / `100` 填充；任一指标非数值时不得触发阈值动作。
+
+### 8.3 分组、窗口与阈值
+
+- 统计按 `model id × role × task category` 分组；Runtime / 版本、Agent alias、Token 来源与证据引用随记录保存。模型 / Runtime / 主要配置变化后旧记录标 `STALE` / `IDENTITY_CHANGED`，不自动继承为当前版本成绩。
+- 默认窗口为最近 90 天；窗口外记录不进入当前分母。
+- 初始 50% 只是 `PROVISIONAL` 中性先验，与实测 ETR 分开保存，不计入实测值，也不得压过已有可比较的实测 ETR。
+- 40% / 80% 是可配置的临时阈值；默认还要求至少 20 个已完成且可评价的任务、Token coverage ≥ 80%。这些门槛待真实数据校准，报告必须标明。
+- 低于 40% 且满足门槛：只建议暂停**自动**选用，不删除候选、不禁止人工使用；高于 80% 且满足门槛：只提升已通过硬约束与质量要求的候选的优先级。动作始终是建议（`applies_automatically=False`）。
+- 可计算但样本不足或 coverage 低于门槛：实测 ETR 仍可报告，判定状态只能是 `PROVISIONAL`，不触发阈值动作。
+
+记录仍写入当前 scope 的 `.local/agent-orch/<scope-id>/observed-performance.md`，不建立第二个数据库、不跨 scope 汇总，也不保存凭据、完整 Prompt 或原始对话。实现位置：`scripts/agent_selection/feedback.py`（ETR 与策略）、`scripts/agent_selection/runtime_adapter.py`（`TokenUsage` 字段）。

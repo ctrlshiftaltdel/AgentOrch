@@ -48,12 +48,23 @@ def review_evidence(ref='pr:1#c1', at=RECENT):
     return fb.EvidenceRef('review_conclusion', ref, at)
 
 
+def usage(total=1000, *, input_tokens=None, output_tokens=None,
+          cached_tokens=None, reasoning_tokens=None,
+          source='runtime:fixture', complete=True):
+    """One source-reported Token usage value; never an estimate."""
+    return fb.TokenUsage(
+        total_tokens=total, input_tokens=input_tokens,
+        output_tokens=output_tokens, cached_tokens=cached_tokens,
+        reasoning_tokens=reasoning_tokens, source=source, complete=complete)
+
+
 def execution(index=1, **overrides):
     values = dict(
         task_id=f'issue:{index}', category='code-change', identity=EXECUTION_ID,
         observed_at=RECENT, evidence=(task_evidence(f'issue:{index}'),),
         first_acceptance='PASS', rework_rounds=0,
-        post_merge_regression_defects=0, duration_seconds=None, cost=None)
+        post_merge_regression_defects=0, duration_seconds=None, cost=None,
+        token_usage=None, contribution='UNRATED', agent_alias=fb.UNKNOWN)
     values.update(overrides)
     return fb.ExecutionOutcome(**values)
 
@@ -649,6 +660,402 @@ class ReportSurfaceTests(StoreFixture):
             if path.is_file():
                 self.assertIn(self.store.scope_id, str(path))
         self.assertNotIn(str(self.root), self.document())
+
+
+class EtrCalculationTests(StoreFixture):
+    """Fixed synthetic Token data: every number is recomputable by hand.
+
+    The expectations mirror design §7.2: EFFECTIVE=1.0, PARTIAL=0.5,
+    INEFFECTIVE=0.0, UNRATED is not scored, telemetry missing is ``UNKNOWN``,
+    a zero denominator is ``NO_DATA`` and sub-fields never inflate the total.
+    """
+
+    def fill(self, count, contribution, *, total=1000, category='code-change'):
+        for index in range(1, count + 1):
+            self.record(execution(
+                index, category=category, token_usage=usage(total),
+                contribution=contribution))
+
+    def etr(self, report=None):
+        return (report or self.report()).cohort(
+            'execution', 'code-change').etr
+
+    def test_all_effective_is_100_percent(self):
+        for index in range(1, 4):
+            self.record(execution(index, token_usage=usage(1000),
+                                  contribution='EFFECTIVE'))
+        etr = self.etr()
+        self.assertEqual(etr.value_status, 'OK')
+        self.assertEqual(etr.value, 100.0)
+        self.assertEqual(etr.token_coverage, 100.0)
+        self.assertEqual(etr.observed_tokens, 3000)
+        self.assertEqual(etr.scored_tokens, 3000)
+        self.assertEqual(etr.rated_tasks, 3)
+        self.assertEqual(etr.unrated_tasks, 0)
+        self.assertEqual(etr.unit, 'percent')
+
+    def test_a_partial_contribution_is_weighted_half(self):
+        self.record(execution(1, token_usage=usage(1000),
+                              contribution='EFFECTIVE'))
+        self.record(execution(2, token_usage=usage(1000),
+                              contribution='PARTIAL'))
+        etr = self.etr()
+        self.assertEqual(etr.value_status, 'OK')
+        self.assertEqual(etr.value, 75.0)
+        self.assertEqual(etr.token_coverage, 100.0)
+
+    def test_all_ineffective_is_a_measured_zero_not_missing_data(self):
+        for index in range(1, 3):
+            self.record(execution(index, token_usage=usage(1000),
+                                  contribution='INEFFECTIVE'))
+        etr = self.etr()
+        self.assertEqual(etr.value_status, 'OK')
+        self.assertEqual(etr.value, 0.0)
+        self.assertIsNotNone(etr.value)
+        self.assertEqual(etr.token_coverage_status, 'OK')
+
+    def test_unrated_tokens_are_outside_the_etr_fraction_but_inside_coverage(self):
+        self.fill(2, 'EFFECTIVE')
+        self.fill(2, 'UNRATED')
+        etr = self.etr()
+        self.assertEqual(etr.value_status, 'OK')
+        self.assertEqual(etr.value, 100.0)
+        self.assertEqual(etr.scored_tokens, 2000)
+        self.assertEqual(etr.observed_tokens, 4000)
+        self.assertEqual(etr.token_coverage, 50.0)
+        self.assertEqual(etr.rated_tasks, 2)
+        self.assertEqual(etr.unrated_tasks, 2)
+
+    def test_only_unrated_calls_have_no_etr_but_a_real_zero_coverage(self):
+        # T3: observed tokens > 0, scored tokens = 0.
+        for index, total in enumerate((1200, 800, 0, 2000), start=1):
+            self.record(execution(index, token_usage=usage(total),
+                                  contribution='UNRATED'))
+        etr = self.etr()
+        self.assertEqual(etr.value_status, 'NO_DATA')
+        self.assertIsNone(etr.value)
+        self.assertEqual(etr.observed_tokens, 4000)
+        self.assertEqual(etr.scored_tokens, 0)
+        self.assertEqual(etr.token_coverage_status, 'OK')
+        self.assertEqual(etr.token_coverage, 0.0)
+        self.assertEqual(etr.gate_status, 'NO_GATE')
+
+    def test_zero_observed_tokens_has_no_coverage_or_etr(self):
+        # T2: telemetry exists, every call reported 0 Token.
+        for index in range(1, 4):
+            self.record(execution(index, token_usage=usage(0),
+                                  contribution='EFFECTIVE'))
+        etr = self.etr()
+        self.assertEqual(etr.value_status, 'NO_DATA')
+        self.assertIsNone(etr.value)
+        self.assertEqual(etr.token_coverage_status, 'NO_DATA')
+        self.assertIsNone(etr.token_coverage)
+        self.assertEqual(etr.observed_tokens, 0)
+        self.assertEqual(etr.gate_status, 'NO_GATE')
+
+    def test_missing_total_cannot_be_summed_from_sub_fields(self):
+        # T1: a partial source report is not a total, and no estimate is made.
+        self.record(execution(
+            1, token_usage=fb.TokenUsage(input_tokens=100, output_tokens=50,
+                                         source='runtime:fixture', complete=True),
+            contribution='EFFECTIVE'))
+        etr = self.etr()
+        self.assertEqual(etr.value_status, 'UNKNOWN')
+        self.assertIsNone(etr.value)
+        self.assertEqual(etr.token_coverage_status, 'UNKNOWN')
+        self.assertIsNone(etr.token_coverage)
+        self.assertIsNone(etr.observed_tokens)
+        self.assertEqual(etr.gate_status, 'NO_GATE')
+
+    def test_cached_and_reasoning_tokens_never_inflate_the_total(self):
+        usage_value = usage(1000, input_tokens=800, output_tokens=200,
+                            cached_tokens=400, reasoning_tokens=200)
+        self.record(execution(1, token_usage=usage_value,
+                              contribution='EFFECTIVE'))
+        etr = self.etr()
+        self.assertEqual(etr.observed_tokens, 1000)
+        self.assertNotEqual(etr.observed_tokens, 800 + 200 + 400 + 200)
+        self.assertEqual(etr.value, 100.0)
+        self.assertEqual(etr.breakdown.input_tokens, 800)
+        self.assertEqual(etr.breakdown.output_tokens, 200)
+        self.assertEqual(etr.breakdown.cached_tokens, 400)
+        self.assertEqual(etr.breakdown.reasoning_tokens, 200)
+        self.assertEqual(etr.breakdown.input_reported, 1)
+        self.assertIn('never added', ' '.join(etr.notes))
+
+    def test_a_partially_reported_breakdown_is_not_filled_in(self):
+        self.record(execution(1, token_usage=usage(1000, input_tokens=800),
+                              contribution='EFFECTIVE'))
+        self.record(execution(2, token_usage=usage(1000),
+                              contribution='EFFECTIVE'))
+        breakdown = self.etr().breakdown
+        self.assertEqual(breakdown.input_tokens, 800)
+        self.assertEqual(breakdown.input_reported, 1)
+        self.assertIsNone(breakdown.output_tokens)
+        self.assertEqual(breakdown.output_reported, 0)
+
+
+class EtrTelemetryTests(StoreFixture):
+    def test_one_call_without_telemetry_makes_the_cohort_unknown(self):
+        self.record(execution(1, token_usage=usage(1000),
+                              contribution='EFFECTIVE'))
+        self.record(execution(2, contribution='EFFECTIVE'))
+        etr = self.report().cohort('execution', 'code-change').etr
+        self.assertEqual(etr.value_status, 'UNKNOWN')
+        self.assertIsNone(etr.value)
+        self.assertIsNone(etr.observed_tokens)
+        self.assertIn('telemetry', ' '.join(etr.gate_reasons))
+
+    def test_an_unknown_source_is_not_trusted_telemetry(self):
+        self.record(execution(
+            1, token_usage=usage(1000, source=fb.UNKNOWN),
+            contribution='EFFECTIVE'))
+        etr = self.report().cohort('execution', 'code-change').etr
+        self.assertEqual(etr.value_status, 'UNKNOWN')
+        self.assertIsNone(etr.value)
+
+    def test_an_explicitly_incomplete_count_is_not_trusted(self):
+        self.record(execution(
+            1, token_usage=usage(1000, complete=False),
+            contribution='EFFECTIVE'))
+        etr = self.report().cohort('execution', 'code-change').etr
+        self.assertEqual(etr.value_status, 'UNKNOWN')
+        self.assertIsNone(etr.value)
+
+    def test_old_records_without_token_fields_are_read_but_never_scored(self):
+        outcome = execution(1)
+        details = dict(outcome.as_details())
+        for key in [name for name in details
+                    if name.startswith('token_')
+                    or name in ('contribution', 'contribution_weight',
+                                'agent_alias')]:
+            details.pop(key)
+        self.store.append_record(
+            fb.FEEDBACK_DOCUMENT, summary='legacy outcome',
+            source_class='OBSERVED', status='RECORDED', details=details,
+            record_id='legacy', now=RECENT)
+        loaded = fb.load_outcomes(self.store)
+        self.assertEqual(len(loaded.outcomes), 1)
+        self.assertIsNone(loaded.outcomes[0].token_usage)
+        self.assertEqual(loaded.outcomes[0].contribution, 'UNRATED')
+        etr = self.report().cohort('execution', 'code-change').etr
+        self.assertEqual(etr.value_status, 'UNKNOWN')
+        self.assertIsNone(etr.value)
+
+
+class EtrThresholdTests(StoreFixture):
+    def fill(self, count, contribution):
+        for index in range(1, count + 1):
+            self.record(execution(index, token_usage=usage(1000),
+                                  contribution=contribution))
+
+    def etr(self):
+        return self.report().cohort('execution', 'code-change').etr
+
+    def test_low_coverage_keeps_a_measured_value_but_stays_provisional(self):
+        self.fill(2, 'EFFECTIVE')
+        self.fill(2, 'UNRATED')
+        etr = self.etr()
+        self.assertEqual(etr.value, 100.0)
+        self.assertEqual(etr.token_coverage, 50.0)
+        self.assertEqual(etr.gate_status, 'PROVISIONAL')
+        self.assertIn('coverage', ' '.join(etr.gate_reasons))
+        self.assertFalse(etr.applies_automatically)
+
+    def test_too_few_rated_tasks_never_trigger_a_threshold(self):
+        self.fill(3, 'EFFECTIVE')
+        etr = self.etr()
+        self.assertEqual(etr.value, 100.0)
+        self.assertEqual(etr.token_coverage, 100.0)
+        self.assertEqual(etr.gate_status, 'PROVISIONAL')
+        self.assertIn('20', ' '.join(etr.gate_reasons))
+
+    def test_twenty_effective_tasks_raise_priority(self):
+        self.fill(20, 'EFFECTIVE')
+        etr = self.etr()
+        self.assertEqual(etr.gate_status, 'RAISE_PRIORITY')
+        self.assertFalse(etr.applies_automatically)
+        self.assertTrue(etr.manual_path_preserved)
+
+    def test_twenty_ineffective_tasks_pause_automatic_selection_only(self):
+        self.fill(20, 'INEFFECTIVE')
+        etr = self.etr()
+        self.assertEqual(etr.value, 0.0)
+        self.assertEqual(etr.gate_status, 'PAUSE_AUTO_SELECTION')
+        self.assertFalse(etr.applies_automatically)
+        self.assertTrue(etr.manual_path_preserved)
+
+    def test_a_value_inside_the_band_takes_no_threshold_action(self):
+        self.fill(10, 'EFFECTIVE')
+        self.fill(10, 'INEFFECTIVE')
+        etr = self.etr()
+        self.assertEqual(etr.value, 50.0)
+        self.assertEqual(etr.gate_status, 'NO_GATE')
+        self.assertIn('band', ' '.join(etr.gate_reasons))
+
+    def test_missing_telemetry_never_triggers_a_threshold_action(self):
+        for index in range(1, 21):
+            self.record(execution(index, contribution='INEFFECTIVE'))
+        etr = self.etr()
+        self.assertIsNone(etr.value)
+        self.assertEqual(etr.gate_status, 'NO_GATE')
+
+    def test_thresholds_are_configurable_and_reported(self):
+        self.fill(20, 'EFFECTIVE')
+        policy = fb.EtrPolicy(low_threshold=95.0, high_threshold=99.0,
+                              min_scored_tasks=20, min_token_coverage=80.0)
+        report = self.report(etr_policy=policy)
+        etr = report.cohort('execution', 'code-change').etr
+        self.assertEqual(etr.value, 100.0)
+        self.assertEqual(etr.gate_status, 'RAISE_PRIORITY')
+        self.assertEqual(etr.threshold_low, 95.0)
+        self.assertEqual(etr.threshold_high, 99.0)
+        self.assertEqual(report.etr_policy.as_dict()['low_threshold'], 95.0)
+
+    def test_the_neutral_prior_is_separate_from_a_measured_rate(self):
+        empty = self.report()
+        self.assertEqual(empty.neutral_prior.value, 50.0)
+        self.assertEqual(empty.neutral_prior.status, 'PROVISIONAL')
+        self.assertFalse(empty.neutral_prior.measured)
+        self.fill(10, 'EFFECTIVE')
+        self.fill(10, 'INEFFECTIVE')
+        report = self.report()
+        etr = report.cohort('execution', 'code-change').etr
+        self.assertEqual(etr.value, 50.0)
+        self.assertFalse(etr.prior_applied)
+        self.assertEqual(report.neutral_prior.value, 50.0)
+        self.assertFalse(report.neutral_prior.measured)
+        self.assertIn('prior', ' '.join(report.notes))
+
+
+class EtrIdentityAndWindowTests(StoreFixture):
+    def test_a_changed_model_identity_does_not_inherit_etr(self):
+        for index in range(1, 4):
+            self.record(execution(index, token_usage=usage(1000),
+                                  contribution='EFFECTIVE'))
+        upgraded = fb.ModelIdentity('model-a', 'runtime-x', '2.0.0')
+        for index in range(4, 6):
+            self.record(execution(index, identity=upgraded,
+                                  token_usage=usage(1000),
+                                  contribution='INEFFECTIVE'))
+        report = self.report(current_identities={'execution': upgraded})
+        cohorts = {cohort.identity.runtime_version: cohort
+                   for cohort in report.cohorts_for('execution')}
+        old = cohorts['1.0.0'].etr
+        new = cohorts['2.0.0'].etr
+        self.assertEqual(old.value, 100.0)
+        self.assertEqual(old.evidence_status, 'IDENTITY_CHANGED')
+        self.assertEqual(old.gate_status, 'NO_GATE')
+        self.assertEqual(new.value, 0.0)
+        self.assertEqual(new.rated_tasks, 2)
+
+    def test_an_unknown_model_identity_cannot_trigger_a_threshold(self):
+        unknown = fb.ModelIdentity()
+        for index in range(1, 21):
+            self.record(execution(index, identity=unknown,
+                                  token_usage=usage(1000),
+                                  contribution='EFFECTIVE'))
+        etr = self.report().cohort('execution', 'code-change').etr
+        self.assertEqual(etr.value, 100.0)
+        self.assertEqual(etr.evidence_status, 'UNKNOWN_IDENTITY')
+        self.assertEqual(etr.gate_status, 'NO_GATE')
+
+    def test_records_older_than_the_window_are_stale_and_unscored(self):
+        for index in range(1, 4):
+            self.record(execution(index, observed_at=STALE,
+                                  token_usage=usage(1000),
+                                  contribution='EFFECTIVE'))
+        etr = self.report().cohort('execution', 'code-change').etr
+        self.assertIsNone(etr.value)
+        self.assertEqual(etr.value_status, 'NO_DATA')
+        self.assertEqual(etr.evidence_status, 'STALE')
+        self.assertEqual(etr.gate_status, 'NO_GATE')
+        self.assertIn('window', ' '.join(etr.gate_reasons))
+
+    def test_stale_records_do_not_change_a_fresh_etr(self):
+        for index in range(1, 4):
+            self.record(execution(index, token_usage=usage(1000),
+                                  contribution='EFFECTIVE'))
+        self.record(execution(9, observed_at=STALE, token_usage=usage(9000),
+                              contribution='INEFFECTIVE'))
+        etr = self.report().cohort('execution', 'code-change').etr
+        self.assertEqual(etr.value, 100.0)
+        self.assertEqual(etr.observed_tokens, 3000)
+        self.assertEqual(etr.evidence_status, 'CURRENT')
+
+
+class EtrValidationTests(StoreFixture):
+    def test_an_unknown_contribution_status_is_rejected(self):
+        with self.assertRaises(fb.FeedbackError):
+            execution(1, contribution='GREAT')
+
+    def test_contribution_weights_are_the_frozen_initial_values(self):
+        self.assertEqual(fb.contribution_weight('EFFECTIVE'), 1.0)
+        self.assertEqual(fb.contribution_weight('PARTIAL'), 0.5)
+        self.assertEqual(fb.contribution_weight('INEFFECTIVE'), 0.0)
+        self.assertIsNone(fb.contribution_weight('UNRATED'))
+        with self.assertRaises(fb.FeedbackError):
+            fb.contribution_weight('UNKNOWN')
+
+    def test_a_negative_token_count_is_rejected(self):
+        with self.assertRaises(ValueError):
+            fb.TokenUsage(total_tokens=-1, source='runtime:fixture', complete=True)
+
+    def test_a_token_source_is_required_to_be_usable(self):
+        with self.assertRaises(ValueError):
+            fb.TokenUsage(total_tokens=10, source='', complete=True)
+
+    def test_an_illegal_threshold_pair_is_rejected(self):
+        for kwargs in ({'low_threshold': 60.0, 'high_threshold': 40.0},
+                       {'low_threshold': -1.0},
+                       {'high_threshold': 101.0},
+                       {'min_scored_tasks': 0},
+                       {'min_token_coverage': 0.0},
+                       {'min_token_coverage': 120.0}):
+            with self.assertRaises(fb.FeedbackError):
+                fb.EtrPolicy(**kwargs)
+
+    def test_a_tampered_stored_weight_is_rejected_on_read(self):
+        outcome = execution(1, token_usage=usage(1000),
+                            contribution='EFFECTIVE')
+        details = dict(outcome.as_details())
+        details['contribution_weight'] = '0.5'
+        self.store.append_record(
+            fb.FEEDBACK_DOCUMENT, summary='tampered', source_class='OBSERVED',
+            status='RECORDED', details=details, record_id='tampered',
+            now=RECENT)
+        loaded = fb.load_outcomes(self.store)
+        self.assertEqual(loaded.outcomes, ())
+        self.assertEqual(loaded.ignored, 1)
+        self.assertIn('weight', ' '.join(loaded.diagnostics))
+
+
+class EtrPersistenceTests(StoreFixture):
+    def test_token_usage_and_contribution_survive_a_round_trip(self):
+        outcome = execution(
+            1, token_usage=usage(1200, input_tokens=900, output_tokens=300,
+                                 cached_tokens=100, reasoning_tokens=50),
+            contribution='EFFECTIVE', agent_alias='builder-1')
+        self.record(outcome)
+        loaded = fb.load_outcomes(self.store).outcomes[0]
+        self.assertEqual(loaded.token_usage.total_tokens, 1200)
+        self.assertEqual(loaded.token_usage.input_tokens, 900)
+        self.assertEqual(loaded.token_usage.cached_tokens, 100)
+        self.assertEqual(loaded.token_usage.source, 'runtime:fixture')
+        self.assertEqual(loaded.contribution, 'EFFECTIVE')
+        self.assertEqual(loaded.agent_alias, 'builder-1')
+        self.assertIn('token_total: 1200', self.document())
+        self.assertIn('contribution_weight: 1.0', self.document())
+        etr = self.report().cohort('execution', 'code-change').etr
+        self.assertEqual(etr.observed_tokens, 1200)
+        self.assertEqual(etr.value, 100.0)
+
+    def test_the_report_renders_etr_without_inventing_a_number(self):
+        self.record(execution(1, token_usage=usage(0), contribution='UNRATED'))
+        rendered = '\n'.join(self.report().render_lines())
+        self.assertIn('etr=', rendered)
+        self.assertIn('NO_DATA', rendered)
+        self.assertIn('prior', rendered)
 
 
 if __name__ == '__main__':
