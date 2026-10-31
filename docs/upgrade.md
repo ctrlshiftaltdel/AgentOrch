@@ -601,6 +601,16 @@ python3 -m scripts.update_agentorch.entry --project . \
 
 **Release 1.7.0**：`1.6.3 → 1.7.0` 是 **Format 1.6 → 1.7 的格式升级**，也是 Phase D 的功能发行；`tag_matches_format('v1.7.0', '1.7')` 为真（major.minor = 1.7），满足 `VERSION_MATCH`。把 Format 留在 `1.6` 会让 `v1.7.0` 因 major.minor 不一致被拒绝，因此本次同时升 Format。包内文件集合从 93 个（92 `REQUIRED` + `MANIFEST.json`）增至 118 个（117 + 1），新增的 25 个 `REQUIRED` 文件全部是 Phase D 的 `scripts/agent_selection/` 资产族与随包测试（`tests/agent_selection/`，含 E1–E13 端到端）；无移动 / 改名 / 删除，`MANIFEST.json` schema 1 不变。更新引擎的校验 / 分类 / 备份 / 回滚语义未改动，升级按“新增上游文件”处理，不需要手工搬迁。`v1.7.0` 已于 2026-10-27 发布（[Release v1.7.0](https://github.com/ctrlshiftaltdel/AgentOrch/releases/tag/v1.7.0)，tag `v1.7.0` → `ac3e87f`，资产 `AgentOrch-1.7.0.zip`，602,273 bytes，SHA256 `cbc35fcf…`，与 GitHub API `assets[].digest` 一致）；真实下载与 `1.6.3 → 1.7.0` 隔离升级为 `PASS`（`APPLIED`，Format 1.6 → 1.7、`MANIFEST.json` files 92 → 117、117/117 包内文件逐字节一致、项目自有文件 SHA256 不变、备份 `verified=true`、head 前后不变；§14.6）。真实 1.3 / 1.4 资产、真实 `1.6.0` / `1.6.1` → `1.6.2` 升级与真实断网 / 限速 / DNS 仍为 `NOT_RUN` / `UNKNOWN`，不因本版本改变。
 
+### 13.3.1 Release / Format 解耦与旧客户端桥接（#193）
+
+Release 版本与 Format 是两条序列。本仓库更新器现在把第 10 项 `VERSION_MATCH` 交给显式兼容矩阵判断，而不是只比较 tag 前两段：
+
+- **历史规则保留**：tag 的 major.minor 等于 `format_version` 时通过（`v1.7.0` / `v1.7.1` + `1.7`，历史 `v1.6` / `v1.5`）。`versions.tag_matches_format()` 本身**原样保留**，没有放宽。
+- **桥接规则**：调用者显式声明的受支持 Format 列表包含目标包 `format_version` 时通过。当前声明为 `versions.DECLARED_SUPPORTED_FORMATS = ('1.7',)`，因此**带有该桥接的更新器**可以接受 `v1.8.0` + Format `1.7`。
+- **失败关闭**：缺少或空矩阵、未知 / 非法 Format、非法 tag、清单与包成员不符、版本不前进（降级 / 重装）仍然拒绝。矩阵来自更新器代码，不来自目标包；没有“忽略 `VERSION_MATCH`”的开关。
+
+**已发布的旧客户端仍会拒绝未桥接的 MINOR**：v1.7.0 客户端在安装任何包之前先执行旧的 `tag_matches_format()`，它要求 tag major.minor 等于 Format。`v1.8.0` + Format `1.7` 因此不会被旧客户端接受；必须先有一个**同 Format 的更新器桥接发行**（桥接包自身满足旧规则，例如 tag `v1.7.x` + Format `1.7`）被旧客户端安装，之后才轮到带有桥接的新更新器处理不升 Format 的 MINOR。**本任务只实现并测试桥接，不发布桥接包**；桥接包发布并安装之前，旧客户端对不升 Format 的 MINOR 继续失败关闭。真实旧客户端证据见 §14.7，桥接发行的端到端升级为 `NOT_RUN`。
+
 ### 13.4 冲突、删除与重命名
 
 入口（经由 #51 引擎）逐文件分类；以下情况**默认停止并保留项目文件**：
@@ -789,3 +799,18 @@ APPLY 后的可核对事实：
 - 升级后项目 `python3 scripts/validate_kit.py` 退出码 `0`（`tree mode downstream`，117 required）；包内 `python3 -m unittest discover -s tests` 968 tests `OK`（skip 19）。
 
 本节的命令与结果来自 2026-10-27 派发会话的真实运行记录（证据见 Issue #144）；记录发布后文档的同步任务未重跑该升级。本节只覆盖 `1.6.3 → 1.7.0` 这一次真实升级，不改写 §14.1–§14.5；真实 `1.6.0` / `1.6.1` → `1.6.2` 升级、真实 1.3 / 1.4 资产、真实断网 / 限速 / DNS、`HD-11` 与非 GitHub-hosted 平台仍为 `NOT_RUN` / `UNKNOWN`，不得用本节结果替代。
+
+### 14.7 已发布 v1.7.0 旧客户端对不升 Format MINOR 的失败关闭（#193，2026-10-31 UTC）
+
+环境：Linux x86_64、Python 3.12.15（`uv run python`）、`github` 底座仓库检出；下载与运行目录都在仓库外（`/tmp`）。没有打 tag、没有创建 Release、没有改动本仓库 `.orchestration/`。
+
+1. 下载真实已发布资产：`AgentOrch-1.7.0.zip`，602,273 bytes，SHA256 `cbc35fcf5ddf2aa8c7c799e52c7f5fa83ec8943a7691e1053155cc85988a4c10`（与 Release `assets[].digest` 逐字符一致），解压到仓库外隔离目录。
+2. 从解压目录导入 `scripts/update_agentorch/`，确认 `engine.__file__` / `package.__file__` 指向该解压目录，且该版本的 `versions` **没有** `format_compatibility`（证明执行的是已发布旧代码，不是本分支的新解析器）。
+3. 在仓库外构造合成项目：基线 `MANIFEST.json` 的 `format_version` 为 `1.7`；目标包为合成 zip，清单 `format_version` 也为 `1.7`，内存 `ReleaseInfo` 的 tag 分别为 `v1.8.0`（负向）与 `v1.7.1`（正控），资产摘要按实际字节计算。用旧客户端的 `engine.run_update(..., mode='PLAN', source=<内存源>, edition='github')` 运行。
+
+| # | 旧客户端 | 目标 tag + Format | 结果 | `VERSION_MATCH` | 项目写入 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 已发布 v1.7.0 代码 | `v1.8.0` + `1.7` | `STOPPED_UNSAFE_PACKAGE` | `FAIL`，旧客户端原文 `release tag 'v1.8.0' does not match manifest format_version '1.7'` | 零写入（前后逐文件字节快照一致） |
+| 2 | 已发布 v1.7.0 代码（正控） | `v1.7.1` + `1.7` | `PLANNED` | `PASS` | 零写入 |
+
+**范围与未验证项**：目标包是合成的，运行方式是 `PLAN` + 内存 Release 源，不是旧客户端到真实 `v1.8.0` Release 的完整 CLI / 网络升级；它也**不是**“旧客户端安装桥接包后成功升级”的证据。桥接发行需要自身仍满足旧规则（同 Format），本任务只实现与测试桥接、**不发布桥接包**，因此“旧客户端安装桥接 → 新更新器升级不升 Format MINOR”的端到端为 `NOT_RUN`。真实旧客户端对不升 Format MINOR 的拒绝已由第 1 行实测。

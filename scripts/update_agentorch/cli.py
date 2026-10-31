@@ -13,7 +13,7 @@ import re
 import sys
 from pathlib import Path
 
-from . import engine, sources
+from . import engine, sources, versions
 from . import report as report_module
 
 EDITION_RE = re.compile(r'`?edition`?\s*[:：]\s*`?([^`\s]+)`?', re.IGNORECASE)
@@ -61,7 +61,9 @@ def main(argv: list[str] | None = None) -> int:
 
     source = sources.GitHubReleaseSource()
     try:
-        result = engine.run_update(project, mode=args.mode, source=source, edition=edition)
+        result = engine.run_update(
+            project, mode=args.mode, source=source, edition=edition,
+            supported_formats=versions.DECLARED_SUPPORTED_FORMATS)
     except Exception as exc:  # noqa: BLE001 - the CLI must report, not traceback
         print(f'update_agentorch: no report produced: {type(exc).__name__}: {exc}', file=sys.stderr)
         return 1

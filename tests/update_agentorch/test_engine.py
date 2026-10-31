@@ -360,6 +360,72 @@ class UnsafePackageTests(unittest.TestCase):
                 self.assertEqual(result['target']['version'], '1.6.0')
 
 
+class FormatCompatibilityEngineTests(unittest.TestCase):
+    """The engine must bridge only through an explicit, caller-supplied matrix."""
+
+    def test_unbumped_minor_without_a_matrix_stops_before_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project, source, _, _ = prepare(
+                tmp, tag='v1.8.0', baseline_format='1.7', target_format='1.7')
+            before = project.snapshot()
+            result = run(project, source)
+
+            self.assertEqual(result['result'], 'STOPPED_UNSAFE_PACKAGE')
+            checks = {c['check']: c['result'] for c in result['target']['verification']['checks']}
+            self.assertEqual(checks['VERSION_MATCH'], 'FAIL')
+            self.assertEqual(project.snapshot(), before)
+            self.assertEqual(report_module.validate_report(result), [])
+
+    def test_declared_matrix_plans_an_unbumped_minor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project, source, _, _ = prepare(
+                tmp, tag='v1.8.0', baseline_format='1.7', target_format='1.7')
+            before = project.snapshot()
+            result = run(project, source, mode='PLAN', supported_formats=('1.7',))
+
+            self.assertEqual(result['result'], 'PLANNED')
+            checks = {c['check']: c['result'] for c in result['target']['verification']['checks']}
+            self.assertEqual(checks['VERSION_MATCH'], 'PASS')
+            self.assertEqual(result['target']['release_tag'], 'v1.8.0')
+            self.assertEqual(result['target']['version'], '1.8.0')
+            self.assertEqual(project.snapshot(), before)
+            self.assertEqual(report_module.validate_report(result), [])
+
+    def test_empty_matrix_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project, source, _, _ = prepare(
+                tmp, tag='v1.8.0', baseline_format='1.7', target_format='1.7')
+            result = run(project, source, supported_formats=())
+            self.assertEqual(result['result'], 'STOPPED_UNSAFE_PACKAGE')
+            checks = {c['check']: c['result'] for c in result['target']['verification']['checks']}
+            self.assertEqual(checks['VERSION_MATCH'], 'FAIL')
+
+    def test_matrix_does_not_bypass_the_downgrade_guard(self):
+        # Format 1.8 is declared in the matrix for this fixture, so VERSION_MATCH
+        # passes; the release is still not newer than the installed baseline and
+        # must stop with HD-16 instead of being applied.
+        with tempfile.TemporaryDirectory() as tmp:
+            project, source, _, _ = prepare(
+                tmp, tag='v1.8.0', baseline_format='1.8', target_format='1.7')
+            before = project.snapshot()
+            result = run(project, source, supported_formats=('1.7',))
+
+            self.assertEqual(result['result'], 'BLOCKED')
+            self.assertIn('HD-16', {entry['decision_id'] for entry in result['human_decisions']})
+            self.assertEqual(project.snapshot(), before)
+
+    def test_declared_matrix_is_the_only_bridge(self):
+        # A tag/format pair outside both the tag rule and the matrix is rejected
+        # even when the matrix itself is valid.
+        with tempfile.TemporaryDirectory() as tmp:
+            project, source, _, _ = prepare(
+                tmp, tag='v1.9.0', baseline_format='1.7', target_format='1.8')
+            result = run(project, source, supported_formats=('1.7',))
+            self.assertEqual(result['result'], 'STOPPED_UNSAFE_PACKAGE')
+            checks = {c['check']: c['result'] for c in result['target']['verification']['checks']}
+            self.assertEqual(checks['VERSION_MATCH'], 'FAIL')
+
+
 class WorkspaceTests(unittest.TestCase):
     def test_dirty_git_worktree_is_isolated_and_left_untouched(self):
         with tempfile.TemporaryDirectory() as tmp:

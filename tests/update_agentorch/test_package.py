@@ -29,6 +29,7 @@ def results(result) -> dict[str, str]:
 class PackageVerificationTests(unittest.TestCase):
     def verify(self, files=None, manifest=None, *, tag='v1.6', digest='auto',
                manifest_format=None, expected_suite=None,
+               supported_formats=None,
                limits=package.DEFAULT_LIMITS, **zip_kwargs):
         files = dict(UPSTREAM if files is None else files)
         if manifest is None:
@@ -37,6 +38,7 @@ class PackageVerificationTests(unittest.TestCase):
         payload = support.make_zip(files, manifest, **zip_kwargs)
         release = support.release_info(tag, payload, digest=digest)
         return package.verify_package(release, payload, expected_suite=expected_suite,
+                                      supported_formats=supported_formats,
                                       limits=limits), manifest, payload
 
     def test_clean_package_passes_every_check(self):
@@ -250,6 +252,56 @@ class PackageVerificationTests(unittest.TestCase):
     def test_version_must_match_manifest_format(self):
         result, _, _ = self.verify(tag='v1.7', manifest_format='1.6')
         self.assertEqual(results(result)['VERSION_MATCH'], 'FAIL')
+
+    def test_unbumped_minor_without_a_matrix_is_unsafe(self):
+        result, _, _ = self.verify(tag='v1.8.0', manifest_format='1.7')
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, 'UNSAFE_PACKAGE')
+        self.assertEqual(results(result)['VERSION_MATCH'], 'FAIL')
+        self.assertEqual(result.failed_check, 'VERSION_MATCH')
+
+    def test_declared_matrix_accepts_unbumped_minor(self):
+        result, _, _ = self.verify(tag='v1.8.0', manifest_format='1.7',
+                                   supported_formats=('1.7',))
+        self.assertTrue(result.ok, result.detail)
+        self.assertEqual(results(result)['VERSION_MATCH'], 'PASS')
+        self.assertEqual(result.version, '1.8.0')
+        self.assertEqual(result.format_version, '1.7')
+
+    def test_empty_matrix_is_not_a_matrix(self):
+        result, _, _ = self.verify(tag='v1.8.0', manifest_format='1.7',
+                                   supported_formats=())
+        self.assertEqual(results(result)['VERSION_MATCH'], 'FAIL')
+
+    def test_matrix_does_not_accept_an_undeclared_format(self):
+        # v1.9.0 no longer encodes Format 1.8, so only the matrix could accept it.
+        result, _, _ = self.verify(tag='v1.9.0', manifest_format='1.8',
+                                   supported_formats=('1.7',))
+        self.assertEqual(results(result)['VERSION_MATCH'], 'FAIL')
+
+    def test_matrix_never_masks_a_suite_mismatch(self):
+        result, _, _ = self.verify(tag='v1.8.0', manifest_format='1.7',
+                                   supported_formats=('1.7',),
+                                   expected_suite='Another Suite')
+        self.assertEqual(results(result)['VERSION_MATCH'], 'FAIL')
+
+    def test_matrix_never_masks_a_manifest_member_mismatch(self):
+        files = dict(UPSTREAM)
+        manifest = support.build_manifest({**files, 'kit/extra.md': b'extra\n'},
+                                           format_version='1.7')
+        result, _, _ = self.verify(files, manifest, tag='v1.8.0',
+                                   supported_formats=('1.7',))
+        self.assertFalse(result.ok)
+        self.assertEqual(results(result)['FILE_SET'], 'FAIL')
+        self.assertEqual(results(result)['VERSION_MATCH'], 'NOT_RUN')
+
+    def test_malformed_tag_is_rejected_before_the_matrix(self):
+        # `sources.select_asset` owns tag shape, so an invalid tag never reaches
+        # VERSION_MATCH; this asserts the package still fails closed.
+        result, _, _ = self.verify(tag='1.8.0', manifest_format='1.7',
+                                   supported_formats=('1.7',))
+        self.assertFalse(result.ok)
+        self.assertEqual(results(result)['SOURCE_ALLOWLIST'], 'FAIL')
 
     def test_suite_must_match_baseline(self):
         result, _, _ = self.verify(expected_suite='Another Suite')
