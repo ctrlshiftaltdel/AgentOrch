@@ -1,0 +1,19 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "runtime_status": "MANUAL_HANDOFF",
+  "handoff_required": true,
+  "trusted_identity": true,
+  "missing_capabilities": [],
+  "required_human_decision_ids": [
+    "concurrency_conflict"
+  ],
+  "required_substrings": [
+    "path_conflict:scripts/orchestrator.py",
+    "resource_conflict:db:main",
+    "\"dispatched\": false"
+  ],
+  "forbidden_substrings": [
+    "\"dispatched\": true"
+  ]
+}

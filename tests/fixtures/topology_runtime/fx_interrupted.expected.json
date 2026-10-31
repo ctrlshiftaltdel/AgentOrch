@@ -1,0 +1,21 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "runtime_status": "MANUAL_HANDOFF",
+  "handoff_required": true,
+  "trusted_identity": true,
+  "missing_capabilities": [
+    "collect"
+  ],
+  "required_human_decision_ids": [
+    "runtime_capability_gap"
+  ],
+  "required_substrings": [
+    "capability_collect_fail",
+    "manual_session",
+    "\"dispatched\": false"
+  ],
+  "forbidden_substrings": [
+    "\"dispatched\": true"
+  ]
+}
