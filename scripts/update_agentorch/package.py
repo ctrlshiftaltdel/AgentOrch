@@ -227,6 +227,7 @@ def _passed(checks: list[dict], name: str, detail: str | None = None) -> None:
 def verify_package(release: sources.ReleaseInfo, payload: bytes, *,
                    expected_suite: str | None = None,
                    expected_manifest_sha256: str | None = None,
+                   supported_formats: object = None,
                    limits: PackageLimits = DEFAULT_LIMITS) -> PackageResult:
     """Run the ten frozen checks against downloaded bytes. Never touches the project."""
     checks: list[dict] = []
@@ -340,16 +341,17 @@ def verify_package(release: sources.ReleaseInfo, payload: bytes, *,
         _passed(checks, 'EXPECTED_LAYOUT', f'single top-level directory {top_dir!r}, no executables')
 
         # 10: version / suite corroboration
-        if not versions.tag_matches_format(release.tag_name, manifest['format_version']):
-            return _abort(checks, 'VERSION_MATCH',
-                          f'release tag {release.tag_name!r} does not match manifest '
-                          f'format_version {manifest["format_version"]!r}')
+        compatibility = versions.format_compatibility(
+            release.tag_name, manifest['format_version'], supported_formats)
+        if not compatibility.accepted:
+            return _abort(checks, 'VERSION_MATCH', compatibility.detail)
         if expected_suite is not None and manifest['suite'] != expected_suite:
             return _abort(checks, 'VERSION_MATCH',
                           f'package suite {manifest["suite"]!r} != installed suite {expected_suite!r}')
         version = versions.normalize_version(release.tag_name)
         _passed(checks, 'VERSION_MATCH',
-                f'{release.tag_name} -> {version}, format {manifest["format_version"]}')
+                f'{release.tag_name} -> {version}, format {manifest["format_version"]} '
+                f'({compatibility.rule})')
 
     return PackageResult(
         ok=True,

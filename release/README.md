@@ -242,7 +242,8 @@
 - **只读发行评估**：Master 在会话恢复、重要 PR 合并后、阶段完成时执行只读评估，列出最新已发布 tag 之后的已合并已验证项、每项兼容性分类、建议 bump、被阻塞或回滚的项。只读表示**不修改 `VERSION.md`、不打 tag、不建 Release、不上传资产**。
 - **离线或无权限**：只能产出报告（建议版本、分类依据、缺口、待授权项），如实标 `NOT_RUN` / `BLOCKED`，不得声明已发布，也不得用本地构建冒充 Release。
 - **常设自动发版授权范围：空**。当前没有任何 PATCH / MINOR 处于“无需逐次确认即可发版”的常设授权内。没有 Owner 另一次明确授权（写明批次、版本级别与范围）时，**不得打 tag 或创建 Release**；“无需逐次提醒”的意图不折算为授权。MAJOR、破坏性迁移、无法回退或安全授权变化即使获得常规授权，仍须单独提交 Owner 决策。执行代理永远不得自行发版。
-- **现行 Release / Format 耦合仍然存在**：`scripts/update_agentorch/versions.py` 的 `tag_matches_format()` 要求 tag 的 major.minor 等于 `MANIFEST.json` 的 `format_version`。因此在当前实现下，“升 MINOR 但不升 Format”（如 `v1.8.0` + Format `1.7`）会被升级器拒绝；要么按 v1.7.0 的先例同步处理 Format，要么等解耦落地，具体取舍属于每次发行的独立决定，不由本节授权。**解耦实现与旧客户端 `VERSION_MATCH` 桥接验证归 #193**；#192 不修改 `scripts/update_agentorch/`，本节也不声称已解耦。
+- **Release / Format 解耦与旧客户端桥接（#193）**：旧的 `tag_matches_format()` 原样保留，已发布的旧客户端继续在安装前用它失败关闭。新增 `versions.format_compatibility()` 供新更新器使用：除了原有的“tag major.minor == Format”规则，它还接受调用者显式给出且包含目标 `format_version` 的受支持列表；当前声明为 `DECLARED_SUPPORTED_FORMATS = ('1.7',)`。缺少 / 空矩阵、未知 / 非法 Format、非法 tag、清单与包成员不符、降级 / 重装仍失败关闭，没有“忽略 `VERSION_MATCH`”的开关。
+- **桥接未发布前，旧客户端仍拒绝不升 Format 的 MINOR**：`v1.8.0` + Format `1.7` 不会被已发布的 v1.7.0 客户端接受。桥接发行必须自身仍满足旧规则（例如 tag `v1.7.x` + Format `1.7`），旧客户端才能安装它，之后才是带有桥接的新更新器处理不升 Format 的 MINOR。**本任务只实现并测试桥接，不发布桥接包**；桥接发行端到端升级为 `NOT_RUN`，详见仓库文档 `docs/upgrade.md` §14.7。
 
 ## 6. 声明
 

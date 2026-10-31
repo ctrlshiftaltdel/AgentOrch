@@ -32,7 +32,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import classify, cli, engine, report as report_module, sources, workspace
+from . import classify, cli, engine, report as report_module, sources, versions, workspace
 
 try:  # repository checkout / package root on sys.path
     from scripts.self_improvement import planning
@@ -308,13 +308,20 @@ def _github_delivery(environment, report, mode):
 # --------------------------------------------------------------------------- #
 
 def prepare_update(project, request, *, mode='PLAN', source=None, edition=None,
-                   isolation=True, now=None):
+                   supported_formats=None, isolation=True, now=None):
     """Route one message, inspect the project, run the engine, shape the carrier.
 
     The function performs no carrier write: ``local`` returns a task packet and
     ``github`` returns Issue / Draft PR payloads. Use the returned ``status`` to
     decide whether to continue; ``NOT_UPDATE`` and ``NEEDS_CLARIFICATION`` mean
     no engine call happened.
+
+    ``supported_formats`` is the trusted compatibility matrix handed to package
+    verification. ``None`` means "use this updater's declared matrix"
+    (:data:`scripts.update_agentorch.versions.DECLARED_SUPPORTED_FORMATS`), so the
+    shipped entry can bridge a MINOR release that keeps the Format. Pass an
+    explicit list / tuple (including an empty one) only to narrow or disable the
+    bridge; do not derive it from the downloaded package.
     """
     if mode not in ('PLAN', 'APPLY'):
         raise EntryError(f'mode must be PLAN or APPLY, got {mode!r}')
@@ -360,8 +367,11 @@ def prepare_update(project, request, *, mode='PLAN', source=None, edition=None,
         raise EntryError(f'edition must be local or github, got {effective_edition!r}')
 
     source = source if source is not None else sources.GitHubReleaseSource()
+    matrix = (versions.DECLARED_SUPPORTED_FORMATS
+              if supported_formats is None else supported_formats)
     report = engine.run_update(project, mode=mode, source=source,
                                edition=effective_edition, now=now,
+                               supported_formats=matrix,
                                isolation=isolation)
     environment['edition'] = effective_edition
 

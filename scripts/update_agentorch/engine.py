@@ -229,6 +229,7 @@ def _rollback_failed(report: dict, problems: list[str]) -> None:
 def run_update(project, *, mode: str, source, edition: str,
                now: datetime | None = None, fault_injector=None,
                limits: package.PackageLimits | None = None,
+               supported_formats: object = None,
                isolation: bool = True) -> dict:
     """Run one PLAN or APPLY against ``project`` and return the report dict."""
     if mode not in ('PLAN', 'APPLY'):
@@ -328,7 +329,7 @@ def run_update(project, *, mode: str, source, edition: str,
         return report
 
     pkg = package.verify_package(release, payload, expected_suite=baseline.suite,
-                                 limits=limits)
+                                 supported_formats=supported_formats, limits=limits)
     report['target'].update(_target_fields(release, asset, now))
     report['target']['asset_sha256'] = _raw_sha256(payload)
     report['target']['manifest_sha256'] = pkg.manifest_sha256

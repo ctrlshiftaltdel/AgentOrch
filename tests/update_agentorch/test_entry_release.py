@@ -41,7 +41,7 @@ PROJECT_FILES = {
 
 
 def prepare(tmp, *, baseline_format='1.5', old=None, target=None,
-            target_format='1.6', manifest=True, git=False):
+            target_format='1.6', tag='v1.6', manifest=True, git=False):
     project = support.ProjectTree(tmp)
     old = dict(UPSTREAM_15 if old is None else old)
     target = dict(UPSTREAM_16 if target is None else target)
@@ -55,7 +55,7 @@ def prepare(tmp, *, baseline_format='1.5', old=None, target=None,
     manifest_target = support.build_manifest(target, format_version=target_format)
     payload = support.make_zip(target, manifest_target)
     source = support.FakeReleaseSource(
-        support.release_info('v1.6', payload), payload)
+        support.release_info(tag, payload), payload)
     return project, source, target, manifest_target
 
 
@@ -198,6 +198,37 @@ class StopConditionsTests(unittest.TestCase):
                                 for check in report['target']['verification']['checks']))
             self.assertEqual(project.snapshot(), before)
             self.assertTrue(payload['gates']['report_valid'])
+
+
+class FormatBridgeTests(unittest.TestCase):
+    """The shipped entry is the *new* updater: it declares its own matrix."""
+
+    def test_entry_bridges_an_unbumped_minor_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project, source, target, _ = prepare(
+                tmp, baseline_format='1.7', target_format='1.7', tag='v1.8.0')
+            payload = run_entry(project, source)
+
+            self.assertEqual(payload['status'], 'PREPARED')
+            self.assertEqual(payload['engine_report']['result'], 'APPLIED')
+            checks = {check['check']: check['result']
+                      for check in payload['engine_report']['target']['verification']['checks']}
+            self.assertEqual(checks['VERSION_MATCH'], 'PASS')
+            for rel, data in target.items():
+                self.assertEqual(project.read(rel), data, rel)
+
+    def test_entry_honours_an_explicitly_empty_matrix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project, source, _, _ = prepare(
+                tmp, baseline_format='1.7', target_format='1.7', tag='v1.8.0')
+            before = project.snapshot()
+            payload = run_entry(project, source, supported_formats=())
+
+            self.assertEqual(payload['engine_report']['result'], 'STOPPED_UNSAFE_PACKAGE')
+            checks = {check['check']: check['result']
+                      for check in payload['engine_report']['target']['verification']['checks']}
+            self.assertEqual(checks['VERSION_MATCH'], 'FAIL')
+            self.assertEqual(project.snapshot(), before)
 
 
 if __name__ == '__main__':

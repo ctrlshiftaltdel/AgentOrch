@@ -37,6 +37,70 @@ class VersionTests(unittest.TestCase):
         self.assertFalse(versions.tag_matches_format('v1.7', '1.6'))
         self.assertFalse(versions.tag_matches_format('nope', '1.6'))
 
+    def test_legacy_helper_still_rejects_a_minor_that_keeps_the_format(self):
+        # The published v1.7.0 client runs exactly this function before install;
+        # it must keep failing closed for v1.8.0 + Format 1.7.
+        self.assertFalse(versions.tag_matches_format('v1.8.0', '1.7'))
+
+    def test_legacy_helper_keeps_historical_acceptance(self):
+        cases = (
+            ('v1.7.0', '1.7'),
+            ('v1.7.1', '1.7'),
+            ('v1.7', '1.7'),
+            ('v1.6', '1.6'),
+            ('v1.6.3', '1.6'),
+            ('v1.5', '1.5'),
+        )
+        for tag, format_version in cases:
+            with self.subTest(tag=tag, format_version=format_version):
+                self.assertTrue(versions.tag_matches_format(tag, format_version))
+
+
+class FormatCompatibilityTests(unittest.TestCase):
+    """The new bridge: an explicit, caller-supplied compatibility matrix."""
+
+    def test_declared_matrix_accepts_minor_without_format_bump(self):
+        decision = versions.format_compatibility('v1.8.0', '1.7', ('1.7',))
+        self.assertTrue(decision.accepted)
+        self.assertEqual(decision.rule, 'declared_supported_format')
+
+    def test_legacy_rule_is_accepted_without_a_matrix(self):
+        decision = versions.format_compatibility('v1.7.1', '1.7', None)
+        self.assertTrue(decision.accepted)
+        self.assertEqual(decision.rule, 'tag_matches_format')
+
+    def test_missing_or_empty_matrix_fails_closed(self):
+        for matrix in (None, (), [], '1.7'):
+            with self.subTest(matrix=matrix):
+                decision = versions.format_compatibility('v1.8.0', '1.7', matrix)
+                self.assertFalse(decision.accepted)
+                self.assertIsNone(decision.rule)
+
+    def test_unknown_target_format_fails_closed(self):
+        # A well-formed Format 1.8 is not declared by this updater; the tag no
+        # longer encodes it (v1.9.0), so the bridge must reject it.
+        decision = versions.format_compatibility('v1.9.0', '1.8', ('1.7',))
+        self.assertFalse(decision.accepted)
+        # A malformed Format is rejected regardless of tag or matrix.
+        for bad_format in ('1', '1.8.0', 'latest', '', None):
+            with self.subTest(bad_format=bad_format):
+                decision = versions.format_compatibility('v1.9.0', bad_format, ('1.7',))
+                self.assertFalse(decision.accepted)
+
+    def test_wrong_tag_fails_closed(self):
+        for tag in ('1.8.0', 'v1', 'v1.8.0.1', 'v1.8.0-rc1', 'release-1.8', '', None):
+            with self.subTest(tag=tag):
+                decision = versions.format_compatibility(tag, '1.7', ('1.7',))
+                self.assertFalse(decision.accepted)
+
+    def test_invalid_matrix_entry_fails_closed(self):
+        decision = versions.format_compatibility('v1.8.0', '1.7', ('1.7', 'latest'))
+        self.assertFalse(decision.accepted)
+
+    def test_undeclared_format_fails_closed(self):
+        decision = versions.format_compatibility('v1.8.0', '1.7', ('1.6',))
+        self.assertFalse(decision.accepted)
+
 
 class SourceTests(unittest.TestCase):
     def test_allowlist_constant_is_the_official_repository(self):
