@@ -1,0 +1,11 @@
+{
+  "exit_code": 2,
+  "diagnostic_code": "forbidden_field",
+  "risk_level": null,
+  "selection_status": null,
+  "selected_topology": null,
+  "candidate_eligibility": {},
+  "required_substrings": [],
+  "forbidden_substrings": [],
+  "required_human_decision_ids": []
+}

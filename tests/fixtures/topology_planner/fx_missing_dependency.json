@@ -1,0 +1,60 @@
+{
+  "schema_version": "topology-planner-input/1",
+  "task_ref": "issue-178-missing-dependency",
+  "edition": "github",
+  "acceptance": [
+    {
+      "ac_id": "AC-1",
+      "text": "an unverified dependency blocks every topology candidate"
+    }
+  ],
+  "changed_paths": [
+    {
+      "path": "scripts/topology_planner/cli.py",
+      "source_ref": "caller:diff/1"
+    }
+  ],
+  "risk": {
+    "signals": [],
+    "claimed_level": null
+  },
+  "ambiguities": [],
+  "dependencies": [
+    {
+      "dep_id": "#999",
+      "state": "not_verified"
+    }
+  ],
+  "context": {
+    "load": "low",
+    "isolation_required": false,
+    "parallelizable": false,
+    "subtask_count": 1
+  },
+  "tools": {
+    "required": [
+      "read_file"
+    ],
+    "available": [
+      "read_file"
+    ]
+  },
+  "capabilities": {
+    "C1": "pass",
+    "C2": "pass",
+    "C3": "pass",
+    "C4": "pass"
+  },
+  "reviewer": {
+    "required": false,
+    "claims": {}
+  },
+  "implementation": {
+    "required": true,
+    "master_exception": false
+  },
+  "locks": {
+    "path_conflicts": [],
+    "resource_conflicts": []
+  }
+}

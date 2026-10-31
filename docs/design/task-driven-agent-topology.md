@@ -185,6 +185,8 @@
 
 以上并非强制使用固定数目的角色实例，也不创建 Backend/Frontend/Database 等岗位代理；一个任务的独立 Reviewer 由其独立审查需求定义。
 
+> `python scripts/topology_planner/cli.py --input PATH` 是 observe-only 的只读推荐 CLI：#178 只输出 T0–T4 候选与硬筛选原因，不执行、不派发、不扩权限。
+
 ### 3.4 选择流程与不变量
 
 本流程顺序固定为 **Task → Topology → 角色 / 模型匹配**；不得先按角色名册或模型排名反推任务与拓扑。以下「候选」「推荐」都不是派发。

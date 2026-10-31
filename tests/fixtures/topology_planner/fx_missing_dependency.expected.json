@@ -1,0 +1,25 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "risk_level": "low",
+  "selection_status": "BLOCKED",
+  "selected_topology": null,
+  "candidate_eligibility": {
+    "T0": false,
+    "T1": false,
+    "T2": false,
+    "T3": false,
+    "T4": false
+  },
+  "required_substrings": [
+    "dependency_not_verified:#999",
+    "dependency_not_verified"
+  ],
+  "forbidden_substrings": [
+    "\"selection_status\": \"RECOMMENDED\"",
+    "\"selected_topology\": \"T0\""
+  ],
+  "required_human_decision_ids": [
+    "dependency_not_verified"
+  ]
+}

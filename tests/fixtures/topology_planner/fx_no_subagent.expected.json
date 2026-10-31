@@ -1,0 +1,28 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "risk_level": "low",
+  "selection_status": "MANUAL_HANDOFF",
+  "selected_topology": null,
+  "candidate_eligibility": {
+    "T0": false,
+    "T1": false,
+    "T2": false,
+    "T3": false,
+    "T4": true
+  },
+  "required_substrings": [
+    "capability_C1_unknown",
+    "capability_C2_unknown",
+    "capability_C3_stale",
+    "capability_C4_not_run",
+    "runtime_capability_gap"
+  ],
+  "forbidden_substrings": [
+    "\"selection_status\": \"RECOMMENDED\"",
+    "\"dispatched\": true"
+  ],
+  "required_human_decision_ids": [
+    "runtime_capability_gap"
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "schema_version": "topology-planner-input/1",
+  "task_ref": "issue-178-ambiguity",
+  "edition": "local",
+  "acceptance": [
+    {
+      "ac_id": "AC-1",
+      "text": "declared ambiguity is never auto classified as low risk"
+    }
+  ],
+  "changed_paths": [
+    {
+      "path": "docs/design/task-driven-agent-topology.md",
+      "source_ref": "caller:diff/1"
+    }
+  ],
+  "risk": {
+    "signals": [],
+    "claimed_level": "low"
+  },
+  "ambiguities": [
+    {
+      "item_id": "scope_unclear",
+      "source_ref": "caller:issue/1"
+    }
+  ],
+  "dependencies": [
+    {
+      "dep_id": "#177",
+      "state": "verified"
+    }
+  ],
+  "context": {
+    "load": "low",
+    "isolation_required": false,
+    "parallelizable": false,
+    "subtask_count": 1
+  },
+  "tools": {
+    "required": [
+      "read_file"
+    ],
+    "available": [
+      "read_file"
+    ]
+  },
+  "capabilities": {
+    "C1": "pass",
+    "C2": "pass",
+    "C3": "pass",
+    "C4": "pass"
+  },
+  "reviewer": {
+    "required": false,
+    "claims": {}
+  },
+  "implementation": {
+    "required": false,
+    "master_exception": false
+  },
+  "locks": {
+    "path_conflicts": [],
+    "resource_conflicts": []
+  }
+}
