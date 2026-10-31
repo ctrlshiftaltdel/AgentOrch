@@ -1,0 +1,27 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "runtime_status": "MANUAL_HANDOFF",
+  "handoff_required": true,
+  "trusted_identity": false,
+  "missing_capabilities": [
+    "spawn",
+    "wait",
+    "collect",
+    "context_isolation",
+    "tool_permissions"
+  ],
+  "required_human_decision_ids": [
+    "runtime_capability_gap",
+    "identity_untrusted"
+  ],
+  "required_substrings": [
+    "capability_spawn_unknown",
+    "capability_wait_not_run",
+    "\"dispatched\": false"
+  ],
+  "forbidden_substrings": [
+    "\"dispatched\": true",
+    "\"runtime_support_inferred\": true"
+  ]
+}

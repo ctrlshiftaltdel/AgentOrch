@@ -1,0 +1,57 @@
+{
+  "schema_version": "topology-runtime-input/1",
+  "task_ref": "issue-179-unavailable",
+  "edition": "github",
+  "as_of": "2026-11-01T00:00:00Z",
+  "runtime": {
+    "runtime_id": "codex",
+    "capabilities": {
+      "spawn": {
+        "state": "unknown",
+        "evidence_class": "UNKNOWN",
+        "evidence_ref": "caller:capability/spawn",
+        "observed_at": "2026-10-31T20:00:00Z"
+      },
+      "wait": {
+        "state": "not_run",
+        "evidence_class": "UNKNOWN",
+        "evidence_ref": "caller:capability/wait",
+        "observed_at": "2026-10-31T20:00:00Z"
+      },
+      "collect": {
+        "state": "unknown",
+        "evidence_class": "UNKNOWN",
+        "evidence_ref": "caller:capability/collect",
+        "observed_at": "2026-10-31T20:00:00Z"
+      },
+      "context_isolation": {
+        "state": "unknown",
+        "evidence_class": "UNKNOWN",
+        "evidence_ref": "caller:capability/context_isolation",
+        "observed_at": "2026-10-31T20:00:00Z"
+      }
+    },
+    "tool_permissions": {
+      "state": "unknown",
+      "granted_tools": [],
+      "evidence_class": "UNKNOWN",
+      "evidence_ref": "caller:capability/tool_permissions",
+      "observed_at": "2026-10-31T20:00:00Z"
+    }
+  },
+  "task": {
+    "required_tools": [
+      "read_file"
+    ]
+  },
+  "identity": {
+    "declared_status": "UNKNOWN",
+    "canonical_identity": null,
+    "verified_until": null,
+    "source_ref": "caller:identity"
+  },
+  "locks": {
+    "path_conflicts": [],
+    "resource_conflicts": []
+  }
+}

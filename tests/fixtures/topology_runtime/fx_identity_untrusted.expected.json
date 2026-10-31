@@ -1,0 +1,18 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "runtime_status": "MANUAL_HANDOFF",
+  "handoff_required": true,
+  "trusted_identity": false,
+  "missing_capabilities": [],
+  "required_human_decision_ids": [
+    "identity_untrusted"
+  ],
+  "required_substrings": [
+    "identity_status_unknown",
+    "\"dispatched\": false"
+  ],
+  "forbidden_substrings": [
+    "\"dispatched\": true"
+  ]
+}

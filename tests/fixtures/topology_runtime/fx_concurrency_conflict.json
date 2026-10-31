@@ -1,0 +1,66 @@
+{
+  "schema_version": "topology-runtime-input/1",
+  "task_ref": "issue-179-concurrency-conflict",
+  "edition": "github",
+  "as_of": "2026-11-01T00:00:00Z",
+  "runtime": {
+    "runtime_id": "fixture-runtime",
+    "capabilities": {
+      "spawn": {
+        "state": "pass",
+        "evidence_class": "OBSERVED",
+        "evidence_ref": "probe:fixture-runtime/spawn/20261031",
+        "observed_at": "2026-10-31T20:00:00Z"
+      },
+      "wait": {
+        "state": "pass",
+        "evidence_class": "OBSERVED",
+        "evidence_ref": "probe:fixture-runtime/wait/20261031",
+        "observed_at": "2026-10-31T20:05:00Z"
+      },
+      "collect": {
+        "state": "pass",
+        "evidence_class": "OBSERVED",
+        "evidence_ref": "probe:fixture-runtime/collect/20261031",
+        "observed_at": "2026-10-31T20:10:00Z"
+      },
+      "context_isolation": {
+        "state": "pass",
+        "evidence_class": "OBSERVED",
+        "evidence_ref": "probe:fixture-runtime/isolation/20261031",
+        "observed_at": "2026-10-31T20:15:00Z"
+      }
+    },
+    "tool_permissions": {
+      "state": "pass",
+      "granted_tools": [
+        "read_file",
+        "write_file",
+        "run_command"
+      ],
+      "evidence_class": "OBSERVED",
+      "evidence_ref": "probe:fixture-runtime/tools/20261031",
+      "observed_at": "2026-10-31T20:20:00Z"
+    }
+  },
+  "task": {
+    "required_tools": [
+      "read_file",
+      "write_file"
+    ]
+  },
+  "identity": {
+    "declared_status": "CONFIRMED",
+    "canonical_identity": "provider:model:2026-10",
+    "verified_until": "2026-12-01T00:00:00Z",
+    "source_ref": "agent-registry:scope/fixture-runtime"
+  },
+  "locks": {
+    "path_conflicts": [
+      "scripts/orchestrator.py"
+    ],
+    "resource_conflicts": [
+      "db:main"
+    ]
+  }
+}
