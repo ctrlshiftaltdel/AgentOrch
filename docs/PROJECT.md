@@ -32,12 +32,17 @@
 - 构建 / 打包：不适用（无构建产物）
 - 手工 / UI 冒烟检查：按新提示词走一遍空目录启动冒烟
 - 合并后必须执行：快速测试 + 完整回归 + `python scripts/orchestrator.py backup` + 静态检查。`backup` 只按「维护写入边界」执行；该边界未出现在合并目标 `main` 上时，不得用待合并文本给当次合并授权。
+- 合并后验证 profile（2026-10-31 项目所有者授权，Issue #188）：每个 HEAD 的 CI 全套仍必须真实通过；默认集合仍是快速测试 + 完整回归 + `backup` + 静态检查。唯一授权减项仅当 `verification_profile` 精确等于 `risk_pilot` 且调用者用 `python scripts/verification_profile.py --evidence <json>` 显式证明变更为 L0 时生效：此时合并后集合可以不含 `python -m unittest discover -s tests`，但仍必须含 `python scripts/validate_kit.py`、`python -m py_compile scripts/orchestrator.py scripts/validate_kit.py` 与 `python scripts/orchestrator.py backup`。
+- 上述减项的关闭条件：证明缺失或不可判定、`executable_doc` / `policy` / `contract` / `uncertainty_l3` 任一为真，或任一路径命中 `scripts/orchestrator.py`、`kit/`、`.github/workflows/`、`docs/PROJECT.md`、`docs/PLAN.md`、`AGENTS.md`、`editions/`、`scripts/`、`release/`、`templates/`、`VERSION.md` 时，仍执行完整回归。L1 / L2 / L3、发布、安全、权限、身份、迁移、锁与状态机相关检查一律不减。
+- 回退：把 `verification_profile` 改回 `strict`（或删除该键）即恢复唯一的默认完整集合，不需要改代码。
 
 ## 运行配置
 
 本文件的 `edition` 键是底座选择的**唯一权威来源**；`.orchestration/config.json` 只描述本地 CLI 运行参数（`retry_cap`、`local_dir`），不参与底座选择，也不存在“缺省底座”。
 
 - `edition`：`github`
+- `verification_profile`：`risk_pilot`
+- 上面 `verification_profile` 的回退：改回 `strict` 或删除该键（2026-10-31 起，Issue #188）。
 - （可选）`architecture_contract_path`：架构契约文件路径，默认 `docs/architecture/contract.json`。**不配置等价于 `OFF`（只读诊断，不阻断）**；配置了但文件缺失属于配置错误，检查器失败关闭。检查器与能力边界见 `docs/self-improvement/architecture-checker.md`。
 - 本地 CLI 边界：`scripts/orchestrator.py` 只维护 `local` 任务库。声明 `github` 时，`task add` / `task ready` / `task dispatch` / `task status` / `task workspace` / `task amend` / `task unlock` 会拒绝执行并给出下一步指引；`init`、`backup`、`config show`、`task list`、`task show` 仍可用。`edition` 缺失、为空、非法字符串、类型错误或文件不可读时同样拒绝调度，并报出实际值与修复位置（本文件 + 键名）。完整矩阵见 `README.md` 6.2。
 - 并发策略：**按机器余量动态决定，不设固定上限**。派发前观察 CPU / 内存 / 磁盘 / 测试资源争用，有余量即可并行；同一 worktree 同一时刻只允许一个测试进程。把「本机实测可承载并发」作为参考记录，而不是规则常量。
