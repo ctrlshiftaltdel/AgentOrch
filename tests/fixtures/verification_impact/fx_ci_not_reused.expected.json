@@ -1,0 +1,41 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "coverage_status": "complete",
+  "required_coverage_reasons": [],
+  "required_unknowns": [],
+  "identity": {
+    "requirement": "not_required",
+    "assessment": "not_assessed"
+  },
+  "required_reuse": [
+    {
+      "evidence_id": "ev_ci",
+      "reuse_decision": "not_reused",
+      "required_reasons": [
+        "ci_required"
+      ]
+    },
+    {
+      "evidence_id": "ev_approval",
+      "reuse_decision": "not_reused",
+      "required_reasons": [
+        "approval_class"
+      ]
+    },
+    {
+      "evidence_id": "ev_security",
+      "reuse_decision": "not_reused",
+      "required_reasons": [
+        "security_class"
+      ]
+    }
+  ],
+  "false_negatives": [],
+  "time_saved": 5.0,
+  "out_of_mapping_failure_ids": [],
+  "high_risk_paths": [],
+  "suggestions_equal_snapshot": true,
+  "counterfactual_removed_empty": true,
+  "subset_claimed_sufficient": false
+}

@@ -1,0 +1,361 @@
+{
+  "input": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "verification-impact-input/1",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "schema_version", "task_ref", "edition", "base_sha", "head_sha",
+      "acceptance", "changed_paths", "impact_graph", "dynamic_references",
+      "checks", "old_evidence", "comparison", "requires_independent_reviewer"
+    ],
+    "properties": {
+      "schema_version": {"const": "verification-impact-input/1"},
+      "task_ref": {"type": "string", "minLength": 1, "maxLength": 200},
+      "edition": {"enum": ["local", "github"]},
+      "base_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+      "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+      "acceptance": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ac_id", "text"],
+          "properties": {
+            "ac_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"},
+            "text": {"type": "string", "minLength": 1, "maxLength": 500}
+          }
+        }
+      },
+      "changed_paths": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "source_ref"],
+          "properties": {
+            "path": {"type": "string", "minLength": 1, "maxLength": 300},
+            "source_ref": {"type": "string", "pattern": "^[A-Za-z0-9_.:/#-]{1,200}$"}
+          }
+        }
+      },
+      "impact_graph": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["nodes", "edges"],
+        "properties": {
+          "nodes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["node_id", "kind", "path", "source_ref"],
+              "properties": {
+                "node_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"},
+                "kind": {"enum": ["changed_path", "test", "caller"]},
+                "path": {"type": "string", "minLength": 1, "maxLength": 300},
+                "source_ref": {"type": "string", "pattern": "^[A-Za-z0-9_.:/#-]{1,200}$"}
+              }
+            }
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["edge_id", "from_node", "to_node", "kind", "source_ref"],
+              "properties": {
+                "edge_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"},
+                "from_node": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"},
+                "to_node": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"},
+                "kind": {"enum": ["covers", "calls"]},
+                "source_ref": {"type": "string", "pattern": "^[A-Za-z0-9_.:/#-]{1,200}$"}
+              }
+            }
+          }
+        }
+      },
+      "dynamic_references": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["item_id", "reference_state", "source_ref"],
+          "properties": {
+            "item_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,80}$"},
+            "reference_state": {"enum": ["known", "unknown", "missing"]},
+            "source_ref": {"type": "string", "pattern": "^[A-Za-z0-9_.:/#-]{1,200}$"}
+          }
+        }
+      },
+      "checks": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "check_id", "scope", "source_ref", "mandatory", "ci_required",
+            "approval_class", "security_class", "cacheable", "command",
+            "input_hash", "dependency_fingerprint", "environment_fingerprint"
+          ],
+          "properties": {
+            "check_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+            "scope": {"enum": ["quick", "full", "static", "post_merge", "ci", "doc"]},
+            "source_ref": {"type": "string", "pattern": "^[A-Za-z0-9_.:/#-]{1,200}$"},
+            "mandatory": {"type": "boolean"},
+            "ci_required": {"type": "boolean"},
+            "approval_class": {"type": "boolean"},
+            "security_class": {"type": "boolean"},
+            "cacheable": {"type": "boolean"},
+            "command": {"type": "string", "minLength": 1, "maxLength": 500},
+            "input_hash": {"type": ["string", "null"]},
+            "dependency_fingerprint": {"type": ["string", "null"]},
+            "environment_fingerprint": {"type": ["string", "null"]}
+          }
+        }
+      },
+      "old_evidence": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "evidence_id", "check_id", "ran_on_sha", "command", "input_hash",
+            "dependency_fingerprint", "environment_fingerprint", "tests"
+          ],
+          "properties": {
+            "evidence_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,80}$"},
+            "check_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+            "ran_on_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "command": {"type": "string", "minLength": 1, "maxLength": 500},
+            "input_hash": {"type": ["string", "null"]},
+            "dependency_fingerprint": {"type": ["string", "null"]},
+            "environment_fingerprint": {"type": ["string", "null"]},
+            "tests": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["test_id", "path", "modified_since_evidence"],
+                "properties": {
+                  "test_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,120}$"},
+                  "path": {"type": "string", "minLength": 1, "maxLength": 300},
+                  "modified_since_evidence": {"type": "boolean"}
+                }
+              }
+            }
+          }
+        }
+      },
+      "comparison": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "suite_failures_included", "suite_failures", "timings_included",
+          "suite_seconds_before", "suite_seconds_after"
+        ],
+        "properties": {
+          "suite_failures_included": {"type": "boolean"},
+          "suite_failures": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["failure_id", "test_path", "source_ref"],
+              "properties": {
+                "failure_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,80}$"},
+                "test_path": {"type": "string", "minLength": 1, "maxLength": 300},
+                "source_ref": {"type": "string", "pattern": "^[A-Za-z0-9_.:/#-]{1,200}$"}
+              }
+            }
+          },
+          "timings_included": {"type": "boolean"},
+          "suite_seconds_before": {"type": ["number", "null"], "minimum": 0},
+          "suite_seconds_after": {"type": ["number", "null"], "minimum": 0}
+        }
+      },
+      "requires_independent_reviewer": {"type": "boolean"}
+    }
+  },
+  "report": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "verification-impact-output/1",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "schema_version", "tool_version", "plan_usability", "mode", "task_ref",
+      "edition", "base_sha", "head_sha", "closure", "impact", "checks",
+      "reuse", "comparison", "review_package", "identity", "policy"
+    ],
+    "properties": {
+      "schema_version": {"const": "verification-impact-output/1"},
+      "tool_version": {"const": "187-draft-1"},
+      "plan_usability": {"const": "not_a_verification_result"},
+      "mode": {"const": "shadow_only"},
+      "task_ref": {"type": "string"},
+      "edition": {"enum": ["local", "github"]},
+      "base_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+      "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+      "closure": {"const": "open"},
+      "impact": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "authority", "repository_scanned", "coverage_status",
+          "coverage_reasons", "covered_paths", "uncovered_paths",
+          "high_risk_paths", "dynamic_references", "nodes", "edges",
+          "observed_tests", "mapped_tests_authority"
+        ],
+        "properties": {
+          "authority": {"const": "caller_snapshot_only"},
+          "repository_scanned": {"const": false},
+          "coverage_status": {"enum": ["complete", "incomplete"]},
+          "coverage_reasons": {"type": "array", "items": {"type": "string"}},
+          "covered_paths": {"type": "array", "items": {"type": "string"}},
+          "uncovered_paths": {"type": "array", "items": {"type": "string"}},
+          "high_risk_paths": {"type": "array", "items": {"type": "string"}},
+          "dynamic_references": {"type": "array"},
+          "nodes": {"type": "array"},
+          "edges": {"type": "array"},
+          "observed_tests": {"type": "array"},
+          "mapped_tests_authority": {"const": "observation_only"}
+        }
+      },
+      "checks": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "authority", "cache_policy", "caller_snapshot", "suggested_checks",
+          "counterfactual_removed", "subset_claimed_sufficient"
+        ],
+        "properties": {
+          "authority": {"const": "unverified_snapshot"},
+          "cache_policy": {"const": "not_cacheable_by_default"},
+          "caller_snapshot": {"type": "array"},
+          "suggested_checks": {"type": "array"},
+          "counterfactual_removed": {"type": "array", "maxItems": 0},
+          "subset_claimed_sufficient": {"const": false}
+        }
+      },
+      "reuse": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "check_id", "evidence_id", "reuse_decision", "reasons",
+            "ran_on_sha", "head_sha", "same_head", "head_rerun"
+          ],
+          "properties": {
+            "check_id": {"type": "string"},
+            "evidence_id": {"type": "string"},
+            "reuse_decision": {"enum": ["not_reused", "rejected", "applicable_on_head"]},
+            "reasons": {"type": "array", "items": {"type": "string"}},
+            "ran_on_sha": {"type": "string"},
+            "head_sha": {"type": "string"},
+            "same_head": {"type": "boolean"},
+            "head_rerun": {"const": false}
+          }
+        }
+      },
+      "comparison": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "suite_failures_included", "timings_included", "false_negatives",
+          "time_saved", "out_of_mapping_failures", "mapping_authority"
+        ],
+        "properties": {
+          "suite_failures_included": {"type": "boolean"},
+          "timings_included": {"type": "boolean"},
+          "false_negatives": {
+            "oneOf": [
+              {"const": "UNKNOWN"},
+              {"type": "array", "items": {"type": "string"}}
+            ]
+          },
+          "time_saved": {
+            "oneOf": [
+              {"const": "UNKNOWN"},
+              {"type": "number"}
+            ]
+          },
+          "out_of_mapping_failures": {"type": "array"},
+          "mapping_authority": {"const": "observation_only"}
+        }
+      },
+      "review_package": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "acceptance", "mandatory_checks", "unknowns", "rejected_reuse",
+          "failures", "gates_unchanged"
+        ],
+        "properties": {
+          "acceptance": {"type": "array"},
+          "mandatory_checks": {"type": "array"},
+          "unknowns": {"type": "array", "items": {"type": "string"}},
+          "rejected_reuse": {"type": "array"},
+          "failures": {"type": "array"},
+          "gates_unchanged": {"const": true}
+        }
+      },
+      "identity": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["requirement", "assessment"],
+        "properties": {
+          "requirement": {"enum": ["required", "not_required"]},
+          "assessment": {"enum": ["unproven", "not_assessed"]}
+        }
+      },
+      "policy": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["effect", "cache_default", "refs"],
+        "properties": {
+          "effect": {"const": "current_rules_unchanged"},
+          "cache_default": {"const": "not_cacheable"},
+          "refs": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": [
+              {"const": "kit/orchestration.md"},
+              {"const": "editions/local/master.md"},
+              {"const": "editions/github/master.md"}
+            ]
+          }
+        }
+      }
+    }
+  },
+  "diagnostic": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "verification-impact-diagnostic/1",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["schema_version", "plan_usability", "diagnostic"],
+    "properties": {
+      "schema_version": {"const": "verification-impact-diagnostic/1"},
+      "plan_usability": {"const": "not_a_verification_result"},
+      "diagnostic": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "path"],
+        "properties": {
+          "code": {
+            "enum": [
+              "schema_invalid", "sha_invalid", "edition_invalid",
+              "unknown_field", "forbidden_field", "path_invalid", "usage"
+            ]
+          },
+          "path": {"type": "string"}
+        }
+      }
+    }
+  }
+}

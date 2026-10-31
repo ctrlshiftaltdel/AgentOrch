@@ -1,0 +1,27 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "coverage_status": "complete",
+  "required_coverage_reasons": [],
+  "required_unknowns": [],
+  "identity": {
+    "requirement": "not_required",
+    "assessment": "not_assessed"
+  },
+  "required_reuse": [
+    {
+      "evidence_id": "ev_env_drift",
+      "reuse_decision": "rejected",
+      "required_reasons": [
+        "environment_drift"
+      ]
+    }
+  ],
+  "false_negatives": [],
+  "time_saved": 5.0,
+  "out_of_mapping_failure_ids": [],
+  "high_risk_paths": [],
+  "suggestions_equal_snapshot": true,
+  "counterfactual_removed_empty": true,
+  "subset_claimed_sufficient": false
+}

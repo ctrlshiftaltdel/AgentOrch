@@ -1,0 +1,97 @@
+{
+  "schema_version": "verification-impact-input/1",
+  "task_ref": "issue-187-fixture",
+  "edition": "github",
+  "base_sha": "1111111111111111111111111111111111111111",
+  "head_sha": "2222222222222222222222222222222222222222",
+  "acceptance": [
+    {
+      "ac_id": "AC1",
+      "text": "shadow report never qualifies a check"
+    },
+    {
+      "ac_id": "AC2",
+      "text": "suggestions keep the full caller snapshot"
+    }
+  ],
+  "changed_paths": [
+    {
+      "path": "scripts/verification_impact/classify.py",
+      "source_ref": "caller:diff/1"
+    }
+  ],
+  "impact_graph": {
+    "nodes": [
+      {
+        "node_id": "n_path",
+        "kind": "changed_path",
+        "path": "scripts/verification_impact/classify.py",
+        "source_ref": "caller:graph/1"
+      },
+      {
+        "node_id": "n_test",
+        "kind": "test",
+        "path": "tests/test_verification_impact.py",
+        "source_ref": "caller:graph/2"
+      }
+    ],
+    "edges": [
+      {
+        "edge_id": "e1",
+        "from_node": "n_path",
+        "to_node": "n_test",
+        "kind": "covers",
+        "source_ref": "caller:graph/3"
+      }
+    ]
+  },
+  "dynamic_references": [
+    {
+      "item_id": "dynamic_import",
+      "reference_state": "known",
+      "source_ref": "caller:dyn/1"
+    }
+  ],
+  "checks": [
+    {
+      "check_id": "project.unittest",
+      "scope": "full",
+      "source_ref": "docs/PROJECT.md#verification-commands",
+      "mandatory": false,
+      "ci_required": false,
+      "approval_class": false,
+      "security_class": false,
+      "cacheable": true,
+      "command": "python -m unittest discover -s tests",
+      "input_hash": "sha256:aaa",
+      "dependency_fingerprint": "deps:bbb",
+      "environment_fingerprint": "env:new"
+    }
+  ],
+  "old_evidence": [
+    {
+      "evidence_id": "ev_env_drift",
+      "check_id": "project.unittest",
+      "ran_on_sha": "2222222222222222222222222222222222222222",
+      "command": "python -m unittest discover -s tests",
+      "input_hash": "sha256:aaa",
+      "dependency_fingerprint": "deps:bbb",
+      "environment_fingerprint": "env:old",
+      "tests": [
+        {
+          "test_id": "tests.test_verification_impact",
+          "path": "tests/test_verification_impact.py",
+          "modified_since_evidence": false
+        }
+      ]
+    }
+  ],
+  "comparison": {
+    "suite_failures_included": true,
+    "suite_failures": [],
+    "timings_included": true,
+    "suite_seconds_before": 12.5,
+    "suite_seconds_after": 7.5
+  },
+  "requires_independent_reviewer": false
+}
