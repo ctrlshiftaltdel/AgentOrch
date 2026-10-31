@@ -56,6 +56,7 @@ from .runtime_adapter import TokenUsage
 __all__ = [
     'FEEDBACK_DOCUMENT',
     'SCHEMA_VERSION',
+    'PEER_REVIEW_SCHEMA',
     'UNKNOWN',
     'FIRST_ACCEPTANCE_RESULTS',
     'SEVERITIES',
@@ -103,6 +104,11 @@ __all__ = [
 
 FEEDBACK_DOCUMENT = 'observed-performance.md'
 SCHEMA_VERSION = 's4-feedback-1'
+# Peer-review events (#156) share the same scope document but are a different
+# record kind. The format is owned by ``scripts/agent_selection/peer_review.py``;
+# the marker lives here so the feedback reader can recognise and skip those
+# records without taking a dependency on the other module.
+PEER_REVIEW_SCHEMA = 's4-peer-review-1'
 UNKNOWN = 'UNKNOWN'
 
 FIRST_ACCEPTANCE_RESULTS = ('PASS', 'FAIL', UNKNOWN)
@@ -1319,6 +1325,13 @@ def load_outcomes(store):
                           diagnostics=tuple(state.issues))
     outcomes, ignored = [], 0
     for record in state.records:
+        if record.details.get('schema') == PEER_REVIEW_SCHEMA:
+            # A peer-review event, not a role-performance outcome: it is another
+            # record kind, not a foreign or broken schema, so it is skipped
+            # without the "migration decision" diagnostic. It never enters the
+            # ETR fraction, the metrics or the recommendations.
+            ignored += 1
+            continue
         if record.status == 'SUPERSEDED':
             ignored += 1
             continue

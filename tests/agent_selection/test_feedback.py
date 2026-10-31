@@ -27,6 +27,7 @@ if str(ROOT) not in sys.path:
 
 from scripts.agent_selection import feedback as fb  # noqa: E402
 from scripts.agent_selection import local_store  # noqa: E402
+from scripts.agent_selection import peer_review as pr  # noqa: E402
 
 NOW = '2026-10-27T12:00:00Z'
 RECENT = '2026-10-20T00:00:00Z'
@@ -1056,6 +1057,379 @@ class EtrPersistenceTests(StoreFixture):
         self.assertIn('etr=', rendered)
         self.assertIn('NO_DATA', rendered)
         self.assertIn('prior', rendered)
+
+
+# --- Peer review: three roles, double review and evaluator credibility (#156) -
+PEER_A = fb.ModelIdentity('model-a', 'runtime-x', '1.0.0')
+PEER_B = fb.ModelIdentity('model-b', 'runtime-x', '1.0.0')
+PEER_C = fb.ModelIdentity('model-c', 'runtime-x', '1.0.0')
+PEER_D = fb.ModelIdentity('model-d', 'runtime-x', '1.0.0')
+
+
+def peer(direction='execution->master', index=156, **overrides):
+    """One synthetic peer-review event; every field is supplied explicitly."""
+    values = dict(
+        direction=direction,
+        task_id=f'issue:{index}',
+        category='code-change',
+        task_version='sha-abc123',
+        dimension=pr.DIRECTION_DIMENSIONS[direction][0],
+        score='+1',
+        evaluator=PEER_A,
+        evaluator_alias='builder-a',
+        subject=PEER_B,
+        subject_alias='master-b',
+        observed_at=RECENT,
+        evidence=(task_evidence(f'issue:{index}'),),
+        reason='clear task packet',
+        evidence_scope=f'issue:{index}@sha-abc123',
+        config_id='cfg-1',
+        identity_verified=True,
+        blind=True,
+    )
+    values.update(overrides)
+    return pr.PeerReview(**values)
+
+
+def confirmation(evaluator=PEER_A, outcome='CONFIRMED', index=1):
+    """One later, independently evidenced check of an earlier evaluation."""
+    return pr.ReviewConfirmation(
+        evaluator=evaluator, evaluation_ref=f'review:{index}', outcome=outcome,
+        evidence=(fb.EvidenceRef('regression_defect', f'defect:{index}', RECENT),),
+        observed_at=RECENT)
+
+
+class PeerReviewEventTests(StoreFixture):
+    def test_all_six_directions_are_recordable(self):
+        for index, (direction, roles) in enumerate(pr.DIRECTION_ROLES.items(),
+                                                   start=1):
+            event = peer(direction, index=index)
+            self.assertEqual(event.evaluator_role, roles[0])
+            self.assertEqual(event.subject_role, roles[1])
+            pr.record_review(self.store, event, now=RECENT)
+        loaded = pr.load_reviews(self.store)
+        self.assertEqual(loaded.diagnostics, ())
+        self.assertEqual(len(loaded.reviews), len(pr.DIRECTION_ROLES))
+        self.assertEqual({item.direction for item in loaded.reviews},
+                         set(pr.DIRECTION_ROLES))
+
+    def test_a_dimension_outside_the_direction_is_rejected(self):
+        with self.assertRaises(fb.FeedbackError):
+            peer('execution->master', dimension='fix_quality')
+
+    def test_only_the_declared_scores_are_accepted_and_normalised(self):
+        self.assertEqual(peer(score=1).score, pr.POSITIVE)
+        self.assertEqual(peer(score=0).score, pr.NEUTRAL)
+        self.assertEqual(peer(score=-1).score, pr.NEGATIVE)
+        self.assertEqual(peer(score='NOT_RATED').score, pr.NOT_RATED)
+        for invalid in (True, 1.0, '1', 'UNKNOWN', None):
+            with self.assertRaises(fb.FeedbackError):
+                peer(score=invalid)
+
+    def test_zero_is_an_explicit_neutral_judgement(self):
+        event = peer(score=0)
+        self.assertEqual(event.score, pr.NEUTRAL)
+        self.assertEqual(pr.SCORE_NUMBERS[event.score], 0)
+        assessment = pr.assess((event,))
+        self.assertEqual(assessment.quality_score, pr.NEUTRAL)
+        self.assertEqual(assessment.counted, 1)
+
+    def test_not_rated_is_not_zero_and_contributes_no_score(self):
+        self.assertIsNone(pr.SCORE_NUMBERS[pr.NOT_RATED])
+        assessment = pr.assess((peer(score=pr.NOT_RATED, evidence=()),))
+        self.assertEqual(assessment.credibility, pr.UNKNOWN)
+        self.assertIsNone(assessment.quality_score)
+        self.assertEqual(assessment.counted, 0)
+        self.assertIn(pr.NOT_RATED, ' '.join(assessment.reasons))
+
+    def test_a_reason_is_required_and_must_not_carry_a_conversation(self):
+        with self.assertRaises(fb.FeedbackError):
+            peer(reason='')
+        with self.assertRaises(fb.FeedbackError):
+            peer(reason='line one\nline two')
+        with self.assertRaises(fb.FeedbackError):
+            peer(reason='x' * 401)
+
+    def test_an_event_round_trips_through_the_scope_markdown(self):
+        event = peer('reviewer->execution', dimension='fix_quality',
+                     evaluator=PEER_C, evaluator_alias='reviewer-c',
+                     subject=PEER_A, evidence_scope='pr:156@sha-abc123',
+                     config_id='cfg-blind')
+        pr.record_review(self.store, event, now=RECENT)
+        loaded = pr.load_reviews(self.store)
+        self.assertEqual(loaded.diagnostics, ())
+        self.assertEqual(len(loaded.reviews), 1)
+        restored = loaded.reviews[0]
+        self.assertEqual(restored.fact_key, event.fact_key)
+        self.assertEqual(restored.score, pr.POSITIVE)
+        self.assertEqual(restored.evaluator.key, PEER_C.key)
+        self.assertEqual(restored.evaluator_alias, 'reviewer-c')
+        self.assertEqual(restored.subject.key, PEER_A.key)
+        self.assertEqual(restored.config_id, 'cfg-blind')
+        self.assertTrue(restored.blind)
+        self.assertTrue(restored.identity_verified)
+        self.assertEqual(restored.evidence, event.evidence)
+        self.assertIn('peer review', self.document())
+
+    def test_another_scope_is_refused(self):
+        other = self.make_store(SCOPE_B)
+        with self.assertRaises(fb.FeedbackError):
+            pr.record_review(self.store, peer(scope_id=other.scope_id),
+                             now=RECENT)
+        self.assertEqual(pr.load_reviews(self.store).reviews, ())
+
+    def test_the_record_holds_no_prompt_or_conversation_body(self):
+        details = peer().as_details()
+        self.assertEqual(details['schema'], pr.PEER_REVIEW_SCHEMA)
+        self.assertNotIn('prompt', details)
+        self.assertNotIn('conversation', details)
+        self.assertEqual(details['direction'], 'execution->master')
+        self.assertEqual(details['score'], pr.POSITIVE)
+
+
+class PeerReviewIndependenceTests(StoreFixture):
+    def test_a_single_evaluation_cannot_establish_independence(self):
+        self.assertEqual(pr.independence((peer(),)).status, pr.UNKNOWN)
+
+    def test_two_verified_distinct_blind_evaluations_are_independent(self):
+        result = pr.independence((peer(evaluator=PEER_A),
+                                  peer(evaluator=PEER_C)))
+        self.assertEqual(result.status, pr.INDEPENDENT)
+
+    def test_an_unverified_identity_makes_independence_unknown(self):
+        pair = (peer(evaluator=PEER_A, identity_verified=False),
+                peer(evaluator=PEER_C))
+        self.assertEqual(pr.independence(pair).status, pr.UNKNOWN)
+        assessment = pr.assess(pair)
+        self.assertEqual(assessment.credibility, pr.UNKNOWN)
+        self.assertEqual(assessment.counted, 0)
+
+    def test_an_unknown_model_family_is_not_identity_evidence(self):
+        pair = (peer(evaluator=PEER_A),
+                peer(evaluator=fb.ModelIdentity(),
+                     evaluator_alias='builder-family-self-report'))
+        self.assertEqual(pr.independence(pair).status, pr.UNKNOWN)
+        with self.assertRaises(TypeError):
+            peer(family='deepseek')
+
+    def test_the_same_model_under_another_alias_is_not_independent(self):
+        pair = (peer(evaluator=PEER_A, evaluator_alias='builder-a',
+                     config_id='cfg-hot'),
+                peer(evaluator=PEER_A, evaluator_alias='builder-a-alias',
+                     config_id='cfg-cold-prompt'))
+        result = pr.independence(pair)
+        self.assertEqual(result.status, pr.NOT_INDEPENDENT)
+        self.assertIn('canonical', ' '.join(result.reasons))
+        assessment = pr.assess(pair)
+        self.assertEqual(assessment.credibility, pr.LOW)
+        self.assertNotEqual(assessment.credibility, pr.CORROBORATED)
+        self.assertEqual(assessment.counted, 1)
+
+    def test_an_unblinded_pair_is_not_independent(self):
+        pair = (peer(evaluator=PEER_A), peer(evaluator=PEER_C, blind=False))
+        result = pr.independence(pair)
+        self.assertEqual(result.status, pr.NOT_INDEPENDENT)
+        self.assertIn('blind', ' '.join(result.reasons))
+
+    def test_different_task_versions_are_not_independent(self):
+        pair = (peer(), peer(evaluator=PEER_C, task_version='sha-def456'))
+        result = pr.independence(pair)
+        self.assertEqual(result.status, pr.NOT_INDEPENDENT)
+        self.assertIn('task version', ' '.join(result.reasons))
+
+    def test_different_evidence_scopes_are_not_independent(self):
+        pair = (peer(), peer(evaluator=PEER_C,
+                             evidence_scope='issue:156@sha-def456'))
+        result = pr.independence(pair)
+        self.assertEqual(result.status, pr.NOT_INDEPENDENT)
+        self.assertIn('evidence scope', ' '.join(result.reasons))
+
+    def test_a_self_assessment_is_never_independent(self):
+        pair = (peer(evaluator=PEER_A, subject=PEER_A),
+                peer(evaluator=PEER_C, subject=PEER_A))
+        result = pr.independence(pair)
+        self.assertEqual(result.status, pr.NOT_INDEPENDENT)
+        self.assertIn('itself', ' '.join(result.reasons))
+        assessment = pr.assess(pair)
+        self.assertTrue(assessment.self_assessed)
+        self.assertNotEqual(assessment.credibility, pr.CORROBORATED)
+
+
+class PeerReviewCredibilityTests(StoreFixture):
+    def test_a_single_verified_evaluation_is_low(self):
+        assessment = pr.assess((peer(),))
+        self.assertEqual(assessment.credibility, pr.LOW)
+        self.assertEqual(assessment.independence, pr.UNKNOWN)
+        self.assertEqual(assessment.quality_score, pr.POSITIVE)
+        self.assertEqual(assessment.counted, 1)
+        self.assertIn('single', ' '.join(assessment.reasons))
+
+    def test_no_sufficient_evidence_is_unknown(self):
+        event = peer(evidence=(fb.EvidenceRef('self_assessment', 'self:156',
+                                              RECENT),))
+        assessment = pr.assess((event,))
+        self.assertEqual(assessment.credibility, pr.UNKNOWN)
+        self.assertEqual(assessment.counted, 0)
+        self.assertIn('evidence', ' '.join(assessment.reasons).lower())
+
+    def test_an_agreeing_independent_pair_is_corroborated(self):
+        assessment = pr.assess((peer(evaluator=PEER_A),
+                                peer(evaluator=PEER_C)))
+        self.assertEqual(assessment.credibility, pr.CORROBORATED)
+        self.assertEqual(assessment.independence, pr.INDEPENDENT)
+        self.assertEqual(assessment.quality_score, pr.POSITIVE)
+        self.assertEqual(assessment.counted, 1)
+        self.assertEqual(assessment.evaluations, 2)
+        self.assertIn('independent', assessment.evidence_condition)
+
+    def test_a_not_rated_third_event_does_not_block_corroboration(self):
+        assessment = pr.assess((
+            peer(evaluator=PEER_A),
+            peer(evaluator=PEER_C),
+            peer(evaluator=PEER_D, score=pr.NOT_RATED, evidence=())))
+        self.assertEqual(assessment.credibility, pr.CORROBORATED)
+        self.assertEqual(assessment.counted, 1)
+
+    def test_assess_refuses_mixed_quality_facts(self):
+        with self.assertRaises(fb.FeedbackError):
+            pr.assess((peer(), peer(dimension='acceptance_testability')))
+
+    def test_corroboration_counts_the_quality_fact_once(self):
+        facts = pr.assess_all((peer(evaluator=PEER_A),
+                               peer(evaluator=PEER_C)))
+        self.assertEqual(len(facts), 1)
+        self.assertEqual(sum(item.counted for item in facts), 1)
+        other = peer(dimension='acceptance_testability', evaluator=PEER_C)
+        facts = pr.assess_all((peer(evaluator=PEER_A),
+                               peer(evaluator=PEER_C), other))
+        self.assertEqual(len(facts), 2)
+        self.assertEqual(sum(item.counted for item in facts), 2)
+
+    def test_a_conflict_stays_conflicted_and_is_never_averaged(self):
+        assessment = pr.assess((peer(score=pr.POSITIVE, evaluator=PEER_A),
+                                peer(score=pr.NEGATIVE, evaluator=PEER_C)))
+        self.assertEqual(assessment.credibility, pr.CONFLICTED)
+        self.assertIsNone(assessment.quality_score)
+        self.assertEqual(assessment.counted, 0)
+        self.assertIn('not averaged', ' '.join(assessment.reasons))
+
+    def test_a_master_dispute_needs_independent_evidence_or_a_user_decision(self):
+        assessment = pr.assess((
+            peer('reviewer->master', score=pr.POSITIVE, evaluator=PEER_A),
+            peer('reviewer->master', score=pr.NEGATIVE, evaluator=PEER_C)))
+        self.assertEqual(assessment.credibility, pr.CONFLICTED)
+        self.assertTrue(assessment.requires_human)
+        self.assertIn('Master', ' '.join(assessment.reasons))
+
+    def test_every_credibility_status_has_a_stated_evidence_condition(self):
+        self.assertEqual(set(pr.CREDIBILITY_CONDITIONS),
+                         set(pr.CREDIBILITY_STATUSES))
+        for status in pr.CREDIBILITY_STATUSES:
+            self.assertTrue(pr.CREDIBILITY_CONDITIONS[status].strip())
+
+
+class PeerReviewReliabilityTests(StoreFixture):
+    def test_fewer_than_three_confirmations_is_unknown(self):
+        reliability = pr.evaluator_reliability((confirmation(),))
+        self.assertEqual(reliability[PEER_A.key].status, pr.UNKNOWN)
+        self.assertEqual(reliability[PEER_A.key].sample_size, 1)
+
+    def test_three_refuted_evaluations_make_an_evaluator_low(self):
+        items = tuple(confirmation(outcome='REFUTED', index=index)
+                      for index in range(1, 4))
+        reliability = pr.evaluator_reliability(items)
+        self.assertEqual(reliability[PEER_A.key].status, pr.LOW)
+        self.assertEqual(reliability[PEER_A.key].refuted, 3)
+
+    def test_a_low_reliability_evaluator_blocks_corroboration(self):
+        items = tuple(confirmation(outcome='REFUTED', index=index)
+                      for index in range(1, 4))
+        reliability = pr.evaluator_reliability(items)
+        assessment = pr.assess((peer(evaluator=PEER_A),
+                                peer(evaluator=PEER_C)),
+                               reliability=reliability)
+        self.assertEqual(assessment.credibility, pr.LOW)
+        self.assertIn('reliability', ' '.join(assessment.reasons))
+
+    def test_a_confirmation_needs_independent_evidence(self):
+        with self.assertRaises(fb.FeedbackError):
+            pr.ReviewConfirmation(
+                evaluator=PEER_A, evaluation_ref='review:1',
+                outcome='CONFIRMED',
+                evidence=(fb.EvidenceRef('self_assessment', 'self:1', RECENT),),
+                observed_at=RECENT)
+        with self.assertRaises(fb.FeedbackError):
+            confirmation(outcome='APPROVED')
+
+    def test_confidence_or_fluency_cannot_calibrate_credibility(self):
+        with self.assertRaises(TypeError):
+            confirmation(confidence=0.99)
+        with self.assertRaises(TypeError):
+            peer(fluency=0.9)
+        with self.assertRaises(TypeError):
+            pr.assess((peer(),), confidence=0.99)
+
+
+class PeerReviewMissedIssueTests(StoreFixture):
+    def test_the_missed_issue_rate_is_unknown_without_a_defect_set(self):
+        report = pr.missed_issue_rate(('defect:1',))
+        self.assertEqual(report.status, pr.UNKNOWN)
+        self.assertIsNone(report.value)
+        self.assertFalse(report.computed)
+        self.assertIn('no independent defect set', report.note)
+
+    def test_a_defect_set_makes_the_rate_computable(self):
+        defects = pr.DefectSet(
+            label='injected-156',
+            refs=('defect:1', 'defect:2', 'defect:3'),
+            evidence=(fb.EvidenceRef('comparison_baseline', 'baseline:156',
+                                     RECENT),),
+            source='synthetic_injection')
+        report = pr.missed_issue_rate(('defect:1', 'defect:2'), defects)
+        self.assertEqual(report.status, 'OK')
+        self.assertTrue(report.computed)
+        self.assertEqual(report.missed, 1)
+        self.assertEqual(report.total, 3)
+        self.assertEqual(report.value, 0.333)
+        self.assertIn('synthetic_injection', report.note)
+
+    def test_a_defect_set_needs_traceable_evidence(self):
+        baseline = fb.EvidenceRef('comparison_baseline', 'baseline:156', RECENT)
+        with self.assertRaises(fb.FeedbackError):
+            pr.DefectSet(label='x', refs=('defect:1',),
+                         evidence=(fb.EvidenceRef('self_assessment', 'self:1',
+                                                  RECENT),),
+                         source='synthetic_injection')
+        with self.assertRaises(fb.FeedbackError):
+            pr.DefectSet(label='x', refs=(), evidence=(baseline,),
+                         source='synthetic_injection')
+        with self.assertRaises(fb.FeedbackError):
+            pr.DefectSet(label='x', refs=('defect:1',), evidence=(baseline,),
+                         source='vibes')
+
+
+class PeerReviewFeedbackIntegrationTests(StoreFixture):
+    def test_peer_reviews_are_not_feedback_outcomes_and_do_not_change_etr(self):
+        self.record(execution(1, token_usage=usage(1000),
+                              contribution='EFFECTIVE'))
+        pr.record_review(self.store, peer(), now=RECENT)
+        loaded = fb.load_outcomes(self.store)
+        self.assertEqual(len(loaded.outcomes), 1)
+        self.assertEqual(loaded.diagnostics, ())
+        self.assertEqual(loaded.ignored, 1)
+        etr = self.report().cohort('execution', 'code-change').etr
+        self.assertEqual(etr.value_status, 'OK')
+        self.assertEqual(etr.value, 100.0)
+        self.assertEqual(etr.observed_tokens, 1000)
+
+    def test_both_record_kinds_share_one_scope_document(self):
+        self.record(execution(1))
+        pr.record_review(self.store, peer(), now=RECENT)
+        text = self.document()
+        self.assertIn('s4-feedback-1', text)
+        self.assertIn('s4-peer-review-1', text)
+        names = sorted(path.name for path in self.store.directory.iterdir())
+        self.assertEqual(names, sorted(local_store.DOCUMENTS))
 
 
 if __name__ == '__main__':
