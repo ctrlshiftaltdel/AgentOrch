@@ -1,0 +1,27 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "coverage_status": "incomplete",
+  "required_coverage_reasons": [
+    "empty_mapping",
+    "path_without_coverage_edge"
+  ],
+  "required_unknowns": [
+    "coverage:empty_mapping",
+    "coverage:path_without_coverage_edge:scripts/verification_impact/classify.py",
+    "comparison:false_negatives_unknown",
+    "comparison:time_saved_unknown"
+  ],
+  "identity": {
+    "requirement": "not_required",
+    "assessment": "not_assessed"
+  },
+  "required_reuse": [],
+  "false_negatives": "UNKNOWN",
+  "time_saved": "UNKNOWN",
+  "out_of_mapping_failure_ids": [],
+  "high_risk_paths": [],
+  "suggestions_equal_snapshot": true,
+  "counterfactual_removed_empty": true,
+  "subset_claimed_sufficient": false
+}

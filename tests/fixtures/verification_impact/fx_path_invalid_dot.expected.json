@@ -1,0 +1,5 @@
+{
+  "exit_code": 2,
+  "diagnostic_code": "path_invalid",
+  "diagnostic_path": "$.changed_paths[0].path"
+}

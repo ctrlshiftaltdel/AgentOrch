@@ -1,0 +1,5 @@
+{
+  "exit_code": 2,
+  "diagnostic_code": "schema_invalid",
+  "diagnostic_path": "$.task_ref"
+}

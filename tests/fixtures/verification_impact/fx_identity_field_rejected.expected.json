@@ -1,0 +1,5 @@
+{
+  "exit_code": 2,
+  "diagnostic_code": "forbidden_field",
+  "diagnostic_path": "$.checks[0].model_alias"
+}

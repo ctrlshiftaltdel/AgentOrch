@@ -1,0 +1,25 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "coverage_status": "incomplete",
+  "required_coverage_reasons": [
+    "high_risk_path"
+  ],
+  "required_unknowns": [
+    "coverage:high_risk_path:scripts/orchestrator.py"
+  ],
+  "identity": {
+    "requirement": "not_required",
+    "assessment": "not_assessed"
+  },
+  "required_reuse": [],
+  "false_negatives": [],
+  "time_saved": 5.0,
+  "out_of_mapping_failure_ids": [],
+  "high_risk_paths": [
+    "scripts/orchestrator.py"
+  ],
+  "suggestions_equal_snapshot": true,
+  "counterfactual_removed_empty": true,
+  "subset_claimed_sufficient": false
+}
