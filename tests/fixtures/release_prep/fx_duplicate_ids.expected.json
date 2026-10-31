@@ -1,0 +1,19 @@
+{
+  "exit_code": 3,
+  "status": "candidate",
+  "bump": "patch",
+  "next_version": "v1.7.1",
+  "trigger": "batch",
+  "urgent_ids": [],
+  "reason": "max_bump_of_eligible_changes",
+  "edition": "github",
+  "tag_form": "three_part",
+  "eligible_count": 2,
+  "excluded": [],
+  "duplicate_ids": [
+    "PR-271"
+  ],
+  "blocked_reasons": [],
+  "diagnostic_code": null,
+  "diagnostic_path": null
+}

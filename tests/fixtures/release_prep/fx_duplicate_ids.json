@@ -1,0 +1,35 @@
+{
+  "schema_version": "release-prep-input/1",
+  "edition": "github",
+  "latest_published_tag": "v1.7.0",
+  "items": [
+    {
+      "id": "PR-271",
+      "kind": "patch",
+      "state": "merged_verified",
+      "urgent": false,
+      "summary": "fix reported twice by two sources"
+    },
+    {
+      "id": "PR-271",
+      "kind": "patch",
+      "state": "merged_verified",
+      "urgent": false,
+      "summary": "fix reported twice by two sources"
+    },
+    {
+      "id": "PR-272",
+      "kind": "patch",
+      "state": "merged_verified",
+      "urgent": false,
+      "summary": "fix second change"
+    }
+  ],
+  "release_version_record": "1.7.0",
+  "evidence": {
+    "identity": "reliable",
+    "ci": "reliable",
+    "permissions": "reliable",
+    "assets": "reliable"
+  }
+}

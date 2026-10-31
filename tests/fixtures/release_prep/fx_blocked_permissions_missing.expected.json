@@ -1,0 +1,19 @@
+{
+  "exit_code": 3,
+  "status": "blocked",
+  "bump": null,
+  "next_version": null,
+  "trigger": null,
+  "urgent_ids": [],
+  "reason": "blocked_evidence",
+  "edition": "github",
+  "tag_form": "three_part",
+  "eligible_count": 1,
+  "excluded": [],
+  "duplicate_ids": [],
+  "blocked_reasons": [
+    "permissions_missing"
+  ],
+  "diagnostic_code": null,
+  "diagnostic_path": null
+}

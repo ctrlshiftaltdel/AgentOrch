@@ -1,0 +1,35 @@
+{
+  "schema_version": "release-prep-input/1",
+  "edition": "github",
+  "latest_published_tag": "v1.7.0",
+  "items": [
+    {
+      "id": "PR-231",
+      "kind": "patch",
+      "state": "merged_verified",
+      "urgent": false,
+      "summary": "fix typo"
+    },
+    {
+      "id": "PR-232",
+      "kind": "minor",
+      "state": "merged_verified",
+      "urgent": false,
+      "summary": "add optional report field"
+    },
+    {
+      "id": "PR-233",
+      "kind": "major",
+      "state": "merged_verified",
+      "urgent": false,
+      "summary": "remove legacy CLI flag"
+    }
+  ],
+  "release_version_record": "1.7.0",
+  "evidence": {
+    "identity": "reliable",
+    "ci": "reliable",
+    "permissions": "reliable",
+    "assets": "reliable"
+  }
+}
