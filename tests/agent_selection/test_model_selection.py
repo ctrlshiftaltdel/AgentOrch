@@ -17,13 +17,20 @@ import sys
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.agent_selection import discovery, model_selection, roles  # noqa: E402
+from scripts.agent_selection import (  # noqa: E402
+    discovery,
+    feedback,
+    model_selection,
+    peer_review,
+    roles,
+)
 from scripts.agent_selection.model_sources import (  # noqa: E402
     artificial_analysis,
     snapshot,
@@ -90,14 +97,83 @@ def make_discovery(candidates):
 
 
 def select(candidates=None, *, batch=None, links=None, policy=None,
-           requirements=None, now=NOW):
+           requirements=None, now=NOW, **extra):
     candidates = support.standard_candidates() if candidates is None else candidates
     batch = fetch_batch() if batch is None else batch
     return model_selection.select_models(
         batch, make_discovery(candidates),
         requirements or support.task_requirements(),
         links=default_links() if links is None else links,
-        policy=policy, now=now)
+        policy=policy, now=now, **extra)
+
+
+# --- local ETR / credibility fixtures (#157) --------------------------------
+LOCAL_SCOPE = 'model-selection-scope-157'
+LOCAL_RUNTIME = 'fixture-runtime'
+LOCAL_RUNTIME_VERSION = '1.0.0'
+LOCAL_CATEGORY = 'code-change'
+
+
+def local_outcome(model_id, index, contribution, *, total_tokens=1000):
+    return feedback.ExecutionOutcome(
+        task_id=f'{model_id.replace("/", "-")}-{index}',
+        category=LOCAL_CATEGORY,
+        identity=feedback.ModelIdentity(
+            model_id, LOCAL_RUNTIME, LOCAL_RUNTIME_VERSION),
+        observed_at=NOW,
+        evidence=(feedback.EvidenceRef(
+            'task_record', f'issue:{model_id}-{index}', NOW),),
+        first_acceptance='PASS',
+        token_usage=feedback.TokenUsage(
+            total_tokens=total_tokens, source='runtime:fixture',
+            complete=True),
+        contribution=contribution,
+        scope_id=LOCAL_SCOPE)
+
+
+def local_report(models, *, total=20):
+    """One feedback report per model id; ``models`` maps id -> effective count."""
+    outcomes = []
+    for model_id, effective in models.items():
+        for index in range(total):
+            contribution = 'EFFECTIVE' if index < effective else 'INEFFECTIVE'
+            outcomes.append(local_outcome(model_id, index, contribution))
+    store = SimpleNamespace(scope_id=LOCAL_SCOPE)
+    return feedback.build_report(store, now=NOW, outcomes=outcomes)
+
+
+def review_event(evaluator, subject_model, *, category=LOCAL_CATEGORY,
+                 task='issue:157', dimension='goal_conformance'):
+    return peer_review.PeerReview(
+        direction='master->execution', task_id=task, category=category,
+        dimension=dimension, score=peer_review.POSITIVE,
+        evaluator=feedback.ModelIdentity(
+            evaluator, LOCAL_RUNTIME, LOCAL_RUNTIME_VERSION),
+        subject=feedback.ModelIdentity(
+            subject_model, LOCAL_RUNTIME, LOCAL_RUNTIME_VERSION),
+        observed_at=NOW,
+        evidence=(feedback.EvidenceRef(
+            'master_review', f'review:{task}', NOW),),
+        reason='fixture independent review', task_version='v1',
+        evidence_scope=LOCAL_SCOPE, identity_verified=True, blind=True,
+        scope_id=LOCAL_SCOPE)
+
+
+def corroborated(subject_model):
+    """Two independent, blind, verified evaluations of the same fact."""
+    return (review_event('evaluator-a', subject_model),
+            review_event('evaluator-b', subject_model))
+
+
+def single_review(subject_model):
+    return (review_event('evaluator-a', subject_model),)
+
+
+def select_with_local(candidates=None, *, report, reviews=(), requirements=None):
+    return select(
+        candidates, requirements=requirements, feedback_report=report,
+        task_category=LOCAL_CATEGORY, scope_id=LOCAL_SCOPE,
+        peer_reviews=reviews)
 
 
 class SuccessfulSelectionTests(unittest.TestCase):
@@ -395,6 +471,163 @@ class SelectionStopTests(unittest.TestCase):
         self.assertEqual(coding.grade, 'UNKNOWN')
         self.assertIsNotNone(coding.value)
         self.assertIn('cohort', coding.note)
+
+
+class LocalEvidenceSelectionTests(unittest.TestCase):
+    """ETR / credibility are applied only after the existing hard filters."""
+
+    def execution_filter(self, selection, candidate_id, filter_id):
+        entry = next(item for item in selection.excluded
+                     if item.candidate.candidate_id == candidate_id)
+        return next(item for item in entry.filters
+                    if item.filter_id == filter_id)
+
+    def test_high_etr_cannot_offset_a_permission_failure(self):
+        master, execution, reviewer = support.standard_candidates()
+        denied = replace(execution, permissions=support.permissions(
+            read_paths=('src',), write_paths=(), commands=('python',),
+            read_only=True))
+        report = local_report({'model-a': 18})
+        selected = select_with_local(
+            (master, denied, reviewer), report=report,
+            reviews=corroborated('model-a'))
+        execution_selection = selected.role(roles.ROLE_EXECUTION)
+        self.assertIsNone(execution_selection.selected)
+        permissions = self.execution_filter(
+            execution_selection, 'fixture-runtime:exec-1', 'permissions')
+        self.assertEqual(permissions.status, 'FAIL')
+        self.assertFalse(selected.automatic_allowed)
+        evidence = selected.local_evidence_for(
+            roles.ROLE_EXECUTION, 'fixture-runtime:exec-1')
+        self.assertEqual(evidence.gate_status, 'RAISE_PRIORITY')
+        self.assertEqual(evidence.applied_action, 'NOT_APPLICABLE')
+        self.assertIn('hard filter', ' '.join(evidence.reasons))
+
+    def test_alias_of_the_execution_model_is_not_an_independent_reviewer(self):
+        master, execution, reviewer = support.standard_candidates()
+        shared = support.identity(
+            'canonical-shared', aliases=('model-a', 'model-b'))
+        execution = replace(execution, canonical_identity=shared)
+        reviewer = replace(reviewer, canonical_identity=shared)
+        report = local_report({'model-a': 18, 'model-b': 18})
+        selected = select_with_local(
+            (master, execution, reviewer), report=report,
+            reviews=corroborated('model-a') + corroborated('model-b'))
+        reviewer_selection = selected.role(roles.ROLE_REVIEWER)
+        self.assertIsNone(reviewer_selection.selected)
+        independence = self.execution_filter(
+            reviewer_selection, 'fixture-runtime:review-1', 'independence')
+        self.assertEqual(independence.status, 'FAIL')
+        self.assertIn('verified canonical identity', independence.detail)
+        self.assertFalse(selected.automatic_allowed)
+        # Both aliases resolve through the registry to one underlying model,
+        # so the report records that canonical identity instead of inventing
+        # two independent models.
+        reviewer_evidence = selected.local_evidence_for(
+            roles.ROLE_REVIEWER, 'fixture-runtime:review-1')
+        self.assertEqual(reviewer_evidence.canonical_model_id,
+                         'canonical-shared')
+        self.assertEqual(reviewer_evidence.identity_status, 'CONFIRMED')
+
+    def test_high_etr_cannot_rescue_an_uncallable_candidate(self):
+        master, execution, reviewer = support.standard_candidates()
+        blocked = replace(execution, capability_record=support.capability_record(
+            overrides={'C1': support.capability('C1', 'FAIL')}))
+        report = local_report({'model-a': 18})
+        selected = select_with_local(
+            (master, blocked, reviewer), report=report,
+            reviews=corroborated('model-a'))
+        execution_selection = selected.role(roles.ROLE_EXECUTION)
+        self.assertIsNone(execution_selection.selected)
+        callable_filter = self.execution_filter(
+            execution_selection, 'fixture-runtime:exec-1', 'callable')
+        self.assertEqual(callable_filter.status, 'FAIL')
+        evidence = selected.local_evidence_for(
+            roles.ROLE_EXECUTION, 'fixture-runtime:exec-1')
+        self.assertEqual(evidence.applied_action, 'NOT_APPLICABLE')
+        self.assertFalse(selected.automatic_allowed)
+
+    def test_low_sample_does_not_pause_automatic_selection(self):
+        report = local_report({'model-a': 1}, total=5)
+        selected = select_with_local(report=report,
+                                     reviews=corroborated('model-a'))
+        execution = selected.role(roles.ROLE_EXECUTION)
+        self.assertIsNotNone(execution.selected)
+        evidence = selected.local_evidence_for(
+            roles.ROLE_EXECUTION, 'fixture-runtime:exec-1')
+        self.assertEqual(evidence.etr_value_status, 'OK')
+        self.assertLess(evidence.etr_value, 40.0)
+        self.assertEqual(evidence.gate_status, 'PROVISIONAL')
+        self.assertEqual(evidence.applied_action, 'PROVISIONAL')
+        self.assertEqual(execution.withheld, ())
+        self.assertTrue(selected.automatic_allowed)
+
+    def test_below_threshold_with_evidence_pauses_automatic_selection(self):
+        report = local_report({'model-a': 6})
+        selected = select_with_local(report=report,
+                                     reviews=corroborated('model-a'))
+        execution = selected.role(roles.ROLE_EXECUTION)
+        self.assertIsNone(execution.selected)
+        self.assertEqual(len(execution.withheld), 1)
+        self.assertEqual(execution.withheld[0].candidate.candidate_id,
+                         'fixture-runtime:exec-1')
+        evidence = selected.local_evidence_for(
+            roles.ROLE_EXECUTION, 'fixture-runtime:exec-1')
+        self.assertEqual(evidence.gate_status, 'PAUSE_AUTO_SELECTION')
+        self.assertEqual(evidence.applied_action, 'PAUSE_AUTO_SELECTION')
+        self.assertFalse(selected.automatic_allowed)
+        self.assertTrue(execution.manual_handoff)
+        self.assertFalse(selected.executed)
+
+    def test_low_etr_with_low_credibility_is_provisional_not_paused(self):
+        report = local_report({'model-a': 6})
+        selected = select_with_local(report=report,
+                                     reviews=single_review('model-a'))
+        execution = selected.role(roles.ROLE_EXECUTION)
+        self.assertIsNotNone(execution.selected)
+        evidence = selected.local_evidence_for(
+            roles.ROLE_EXECUTION, 'fixture-runtime:exec-1')
+        self.assertEqual(evidence.credibility, 'LOW')
+        self.assertEqual(evidence.gate_status, 'PAUSE_AUTO_SELECTION')
+        self.assertEqual(evidence.applied_action, 'PROVISIONAL')
+        self.assertIn('credibility', ' '.join(evidence.reasons))
+
+    def test_above_high_line_raises_priority_over_cheaper_candidate(self):
+        master, execution, reviewer = support.standard_candidates()
+        cheap = replace(execution, agent_id='exec-2', model_id='model-c',
+                        model_family='family-c', cost_per_mtok=0.1)
+        expensive = replace(execution, cost_per_mtok=5.0)
+        report = local_report({'model-a': 18})
+        selected = select_with_local(
+            (master, expensive, cheap, reviewer), report=report,
+            reviews=corroborated('model-a'))
+        self.assertEqual(
+            selected.role(roles.ROLE_EXECUTION).selected.candidate.model_id,
+            'model-a')
+        evidence = selected.local_evidence_for(
+            roles.ROLE_EXECUTION, 'fixture-runtime:exec-1')
+        self.assertEqual(evidence.applied_action, 'RAISE_PRIORITY')
+
+    def test_no_candidate_is_never_reported_as_dispatched(self):
+        empty = discovery.discover_candidates(
+            adapter=support.FixtureAdapter(
+                support.runtime_adapter.DiscoveryResult(
+                    outcome='EMPTY', mode='runtime')))
+        report = model_selection.select_models(
+            fetch_batch(), empty, support.task_requirements(),
+            links=default_links(), now=NOW,
+            feedback_report=local_report({'model-a': 18}),
+            task_category=LOCAL_CATEGORY, scope_id=LOCAL_SCOPE,
+            peer_reviews=corroborated('model-a'))
+        self.assertEqual(report.local_evidence, ())
+        self.assertFalse(report.automatic_allowed)
+        self.assertFalse(report.executed)
+        self.assertFalse(hasattr(report, 'dispatched'))
+        for role in roles.ROLES:
+            selection = report.role(role)
+            self.assertIsNone(selection.selected)
+            self.assertTrue(selection.manual_handoff)
+            self.assertEqual(selection.withheld, ())
 
 
 if __name__ == '__main__':

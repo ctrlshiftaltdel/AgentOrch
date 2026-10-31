@@ -33,6 +33,7 @@ from __future__ import annotations
 from bisect import bisect_right
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 
 from .model_sources.snapshot import (
     FRESHNESS_FRESH,
@@ -58,11 +59,14 @@ __all__ = [
     'ROLE_BENCHMARK_MAP',
     'REVIEWER_NO_BENCHMARK_NOTE',
     'DEFAULT_MIN_COHORT_SIZE',
+    'LOCAL_EVIDENCE_STATUSES',
+    'LOCAL_ACTIONS',
     'ModelSelectionError',
     'ModelLink',
     'AssessmentPolicy',
     'ExternalSignal',
     'ModelAssessment',
+    'LocalEvidence',
     'ModelSelectionReport',
     'select_models',
 ]
@@ -98,6 +102,127 @@ REVIEWER_NO_BENCHMARK_NOTE = (
 
 DEFAULT_MIN_COHORT_SIZE = 6
 _GRADE_ORDER = {'STRONG': 0, 'MODERATE': 1, 'WEAK': 2, 'UNKNOWN': 3}
+
+# Local, current-scope evidence states. They are separate from the external
+# snapshot statuses: a missing local cohort is not "bad quality", and a
+# measured ETR is never inherited across a model identity, a task category or
+# a scope.
+LOCAL_EVIDENCE_STATUSES = (
+    'CURRENT', 'PROVISIONAL', 'PAUSE_AUTO_SELECTION', 'RAISE_PRIORITY',
+    'NO_HISTORY', 'NO_CATEGORY', 'NO_COHORT', 'AMBIGUOUS_IDENTITY',
+    'STALE', 'IDENTITY_CHANGED', 'UNKNOWN_IDENTITY', 'UNKNOWN', 'NO_DATA',
+)
+# What the selector actually did with the local evidence. ``NOT_APPLICABLE`` is
+# a candidate that already failed an existing hard filter; ``MANUAL_ONLY`` is
+# the Master, which is always selected by the user.
+LOCAL_ACTIONS = ('NONE', 'PROVISIONAL', 'PAUSE_AUTO_SELECTION',
+                 'RAISE_PRIORITY', 'NOT_APPLICABLE', 'MANUAL_ONLY')
+
+
+@dataclass(frozen=True)
+class LocalEvidence:
+    """One candidate's ETR / credibility view for one role and task category.
+
+    It is sourced only from the caller's *current scope* feedback report and
+    peer-review events passed to :func:`select_models`. It cannot change a
+    hard filter result: :attr:`applied_action` is ``NOT_APPLICABLE`` when the
+    candidate already failed one. ``applied_action`` is also where the
+    provisional thresholds are expressed, so ``gate_status`` (the raw measured
+    gate) and the action actually taken stay separate.
+    """
+
+    role: str
+    candidate_id: str
+    model_id: str | None
+    canonical_model_id: str | None
+    identity_status: str
+    category: str | None
+    scope_id: str | None
+    status: str = 'NO_HISTORY'
+    etr_value_status: str = UNKNOWN
+    etr_value: float | None = None
+    token_coverage_status: str = UNKNOWN
+    token_coverage: float | None = None
+    observed_tokens: int | None = None
+    scored_tokens: int | None = None
+    rated_tasks: int = 0
+    total_tasks: int = 0
+    window_start: str = UNKNOWN
+    window_end: str = UNKNOWN
+    evidence_status: str = UNKNOWN
+    gate_status: str = 'NO_GATE'
+    applied_action: str = 'NONE'
+    credibility: str = UNKNOWN
+    credibility_basis: str = ''
+    cost_per_mtok: float | None = None
+    latency_ms: int | None = None
+    hard_filter_status: str = 'UNKNOWN'
+    decided_at: str = ''
+    reasons: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
+
+    unit = 'percent'
+
+    def __post_init__(self):
+        if self.role not in ROLES:
+            raise ModelSelectionError(f'unknown role {self.role!r}')
+        if self.status not in LOCAL_EVIDENCE_STATUSES:
+            raise ModelSelectionError(
+                f'unknown local evidence status {self.status!r}')
+        if self.applied_action not in LOCAL_ACTIONS:
+            raise ModelSelectionError(
+                f'unknown local action {self.applied_action!r}')
+        for name in ('etr_value', 'token_coverage'):
+            value = getattr(self, name)
+            if value is not None and not 0.0 <= value <= 100.0:
+                raise ModelSelectionError(
+                    f'{name} must be a percentage in [0, 100]')
+
+    @property
+    def measured(self):
+        return self.etr_value_status == 'OK' and self.etr_value is not None
+
+    def as_dict(self):
+        return {
+            'role': self.role,
+            'candidate_id': self.candidate_id,
+            'model_id': self.model_id if self.model_id is not None else UNKNOWN,
+            'canonical_model_id': (self.canonical_model_id
+                                   if self.canonical_model_id is not None
+                                   else UNKNOWN),
+            'identity_status': self.identity_status,
+            'category': self.category if self.category is not None else UNKNOWN,
+            'scope_id': self.scope_id if self.scope_id is not None else UNKNOWN,
+            'status': self.status,
+            'etr_value_status': self.etr_value_status,
+            'etr_value': (self.etr_value if self.etr_value is not None
+                          else UNKNOWN),
+            'unit': self.unit,
+            'token_coverage_status': self.token_coverage_status,
+            'token_coverage': (self.token_coverage
+                               if self.token_coverage is not None else UNKNOWN),
+            'observed_tokens': (self.observed_tokens
+                                if self.observed_tokens is not None
+                                else UNKNOWN),
+            'scored_tokens': (self.scored_tokens
+                              if self.scored_tokens is not None else UNKNOWN),
+            'rated_tasks': self.rated_tasks,
+            'total_tasks': self.total_tasks,
+            'window': {'start': self.window_start, 'end': self.window_end},
+            'evidence_status': self.evidence_status,
+            'gate_status': self.gate_status,
+            'applied_action': self.applied_action,
+            'credibility': self.credibility,
+            'credibility_basis': self.credibility_basis,
+            'cost_per_mtok': (self.cost_per_mtok
+                              if self.cost_per_mtok is not None else UNKNOWN),
+            'latency_ms': (self.latency_ms
+                           if self.latency_ms is not None else UNKNOWN),
+            'hard_filter_status': self.hard_filter_status,
+            'decided_at': self.decided_at,
+            'reasons': list(self.reasons),
+            'notes': list(self.notes),
+        }
 
 
 class ModelSelectionError(ValueError):
@@ -297,6 +422,9 @@ class ModelSelectionReport:
     decisions: tuple[str, ...]
     notes: tuple[str, ...]
     executed: bool = False
+    local_evidence: tuple[LocalEvidence, ...] = ()
+    task_category: str | None = None
+    decision_time: str = ''
 
     def role(self, role):
         return self.role_selection.role(role)
@@ -310,11 +438,24 @@ class ModelSelectionReport:
                 return item
         return None
 
+    def local_evidence_for(self, role, candidate_id=None):
+        items = tuple(item for item in self.local_evidence
+                      if item.role == role
+                      and (candidate_id is None
+                           or item.candidate_id == candidate_id))
+        if candidate_id is None:
+            return items
+        return items[0] if items else None
+
     def as_dict(self):
         return {
             'source': self.source.as_dict(),
             'role_selection': self.role_selection.as_dict(),
             'assessments': [item.as_dict() for item in self.assessments],
+            'local_evidence': [item.as_dict() for item in self.local_evidence],
+            'task_category': (self.task_category
+                              if self.task_category is not None else UNKNOWN),
+            'decision_time': self.decision_time or UNKNOWN,
             'automatic_allowed': self.automatic_allowed,
             'degradations': list(self.degradations),
             'decisions': list(self.decisions),
@@ -351,11 +492,27 @@ class ModelSelectionReport:
                     lines.append(
                         f'  signal: {signal.dimension}={signal.grade} '
                         f'({signal.evaluation_name or UNKNOWN})')
+            for local in self.local_evidence_for(role):
+                measured = (local.etr_value if local.measured
+                            else local.etr_value_status)
+                coverage = (local.token_coverage
+                            if local.token_coverage is not None
+                            else local.token_coverage_status)
+                lines.append(
+                    f'  local: {local.candidate_id} status={local.status} '
+                    f'etr={measured} coverage={coverage} '
+                    f'credibility={local.credibility} '
+                    f'action={local.applied_action}')
+            for held in selection.withheld:
+                lines.append(
+                    f'  withheld: {held.candidate.candidate_id}')
             if selection.reminder:
                 lines.append(f'  reminder: {selection.reminder}')
         lines.append(
             f'automatic_allowed={self.automatic_allowed} '
-            f'executed={self.executed}')
+            f'executed={self.executed} '
+            f'category={self.task_category or UNKNOWN} '
+            f'decided_at={self.decision_time or UNKNOWN}')
         for degradation in self.degradations:
             lines.append(f'degradation: {degradation}')
         for decision in self.decisions:
@@ -628,19 +785,290 @@ def _verify_selected_hard_filters(role_selection, *, now):
                 'change a hard constraint')
 
 
+def _decision_time(now):
+    if now is not None:
+        return str(now)
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _identity_keys(candidate, now):
+    """The model ids this candidate's registry identity covers.
+
+    An untrusted declaration never broadens the match: only the id the
+    candidate itself reports is used, so an alias cannot inherit another
+    model's scores. A trusted declaration covers its canonical id and its
+    confirmed aliases, which keeps two names for the same underlying model on
+    one identity instead of inventing two models.
+    """
+    identity = candidate.canonical_identity
+    model_id = candidate.model_id
+    own = {model_id.casefold()} if model_id else set()
+    if identity is None:
+        return own, None, 'ABSENT', (
+            'no canonical model identity is registered for this candidate')
+    trusted, status, detail = identity.trusted_at(now)
+    if not trusted:
+        return own, None, status, detail
+    return identity.alias_keys(model_id), identity.canonical_id, status, detail
+
+
+def _match_cohort(report, role, candidate, category, now):
+    """Find the one current-scope cohort for this exact role/category/identity.
+
+    No cross-category and no cross-identity fallback is attempted. More than
+    one matching cohort means the identity was recorded under several names;
+    the safe answer is to apply no threshold action and say so.
+    """
+    if report is None:
+        return None, 'NO_HISTORY', (
+            'no local feedback report for the current scope was supplied; no '
+            'local ETR or credibility is used')
+    if not category:
+        return None, 'NO_CATEGORY', (
+            'no task category was supplied, so a per-category ETR cohort '
+            'cannot be selected without crossing categories')
+    cohorts = [item for item in report.cohorts
+               if item.role == role and item.category == category]
+    if not cohorts:
+        return None, 'NO_COHORT', (
+            f'this scope has no local cohort for {role}/{category}; a score '
+            'is never inherited from another role or category')
+    keys, _canonical, _status, _detail = _identity_keys(candidate, now)
+    matches = [
+        item for item in cohorts
+        if item.identity.runtime_id.casefold() == candidate.runtime_id.casefold()
+        and item.identity.runtime_version.casefold()
+        == candidate.runtime_version.casefold()
+        and item.identity.model_id.casefold() in keys]
+    if not matches:
+        return None, 'NO_COHORT', (
+            f'this scope has no local cohort for the exact identity '
+            f'{candidate.model_id!r} on {candidate.runtime_id} '
+            f'{candidate.runtime_version}; scores are never inherited across '
+            'identities')
+    if len({item.identity.key for item in matches}) > 1:
+        return None, 'AMBIGUOUS_IDENTITY', (
+            'several local cohorts match this candidate under different '
+            'recorded model ids; the selector does not guess whether they are '
+            'the same model, so no ETR threshold action is applied')
+    return matches[0], 'MATCHED', ''
+
+
+def _credibility_for(role, candidate, category, peer_reviews, reliability,
+                     now, scope_id=None):
+    """Aggregate the peer-review credibility for one role/category/identity.
+
+    Events are filtered by category and subject identity before assessment, so
+    a score from another task category or another model is never inherited.
+    Only every assessed fact being ``CORROBORATED`` yields ``CORROBORATED``;
+    any conflict or low-credibility fact keeps the overall answer at or below
+    the weaker status.
+    """
+    if not peer_reviews:
+        return UNKNOWN, (
+            'no peer-review events were supplied for the current scope; '
+            'credibility is UNKNOWN and no threshold action is taken')
+    from . import peer_review
+
+    keys, _canonical, _status, _detail = _identity_keys(candidate, now)
+    matching = []
+    for event in peer_reviews:
+        if getattr(event, 'subject_role', None) != role:
+            continue
+        if getattr(event, 'category', None) != category:
+            continue
+        event_scope = getattr(event, 'scope_id', '') or ''
+        if event_scope and event_scope != scope_id:
+            continue
+        subject = getattr(event, 'subject', None)
+        if subject is None:
+            continue
+        if subject.runtime_id.casefold() != candidate.runtime_id.casefold():
+            continue
+        if subject.runtime_version.casefold() \
+                != candidate.runtime_version.casefold():
+            continue
+        if subject.model_id.casefold() not in keys:
+            continue
+        matching.append(event)
+    if not matching:
+        return UNKNOWN, (
+            'no peer-review event matches this role, task category and exact '
+            'identity; credibility is UNKNOWN, not inherited')
+    assessments = peer_review.assess_all(matching, reliability=reliability)
+    statuses = {item.credibility for item in assessments}
+    basis = (
+        f'{len(assessments)} assessed fact(s) from {len(matching)} event(s): '
+        + ', '.join(sorted(statuses)))
+    if 'CONFLICTED' in statuses:
+        return 'CONFLICTED', basis
+    if not statuses or statuses == {'UNKNOWN'}:
+        return UNKNOWN, basis
+    if 'LOW' in statuses:
+        return 'LOW', basis
+    if statuses == {'CORROBORATED'}:
+        return 'CORROBORATED', basis
+    return UNKNOWN, basis
+
+
+def _local_evidence_for(role, candidate, report, category, peer_reviews,
+                        reliability, now, hard_status, decided_at,
+                        scope_id=None):
+    """Build one candidate's local ETR / credibility view and its action."""
+    keys, canonical, identity_status, identity_detail = _identity_keys(
+        candidate, now)
+    credibility, credibility_basis = _credibility_for(
+        role, candidate, category, peer_reviews, reliability, now,
+        scope_id=scope_id)
+    base = dict(
+        role=role, candidate_id=candidate.candidate_id,
+        model_id=candidate.model_id, canonical_model_id=canonical,
+        identity_status=identity_status, category=category,
+        scope_id=(report.scope_id if report is not None else None),
+        credibility=credibility, credibility_basis=credibility_basis,
+        cost_per_mtok=candidate.cost_per_mtok,
+        latency_ms=candidate.latency_ms, hard_filter_status=hard_status,
+        decided_at=decided_at)
+    notes = (
+        'local evidence is read only from the current scope; it is never '
+        'merged with another scope',
+        'ETR is a percentage over observed Token in rated calls; token '
+        'coverage is reported separately',
+        'a provisional threshold action never deletes the candidate; the '
+        'manual path stays open',
+    )
+    cohort, match_status, match_reason = _match_cohort(
+        report, role, candidate, category, now)
+    if cohort is None:
+        reasons = [match_reason]
+        if identity_detail and identity_status != 'CONFIRMED':
+            reasons.append(f'identity {identity_status}: {identity_detail}')
+        return LocalEvidence(
+            status=match_status, reasons=tuple(reasons), notes=notes, **base)
+    etr = cohort.etr
+    if etr is None:
+        return LocalEvidence(
+            status='NO_DATA',
+            reasons=('the local cohort has no ETR result; no threshold action '
+                     'is possible',),
+            notes=notes, **base)
+    base.update(
+        etr_value_status=etr.value_status, etr_value=etr.value,
+        token_coverage_status=etr.token_coverage_status,
+        token_coverage=etr.token_coverage,
+        observed_tokens=etr.observed_tokens, scored_tokens=etr.scored_tokens,
+        rated_tasks=etr.rated_tasks, total_tasks=etr.total_tasks,
+        window_start=etr.window_start, window_end=etr.window_end,
+        evidence_status=etr.evidence_status, gate_status=etr.gate_status)
+    reasons = list(etr.gate_reasons)
+    if etr.evidence_status != 'CURRENT':
+        return LocalEvidence(
+            status=etr.evidence_status,
+            reasons=tuple(reasons + [
+                f'the local evidence is {etr.evidence_status}; no threshold '
+                'action is taken on stale or re-identified history']),
+            notes=notes, **base)
+    if etr.value_status != 'OK' or etr.token_coverage_status != 'OK':
+        status = (etr.value_status if etr.value_status != 'OK'
+                  else etr.token_coverage_status)
+        return LocalEvidence(
+            status=status,
+            reasons=tuple(reasons + [
+                'ETR or coverage has no usable value; it is not filled with 0 '
+                'or 100 and no threshold action is taken']),
+            notes=notes, **base)
+
+    status = etr.gate_status if etr.gate_status != 'NO_GATE' else 'CURRENT'
+    action = 'NONE'
+    if hard_status != 'PASS':
+        action = 'NOT_APPLICABLE'
+        reasons.append(
+            f'the existing hard filters are {hard_status}; local evidence '
+            'cannot change a hard result and no threshold action is applied')
+    elif role == ROLE_MASTER:
+        action = 'MANUAL_ONLY'
+        reasons.append(
+            'Master is always selected and switched by the user; the local '
+            'ETR is reported as a recommendation and is never auto-applied')
+    elif etr.gate_status == 'PAUSE_AUTO_SELECTION':
+        if credibility == 'CORROBORATED':
+            action = 'PAUSE_AUTO_SELECTION'
+            reasons.append(
+                'the measured ETR is below the provisional low line with '
+                'sufficient coverage, samples and corroborated evaluations; '
+                'automatic selection for this role and category is paused')
+        else:
+            action = 'PROVISIONAL'
+            reasons.append(
+                f'credibility is {credibility}, not CORROBORATED, so a low '
+                'ETR does not pause automatic selection; the value is reported '
+                'as PROVISIONAL')
+    elif etr.gate_status == 'RAISE_PRIORITY':
+        quality_ok = any(metric.ok for metric in cohort.metrics.values())
+        if credibility == 'CORROBORATED' and quality_ok:
+            action = 'RAISE_PRIORITY'
+            reasons.append(
+                'the measured ETR is above the provisional high line with '
+                'sufficient coverage, samples, corroborated evaluations and a '
+                'locally observed quality metric; it only reorders candidates '
+                'that already pass the hard filters')
+        else:
+            action = 'PROVISIONAL'
+            reasons.append(
+                'a high ETR does not raise priority unless the hard filters, '
+                f'the local quality metric and credibility all qualify '
+                f'(credibility={credibility}, quality_ok={quality_ok})')
+    elif etr.gate_status == 'PROVISIONAL':
+        action = 'PROVISIONAL'
+        reasons.append(
+            'the measured ETR is reported as PROVISIONAL; the sample, window '
+            'or coverage threshold is not met, so it neither pauses nor '
+            'raises automatic selection')
+    return LocalEvidence(
+        status=status, applied_action=action, reasons=tuple(reasons),
+        notes=notes, **base)
+
+
+def _local_policy(local_evidence):
+    """Translate applied local actions into withheld / priority maps."""
+    withheld, priority = {}, {}
+    for item in local_evidence:
+        if item.applied_action == 'PAUSE_AUTO_SELECTION':
+            reason = (item.reasons[-1] if item.reasons else
+                      'local ETR evidence paused automatic selection')
+            withheld.setdefault(item.role, {})[item.candidate_id] = reason
+        elif item.applied_action == 'RAISE_PRIORITY':
+            priority[(item.role, item.candidate_id)] = (0,)
+    return withheld, priority
+
+
 def _source_degradation(batch):
     return (f'external model source {batch.fetch.status} '
             f'({batch.fetch.source_url}): {batch.fetch.message}')
 
 
 def select_models(batch, discovery, requirements, *, links=None,
-                  policy=None, now=None):
-    """Select roles from S2 hard filters plus external role evidence.
+                  policy=None, now=None, feedback_report=None,
+                  task_category=None, scope_id=None, peer_reviews=None,
+                  peer_review_reliability=None):
+    """Select roles from S2 hard filters, then external and local evidence.
 
     *batch* is a :class:`SnapshotBatch` (a failed fetch is allowed),
     *discovery* the S2 :class:`DiscoveryReport` and *requirements* one
     :class:`RoleRequirement` per role. *links* must be explicit
     :class:`ModelLink` values or a mapping; there is no fuzzy identity match.
+
+    *feedback_report* is this scope's :class:`feedback.FeedbackReport` and
+    *peer_reviews* are its :class:`peer_review.PeerReview` events. Both are
+    optional: without them the selection behaves exactly as before. When a
+    report is supplied, *scope_id* must name the same current scope; a report
+    from another scope is never inherited. *task_category* selects one local
+    cohort; without it no per-category ETR is applied.
+
+    Both local sources are applied **after** every existing hard filter. They
+    can withhold an already-qualified candidate from *automatic* selection or
+    reorder already-qualified candidates; they can never turn a hard failure
+    into a pass, and nothing here spawns or switches an agent.
     """
     if not isinstance(batch, SnapshotBatch):
         raise TypeError('batch must be a SnapshotBatch')
@@ -654,11 +1082,45 @@ def select_models(batch, discovery, requirements, *, links=None,
     _validate_master_requirement(requirements)
     link_map = _link_map(links)
 
+    local_report = feedback_report
+    scope_problem = ''
+    if feedback_report is not None:
+        from .feedback import FeedbackReport
+        if not isinstance(feedback_report, FeedbackReport):
+            raise TypeError('feedback_report must be a FeedbackReport')
+        if not scope_id:
+            scope_problem = (
+                'a local feedback report was supplied without the current '
+                'scope id; it is not used, because scores are never inherited '
+                'across scopes')
+        elif feedback_report.scope_id != scope_id:
+            scope_problem = (
+                f'local feedback belongs to scope {feedback_report.scope_id!r}, '
+                f'not the current scope {scope_id!r}; it is not inherited')
+        if scope_problem:
+            local_report = None
+    if peer_reviews is not None and not isinstance(peer_reviews, (tuple, list)):
+        peer_reviews = tuple(peer_reviews)
+
     enriched, assessments, _ = _enrich(
         discovery, batch, link_map, policy)
 
     enriched_discovery = replace(discovery, candidates=enriched)
-    role_selection = select_roles(enriched_discovery, requirements, now=now)
+    decided_at = _decision_time(now)
+    preliminary = select_roles(enriched_discovery, requirements, now=now)
+    local_evidence = []
+    for role in ROLES:
+        requirement = preliminary.role(role).requirement
+        for candidate in enriched:
+            hard = evaluate_candidate(candidate, requirement, now=now)
+            local_evidence.append(_local_evidence_for(
+                role, candidate, local_report, task_category,
+                peer_reviews or (), peer_review_reliability, now,
+                hard.status, decided_at, scope_id=scope_id))
+    withheld, priority = _local_policy(local_evidence)
+    role_selection = select_roles(
+        enriched_discovery, requirements, now=now,
+        withheld_for_role=withheld, candidate_priority=priority)
     _verify_selected_hard_filters(role_selection, now=now)
 
     selected_ids = {}
@@ -674,6 +1136,31 @@ def select_models(batch, discovery, requirements, *, links=None,
 
     degradations = list(role_selection.degradations)
     decisions = []
+    if scope_problem:
+        degradations.append(scope_problem)
+    for item in local_evidence:
+        if item.applied_action == 'PAUSE_AUTO_SELECTION':
+            degradations.append(
+                f'{item.role}: {item.candidate_id} is withheld from automatic '
+                f'selection by local ETR evidence (ETR {item.etr_value}%, '
+                f'coverage {item.token_coverage}%, credibility '
+                f'{item.credibility}); the candidate and the manual path are '
+                'preserved')
+    for role in ROLES:
+        selection = role_selection.role(role)
+        if selection.selected is None:
+            continue
+        local = next(
+            (item for item in local_evidence
+             if item.role == role
+             and item.candidate_id == selection.selected.candidate.candidate_id),
+            None)
+        if local is not None and local.status in (
+                'NO_DATA', 'UNKNOWN', 'STALE', 'IDENTITY_CHANGED',
+                'UNKNOWN_IDENTITY', 'AMBIGUOUS_IDENTITY'):
+            degradations.append(
+                f'{role}: selected {local.candidate_id} has local evidence '
+                f'{local.status}; no local ETR threshold action was applied')
     if not batch.usable:
         degradations.append(_source_degradation(batch))
         if policy.require_fresh_source:
@@ -726,9 +1213,24 @@ def select_models(batch, discovery, requirements, *, links=None,
          'used as a review score'),
         ('model family is UNKNOWN unless the source publishes it; Reviewer '
          'independence is enforced on the underlying model id'),
+        ('local ETR and peer-review credibility come only from the current '
+         'scope and the supplied task category; they are never inherited '
+         'across scopes, categories, roles or model identities'),
+        ('a local ETR above the high line only reorders candidates that '
+         'already passed the hard filters and have a qualified quality metric; '
+         'a local ETR below the low line pauses automatic selection only when '
+         'the window, sample, coverage and credibility thresholds are met'),
+        ('Master is always selected and switched by the user; local evidence '
+         'about Master is a recommendation, never an automatic change'),
         (f'this selector does not spawn, wait for or collect an agent; '
          f'executed={False}'),
     ))
+    for item in local_evidence:
+        if item.applied_action == 'RAISE_PRIORITY':
+            notes.append(
+                f'{item.role}: {item.candidate_id} raised by a gated ETR '
+                f'({item.etr_value}%, coverage {item.token_coverage}%) among '
+                'hard-qualified candidates only')
     if batch.usable and not batch.live:
         notes.append(
             f'the report uses {batch.fetch.status} data; it is explicitly not '
@@ -744,4 +1246,7 @@ def select_models(batch, discovery, requirements, *, links=None,
         decisions=tuple(dict.fromkeys(decisions)),
         notes=tuple(dict.fromkeys(notes)),
         executed=False,
+        local_evidence=tuple(local_evidence),
+        task_category=task_category,
+        decision_time=decided_at,
     )

@@ -654,14 +654,28 @@ def _reminder(role, requirement):
 
 
 def _selection(role, requirement, candidates, *, now, max_age_days,
-               project_min_samples):
+               project_min_samples, withheld=None, priority=None):
+    """Hard filters first, then ranking; ``withheld`` removes automatic use.
+
+    A withheld candidate already passed every hard filter. It is kept in the
+    report with its filter results (so the reason is inspectable) but is not
+    eligible for automatic selection. It is never deleted: the manual path
+    stays open. ``priority`` is a per-candidate ordering prefix supplied by the
+    caller (for example, a qualified ETR above the high line); it only ever
+    orders candidates that already passed the hard filters.
+    """
+    withheld = withheld or {}
+    priority = priority or {}
     evaluations = [evaluate_candidate(candidate, requirement, now=now,
                                       max_age_days=max_age_days)
                    for candidate in candidates]
-    qualified, unverified, excluded = [], [], []
+    qualified, unverified, excluded, held = [], [], [], []
     for evaluation in evaluations:
         if evaluation.status == 'PASS':
-            qualified.append(evaluation)
+            if evaluation.candidate.candidate_id in withheld:
+                held.append(evaluation)
+            else:
+                qualified.append(evaluation)
         elif evaluation.status == 'UNKNOWN':
             unverified.append(evaluation)
         else:
@@ -671,6 +685,9 @@ def _selection(role, requirement, candidates, *, now, max_age_days,
     for evaluation in qualified:
         key, notes = _rank(evaluation,
                            project_min_samples=project_min_samples)
+        extra = priority.get((role, evaluation.candidate.candidate_id))
+        if extra:
+            key = tuple(extra) + key
         ranked.append(CandidateEvaluation(
             candidate=evaluation.candidate, role=evaluation.role,
             filters=evaluation.filters, reasons=notes, rank_key=key))
@@ -687,6 +704,11 @@ def _selection(role, requirement, candidates, *, now, max_age_days,
     else:
         reasons = ('no candidate passed every hard filter; no role is '
                    'selected',)
+    for evaluation in held:
+        reason = withheld[evaluation.candidate.candidate_id]
+        reasons = reasons + (
+            f'{evaluation.candidate.candidate_id} passed the hard filters but '
+            f'is withheld from automatic selection: {reason}',)
 
     if candidates:
         missing_items = []
@@ -706,7 +728,8 @@ def _selection(role, requirement, candidates, *, now, max_age_days,
             alternatives=(), unverified=tuple(unverified),
             excluded=tuple(excluded), missing=missing,
             reminder=_reminder(role, requirement), reasons=reasons,
-            manual_handoff=True, auto_allowed=False)
+            manual_handoff=True, auto_allowed=False,
+            withheld=tuple(held))
 
     return RoleSelection(
         role=role, requirement=requirement, selected=selected,
@@ -714,7 +737,8 @@ def _selection(role, requirement, candidates, *, now, max_age_days,
         excluded=tuple(excluded), missing=(),
         reminder=None,
         reasons=reasons,
-        manual_handoff=False, auto_allowed=True)
+        manual_handoff=False, auto_allowed=True,
+        withheld=tuple(held))
 
 
 @dataclass(frozen=True)
@@ -732,6 +756,11 @@ class RoleSelection:
     reasons: tuple[str, ...]
     manual_handoff: bool
     auto_allowed: bool
+    # Candidates that passed every hard filter but are excluded from automatic
+    # selection by an explicit caller policy (for example a measured, gated
+    # ETR below the provisional low line). They are kept, inspectable and
+    # manually usable; they are never deleted or turned into a hard failure.
+    withheld: tuple[CandidateEvaluation, ...] = ()
 
     def as_dict(self):
         return {
@@ -742,6 +771,7 @@ class RoleSelection:
             'alternatives': [item.as_dict() for item in self.alternatives],
             'unverified': [item.as_dict() for item in self.unverified],
             'excluded': [item.as_dict() for item in self.excluded],
+            'withheld': [item.as_dict() for item in self.withheld],
             'missing': list(self.missing),
             'reminder': self.reminder,
             'reasons': list(self.reasons),
@@ -805,14 +835,53 @@ class SelectionReport:
         return lines
 
 
+def _withheld_for(role, withheld):
+    items = (withheld or {}).get(role) or {}
+    result = {}
+    for candidate_id, reason in items.items():
+        if not isinstance(candidate_id, str) or not candidate_id.strip():
+            raise ValueError('a withheld candidate needs a candidate_id')
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(
+                f'{candidate_id}: a withheld candidate needs a reason')
+        result[candidate_id] = reason
+    return result
+
+
+def _priority_map(candidate_priority):
+    result = {}
+    for key, value in (candidate_priority or {}).items():
+        if not isinstance(key, tuple) or len(key) != 2:
+            raise ValueError(
+                'candidate_priority keys must be (role, candidate_id) tuples')
+        role, candidate_id = key
+        if role not in ROLES or not isinstance(candidate_id, str) \
+                or not candidate_id.strip():
+            raise ValueError(f'invalid candidate_priority key {key!r}')
+        if not isinstance(value, tuple) or not value:
+            raise ValueError(
+                f'{key}: a priority must be a non-empty tuple of sortable '
+                'values')
+        result[key] = value
+    return result
+
+
 def select_roles(discovery, requirements, *, now=None,
                  max_age_days=DEFAULT_MAX_EVIDENCE_AGE_DAYS,
-                 project_min_samples=PROJECT_MIN_SAMPLES) -> SelectionReport:
+                 project_min_samples=PROJECT_MIN_SAMPLES,
+                 withheld_for_role=None,
+                 candidate_priority=None) -> SelectionReport:
     """Match every role against the discovered candidates.
 
     *requirements* must contain one :class:`RoleRequirement` per role. A missing
     requirement raises: silently substituting a lenient default would drop a
     hard constraint (for example Master's image input).
+
+    ``withheld_for_role`` and ``candidate_priority`` are optional caller policy
+    applied *after* the existing hard filters: a withheld candidate has already
+    passed them, but is kept out of automatic selection (manual use remains);
+    a priority tuple only orders candidates that already passed. Neither
+    changes a filter result.
     """
     if not isinstance(discovery, DiscoveryReport):
         raise TypeError('discovery must be a DiscoveryReport')
@@ -821,6 +890,8 @@ def select_roles(discovery, requirements, *, now=None,
         raise ValueError(
             'a requirement must be supplied for every role; missing: '
             f'{", ".join(missing_requirements)} (no lenient default is used)')
+    withheld = {role: _withheld_for(role, withheld_for_role) for role in ROLES}
+    priority = _priority_map(candidate_priority)
     selections = {}
     degradations = []
     candidates = discovery.candidates if discovery.discovered else ()
@@ -832,7 +903,8 @@ def select_roles(discovery, requirements, *, now=None,
         selections[role] = _selection(
             role, requirement, candidates, now=now,
             max_age_days=max_age_days,
-            project_min_samples=project_min_samples)
+            project_min_samples=project_min_samples,
+            withheld=withheld[role], priority=priority)
 
     # Reviewer independence is a structural consequence of the *selected*
     # Execution model, not of what a caller put in the requirement. Rebuild the
@@ -862,7 +934,8 @@ def select_roles(discovery, requirements, *, now=None,
     selections[ROLE_REVIEWER] = _selection(
         ROLE_REVIEWER, reviewer_requirement_value, candidates, now=now,
         max_age_days=max_age_days,
-        project_min_samples=project_min_samples)
+        project_min_samples=project_min_samples,
+        withheld=withheld[ROLE_REVIEWER], priority=priority)
 
     master = selections[ROLE_MASTER]
     execution = selections[ROLE_EXECUTION]
@@ -888,6 +961,12 @@ def select_roles(discovery, requirements, *, now=None,
             reason = ('no independent Reviewer; the task stays unreviewed and '
                       'Execution self-review is not accepted')
         degradations.append(reason)
+    for role in ROLES:
+        for held in selections[role].withheld:
+            degradations.append(
+                f'{role}: {held.candidate.candidate_id} passed every hard '
+                'filter but is withheld from automatic selection; manual use '
+                'and the candidate itself are preserved')
 
     automatic = (
         discovery.outcome in (DISCOVERY_RUNTIME, DISCOVERY_REGISTRY)

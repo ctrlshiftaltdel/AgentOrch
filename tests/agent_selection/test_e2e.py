@@ -35,6 +35,7 @@ from scripts.agent_selection import (  # noqa: E402
     feedback,
     local_store,
     model_selection,
+    peer_review,
     roles,
     scope,
 )
@@ -188,11 +189,12 @@ class StoreCase(unittest.TestCase):
             store, capability_records={'cap-1': capability_record})
         return discovery.discover_candidates(registry=registry)
 
-    def select(self, discovered, *, batch=None, requirements=None, policy=None):
+    def select(self, discovered, *, batch=None, requirements=None, policy=None,
+               **extra):
         return model_selection.select_models(
             fresh_batch() if batch is None else batch, discovered,
             requirements or support.task_requirements(), links=LINKS,
-            policy=policy, now=NOW)
+            policy=policy, now=NOW, **extra)
 
     def scope_directories(self):
         store_root = self.root / '.local' / 'agent-orch'
@@ -210,6 +212,39 @@ def execution_outcome(store, index=1, **overrides):
         post_merge_regression_defects=0, scope_id=store.scope_id)
     values.update(overrides)
     return feedback.ExecutionOutcome(**values)
+
+
+def etr_outcome(store, index, contribution, *, model_id='model-a',
+                total_tokens=1000):
+    return feedback.ExecutionOutcome(
+        task_id=f'etr-{index}', category='code-change',
+        identity=feedback.ModelIdentity(
+            model_id, 'fixture-runtime', '1.0.0'),
+        observed_at=NOW,
+        evidence=(feedback.EvidenceRef(
+            'task_record', f'issue:etr-{index}', NOW),),
+        first_acceptance='PASS',
+        token_usage=feedback.TokenUsage(
+            total_tokens=total_tokens, source='runtime:fixture',
+            complete=True),
+        contribution=contribution, scope_id=store.scope_id)
+
+
+def review_event(store, evaluator, subject_model, *,
+                 task='issue:etr-1', dimension='goal_conformance'):
+    return peer_review.PeerReview(
+        direction='master->execution', task_id=task, category='code-change',
+        dimension=dimension, score=peer_review.POSITIVE,
+        evaluator=feedback.ModelIdentity(
+            evaluator, 'fixture-runtime', '1.0.0'),
+        subject=feedback.ModelIdentity(
+            subject_model, 'fixture-runtime', '1.0.0'),
+        observed_at=NOW,
+        evidence=(feedback.EvidenceRef(
+            'master_review', f'review:{task}', NOW),),
+        reason='fixture independent review', task_version='v1',
+        evidence_scope=store.scope_id, identity_verified=True, blind=True,
+        scope_id=store.scope_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -629,6 +664,91 @@ class SourceTests(StoreCase):
                              policy=policy)
         self.assertFalse(report.automatic_allowed)
         self.assertTrue(any('STALE_CACHE' in item for item in report.decisions))
+
+
+# --------------------------------------------------------------------------- #
+# ETR / credibility composed with the real S1-S4 records (#157)
+# --------------------------------------------------------------------------- #
+class LocalEvidencePipelineTests(StoreCase):
+    def setUp(self):
+        super().setUp()
+        self.store = self.registry_store()
+        self.discovered = self.registry_discovery(self.store)
+
+    def record_etr(self, effective, *, total=20, model_id='model-a'):
+        for index in range(total):
+            contribution = ('EFFECTIVE' if index < effective
+                            else 'INEFFECTIVE')
+            feedback.record_outcome(
+                self.store,
+                etr_outcome(self.store, f'{model_id}-{index}', contribution,
+                            model_id=model_id),
+                now=NOW, record_id=f'{model_id}-etr-{index}')
+
+    def record_corroborated(self, subject_model='model-a'):
+        for evaluator in ('evaluator-a', 'evaluator-b'):
+            peer_review.record_review(
+                self.store,
+                review_event(self.store, evaluator, subject_model),
+                now=NOW, record_id=f'{subject_model}-{evaluator}')
+
+    def local_select(self, *, scope_id=None, reviews=None):
+        feedback_report = feedback.build_report(self.store, now=NOW)
+        reviews = (reviews if reviews is not None
+                   else peer_review.load_reviews(self.store).reviews)
+        return self.select(
+            self.discovered, feedback_report=feedback_report,
+            task_category='code-change',
+            scope_id=scope_id or self.store.scope_id, peer_reviews=reviews)
+
+    def test_etr_and_credibility_reach_the_selection_report(self):
+        self.record_etr(18)
+        self.record_corroborated()
+        report = self.local_select()
+        evidence = report.local_evidence_for(
+            roles.ROLE_EXECUTION, 'fixture-runtime:exec-1')
+        self.assertIsNotNone(evidence)
+        self.assertEqual(evidence.etr_value_status, 'OK')
+        self.assertEqual(evidence.etr_value, 90.0)
+        self.assertEqual(evidence.token_coverage, 100.0)
+        self.assertEqual(evidence.gate_status, 'RAISE_PRIORITY')
+        self.assertEqual(evidence.applied_action, 'RAISE_PRIORITY')
+        self.assertEqual(evidence.credibility, 'CORROBORATED')
+        self.assertEqual(evidence.scope_id, self.store.scope_id)
+        self.assertFalse(report.executed)
+        self.assertIn('local_evidence', report.as_dict())
+
+    def test_paused_execution_is_withheld_and_not_dispatched(self):
+        self.record_etr(6)
+        self.record_corroborated()
+        report = self.local_select()
+        execution = report.role(roles.ROLE_EXECUTION)
+        self.assertIsNone(execution.selected)
+        self.assertEqual(len(execution.withheld), 1)
+        evidence = report.local_evidence_for(
+            roles.ROLE_EXECUTION, 'fixture-runtime:exec-1')
+        self.assertEqual(evidence.applied_action, 'PAUSE_AUTO_SELECTION')
+        self.assertFalse(report.automatic_allowed)
+        self.assertFalse(report.executed)
+        self.assertTrue(execution.manual_handoff)
+
+    def test_feedback_from_another_scope_is_not_inherited(self):
+        self.record_etr(18)
+        self.record_corroborated()
+        foreign_reviews = (
+            review_event(self.store, 'evaluator-a', 'model-a'),
+            review_event(self.store, 'evaluator-b', 'model-a'))
+        report = self.local_select(
+            scope_id='another-terminal-scope', reviews=foreign_reviews)
+        evidence = report.local_evidence_for(
+            roles.ROLE_EXECUTION, 'fixture-runtime:exec-1')
+        self.assertEqual(evidence.applied_action, 'NONE')
+        self.assertEqual(evidence.status, 'NO_HISTORY')
+        self.assertEqual(evidence.credibility, 'UNKNOWN')
+        self.assertIn('scope', ' '.join(evidence.reasons))
+        self.assertTrue(any('scope' in item for item in report.degradations))
+        # The record is still a selection report, never a dispatch claim.
+        self.assertFalse(report.executed)
 
 
 # --------------------------------------------------------------------------- #
