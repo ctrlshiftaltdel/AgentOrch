@@ -1,0 +1,33 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "recommendation": "UNKNOWN",
+  "safety_status": "CLEAR",
+  "quality": {
+    "hard_constraints": "PASS",
+    "goal_attainment": "PASS",
+    "adjacent_regression": "PASS"
+  },
+  "sample_sufficient": true,
+  "candidate_statuses": {
+    "T0": "NO_DATA",
+    "T1": "UNKNOWN",
+    "T2": "BASELINE",
+    "T3": "NO_DATA",
+    "T4": "NO_DATA"
+  },
+  "rollback_required": false,
+  "required_human_decision_ids": [
+    "missing_measurements"
+  ],
+  "required_substrings": [
+    "\"status\": \"UNKNOWN\"",
+    "\"value\": null",
+    "\"savings_claimed\": false"
+  ],
+  "forbidden_substrings": [
+    "\"recommendation\": \"COST_REVIEW_CANDIDATE\"",
+    "\"savings_claimed\": true",
+    "\"efficiency_proven\": true"
+  ]
+}

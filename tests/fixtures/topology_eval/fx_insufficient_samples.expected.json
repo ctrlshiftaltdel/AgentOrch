@@ -1,0 +1,33 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "recommendation": "INSUFFICIENT_SAMPLES",
+  "safety_status": "CLEAR",
+  "quality": {
+    "hard_constraints": "PASS",
+    "goal_attainment": "PASS",
+    "adjacent_regression": "PASS"
+  },
+  "sample_sufficient": false,
+  "candidate_statuses": {
+    "T0": "NO_DATA",
+    "T1": "INSUFFICIENT_SAMPLES",
+    "T2": "INSUFFICIENT_SAMPLES",
+    "T3": "NO_DATA",
+    "T4": "NO_DATA"
+  },
+  "rollback_required": false,
+  "required_human_decision_ids": [
+    "insufficient_samples"
+  ],
+  "required_substrings": [
+    "INSUFFICIENT_SAMPLES",
+    "\"sufficient\": false",
+    "\"savings_claimed\": false"
+  ],
+  "forbidden_substrings": [
+    "\"recommendation\": \"COST_REVIEW_CANDIDATE\"",
+    "\"savings_claimed\": true",
+    "\"efficiency_proven\": true"
+  ]
+}

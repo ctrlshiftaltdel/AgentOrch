@@ -1,0 +1,205 @@
+{
+  "schema_version": "topology-eval-input/1",
+  "evaluation_ref": "issue-180-comparable-control",
+  "edition": "github",
+  "baseline": {
+    "selection": "T2",
+    "source_ref": "caller:issue/180"
+  },
+  "strata": [
+    {
+      "stratum_id": "config_small",
+      "samples": [
+        {
+          "sample_id": "s01",
+          "selection": "T2",
+          "task_ref": "issue-101",
+          "outcome": "verified",
+          "goal_attainment": "met",
+          "quality_constraints": "pass",
+          "adjacent_regression": "pass",
+          "metrics": {
+            "tokens": 100,
+            "cost_usd": 0.1,
+            "latency_seconds": 40,
+            "handoffs": 2,
+            "false_positives": 0,
+            "false_negatives": 0,
+            "ac_pass_rate": 1.0,
+            "rework_rounds": 0,
+            "severe_regressions": 0
+          },
+          "hard_gate": {
+            "violations": []
+          }
+        },
+        {
+          "sample_id": "s02",
+          "selection": "T2",
+          "task_ref": "issue-102",
+          "outcome": "verified",
+          "goal_attainment": "met",
+          "quality_constraints": "pass",
+          "adjacent_regression": "pass",
+          "metrics": {
+            "tokens": 120,
+            "cost_usd": 0.12,
+            "latency_seconds": 50,
+            "handoffs": 2,
+            "false_positives": 0,
+            "false_negatives": 0,
+            "ac_pass_rate": 1.0,
+            "rework_rounds": 0,
+            "severe_regressions": 0
+          },
+          "hard_gate": {
+            "violations": []
+          }
+        },
+        {
+          "sample_id": "s03",
+          "selection": "T1",
+          "task_ref": "issue-101",
+          "outcome": "verified",
+          "goal_attainment": "met",
+          "quality_constraints": "pass",
+          "adjacent_regression": "pass",
+          "metrics": {
+            "tokens": 60,
+            "cost_usd": 0.06,
+            "latency_seconds": 25,
+            "handoffs": 1,
+            "false_positives": 0,
+            "false_negatives": 0,
+            "ac_pass_rate": 1.0,
+            "rework_rounds": 0,
+            "severe_regressions": 0
+          },
+          "hard_gate": {
+            "violations": []
+          }
+        },
+        {
+          "sample_id": "s04",
+          "selection": "T1",
+          "task_ref": "issue-102",
+          "outcome": "verified",
+          "goal_attainment": "met",
+          "quality_constraints": "pass",
+          "adjacent_regression": "pass",
+          "metrics": {
+            "tokens": 70,
+            "cost_usd": 0.07,
+            "latency_seconds": 30,
+            "handoffs": 1,
+            "false_positives": 0,
+            "false_negatives": 0,
+            "ac_pass_rate": 1.0,
+            "rework_rounds": 0,
+            "severe_regressions": 0
+          },
+          "hard_gate": {
+            "violations": []
+          }
+        }
+      ]
+    },
+    {
+      "stratum_id": "cross_module",
+      "samples": [
+        {
+          "sample_id": "s05",
+          "selection": "T2",
+          "task_ref": "issue-103",
+          "outcome": "verified",
+          "goal_attainment": "met",
+          "quality_constraints": "pass",
+          "adjacent_regression": "pass",
+          "metrics": {
+            "tokens": 140,
+            "cost_usd": 0.14,
+            "latency_seconds": 60,
+            "handoffs": 2,
+            "false_positives": 0,
+            "false_negatives": 0,
+            "ac_pass_rate": 1.0,
+            "rework_rounds": 0,
+            "severe_regressions": 0
+          },
+          "hard_gate": {
+            "violations": []
+          }
+        },
+        {
+          "sample_id": "s06",
+          "selection": "T2",
+          "task_ref": "issue-104",
+          "outcome": "verified",
+          "goal_attainment": "met",
+          "quality_constraints": "pass",
+          "adjacent_regression": "pass",
+          "metrics": {
+            "tokens": 160,
+            "cost_usd": 0.16,
+            "latency_seconds": 70,
+            "handoffs": 2,
+            "false_positives": 0,
+            "false_negatives": 0,
+            "ac_pass_rate": 1.0,
+            "rework_rounds": 0,
+            "severe_regressions": 0
+          },
+          "hard_gate": {
+            "violations": []
+          }
+        },
+        {
+          "sample_id": "s07",
+          "selection": "T1",
+          "task_ref": "issue-103",
+          "outcome": "verified",
+          "goal_attainment": "met",
+          "quality_constraints": "pass",
+          "adjacent_regression": "pass",
+          "metrics": {
+            "tokens": 80,
+            "cost_usd": 0.08,
+            "latency_seconds": 35,
+            "handoffs": 1,
+            "false_positives": 0,
+            "false_negatives": 0,
+            "ac_pass_rate": 1.0,
+            "rework_rounds": 0,
+            "severe_regressions": 0
+          },
+          "hard_gate": {
+            "violations": []
+          }
+        },
+        {
+          "sample_id": "s08",
+          "selection": "T1",
+          "task_ref": "issue-104",
+          "outcome": "verified",
+          "goal_attainment": "met",
+          "quality_constraints": "pass",
+          "adjacent_regression": "pass",
+          "metrics": {
+            "tokens": 90,
+            "cost_usd": 0.09,
+            "latency_seconds": 40,
+            "handoffs": 1,
+            "false_positives": 0,
+            "false_negatives": 0,
+            "ac_pass_rate": 1.0,
+            "rework_rounds": 0,
+            "severe_regressions": 0
+          },
+          "hard_gate": {
+            "violations": []
+          }
+        }
+      ]
+    }
+  ]
+}

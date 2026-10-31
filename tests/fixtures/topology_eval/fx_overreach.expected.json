@@ -1,0 +1,33 @@
+{
+  "exit_code": 3,
+  "diagnostic_code": null,
+  "recommendation": "ROLLBACK_TO_FULL_PROCESS",
+  "safety_status": "VIOLATION",
+  "quality": {
+    "hard_constraints": "PASS",
+    "goal_attainment": "PASS",
+    "adjacent_regression": "PASS"
+  },
+  "sample_sufficient": true,
+  "candidate_statuses": {
+    "T0": "NO_DATA",
+    "T1": "ROLLBACK_REQUIRED",
+    "T2": "BASELINE",
+    "T3": "NO_DATA",
+    "T4": "NO_DATA"
+  },
+  "rollback_required": true,
+  "required_human_decision_ids": [
+    "hard_gate_violation"
+  ],
+  "required_substrings": [
+    "ROLLBACK_TO_FULL_PROCESS",
+    "revert_to_full_current_process",
+    "safety_overreach"
+  ],
+  "forbidden_substrings": [
+    "\"recommendation\": \"COST_REVIEW_CANDIDATE\"",
+    "\"savings_claimed\": true",
+    "\"efficiency_proven\": true"
+  ]
+}
