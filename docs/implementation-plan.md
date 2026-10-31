@@ -4,8 +4,8 @@
 > 设计目标（为什么做、做到什么程度、原则与边界）只在 [PLAN.md](PLAN.md)（1.4 起位于 `docs/`）；字段、状态取值与合并门语义只在 [kit/orchestration.md](../kit/orchestration.md) 4.1 与第 5 节，本文件只引用不重述。
 > 本文件只经任务分支 + PR 修改。与 `PLAN.md` 的设计目标冲突时，以设计目标为准并停下对齐，不得各写一套。
 
-- 版本：v4.6（Issue #207 登记 Owner 2026-10-29 效率优先 S0–S4 排序，显式覆盖 #197 的旧建议「#185→#186 后立即主动发行」；上一版 v4.5 登记 #185 VERIFIED / #186 依赖已满足但仍未 READY；再上一版 v4.4 登记跨专项任务顺序与任务驱动分配 #197，含 Owner 2026-10-28「AVE 先行」排序更新；更早 v4.3 登记 Epic #146 新阶段、#169 维护完成事实与 #174 待设计纠偏；更早 v4.2 记录 Release 1.7.0 已发布 / Format 1.7、Phase D 完成；v4.1 记录 Phase D 完成，v4.0 记录 S5 进行中，v3.9 记录 S4 已完成 / `VERIFIED` 与 S5 `READY`，v3.8 记录 S4 进行中，更早的 v3.7 记录 S3 已完成 / `VERIFIED` 与 S4 `READY`，v3.6 记录 S3 进行中，v3.5 记录 S2 已完成 / `VERIFIED` 与 S3 `READY`，v3.4 记录 S2 进行中，v3.3 记录 S2 `READY`，v3.2 记录 S1 进行中（PR #127），v3.1 / v3.0 记录 Phase D 阶段计划登记、#99–#104 收口与 1.6.3 发布事实、真实 `1.6.2 → 1.6.3` 升级 `APPLIED`）
-- 日期：2026-10-30（本次 #207 排序登记；历史段落保留各自原记录日期）
+- 版本：v4.7（Issue #162 登记 DSH 角色工具适配与独立发行包阶段 §16，并刷新 #162 / #207 的真实状态；上一版 v4.6 由 Issue #207 登记 Owner 2026-10-29 效率优先 S0–S4 排序，显式覆盖 #197 的旧建议「#185→#186 后立即主动发行」；再上一版 v4.5 登记 #185 VERIFIED / #186 依赖已满足但仍未 READY；再上一版 v4.4 登记跨专项任务顺序与任务驱动分配 #197，含 Owner 2026-10-28「AVE 先行」排序更新；更早 v4.3 登记 Epic #146 新阶段、#169 维护完成事实与 #174 待设计纠偏；更早 v4.2 记录 Release 1.7.0 已发布 / Format 1.7、Phase D 完成；v4.1 记录 Phase D 完成，v4.0 记录 S5 进行中，v3.9 记录 S4 已完成 / `VERIFIED` 与 S5 `READY`，v3.8 记录 S4 进行中，更早的 v3.7 记录 S3 已完成 / `VERIFIED` 与 S4 `READY`，v3.6 记录 S3 进行中，v3.5 记录 S2 已完成 / `VERIFIED` 与 S3 `READY`，v3.4 记录 S2 进行中，v3.3 记录 S2 `READY`，v3.2 记录 S1 进行中（PR #127），v3.1 / v3.0 记录 Phase D 阶段计划登记、#99–#104 收口与 1.6.3 发布事实、真实 `1.6.2 → 1.6.3` 升级 `APPLIED`）
+- 日期：2026-10-31（本次 #162 DSH 阶段登记；历史段落保留各自原记录日期）
 - 状态：Phase A / B / C / D 已交付；Epic #46 的 S0–S6 与两项支撑修复均已合并并 `VERIFIED`，Epic 已按阶段审计关闭（[审计评论](https://github.com/ctrlshiftaltdel/AgentOrch/issues/46#issuecomment-6415751115)）；**`v1.7.0` 是最新发布**（[Release v1.7.0](https://github.com/ctrlshiftaltdel/AgentOrch/releases/tag/v1.7.0)，tag `v1.7.0` → `ac3e87f`，资产 `AgentOrch-1.7.0.zip`，602,273 bytes，SHA256 `cbc35fcf…`，与 GitHub API `assets[].digest` 一致），发布属性为 Format 1.7、1047 tests、117 个 `REQUIRED` 文件（发行包 118 = 117 + `MANIFEST.json`）、71/71 场景、四平台 CI 通过（run `40598836550` @ `ac3e87f`），真实 `1.6.3 → 1.7.0` 隔离升级结果为 `APPLIED`（§12.1）；上一个发布 `v1.6.3`（[Release v1.6.3](https://github.com/ctrlshiftaltdel/AgentOrch/releases/tag/v1.6.3)，tag `v1.6.3` → `2adf431`，资产 `AgentOrch-1.6.3.zip`，461,829 bytes，SHA256 `dcce5b24…`）为 Format 1.6、754 tests、92 个 `REQUIRED` 文件（发行包 93 = 92 + `MANIFEST.json`）、58/58 场景、四平台 CI 通过，真实 `1.6.2 → 1.6.3` 隔离升级结果为 `APPLIED`（§12.2）；再上一个发布 `v1.6.2`（[Release v1.6.2](https://github.com/ctrlshiftaltdel/AgentOrch/releases/tag/v1.6.2)，资产 `AgentOrch-1.6.2.zip`，SHA256 `096e1fba…`）为 Format 1.6、715 tests、91 文件包（90 `REQUIRED` + `MANIFEST.json`）、58/58 场景、四平台 CI 通过；#85、#86、#93、#95、#99–#104、#113 与 #142 均已 `VERIFIED`；[#73](https://github.com/ctrlshiftaltdel/AgentOrch/issues/73) 已由 PR [#171](https://github.com/ctrlshiftaltdel/AgentOrch/pull/171) 合并 `876b8d54eb6a69b77c55f6de9a2523e8c1ba2e93` 并 `VERIFIED`（[主分支验证](https://github.com/ctrlshiftaltdel/AgentOrch/issues/73#issuecomment-6468978648)：124 `REQUIRED`、1050 tests、71/71 场景），#71、#72 更早已由后续任务收口并 `VERIFIED`——Epic #46 审计登记的三项 `NON_BLOCKING_HARDENING` 至此全部完成；Epic 之外的 validator 维护任务 [#169](https://github.com/ctrlshiftaltdel/AgentOrch/issues/169) / PR [#159](https://github.com/ctrlshiftaltdel/AgentOrch/pull/159) 已于 2026-10-28 合并 `6893a2e` 并 `VERIFIED`（117 `REQUIRED`、1050 tests、71/71 场景、四平台 CI 通过）；**Phase D（Agent 角色发现、Subagent 能力考核与动态模型选型）已按 §13 登记**：设计冻结 #117 已通过 PR #118 合并 `ceb2c0a` 并 `VERIFIED`，阶段计划登记 #125 已 `VERIFIED`；S1 #120 已 `VERIFIED`（PR #127 合并 `818adaa`；主分支 813 tests / 98 `REQUIRED` / 58/58 / `build_release` SHA `e32dda30…`）；S2 #121 已 `VERIFIED`（PR #130 合并 `9c9b1d2`；主分支 888 tests / 105 `REQUIRED` / 58/58 / `build_release` SHA `e879a3ea…`）；S3 #122 已 `VERIFIED`（PR #133 合并 `2b0fd3d`；主分支 957 tests / 114 `REQUIRED` / 58/58 / `build_release` SHA `ee941c7e…`）；S4 #123 已 `VERIFIED`（PR #136 合并 `86463ec`；主分支 1016 tests / 116 `REQUIRED` / 58/58 / `build_release` SHA `9370400f…`）；S5 #124 已 `VERIFIED`（PR #139 合并 `b18d3b2`；主分支 1047 tests / 117 `REQUIRED` / 71/71 场景 / `build_release` SHA `19ca7e8e…`）；S1–S5 全部完成，Phase D 完成，Epic #119 已关闭；Phase D 是新增阶段，不改写既有发布、硬化与验收结论；**新阶段（Epic [#146](https://github.com/ctrlshiftaltdel/AgentOrch/issues/146)：项目规范治理、旧项目隔离接入与 ETR 驱动评价选型）已按 §14 登记**：设计冻结 #147 / PR #148 已合并 `3528e3f` 并 `VERIFIED`，阶段计划登记 #149 已由 PR [#175](https://github.com/ctrlshiftaltdel/AgentOrch/pull/175) 合并 `dedb6f9` 并 `VERIFIED`（[主分支验证](https://github.com/ctrlshiftaltdel/AgentOrch/issues/149#issuecomment-6470004668)），#150–#158 尚未 `READY`；[#174](https://github.com/ctrlshiftaltdel/AgentOrch/issues/174) 为方向已批准、设计未冻结的纠偏任务（见 §14.4）；**跨专项顺序、条件边与建议优先级见 §15**（Issue [#197](https://github.com/ctrlshiftaltdel/AgentOrch/issues/197)；只登记协调事实，不授权发行或降低验证）
 - 适用范围：AgentOrch 核心规则、local/github edition、任务模板、验证脚本与发行机制
 - 设计目标来源：[PLAN.md](PLAN.md)
@@ -43,10 +43,10 @@
 | [#156](https://github.com/ctrlshiftaltdel/AgentOrch/issues/156) | E2 三角色互评、双评佐证与评价者可信度 | #155 | 未 READY（`OPEN` / `PLANNED`；#155 未 `VERIFIED`） | Issue 正文；§14.1 / §15.3 |
 | [#157](https://github.com/ctrlshiftaltdel/AgentOrch/issues/157) | E3 ETR / 可信度接入预配置 Subagent 选型，Master 手动切换 | #155、#156 | 未 READY（`OPEN` / `PLANNED`；#155 / #156 未 `VERIFIED`） | Issue 正文；§14.1 / §15.3 |
 | [#158](https://github.com/ctrlshiftaltdel/AgentOrch/issues/158) | V0 新阶段端到端回归、发行验收与文档同步 | #73（已 `VERIFIED`）、#153–#157 | 未 READY（`OPEN` / `PLANNED`；#153–#157 未 `VERIFIED`） | Issue 正文；§14.1 / §15.3 |
-| [#160](https://github.com/ctrlshiftaltdel/AgentOrch/issues/160) | Epic：DSH 角色工具适配与独立发行包 | #161 / #172 已 `VERIFIED`；#151 / #153 仅条件约束 #164 / #167 | 规划中（Epic `OPEN`；#162–#167 未 READY） | Issue 正文；§15.2.2 |
+| [#160](https://github.com/ctrlshiftaltdel/AgentOrch/issues/160) | Epic：DSH 角色工具适配与独立发行包 | #161 / #172 已 `VERIFIED`；#151 / #153 仅条件约束 #164 / #167 | 规划中（Epic `OPEN`；#162 已派发、未 `VERIFIED`；#163–#167 未 READY） | Issue 正文；§15.2.2 / §16 |
 | [#161](https://github.com/ctrlshiftaltdel/AgentOrch/issues/161) | 冻结 DSH 适配器与三角色工具设计 | 无 | 已完成 / `VERIFIED` | PR [#168](https://github.com/ctrlshiftaltdel/AgentOrch/pull/168) 合并 `3f787c6`；设计文稿 `FROZEN`（≠ 运行时已验证） |
 | [#172](https://github.com/ctrlshiftaltdel/AgentOrch/issues/172) | 将 DSH 设计文稿状态标为 `FROZEN` | #161 | 已完成 / `VERIFIED` | PR [#173](https://github.com/ctrlshiftaltdel/AgentOrch/pull/173) 合并 `4e72e8f`；只证明设计状态，不证明运行时 |
-| [#162](https://github.com/ctrlshiftaltdel/AgentOrch/issues/162) | P1 将 DSH 角色工具阶段登记到唯一实施计划 | #161 / #172 / #149（均已 `VERIFIED`）；计划文件顺序 #149 → #162 | 未 READY（`OPEN` / `status:blocked`；等待路径锁与派发复核） | Issue 正文；§14.1 / §15.3 |
+| [#162](https://github.com/ctrlshiftaltdel/AgentOrch/issues/162) | P1 将 DSH 角色工具阶段登记到唯一实施计划 | #161 / #172 / #149（均已 `VERIFIED`）；计划文件顺序 #149 → #162 → #151 → #152 | 进行中（`OPEN` / `status:in-progress` / `DISPATCHED`；本任务 PR 未合并、未 `VERIFIED`） | Issue 登记块（2026-10-31 派发）；§16 |
 | [#163](https://github.com/ctrlshiftaltdel/AgentOrch/issues/163) | DSH 公开 API、角色级工具隔离与上下文核验 | #161（已 `VERIFIED`） | 未 READY（`OPEN` / `PLANNED`） | Issue 正文；§15.2.2 |
 | [#164](https://github.com/ctrlshiftaltdel/AgentOrch/issues/164) | 实现 DSH 三角色工具与安全适配器 | #161–#163、#162；#151 / #153 条件依赖 | 未 READY（`OPEN` / `PLANNED`；#162 / #163 未 `VERIFIED`） | Issue 正文；§15.2.2 / §15.3 |
 | [#165](https://github.com/ctrlshiftaltdel/AgentOrch/issues/165) | DSH bundle 独立构建、可信哈希基线与可复现自检 | #161、#163、#162 | 未 READY（`OPEN` / `PLANNED`；#162 / #163 未 `VERIFIED`） | Issue 正文；§15.2.2 / §15.3 |
@@ -80,7 +80,7 @@
 | PR [#208](https://github.com/ctrlshiftaltdel/AgentOrch/pull/208) | 承载 #204 政策维护的合并载体（base `main`） | #204（同一交付） | 已合并（交付随 #204 `VERIFIED`） | PR 时间线；合并提交 `b64de061f32176acf896fda4de3c801007ecd132` |
 | [#205](https://github.com/ctrlshiftaltdel/AgentOrch/issues/205) | 修复新总日期掩盖过期 C1–C4 单项证据的资格误判 | 就绪治理门：#207 合并并 `VERIFIED`（§15.8）；代码路径序 #205 → #206 → #170 | 未 READY（`OPEN` / `bug`；未派发） | Issue 正文；§15.8；S0-2 顺位不使其 `READY` |
 | [#206](https://github.com/ctrlshiftaltdel/AgentOrch/issues/206) | 修复空路径通配与父目录越界导致的权限覆盖误判 | 就绪治理门：#207 合并并 `VERIFIED`（§15.8）；代码路径序 #205 → #206 → #170 | 未 READY（`OPEN` / `bug`；未派发） | Issue 正文；§15.8 |
-| [#207](https://github.com/ctrlshiftaltdel/AgentOrch/issues/207) | 登记 Owner 2026-10-29 效率优先 S0–S4 排序到本文件 §1 / §15 | #202 / PR #203 已 `VERIFIED`（共享计划文件）；#147 / #149 已 `VERIFIED`。**#204 是已完成的排程事实，不是 `#204 → #207` 功能边** | 进行中（本 PR 未合并、未 `VERIFIED`；最终状态由 Master 在主分支验证后决定） | Issue 登记块；§1.1 / §15.8 |
+| [#207](https://github.com/ctrlshiftaltdel/AgentOrch/issues/207) | 登记 Owner 2026-10-29 效率优先 S0–S4 排序到本文件 §1 / §15 | #202 / PR #203 已 `VERIFIED`（共享计划文件）；#147 / #149 已 `VERIFIED`。**#204 是已完成的排程事实，不是 `#204 → #207` 功能边** | 已完成 / `VERIFIED` | PR [#209](https://github.com/ctrlshiftaltdel/AgentOrch/pull/209) 合并 `578022ab837033ede96579cb71ba7750e14cc758`；Issue 已关闭并标 `status:verified`；§1.1 / §15.8 |
 | PR [#182](https://github.com/ctrlshiftaltdel/AgentOrch/pull/182) | 承载任务驱动拓扑设计提案的合并载体 | #183（同一交付） | 已合并（交付随 #183 `VERIFIED`） | PR 时间线；合并提交 `5c3b9339d676224ed7b64dd2b610460816739a72`；设计仍 `PROPOSED` |
 | PR [#190](https://github.com/ctrlshiftaltdel/AgentOrch/pull/190) | 承载自适应验证设计提案的合并载体 | #199（同一交付） | 已合并（交付随 #199 `VERIFIED`） | PR 时间线；合并提交 `16753d96102754062e42c327e0ea244b4516d093`；设计仍 `PROPOSED` |
 | PR [#196](https://github.com/ctrlshiftaltdel/AgentOrch/pull/196) | 承载主动发行设计提案的合并载体 | #198（同一交付） | 已合并（交付随 #198 `VERIFIED`） | PR 时间线；合并提交 `c1f274593fd8ad6f3aa5ee53e06ab0040f425470`；设计仍 `PROPOSED` |
@@ -91,10 +91,10 @@
 
 Owner 于 2026-10-29 明确要求“按项目规则发送整改 issues（不用亲自实施），最高优先级；优化后续 issue 顺序，以推进效率为目标”。本节登记的 S0–S4 队列是当前调度顺序，**显式覆盖 #197 / PR #200 的旧建议「#185→#186 后立即主动发行」**（§15.1 / §15.3.4 保留为历史记录）。覆盖只改变优先级：既有功能硬依赖、设计冻结、`READY` 门与发布 / 生产门禁的专属授权继续有效，不因排序变化而消失。完整理由、放行条件、路径序与无环核对见 §15.8；本节只登记顺序摘要，不授予任何状态。
 
-1. **S0-1 / P0**：#204 备份政策自举整改 → #202 / PR #203 收口 → 本计划登记任务（#207）。#204 / PR #208 与 #202 / PR #203 均已 `VERIFIED`；这是处理顺序，不是 `#202 → #204` 或 `#204 → #207` 功能边；本任务进行中。
+1. **S0-1 / P0**：#204 备份政策自举整改 → #202 / PR #203 收口 → 本计划登记任务（#207）。#204 / PR #208 与 #202 / PR #203 均已 `VERIFIED`；这是处理顺序，不是 `#202 → #204` 或 `#204 → #207` 功能边；#207 已由 PR #209 合并并 `VERIFIED`。
 2. **S0-2 / P0**：#205 单项证据时间 → #206 路径权限 → #170 可信模型身份。同一 `runtime_adapter` / 测试 / 设计文件必须串行，每个任务 `VERIFIED` 后从新基线派下一个；三者均未 READY。
 3. **S1-1 / P1**：#186 书面冻结及完整任务包 → 只读 Planner 实现 / 验证 → #187。优先拿到可验证的提效工具与对照数据；#186 仍为 DRAFT v2，排程不使其冻结或 `READY`；#187 仍等 #186 `VERIFIED`。
-4. **S1-2 / P1**：#174 快速探测 / 告警策略设计；#150 文件责任地图；#162 DSH 计划登记；#163 DSH API 核验。各自前置齐备且与主线路径不相交时可作为独立入口；#174 仍只交付设计，冻结后由 Master 另行登记最小契约与选择器原子切换任务；#162 须等本计划任务释放计划路径；#163 不必等待 DSH 实现链。
+4. **S1-2 / P1**：#174 快速探测 / 告警策略设计；#150 文件责任地图；#162 DSH 计划登记；#163 DSH API 核验。各自前置齐备且与主线路径不相交时可作为独立入口；#174 仍只交付设计，冻结后由 Master 另行登记最小契约与选择器原子切换任务；#162 的计划路径已由 #207 释放并在 2026-10-31 派发（本任务，未 `VERIFIED`）；#163 不必等待 DSH 实现链。
 5. **S2 / P1**：#192 发行分类与授权范围 → #193 Release/Format 兼容解耦 → #194 只读发行准备。保留 v1.7.0 旧客户端桥接正负验收；未获常设授权不真实发布，也不因 DSH 未交付而伪造双资产。
 6. **S3 / P1**：#155 真实 Token / ETR 基础；#177 拓扑契约 → #178 只读推荐 → #180 对照评测。先可观测、再证明编排收益；#180 可与 #179 在无路径冲突时分开推进；未接入的 telemetry 明确 `UNKNOWN`。
 7. **S4 / P2**：#156 → #157；#179 → #181；#151 → #152 → #153 → #154 → #158；DSH 侧 #164 / #165 在 #162 / #163 后按真实路径串行 → #166 → #167 → #195。评价 / 自动接线与大范围目录迁移在上述提效主线之后，各自完整前置保留。
@@ -201,6 +201,7 @@ Owner 于 2026-10-29 明确要求“按项目规则发送整改 issues（不用�
 - Phase D（#117 / #119 / #120–#124）的顺序、依赖与出口条件见 §13。
 - 新阶段（Epic #146 / #147 / #149 / #150–#158）的顺序、依赖与出口条件见 §14；#174 只登记为待设计纠偏任务（§14.4），不进入本阶段实施顺序。
 - 跨专项（治理 / ETR、DSH、任务驱动拓扑、自适应验证、主动发行）的实时状态、条件边与建议顺序见 §15；§15 只登记协调事实，不改变本节既有依赖。
+- DSH 阶段的目标、子任务拆分、无环依赖与入口 / 出口见 §16；实时状态仍以第 1 节与 §15.2.2 为准。
 
 ## 6. 跨项目合成回归矩阵（Phase C 的输入）
 
@@ -415,7 +416,7 @@ Owner 于 2026-10-29 明确要求“按项目规则发送整改 issues（不用�
 |---|---|---|---|---|
 | S0 设计冻结 | [#147](https://github.com/ctrlshiftaltdel/AgentOrch/issues/147) / PR [#148](https://github.com/ctrlshiftaltdel/AgentOrch/pull/148) | 设计文稿与关键决策经独立审查并合并 | Epic [#146](https://github.com/ctrlshiftaltdel/AgentOrch/issues/146) | 已满足：#147 `VERIFIED`（主分支 `3528e3f`） |
 | P0 阶段计划登记 | [#149](https://github.com/ctrlshiftaltdel/AgentOrch/issues/149) | 本节与第 1 节登记；不实现功能 | S0 | #149 `VERIFIED`；此前 GOV-* / I1 / E* / V0 不得 `READY` |
-| P1 DSH 阶段登记 | [#162](https://github.com/ctrlshiftaltdel/AgentOrch/issues/162) | 把 DSH 角色工具阶段登记进本文件，工具名固定 `ao_master` / `ao_execution` / `ao_reviewer`；`FROZEN` 只表示设计冻结，不表示 DSH 运行时已支持 | P0；[#161](https://github.com/ctrlshiftaltdel/AgentOrch/issues/161) / PR [#168](https://github.com/ctrlshiftaltdel/AgentOrch/pull/168) 与 [#172](https://github.com/ctrlshiftaltdel/AgentOrch/issues/172) 均已 `VERIFIED` | #162 `VERIFIED`；此后 #151 / #152 必须保留该登记段 |
+| P1 DSH 阶段登记 | [#162](https://github.com/ctrlshiftaltdel/AgentOrch/issues/162) | 把 DSH 角色工具阶段登记进本文件，工具名固定 `ao_master` / `ao_execution` / `ao_reviewer`；阶段目标、子任务出口与无环依赖见 §16；`FROZEN` 只表示设计冻结，不表示 DSH 运行时已支持 | P0；[#161](https://github.com/ctrlshiftaltdel/AgentOrch/issues/161) / PR [#168](https://github.com/ctrlshiftaltdel/AgentOrch/pull/168) 与 [#172](https://github.com/ctrlshiftaltdel/AgentOrch/issues/172) 均已 `VERIFIED` | #162 `VERIFIED`；此后 #151 / #152 必须保留该登记段 |
 | GOV-1 文件地图 / 生命周期 | [#150](https://github.com/ctrlshiftaltdel/AgentOrch/issues/150) | 文件责任、权威来源与过期退出机制 | S0、P0；与 P1 路径不重叠，可并行 | 责任地图与生命周期规则落地，并在当前 head 验证 |
 | GOV-2 核心契约迁移 | [#151](https://github.com/ctrlshiftaltdel/AgentOrch/issues/151) | `kit/orchestration.md` → `docs/orchestration.md`，保持发行 / 升级兼容 | GOV-1、P1、[#169](https://github.com/ctrlshiftaltdel/AgentOrch/issues/169)（已 `VERIFIED`） | 引用、发行包、包内自检、旧版升级与回滚全部通过 |
 | GOV-3 计划精简 | [#152](https://github.com/ctrlshiftaltdel/AgentOrch/issues/152) | 精简本文件、治理过期规划文档 | GOV-1、GOV-2 | 历史信息可追溯，当前未完成风险不丢失 |
@@ -450,7 +451,7 @@ Owner 于 2026-10-29 明确要求“按项目规则发送整改 issues（不用�
 启动门：
 
 - S0 已满足；P0（本任务）交付后仍须 Master 审查、合并并在主分支验证，才可把 #150–#158 逐项置 `READY`。
-- #162 除 #149 外还需 #172 `VERIFIED`（已满足）；本登记不改变 #162 的 `status:blocked` 状态。
+- #162 除 #149 外还需 #161 / #172 `VERIFIED`（均已满足）；#162 已于 2026-10-31 派发（`DISPATCHED`），本任务只登记 DSH 阶段，不改写其他任务状态。
 - 每个实现任务派发前仍须按自身允许路径重新核对最新 `main` 与开放 PR 的路径冲突；依赖满足不代表必须并行。
 
 ### 14.3 阶段边界、指标口径与失败处理
@@ -479,8 +480,8 @@ Owner 于 2026-10-29 明确要求“按项目规则发送整改 issues（不用�
 - **三份专案提案已交付、设计仍未冻结**：PR [#182](https://github.com/ctrlshiftaltdel/AgentOrch/pull/182) → #183、PR [#190](https://github.com/ctrlshiftaltdel/AgentOrch/pull/190) → #199、PR [#196](https://github.com/ctrlshiftaltdel/AgentOrch/pull/196) → #198 均为 `MERGED`，对应 Issue 均 `VERIFIED`；但 [task-driven-agent-topology.md](design/task-driven-agent-topology.md)、[adaptive-verification-and-quality-gates.md](design/adaptive-verification-and-quality-gates.md)、[semver-proactive-release-policy.md](design/semver-proactive-release-policy.md) 的文稿状态仍是 `PROPOSED`。**提案交付 ≠ 契约冻结 ≠ 运行时已实现 ≠ 发行已授权。**
 - **DSH 设计已冻结、运行时未验证**：设计 #161 与状态修正 #172 已 `VERIFIED`，[deepseek-harness-agent-role-tools.md](design/deepseek-harness-agent-role-tools.md) 为 `FROZEN`；这只表示设计冻结，真实 DSH API、角色隔离与实机行为仍待 #163 / #167。
 - **身份与探测纠偏仍未冻结**：#170 为 `OPEN`（`bug`），可信底层模型身份来源、核验与失效规则未冻结；#174 为 `OPEN` / `status:blocked`，所有者已批准方案 1 方向，但设计未冻结、未派发、未实现。
-- **开放任务状态**：#150–#158、#162–#167、#177–#181、#186–#189、#192–#195 均为 `OPEN`；除 #162 / #174 的 `status:blocked` 外无状态标签，均按 `PLANNED` / 未 READY 登记。没有除 #197 之外的活动登记块或路径锁。#185 已完成 / `VERIFIED` 并关闭，不再计入开放任务（见第 1 节与 §15.2.4）。
-- **上一句是 #197 当时的快照，不是 2026-10-30 的锁状态**：当前 `docs/implementation-plan.md` 的活动登记块与锁状态见 §15.8（本任务 #207 持有该路径）。
+- **开放任务状态**：#150–#158、#162–#167、#177–#181、#186–#189、#192–#195 均为 `OPEN`；除 #174 的 `status:blocked` 外无状态标签，均按 `PLANNED` / 未 READY 登记（#162 后于 2026-10-31 派发，见 §1 / §15.8）。没有除 #197 之外的活动登记块或路径锁。#185 已完成 / `VERIFIED` 并关闭，不再计入开放任务（见第 1 节与 §15.2.4）。
+- **上一句是 #197 当时的快照，不是 2026-10-31 的锁状态**：当前 `docs/implementation-plan.md` 的活动登记块与锁状态见 §15.8（本任务 #162 持有该路径）。
 - **Owner 2026-10-28 排序决定（历史记录；已被 2026-10-29 S0–S4 排序覆盖，见 §15.8）**：在 #197 本计划任务收口之后，优先推进 AVE #184 的 [#185](https://github.com/ctrlshiftaltdel/AgentOrch/issues/185) → [#186](https://github.com/ctrlshiftaltdel/AgentOrch/issues/186)，完成这两步后再推进主动发行 #192–#195（[决定记录](https://github.com/ctrlshiftaltdel/AgentOrch/issues/197#issuecomment-6473530069)）。该决定只改变调度优先级，不新增硬依赖、不改变各 Epic 内部顺序、不取消发行工作；#185 只做真实测量审计，#186 只在只读 / shadow 模式运行，均不改变或跳过现行门禁；#188 仍须 A–C `VERIFIED` 后另行明确 Owner 授权，当前禁止切换生产门禁。
 
 ### 15.2 五组专项的真实阶段状态
@@ -503,11 +504,11 @@ Owner 于 2026-10-29 明确要求“按项目规则发送整改 issues（不用�
 
 #### 15.2.2 DSH 适配与独立发行包（Epic #160）
 
-**唯一来源**：Epic [#160](https://github.com/ctrlshiftaltdel/AgentOrch/issues/160) 正文的依赖表、设计 [#161](https://github.com/ctrlshiftaltdel/AgentOrch/issues/161) / PR [#168](https://github.com/ctrlshiftaltdel/AgentOrch/pull/168) 与 [DSH 设计文稿](design/deepseek-harness-agent-role-tools.md)。工具名固定为 `ao_master` / `ao_execution` / `ao_reviewer`；本文不复制其接口契约。
+**唯一来源**：Epic [#160](https://github.com/ctrlshiftaltdel/AgentOrch/issues/160) 正文的依赖表、设计 [#161](https://github.com/ctrlshiftaltdel/AgentOrch/issues/161) / PR [#168](https://github.com/ctrlshiftaltdel/AgentOrch/pull/168) 与 [DSH 设计文稿](design/deepseek-harness-agent-role-tools.md)。工具名固定为 `ao_master` / `ao_execution` / `ao_reviewer`；本文不复制其接口契约。阶段目标、子任务拆分、无环依赖与入口 / 出口见 §16；本表只保留实时状态快照，不重复阶段登记。
 
 | Issue | 交付 | 真实状态 | 已有依赖 / 条件 |
 |---|---|---|---|
-| [#162](https://github.com/ctrlshiftaltdel/AgentOrch/issues/162) | 把 DSH 阶段登记进唯一实施计划 | `OPEN` / `status:blocked`；未派发 | #161 / #172 / #149 已 `VERIFIED`；计划文件顺序 #149 → #162 |
+| [#162](https://github.com/ctrlshiftaltdel/AgentOrch/issues/162) | 把 DSH 阶段登记进唯一实施计划 | `OPEN` / `status:in-progress` / `DISPATCHED`；未 `VERIFIED` | #161 / #172 / #149 已 `VERIFIED`；计划文件顺序 #149 → #162 → #151 → #152；阶段登记见 §16 |
 | [#163](https://github.com/ctrlshiftaltdel/AgentOrch/issues/163) | 公开 API、角色级工具隔离与上下文核验 | `OPEN` / `PLANNED`；未 READY | #161 已 `VERIFIED` |
 | [#164](https://github.com/ctrlshiftaltdel/AgentOrch/issues/164) | 三角色工具与安全适配器 | `OPEN` / `PLANNED`；未 READY | #161–#163、#162；#151 / #153 条件依赖 |
 | [#165](https://github.com/ctrlshiftaltdel/AgentOrch/issues/165) | bundle 构建、可信哈希基线与可复现自检 | `OPEN` / `PLANNED`；未 READY | #161、#163、#162 |
@@ -680,7 +681,7 @@ Owner 2026-10-28 排序决定覆盖更早“主动发行优先”的顺序：**#
 
 **覆盖关系**：Owner 2026-10-29 的排序显式覆盖 #197 / PR #200 的旧建议「#185→#186 后立即主动发行」（[#197 旧记录](https://github.com/ctrlshiftaltdel/AgentOrch/issues/197#issuecomment-6473530069)；§15.1 / §15.3.4 保留历史原文）。覆盖只作用于调度优先级；§15.3.1 的功能硬依赖、设计冻结、`READY` 门，以及发布 / 生产门禁的专属授权继续有效，不得因排序变化被视为已满足或已取消。
 
-**2026-10-30 刷新事实**：`origin/main` @ `c812666781b28a3a893d1d469f5f4f98bd7f65d4`（含 PR #203）；#202 / PR #203、#204 / PR #208、#185、#147、#149 均 `VERIFIED` 并关闭；#186、#174、#188、#170、#205、#206、#151、#162 等仍 `OPEN` 且未 READY（#162 / #174 带 `status:blocked`）；开放 PR 为空，`docs/implementation-plan.md` 无本任务之外的活动锁。这些是核对快照，不是永久就绪证明。
+**2026-10-31 刷新事实**：`origin/main` @ `ce80d7917c992dad88615fd18b6fe6b61e79e18a`；#202 / PR #203、#204 / PR #208、#185、#147、#149、#161、#172、#207 / PR #209 均 `VERIFIED` 并关闭；#162 已派发（`DISPATCHED`，本任务，未 `VERIFIED`）；#186、#174、#188、#170、#205、#206、#151 等仍 `OPEN` 且未 READY（#174 带 `status:blocked`）；开放 PR 为空，`docs/implementation-plan.md` 由本任务 #162 持有活动锁。这些是核对快照，不是永久就绪证明。
 
 **#204 不依赖本任务**：S0-1 中 #204 排在本任务之前，只是政策 / 路径阻塞的处理顺序；#204 / PR #208 已 `VERIFIED`，不反向等待 #207。
 
@@ -689,7 +690,7 @@ Owner 2026-10-28 排序决定覆盖更早“主动发行优先”的顺序：**#
 | S0-1 / P0 | #204 → #202 / PR #203 → #207 | 先解决每次合并都重复等待的规则冲突与状态漂移 | #204、#202 已 `VERIFIED`；#207 只登记排序，不代替状态；共享计划文件串行 |
 | S0-2 / P0 | #205 → #206 → #170 | 最高优先级代码整改：证据时间、路径权限、可信身份 | 三者均需完整任务包与路径检查；共享代码路径按序串行，每个 `VERIFIED` 后从新基线派发 |
 | S1-1 / P1 | #186 书面冻结及完整任务包 → 只读 Planner 实现 / 验证 → #187 | 优先拿到可验证的提效工具与对照数据 | #186 DRAFT v2 未冻结；#187 仍等 #186 `VERIFIED`；影子结果不得宣称已节省成本 |
-| S1-2 / P1 | #174 设计；#150；#162；#163 | 减少等待、反复阅读与下游返工 | #174 只交付设计；#162 等计划路径释放；#163 不必等 DSH 实现链；各自完整前置不变 |
+| S1-2 / P1 | #174 设计；#150；#162；#163 | 减少等待、反复阅读与下游返工 | #174 只交付设计；#162 的计划路径已释放并已派发（本任务，未 `VERIFIED`）；#163 不必等 DSH 实现链；各自完整前置不变 |
 | S2 / P1 | #192 → #193 → #194 | 减少版本耦合与重复人工提醒 | 保留 v1.7.0 旧客户端桥接正负验收；未获常设授权不真实发布 |
 | S3 / P1 | #155；#177 → #178 → #180 | 先可观测、再证明编排收益 | #180 可与 #179 在无路径冲突时分开推进；未接入的 telemetry 明确 `UNKNOWN` |
 | S4 / P2 | #156 → #157；#179 → #181；#151 → #152 → #153 → #154 → #158 | 评价 / 自动接线与大范围目录迁移后置 | 保留各自完整前置；#151 仍须 #150 / #162 / #169；#158 仍须治理、旧项目接入、ETR / 评价 / 选型与 #73 等全部 `VERIFIED` |
@@ -715,3 +716,66 @@ Owner 2026-10-28 排序决定覆盖更早“主动发行优先”的顺序：**#
 - **通用**：没有任务包、真实执行实例与路径冲突检查，不标 `READY` 或 `DISPATCHED`；优先级不是 `PASS`、完成或授权。
 
 **本登记任务的证据**：#207 只改本文件；其 changed paths、命令 / 退出码、九列 AC 矩阵与四平台 CI 记录在对应 PR 正文或评论与当前 head，不在本节预写 `PASS`。
+
+## 16. Phase E — DSH 角色工具适配与独立发行包（Epic #160，2026-10-31）
+
+**目标**：在不重建第二套 AgentOrch、不改现有状态机 / 权限 / 发行清单的前提下，让已配置的 DSH Agent 通过三个固定角色工具接入现有治理能力，并把 DSH bundle 作为同一 Release 的独立第二资产交付。设计已在 [deepseek-harness-agent-role-tools.md](design/deepseek-harness-agent-role-tools.md) 冻结（[#161](https://github.com/ctrlshiftaltdel/AgentOrch/issues/161) / [#172](https://github.com/ctrlshiftaltdel/AgentOrch/issues/172) 已 `VERIFIED`）；**设计冻结不等于 DSH 运行时已支持、已兼容或已实测**。
+
+**固定工具名**：`ao_master`、`ao_execution`、`ao_reviewer`。工具名只表达角色，不构成身份认证；调用者身份与工具可见范围必须由 [#163](https://github.com/ctrlshiftaltdel/AgentOrch/issues/163) 实测的 DSH scope / 配置绑定证明，模型自报 role 不授予任何权限。接口、schema、错误码、安全模型与发布步骤只在设计文稿及子 Issue 定义，本节不复制。
+
+**基线事实与本阶段目标必须分开**：
+
+- **已发布基线**：`v1.7.0` / Format 1.7 是当前主线最新发布（§12.1），Kit 包为 117 个 `REQUIRED` 文件加 `MANIFEST.json`；Phase D（#120–#124）已完成并应增量复用。
+- **当前核心契约仍是** [kit/orchestration.md](../kit/orchestration.md)；`docs/orchestration.md` 是 [#151](https://github.com/ctrlshiftaltdel/AgentOrch/issues/151) 的目标，**尚未 `VERIFIED`**，不得写成现行事实。
+- **下游 `agentorch/` 隔离布局**是 [#153](https://github.com/ctrlshiftaltdel/AgentOrch/issues/153) 的目标，**尚未 `VERIFIED`**；#164 / #167 只能按已实测布局限定范围，或把该布局写成依赖 / 目标。
+- **DSH 运行时能力**：公开 API、per-agent 工具隔离、调用上下文、bundle 加载与安装行为均待 #163 / [#167](https://github.com/ctrlshiftaltdel/AgentOrch/issues/167) 实测；未实测项记 `UNKNOWN` / `NOT_RUN`，不得由 stub 或静态 YAML 测试代替。
+- **edition**：本仓库为 `github`；DSH 适配不得用本地 SQLite 冒充 GitHub 任务载体。
+
+### 16.1 阶段顺序、交付与出口
+
+| 阶段 | 承接 Issue | 交付 | 依赖 | 出口条件 |
+|---|---|---|---|---|
+| E0 设计冻结 | [#161](https://github.com/ctrlshiftaltdel/AgentOrch/issues/161) / PR [#168](https://github.com/ctrlshiftaltdel/AgentOrch/pull/168)；[#172](https://github.com/ctrlshiftaltdel/AgentOrch/issues/172) / PR [#173](https://github.com/ctrlshiftaltdel/AgentOrch/pull/173) | 冻结 DSH 适配器与三角色工具设计；把文稿状态修正为 `FROZEN` | Epic [#160](https://github.com/ctrlshiftaltdel/AgentOrch/issues/160) | 已满足：#161 / #172 均 `VERIFIED`；只证明设计状态，不证明运行时 |
+| P1 阶段计划登记 | [#162](https://github.com/ctrlshiftaltdel/AgentOrch/issues/162) | 本节与第 1 节 / §14 / §15 的交叉引用；不实现工具 | E0；[#149](https://github.com/ctrlshiftaltdel/AgentOrch/issues/149) 已 `VERIFIED`；计划文件顺序 #149 → #162 | #162 `VERIFIED`；后续 #151 / #152 必须保留本段 |
+| E1 API 能力核验 | [#163](https://github.com/ctrlshiftaltdel/AgentOrch/issues/163) | 固定 DSH 版本上的工具注册、角色可见性、调用者身份 / 工作目录与 engine range 实测报告 | E0 | 角色隔离正负向、身份 / 上下文、版本兼容与真实包加载均有可定位证据 |
+| E2 角色工具与安全适配器 | [#164](https://github.com/ctrlshiftaltdel/AgentOrch/issues/164) | `ao_master` / `ao_execution` / `ao_reviewer` 三个工具与安全适配器；不新增状态机 | #162、#163；涉及目标布局时 #151 / #153 | 三工具名称固定、角色越权被拒绝、fail-closed 与 edition 分流有测试 |
+| E3 bundle 独立构建 | [#165](https://github.com/ctrlshiftaltdel/AgentOrch/issues/165) | 独立 DSH bundle builder、可信哈希基线与可复现自检；不改 Kit 的 `REQUIRED` / `MANIFEST.json` | #162、#163 | 同一 commit / 版本重复构建 SHA-256 一致；拒绝版本、路径与私密数据异常 |
+| E4 CI / Release 文档 | [#166](https://github.com/ctrlshiftaltdel/AgentOrch/issues/166) | DSH CI job 与同 tag 双资产发布手册；CI 不自动打 tag / 建 Release | #161、#163、#165 | Kit 现有四平台 CI 不削弱；DSH job 通过；发布仍由 Master 人工执行 |
+| E5 最终验收 | [#167](https://github.com/ctrlshiftaltdel/AgentOrch/issues/167) | 隔离安装、迁移、回滚、真实 DSH E2E 与发行验收 | #162–#166、#161；#151 / #153 / [#154](https://github.com/ctrlshiftaltdel/AgentOrch/issues/154) 达到可支持状态 | 真实 DSH 运行证据齐备；未验证平台与版本明示 `NOT_RUN` / `UNKNOWN` |
+
+表中不写实时状态：任务状态只写第 1 节；DSH 各 Issue 的实时状态与条件边见 §15.2.2 / §15.3，本节不另建状态表。
+
+### 16.2 依赖图与无环核对
+
+```text
+#161✓ → #162
+#172✓ → #162
+#149✓ → #162
+#161✓ → #163
+#162 → #164, #165, #167
+#163 → #164, #165, #166, #167
+#164 → #167
+#165 → #166, #167
+#166 → #167
+```
+
+- **无环**：可按 `#161 / #172 / #149 → #162 → #163 → #164 → #165 → #166 → #167` 拓扑排序；#164 同时依赖 #162 / #163，#165 同时依赖 #162 / #163，#167 汇合 #162–#166。
+- **条件边（不是硬依赖）**：`#151 / #153 → #164 / #167` 仅当实现要支持目标 `agentorch/` 布局时成立；否则必须把范围准确限定到已实测布局，或等待 #151 / #153 `VERIFIED`。#154 是后续文档一致性门禁，不是本阶段登记前置。
+- **计划文件路径序**：`#149 → #162 → #151 → #152`。这是同一文件的编辑 / 锁顺序，**不是功能硬依赖**；#151 / #152 必须从最新主分支重验并保留本段。
+- **排程**：§15.8 的优先级只调整执行先后，不新增本图之外的边，也不改变任何 `READY` / 授权门。
+
+### 16.3 入口、出口与失败处理
+
+- **入口**：#161 / #172 / #149 已 `VERIFIED`；#162 完成登记并经 Master 审查、合并与主分支验证后，才可把 #163–#167 逐项置 `READY`。任何前置未 `VERIFIED` 前，下游只登记 `PLANNED` / 未 READY。
+- **独立入口**：#163 可在 #161 后独立开始，不必等 #162 或实现链。#164 / #165 须等 #162 / #163 `VERIFIED`；#166 须等 #161 / #163 / #165；#167 须等 #162–#166 与治理依赖达到可支持状态。
+- **阶段出口**：#163–#167 全部 `VERIFIED`，并在当前主分支 head 有可复核证据：三工具角色可见性与负向调用、调用者身份 / 工作目录、local / github edition 安全分流、脚本篡改拦截、平铺与目标 `agentorch/` 布局（或明确限定）、版本不兼容、bundle 可复现、安装 / 升级 / 回滚，以及发布后资产 SHA 复核。
+- **失败处理**：API 不足、per-agent scope 不可证明、根 / 身份无法确定、脚本哈希不一致、GitHub 后端缺失或 DSH engine 不兼容时 fail-closed，返回 `UNSUPPORTED` / `UNKNOWN` / `NEEDS_HANDOFF` / `BLOCKED`；不得退回全局工具暴露、不得写本地 SQLite、不得静默安装或自动修改用户 profile。
+- Epic #160 的关闭条件不是子 Issue 全部关闭，而是最终 E2E / 发布验收通过、`release/README.md` 已更新、剩余风险均有明确结论。
+
+### 16.4 阶段边界与风险
+
+- 不改任务状态机、路径 / 资源锁、G1–G6、C1–C4 / C1–C8、edition 语义或 Kit 的 `REQUIRED` / `MANIFEST.json`；不新增第四种角色，不自动创建 / 授权 subagent，不自动切换 Master 模型，不自动打 tag / 建 Release / 上传资产。
+- DSH 官方 Release 条目会变化：设计文稿 §2.1 的快照带查询时间，只是历史事实；#163 必须在固定版本上重新查询并记录新的时间戳与 tag，不能把预发布条目当作已兼容。
+- #151 / #153 未 `VERIFIED` 前，只能支持已实测的现行布局；`docs/orchestration.md` 与 `agentorch/` 布局只能写为目标 / 依赖，不能写成已完成。
+- 任何未在当前 head 真实执行的平台、profile 或 engine 版本记 `NOT_RUN` / `UNKNOWN`；Node 单测、mock registry 或 YAML 结构检查不能证明真实 DSH 加载与角色隔离。
+- 本节只登记阶段目标、顺序、依赖与出口；接口契约、字段、错误码、安全模型与发布步骤以设计文稿和各子 Issue 正文为准，本文件不复制。
