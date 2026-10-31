@@ -190,6 +190,7 @@ class EvidenceFallbackTests(ProjectFixture):
         restricted = (
             'scripts/orchestrator.py',
             'docs/orchestration.md',
+            'kit/orchestration.md',
             '.github/workflows/ci.yml',
             'docs/PROJECT.md',
             'docs/PLAN.md',

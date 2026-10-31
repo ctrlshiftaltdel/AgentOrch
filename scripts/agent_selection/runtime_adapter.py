@@ -3,7 +3,7 @@
 
 Design contract: ``docs/design/agent-role-discovery-and-model-selection.md``
 §4–§7. This module defines **only** what a runtime fact is; it does not define
-or redefine C1–C8. C1–C4 stay authoritative in ``kit/orchestration.md`` §5 and
+or redefine C1–C8. C1–C4 stay authoritative in ``docs/orchestration.md`` §5 and
 C5–C8 in ``templates/runtime-capability.md``; here they are consumed as
 evidence and gated, never re-specified.
 
@@ -64,7 +64,7 @@ __all__ = [
 ]
 
 # The capability ids are the existing contract ids: C1-C4 from
-# kit/orchestration.md §5 and C5-C8 from templates/runtime-capability.md.
+# docs/orchestration.md §5 and C5-C8 from templates/runtime-capability.md.
 CAPABILITY_IDS = ('C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8')
 # Only these gate the real automatic dispatch path (kit §5).
 GATING_CAPABILITIES = ('C1', 'C2', 'C3', 'C4')

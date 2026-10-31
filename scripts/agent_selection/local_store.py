@@ -3,7 +3,7 @@
 
 Design contract: ``docs/design/agent-role-discovery-and-model-selection.md`` §8
 (``.local/agent-orch/<scope-id>/``). This module deliberately does **not** define
-a capability model: C1-C4 / C1-C8 stay in ``kit/orchestration.md`` and
+a capability model: C1-C4 / C1-C8 stay in ``docs/orchestration.md`` and
 ``templates/runtime-capability.md``. A record here is a reference plus a short
 summary.
 

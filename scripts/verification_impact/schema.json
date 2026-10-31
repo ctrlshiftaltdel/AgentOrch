@@ -324,7 +324,7 @@
             "minItems": 3,
             "maxItems": 3,
             "items": [
-              {"const": "kit/orchestration.md"},
+              {"const": "docs/orchestration.md"},
               {"const": "editions/local/master.md"},
               {"const": "editions/github/master.md"}
             ]

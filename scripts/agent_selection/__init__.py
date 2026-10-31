@@ -22,7 +22,7 @@ Phase D of ``docs/design/agent-role-discovery-and-model-selection.md``:
                      filters before an explainable ranking and reports the
                      selection, alternatives, missing evidence and degradation.
 
-C1-C4 stay authoritative in ``kit/orchestration.md`` §5 and C5-C8 in
+C1-C4 stay authoritative in ``docs/orchestration.md`` §5 and C5-C8 in
 ``templates/runtime-capability.md``. This package consumes and references them;
 it never redefines them and never grants a permission.
 

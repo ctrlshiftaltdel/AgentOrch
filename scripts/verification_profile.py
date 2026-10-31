@@ -93,6 +93,9 @@ RESTRICTED_PATHS = frozenset({
     'scripts/orchestrator.py',
 })
 RESTRICTED_PREFIXES = (
+    # The legacy kit/ directory is kept restricted too: if it is ever put back
+    # (partial migration, old checkout), it must not lose the full regression.
+    'kit/',
     '.github/workflows/',
     'editions/',
     'scripts/',

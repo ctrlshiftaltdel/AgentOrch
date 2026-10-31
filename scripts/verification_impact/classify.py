@@ -881,7 +881,7 @@ def build_report(task):
         "policy": {
             "effect": "current_rules_unchanged",
             "cache_default": "not_cacheable",
-            "refs": ["kit/orchestration.md", "editions/local/master.md",
+            "refs": ["docs/orchestration.md", "editions/local/master.md",
                      "editions/github/master.md"],
         },
     }

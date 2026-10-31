@@ -149,7 +149,7 @@ Owner 澄清保留如下，并落到字段上。
 {
   "effect": "current_rules_unchanged",
   "refs": [
-    "kit/orchestration.md",
+    "docs/orchestration.md",
     "editions/local/master.md",
     "editions/github/master.md"
   ]
@@ -628,7 +628,7 @@ Planner 进程的写集合为空：不写项目路径，不写 `.orchestration/`
         "refs": {
           "type": "array", "minItems": 3, "maxItems": 3,
           "items": [
-            { "const": "kit/orchestration.md" },
+            { "const": "docs/orchestration.md" },
             { "const": "editions/local/master.md" },
             { "const": "editions/github/master.md" }
           ]
@@ -661,7 +661,7 @@ Planner 进程的写集合为空：不写项目路径，不写 `.orchestration/`
         "required": ["gate_id", "source_path"],
         "properties": {
           "gate_id": { "enum": ["G1", "G2", "G3", "G4", "G5", "G6"] },
-          "source_path": { "const": "kit/orchestration.md" }
+          "source_path": { "const": "docs/orchestration.md" }
         }
       }
     },
