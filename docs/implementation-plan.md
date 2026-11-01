@@ -145,7 +145,7 @@
 
 **基线与当前事实**：
 
-- 最新发布 v1.7.0 / Format 1.7；Kit 包为 117 个 `REQUIRED` 文件加 `MANIFEST.json`。
+- 最新发布 v1.7.0 / Format 1.7；v1.7.0 发行包为 117 个 `REQUIRED` 文件加 `MANIFEST.json`（发布时基线）。当前 `main` 的 `REQUIRED` 数量以 `validate_kit` 实时输出为准（本任务为 130）。
 - 核心契约唯一路径是 [docs/orchestration.md](orchestration.md)（#151 `VERIFIED`）。
 - 下游 `agentorch/` 隔离布局是 #153 的目标，尚未 `VERIFIED`；#164 / #167 只能按已实测布局限定范围，或把该布局写成依赖。
 - 公开 API、per-agent 工具隔离、调用上下文、bundle 加载与安装行为待 #163 / #167 实测；未实测项记 `UNKNOWN` / `NOT_RUN`。
@@ -156,7 +156,7 @@
 | 阶段 | 承接 Issue | 交付 | 依赖 | 出口条件 |
 |---|---|---|---|---|
 | E0 设计冻结 | [#161](https://github.com/ctrlshiftaltdel/AgentOrch/issues/161) / PR [#168](https://github.com/ctrlshiftaltdel/AgentOrch/pull/168)；[#172](https://github.com/ctrlshiftaltdel/AgentOrch/issues/172) / PR [#173](https://github.com/ctrlshiftaltdel/AgentOrch/pull/173) | 冻结 DSH 适配器与三角色工具设计；把文稿状态修正为 `FROZEN` | Epic [#160](https://github.com/ctrlshiftaltdel/AgentOrch/issues/160) | 已满足：#161 / #172 均 `VERIFIED`；只证明设计状态，不证明运行时 |
-| P1 阶段计划登记 | [#162](https://github.com/ctrlshiftaltdel/AgentOrch/issues/162) | 本节与第 1 节 / §2 的交叉引用；不实现工具 | E0；#149 已 `VERIFIED` | 已满足：#162 `VERIFIED`；#151 / #152 已保留本段 |
+| P1 阶段计划登记 | [#162](https://github.com/ctrlshiftaltdel/AgentOrch/issues/162) | 本节与第 1 节 / §2 的交叉引用；不实现工具 | E0；#149 已 `VERIFIED` | 已满足：#162 `VERIFIED`；#151 已保留本段，本任务继续保留 |
 | E1 API 能力核验 | [#163](https://github.com/ctrlshiftaltdel/AgentOrch/issues/163) | 固定 DSH 版本上的工具注册、角色可见性、调用者身份 / 工作目录与 engine range 实测报告 | E0 | 角色隔离正负向、身份 / 上下文、版本兼容与真实包加载均有可定位证据 |
 | E2 角色工具与安全适配器 | [#164](https://github.com/ctrlshiftaltdel/AgentOrch/issues/164) | `ao_master` / `ao_execution` / `ao_reviewer` 三个工具与安全适配器；不新增状态机 | #162、#163；涉及目标布局时 #151 / #153 | 三工具名称固定、角色越权被拒绝、fail-closed 与 edition 分流有测试 |
 | E3 bundle 独立构建 | [#165](https://github.com/ctrlshiftaltdel/AgentOrch/issues/165) | 独立 DSH bundle builder、可信哈希基线与可复现自检；不改 Kit 的 `REQUIRED` / `MANIFEST.json` | #162、#163 | 同一 commit / 版本重复构建 SHA-256 一致；拒绝版本、路径与私密数据异常 |
