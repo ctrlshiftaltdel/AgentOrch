@@ -199,7 +199,7 @@ class RuleDocumentTests(unittest.TestCase):
         self.text = RULE_DOC.read_text(encoding='utf-8')
 
     def test_document_refers_to_the_core_contract_instead_of_restating_it(self):
-        self.assertIn('kit/orchestration.md', self.text)
+        self.assertIn('docs/orchestration.md', self.text)
         self.assertIn('4.1', self.text)
         # It must say, in so many words, that it adds checkpoints only.
         self.assertTrue('不复制' in self.text or 'only references' in self.text.lower(),

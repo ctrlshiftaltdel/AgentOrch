@@ -103,7 +103,7 @@ class NoNewEvidenceTests(unittest.TestCase):
 class GateTests(unittest.TestCase):
     def test_high_risk_candidate_needs_a_human_and_is_not_registered(self):
         record = loop_support.general_lesson()
-        spec = loop_support.spec(allowed_paths=['kit/orchestration.md'])
+        spec = loop_support.spec(allowed_paths=['docs/orchestration.md'])
         carrier = loop_support.RecordingCarrier()
         outcome = run_loop(
             carrier=carrier, lesson_records=[record],

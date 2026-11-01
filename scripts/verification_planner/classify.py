@@ -22,7 +22,7 @@ SCHEMA_VERSION = "verification-planner-input/1"
 OUTPUT_SCHEMA_VERSION = "verification-planner-output/1"
 DIAGNOSTIC_SCHEMA_VERSION = "verification-planner-diagnostic/1"
 PLANNER_VERSION = "186-draft-2"
-GATE_SOURCE_PATH = "kit/orchestration.md"
+GATE_SOURCE_PATH = "docs/orchestration.md"
 GATE_IDS = ("G1", "G2", "G3", "G4", "G5", "G6")
 
 L0, L1, L2, L3 = 0, 1, 2, 3
@@ -684,7 +684,7 @@ def build_plan(task):
         "identity": identity,
         "policy": {
             "effect": "current_rules_unchanged",
-            "refs": ["kit/orchestration.md", "editions/local/master.md",
+            "refs": ["docs/orchestration.md", "editions/local/master.md",
                      "editions/github/master.md"],
         },
         "classification": {

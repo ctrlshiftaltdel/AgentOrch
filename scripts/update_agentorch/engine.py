@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import classify, package, report as report_module, sources, versions, workspace
+from . import classify, migrate, package, report as report_module, sources, versions, workspace
 
 EXIT_CODES = {
     'PLANNED': 0,
@@ -103,6 +103,18 @@ def _decision(decision_id: str, question: str, options: list[str]) -> dict:
         'options': options,
         'status': 'OPEN',
     }
+
+
+def _dedupe_decisions(decisions: list[dict]) -> list[dict]:
+    """Keep the first entry per decision id (the contract-specific wording wins)."""
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for decision in decisions:
+        if decision['decision_id'] in seen:
+            continue
+        seen.add(decision['decision_id'])
+        unique.append(decision)
+    return unique
 
 
 HD_DECISIONS = {
@@ -376,14 +388,25 @@ def run_update(project, *, mode: str, source, edition: str,
         report['classification'] = {'counts': classification.counts,
                                     'files': classification.files}
 
-        if classification.blocked:
+        # The core contract move has its own fail-closed rule, on top of the
+        # frozen three-way classification: never install the new path while the
+        # old authority is still on disk, and never overwrite a local copy.
+        contract_issue = migrate.contract_conflict(
+            current_paths=current_files, target_paths=target_hashes,
+            entries=classification.files)
+
+        if classification.blocked or contract_issue is not None:
             report['result'] = 'STOPPED_CONFLICT'
             decisions = []
+            if contract_issue is not None:
+                decision_id, question = contract_issue
+                decisions.append(_decision(decision_id, question,
+                                           migrate.CONTRACT_OPTIONS[decision_id]))
             if classification.removals or classification.renames:
                 decisions.append(HD_DECISIONS['HD-09']())
             if classification.conflicts:
                 decisions.append(HD_DECISIONS['HD-10']())
-            report['human_decisions'] = decisions
+            report['human_decisions'] = _dedupe_decisions(decisions)
             return report
 
         if mode == 'PLAN':

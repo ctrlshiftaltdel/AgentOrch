@@ -2,7 +2,7 @@
 
 > **状态：PROPOSED（设计提案，未冻结、未实现、不是现行规则）。** 日期：2026-10-31。任务：Issue [#174](https://github.com/ctrlshiftaltdel/AgentOrch/issues/174)。
 >
-> **本文不修改 `kit/orchestration.md` 的 C1–C4，也不把任何提案写成已生效行为。** 现行唯一权威仍是 [核心编排契约 §5](../../kit/orchestration.md) 与 [Runtime Capability Record](../../templates/runtime-capability.md)；在后续独立契约任务被 Owner 批准、实现并回归之前，本文件只有设计参考价值。文中所有“应 / 将 / 建议 / 未来”均为提案语气，不是已发布产品行为。
+> **本文不修改 `docs/orchestration.md` 的 C1–C4，也不把任何提案写成已生效行为。** 现行唯一权威仍是 [核心编排契约 §5](../orchestration.md) 与 [Runtime Capability Record](../../templates/runtime-capability.md)；在后续独立契约任务被 Owner 批准、实现并回归之前，本文件只有设计参考价值。文中所有“应 / 将 / 建议 / 未来”均为提案语气，不是已发布产品行为。
 >
 > 设计目标：[docs/PLAN.md](../PLAN.md) §2–§4；阶段登记：[docs/implementation-plan.md](../implementation-plan.md) §14.4；项目配置：[docs/PROJECT.md](../PROJECT.md)。证据的时间属性（已观测 / 计划 / 未知）在 §9 分开列出；本文不把历史探测结果当作当前 head 的证据。
 
@@ -36,7 +36,7 @@
 
 ### 1.3 非目标
 
-- 不在本任务修改 `kit/orchestration.md`、`templates/**`、`editions/**`、`scripts/**`、`tests/**` 或任何现行门禁。
+- 不在本任务修改 `docs/orchestration.md`、`templates/**`、`editions/**`、`scripts/**`、`tests/**` 或任何现行门禁。
 - 不新增 Runtime、第三方依赖、托管服务或新的状态机。
 - 不把 C1–C4 扩展成沙箱、凭据、Reviewer 独立性或模型身份的证明。
 - 不创建 / 授权任何真实子代理；本文的探针只是设计描述。
@@ -94,7 +94,7 @@
 templates/runtime-capability.md 记录证据、限制与语义版本。
 ```
 
-- 可发现位置（未来实施时）：`kit/orchestration.md` 的角色选择入口、`templates/runtime-capability.md` 的 “When to use”，以及各底座入口提示词中的同一条引用。
+- 可发现位置（未来实施时）：`docs/orchestration.md` 的角色选择入口、`templates/runtime-capability.md` 的 “When to use”，以及各底座入口提示词中的同一条引用。
 - 可移植基线：这段文字 + 下面的探针步骤即可运行，不依赖任何 Runtime 专有 API；有 API 的 Runtime 可以另做**可选适配器**，把同一流程映射到自己的 spawn / wait / cancel 接口。可选适配器不得成为其他 Runtime 的前置条件。
 - 命名：入口名 `runtime-capability-probe` 只是提案标识；未来可以用同名提示词或可选 CLI 暴露，但不得把某个产品的命令硬编码成“所有 Runtime 都可用”。
 
@@ -194,10 +194,10 @@ templates/runtime-capability.md 记录证据、限制与语义版本。
 
 | 机制 | 由谁判定 | C1–C4 能证明什么 | C1–C4 不能证明什么 | 本设计是否改动 |
 |---|---|---|---|---|
-| 任务锁 / 活动任务锁 | 任务载体与 `kit/orchestration.md` 第二部分 | 仅“能否启动并取回一个实例” | 不能代替锁、不能解除锁、不能证明两个任务不冲突 | 否 |
+| 任务锁 / 活动任务锁 | 任务载体与 `docs/orchestration.md` 第二部分 | 仅“能否启动并取回一个实例” | 不能代替锁、不能解除锁、不能证明两个任务不冲突 | 否 |
 | 专属工作区 / worktree | 任务包与 Git 纪律 | 仅“实例能否被寻址和取回” | 不能证明文件系统隔离、不能证明写入不越界 | 否 |
 | 允许 / 禁改路径 | 任务包 + 路径校验 | 不能 | 不能证明某路径被允许；能力 `PASS` 不是路径授权 | 否 |
-| G1–G6 合并门 | `kit/orchestration.md` 第二部分 | 不能替代任何门 | 不能替代当前 head CI、Diff 审查、逐条验收 | 否 |
+| G1–G6 合并门 | `docs/orchestration.md` 第二部分 | 不能替代任何门 | 不能替代当前 head CI、Diff 审查、逐条验收 | 否 |
 | Reviewer 审查质量 | Reviewer 证据与 Master 判断 | 不能 | 不能证明审查独立、充分或正确 | 否 |
 | #170 可信模型身份 / alias | #170 的独立设计 | 不能 | 不能从模型 ID、family 自述、温度或 Prompt 差异推断底层模型独立 | 否 |
 
@@ -215,9 +215,9 @@ templates/runtime-capability.md 记录证据、限制与语义版本。
 
 | 包 | 内容 | 主要路径 | 授权 / 前置 | 风险 |
 |---|---|---|---|---|
-| **WP-1 契约语义冻结** | 在核心契约中定义四概念、语义版本、风险提示与真实失败的区别；同步两底座入口提示词 | `kit/orchestration.md`（#151 后为 `docs/orchestration.md`）、`editions/**` 入口提示词 | Owner 批准 + 独立契约任务；必须与 #151 的路径迁移协调，不建立第二权威 | 最高：容易把提案写成现行规则或放宽隔离 |
+| **WP-1 契约语义冻结** | 在核心契约中定义四概念、语义版本、风险提示与真实失败的区别；同步两底座入口提示词 | `docs/orchestration.md`（#151 后为 `docs/orchestration.md`）、`editions/**` 入口提示词 | Owner 批准 + 独立契约任务；必须与 #151 的路径迁移协调，不建立第二权威 | 最高：容易把提案写成现行规则或放宽隔离 |
 | **WP-2 记录载体** | 在 `templates/runtime-capability.md` 增加 `probe_kind`、`probe_semantics_version`、`c2_semantics`、`limits` 规则与旧记录迁移说明 | `templates/runtime-capability.md`、`docs/**` 说明 | WP-1 的语义先冻结 | 中：旧记录误标 `PASS` |
-| **WP-3 入口提示词** | 增加一条可发现的 `runtime-capability-probe` 指令与 3 个最小探针步骤；明确禁止子进程 / fixture 冒充 | `kit/` 或 `docs/` 的入口段、可选 `templates/` 探针说明 | WP-1 | 中：被误读成自动派发授权 |
+| **WP-3 入口提示词** | 增加一条可发现的 `runtime-capability-probe` 指令与 3 个最小探针步骤；明确禁止子进程 / fixture 冒充 | `docs/orchestration.md` 或 `docs/` 的入口段、可选 `templates/` 探针说明 | WP-1 | 中：被误读成自动派发授权 |
 | **WP-4 适配器与旧记录消费** | （独立授权任务）让 `RuntimeAdapter` / `CapabilityRecord.gate` 识别语义版本、旧记录降级与风险提示；保留真实失败关闭 | `scripts/agent_selection/runtime_adapter.py`、`tests/agent_selection/**` | WP-1 / WP-2 冻结；涉及产品行为，需单独任务与 Owner 批准 | 高：可能把 `UNKNOWN` 误当 `PASS` 或反向过度阻断 |
 | **WP-5 负向 / 合成测试** | 覆盖旧记录无版本、语义版本不匹配、空结果、fixture 冒充、受授权通信不判失败、真实失败不判成功；合成测试必须标记 `SYNTHETIC` | `tests/**` | WP-3 / WP-4 | 中：测试通过不能冒充真实运行时探测 |
 | **WP-6 发行与升级** | 记录格式兼容、旧记录可读、升级 / 回退说明；不新增第三方依赖 | `docs/upgrade.md`、发行清单相关文件 | 前序包合并后 | 中：旧包升级误覆盖记录 |
@@ -233,7 +233,7 @@ templates/runtime-capability.md 记录证据、限制与语义版本。
 | 负向 / 合成测试 | 新增用例；不允许用合成测试冒充真实探测 | WP-5；fixture 必须带标记 |
 | 发行 / 升级 | 记录格式与升级说明 | WP-6；不引入 Runtime 依赖 |
 | #149 阶段计划 | 已 `VERIFIED` 并登记 | 本设计只引用；不改计划文件 |
-| #151 契约迁移 | `kit/orchestration.md` → `docs/orchestration.md` | 若 #151 先合并，WP-1 改新路径；不得双写；若本设计先合并，迁移任务负责同步引用 |
+| #151 契约迁移 | `docs/orchestration.md` → `docs/orchestration.md` | 若 #151 先合并，WP-1 改新路径；不得双写；若本设计先合并，迁移任务负责同步引用 |
 | #73 历史路径 / 场景 | 已合并的交付场景与路径 | 不修改；#158 收口时按实际契约重新核对 |
 | #182 / #183 拓扑提案 | 已有“能力风险提示化”方向 | 与其 §1.6 / §2 保持一致；不新增第二套策略 |
 | #170 身份 | 独立缺陷修复 | 不合并语义；Reviewer 独立性继续由 #170 治理 |
@@ -321,4 +321,4 @@ templates/runtime-capability.md 记录证据、限制与语义版本。
 
 ---
 
-**本文的状态再声明**：`PROPOSED`。它不是已冻结契约，不是已实现功能，不是对现行 C1–C4 的修改，也不是对任何 Runtime 能力的实测结论。真正生效需要独立契约任务冻结、实现、负向回归与当前 head 的四平台 CI；在那之前，现行 [核心编排契约](../../kit/orchestration.md) §5 继续有效。
+**本文的状态再声明**：`PROPOSED`。它不是已冻结契约，不是已实现功能，不是对现行 C1–C4 的修改，也不是对任何 Runtime 能力的实测结论。真正生效需要独立契约任务冻结、实现、负向回归与当前 head 的四平台 CI；在那之前，现行 [核心编排契约](../orchestration.md) §5 继续有效。

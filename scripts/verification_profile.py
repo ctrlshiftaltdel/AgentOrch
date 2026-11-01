@@ -2,7 +2,7 @@
 """Post-merge verification profile (Issue #188).
 
 The merge gate G4 requires the configured checks on the current head, and
-``kit/orchestration.md`` requires ``docs/PROJECT.md``'s commands after the merge.
+``docs/orchestration.md`` requires ``docs/PROJECT.md``'s commands after the merge.
 The default post-merge set is the full one::
 
     python scripts/validate_kit.py                          # quick
@@ -85,11 +85,16 @@ COMMANDS = {
 RESTRICTED_PATHS = frozenset({
     'AGENTS.md',
     'VERSION.md',
+    # The core contract moved out of kit/; it is still a high-risk path and must
+    # keep the full regression under a risk_pilot claim.
+    'docs/orchestration.md',
     'docs/PROJECT.md',
     'docs/PLAN.md',
     'scripts/orchestrator.py',
 })
 RESTRICTED_PREFIXES = (
+    # The legacy kit/ directory is kept restricted too: if it is ever put back
+    # (partial migration, old checkout), it must not lose the full regression.
     'kit/',
     '.github/workflows/',
     'editions/',

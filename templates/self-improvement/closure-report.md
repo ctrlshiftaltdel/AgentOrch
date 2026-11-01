@@ -2,7 +2,7 @@
 
 > Report one pass of the self-improvement loop. The report never replaces task state or a
 > merge-gate decision: a task is done only when the normal gates G1–G6 (defined in
-> `kit/orchestration.md` §4, not restated here) pass on the current head.
+> `docs/orchestration.md` §4, not restated here) pass on the current head.
 > Mark every unexecuted check `NOT_RUN` and every external blocker `BLOCKED`.
 
 ## 1. Trigger and context

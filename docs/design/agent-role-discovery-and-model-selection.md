@@ -85,7 +85,7 @@ Reviewer 的目标是独立发现错误并提出可验证的修复方向，而�
 
 本设计不另建一套运行时能力定义。
 
-- 运行时 spawn、隔离、wait/collect、终局分类继续以 [核心编排契约 §5](../../kit/orchestration.md) 的 C1–C4 为唯一权威。
+- 运行时 spawn、隔离、wait/collect、终局分类继续以 [核心编排契约 §5](../orchestration.md) 的 C1–C4 为唯一权威。
 - 更细的取消、文件 / 命令 / CI 权限、工具和测试环境、探测元数据继续沿用 [Runtime Capability Record](../../templates/runtime-capability.md) 的 C5–C8。
 - 本文新增的是这些已登记能力如何被角色选择器消费，以及如何将模型评测和本地项目实绩纳入排序。
 - 能力登记不授予权限。实际任务仍受 [AGENTS.md](../../AGENTS.md)、项目权限、允许 / 禁改路径和 G1–G6 约束。
@@ -335,7 +335,7 @@ Scope ID 只能用作本机目录选择，不作为权限授权。实现需验�
 
 - 角色发现、能力判定与模型选型都通过适配器消费运行时事实，不把某个 Runtime、模型供应商或 IDE 的接口写死进契约；更换运行时只需替换适配器并重新探测，本文规则不变。
 - 运行时不提供枚举、spawn 或 wait/collect 时，按 §5.2 降级为人工交接，不构造影子通道，也不假装已经派发。
-- **两个 edition 的核心语义一致。** `local` 与 `github` 的状态机、路径 / 资源锁、G1–G6、C1–C4 与 C1–C8 的定义和判定完全一致，差异仍只在任务载体与证据来源（见 [核心编排契约 §2.1](../../kit/orchestration.md)）。角色选择结果不是新的门，也不能降低任何既有门。
+- **两个 edition 的核心语义一致。** `local` 与 `github` 的状态机、路径 / 资源锁、G1–G6、C1–C4 与 C1–C8 的定义和判定完全一致，差异仍只在任务载体与证据来源（见 [核心编排契约 §2.1](../orchestration.md)）。角色选择结果不是新的门，也不能降低任何既有门。
 - 选型记录只存在当前克隆的本机私有目录里，不写入任务库、Issue 或 PR，也不跨底座同步；两个底座都不把选型记录当作状态事实来源。
 
 ## 12. 分阶段实施计划
@@ -415,7 +415,7 @@ Scope ID 只能用作本机目录选择，不作为权限授权。实现需验�
 ## 15. 相关权威文档
 
 - [核心协作契约](../../AGENTS.md)
-- [核心编排契约：状态机、合并门与 C1–C4](../../kit/orchestration.md)
+- [核心编排契约：状态机、合并门与 C1–C4](../orchestration.md)
 - [Runtime Capability Record：C1–C8](../../templates/runtime-capability.md)
 - [本机私有目录说明](../../.local/README.md)
 - [Artificial Analysis Data API](https://artificialanalysis.ai/data-api) 与 [API 文档](https://artificialanalysis.ai/data-api/docs)

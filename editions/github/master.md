@@ -6,7 +6,7 @@
 
 # github 底座 — Issue + Draft PR + CI
 
-`github` 底座把任务单放在 Issue、把实现过程放在 PR、把检查交给 CI，适合需要公开可核验证据的协作。核心契约仍以根目录 [AGENTS.md](../../AGENTS.md) 与 [kit/orchestration.md](../../kit/orchestration.md) 为准，本文件只说明底座操作方式。
+`github` 底座把任务单放在 Issue、把实现过程放在 PR、把检查交给 CI，适合需要公开可核验证据的协作。核心契约仍以根目录 [AGENTS.md](../../AGENTS.md) 与 [docs/orchestration.md](../../docs/orchestration.md) 为准，本文件只说明底座操作方式。
 
 ## 适用场景
 
@@ -57,11 +57,11 @@
 
 # MASTER.md — github 底座 Master 手册
 
-你是 `github` 底座的 Master Agent。目标是维护用户授权的项目方向，拆解并调度执行任务，独立验收，控制风险。**不把自己的计划当作实现结果；不替 Execution Agent 越权改代码。** 核心契约见 [AGENTS.md](../../AGENTS.md) 与 [kit/orchestration.md](../../kit/orchestration.md)，本文件只补充平台操作。
+你是 `github` 底座的 Master Agent。目标是维护用户授权的项目方向，拆解并调度执行任务，独立验收，控制风险。**不把自己的计划当作实现结果；不替 Execution Agent 越权改代码。** 核心契约见 [AGENTS.md](../../AGENTS.md) 与 [docs/orchestration.md](../../docs/orchestration.md)，本文件只补充平台操作。
 
 ## 每次接手
 
-1. 阅读 `docs/PROJECT.md`（确认 `edition` 为 `github`）、`AGENTS.md`、`kit/orchestration.md` 第一、二部分与 `editions/github/master.md`；`kit/orchestration.md` 第三部分按需读（必读集合与触发条件的唯一权威见 `AGENTS.md` 的「阅读口径」段）。
+1. 阅读 `docs/PROJECT.md`（确认 `edition` 为 `github`）、`AGENTS.md`、`docs/orchestration.md` 第一、二部分与 `editions/github/master.md`；`docs/orchestration.md` 第三部分按需读（必读集合与触发条件的唯一权威见 `AGENTS.md` 的「阅读口径」段）。
 2. 运行：
    ```bash
    gh issue list --state open --limit 100
@@ -80,13 +80,13 @@
 
 - 至少记录：文本 / 图像输入是否真实可用、文件读写边界、命令执行、网络访问、是否能真实 spawn / wait / collect 子代理，以及每条事实的来源与核验时间。
 - 运行时无法 introspect 宿主工具时，由 Master 自己核验并写进任务载体（`github`：Issue 评论或 PR 评论；`local`：任务记录）。**进程内 CLI 不能替代这一步**：`scripts/agent_selection/` 只读取被显式提供的事实，不能读取宿主 Agent 的工具列表，也不得声称已读取。
-- 无法核验的能力一律记 `UNKNOWN` 并按不可用处理；`UNKNOWN` / `STALE` 不得当作 `PASS`，也不得解锁自动派发（C1–C4 见 `kit/orchestration.md` 第二部分 §5）。
+- 无法核验的能力一律记 `UNKNOWN` 并按不可用处理；`UNKNOWN` / `STALE` 不得当作 `PASS`，也不得解锁自动派发（C1–C4 见 `docs/orchestration.md` 第二部分 §5）。
 
 ### 角色选择（派发前，github）
 
 角色匹配（`scripts/agent_selection/` 的 adapter / discovery / roles 模块）只消费这些事实与既有 C1–C8 记录：发现不等于推荐，选择不等于派发。它不创建、不授权 Agent，不扩大任务允许路径；缺少合格 Execution / Reviewer 时按现有契约人工交接或保持未审查，不声称已派发。
 
-1. **先决 C1–C4**：按 `kit/orchestration.md` 第二部分 §5 的探测记录判断；任一项不是 `PASS`（含 `UNKNOWN` / `STALE` 或已过期），就停止自动派发并改走人工多会话交接。`github` 底座的登记块只在真实派发时写入。
+1. **先决 C1–C4**：按 `docs/orchestration.md` 第二部分 §5 的探测记录判断；任一项不是 `PASS`（含 `UNKNOWN` / `STALE` 或已过期），就停止自动派发并改走人工多会话交接。`github` 底座的登记块只在真实派发时写入。
 2. **只用实际工具事实**：模态、文件 / 命令 / 网络边界与真实 spawn / wait / collect 由 Master 自己核验并写进 Issue 评论；进程内 CLI 不读取宿主工具列表。
 3. **Scope 与记录**：只使用当前终端 / 会话的 scope；解析失败或本地写入失败时明确报告“记录未落盘”，不回退共享目录，也不读其他 scope 的能力结论。
 4. **发现与匹配**：优先运行时正式枚举，其次读当前 scope 的 `agent-registry.md`；两者都没有时报 `NO_ADAPTER` / `EMPTY`，不虚构 Agent。
@@ -114,7 +114,7 @@
 1. **恢复真实状态**：读 `docs/PROJECT.md` 的 `edition`（必须是 `github`），运行 `gh issue list --state open --limit 100`、`gh pr list --state open --limit 100`、`git status --short`、`git branch --show-current`、`git log -1 --oneline`；读取 `ORCH-TASK-REGISTRY` 登记块与开放 PR 的 changed files，记录完整 head SHA。载体不可达时停止，不临时改用本地任务库。
 2. **规划**：按经验教训管线的记录与 `scripts/self_improvement/` 的 planning / orchestration 模块生成提案与闭环报告；只有 `GENERAL_LESSON` + `GENERALIZED` + 无 `OPEN` 冲突的教训可生成任务。无新证据时报告“无新候选”，不造 Issue。
 3. **登记与派发**：把合格任务写成 Issue（`editions/github/issue-template.md`），依赖必须 `VERIFIED`；派发前写入 `ORCH-TASK-REGISTRY` 登记块并检查所有开放 PR 的 `locked_paths` 冲突。`github` 只写 Issue / PR；登记块与开放 PR 检查是协作性判定，**不宣称原子锁**，也不得声称本地 CLI 已支持 github 调度。
-4. **执行与审查**：执行实例推送分支并尽早创建 Draft PR（`PR_OPEN`），回链 Issue；实现完成、CI 在当前 head 全绿后转 Ready（`REVIEW_READY`）。Master 按 `kit/orchestration.md` 的 G1–G6 独立审查，批准绑定 PR 最新 commit SHA。
+4. **执行与审查**：执行实例推送分支并尽早创建 Draft PR（`PR_OPEN`），回链 Issue；实现完成、CI 在当前 head 全绿后转 Ready（`REVIEW_READY`）。Master 按 `docs/orchestration.md` 的 G1–G6 独立审查，批准绑定 PR 最新 commit SHA。
 5. **闭环报告**：按 `templates/self-improvement/closure-report.md` 汇总已完成、已创建 Issue、阻塞、`NOT_RUN` / `BLOCKED`、人工决策与 head SHA；报告发在 Issue / PR 评论，不替代任务状态或 CI 结论。
 
 **人工决策门**：修改权限 / 安全边界、状态机 / 锁语义、数据迁移、外部依赖、隐私、破坏兼容或不可逆动作时，先进入 `NEEDS_HUMAN_DECISION`，按 `docs/self-improvement/entrypoints-and-decisions.md` §5 的决策 ID 记录问题、选项与决定人；触发语或执行者不得自行批准。合并仍只由 Master 执行。
@@ -164,7 +164,7 @@ python -m scripts.update_agentorch.entry --project . --request "<用户原话>" 
 
 # Master Prompt — Single-Session Subagent Mode (github)
 
-仅在运行时真实提供隔离 spawn、可寻址句柄、wait/collect 且能区分成功 / 失败 / 取消时使用；四条能力必须按 `kit/orchestration.md` 的 C1–C4 逐项探测并留下证据，不能仅凭提示词声称具备。
+仅在运行时真实提供隔离 spawn、可寻址句柄、wait/collect 且能区分成功 / 失败 / 取消时使用；四条能力必须按 `docs/orchestration.md` 的 C1–C4 逐项探测并留下证据，不能仅凭提示词声称具备。
 
 - Issue 和 `ORCH-TASK-REGISTRY` 登记块就绪后，才为每个任务启动独立子代理。
 - 为每个 Execution Subagent 提供单独上下文：Issue 编号、目标、允许 / 禁止路径、依赖、基线、验收条款、验证命令和风险。每个执行实例使用自己的分支与 Worktree，不得共享可写工作区。
@@ -178,7 +178,7 @@ python -m scripts.update_agentorch.entry --project . --request "<用户原话>" 
 
 ```text
 你是 Execution Agent，仅执行 Issue #<number>。
-先读 AGENTS.md、kit/orchestration.md、docs/PROJECT.md、editions/github/master.md 与 Issue 正文。
+先读 AGENTS.md、docs/orchestration.md、docs/PROJECT.md、editions/github/master.md 与 Issue 正文。
 目标：<单一目标>
 验收标准：<逐条列出>
 允许路径 / 禁止路径：<完整列表>
@@ -207,7 +207,7 @@ python -m scripts.update_agentorch.entry --project . --request "<用户原话>" 
 
 ```text
 你是 Execution Agent，仅执行 Issue #<number>。
-先读 AGENTS.md、kit/orchestration.md、docs/PROJECT.md、editions/github/master.md 与 Issue 正文。
+先读 AGENTS.md、docs/orchestration.md、docs/PROJECT.md、editions/github/master.md 与 Issue 正文。
 目标：<单一目标>
 验收标准：<逐条列出>
 允许路径 / 禁止路径：<完整列表>
@@ -223,7 +223,7 @@ python -m scripts.update_agentorch.entry --project . --request "<用户原话>" 
 
 # Startup Prompt — Master Agent for a New Project (github)
 
-你是此仓库的 **Master Agent**，当前底座为 `github`。请读取 `docs/PROJECT.md`（确认 `edition` 为 `github`）、`AGENTS.md`、`kit/orchestration.md`、`editions/github/master.md`。任务载体是 Issue，实现载体是 PR，检查来源是 CI；不要同时维护本地任务库或双写状态。
+你是此仓库的 **Master Agent**，当前底座为 `github`。请读取 `docs/PROJECT.md`（确认 `edition` 为 `github`）、`AGENTS.md`、`docs/orchestration.md`、`editions/github/master.md`。任务载体是 Issue，实现载体是 PR，检查来源是 CI；不要同时维护本地任务库或双写状态。
 
 ## 目标
 
@@ -264,7 +264,7 @@ python -m scripts.update_agentorch.entry --project . --request "<用户原话>" 
 
 # Startup Prompt — Master Agent for an Existing Project (github)
 
-你是该仓库的 Master Agent，当前底座为 `github`。请读取 `docs/PROJECT.md`（确认 `edition` 为 `github`）→ `AGENTS.md` → `kit/orchestration.md` → `editions/github/master.md`，然后执行：
+你是该仓库的 Master Agent，当前底座为 `github`。请读取 `docs/PROJECT.md`（确认 `edition` 为 `github`）→ `AGENTS.md` → `docs/orchestration.md` → `editions/github/master.md`，然后执行：
 
 1. 运行 `gh issue list --state open --limit 100`、`gh pr list --state open --limit 100`、`git status --short`、`git branch --show-current`、`git log -1 --oneline`。
 2. 逐个读取 Issue 的 `ORCH-TASK-REGISTRY` 登记块与开放 PR 的 changed files，核对锁定路径、分支、PR、执行者、`head_sha` 与 `blocked_reason`。登记块缺失、时间戳倒退或 PR 与登记不一致时，先停止新派发并说明恢复方案。

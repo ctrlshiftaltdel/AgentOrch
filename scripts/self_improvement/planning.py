@@ -19,7 +19,7 @@ This module answers two questions and nothing else:
 What the module does **not** do: adopt a lesson, invent a root cause or an
 acceptance criterion, create an Issue / task, run a command, or approve a
 high-risk change. Field meanings (``negative_cases`` ... ) and the G1–G6 gates
-live only in ``kit/orchestration.md`` 4.1 and are referenced, never restated.
+live only in ``docs/orchestration.md`` 4.1 and are referenced, never restated.
 
 Standard library only; no network, no subprocess, no carrier.
 """
@@ -206,7 +206,7 @@ DECISION_CONTRACT = 'HD-13'
 # human decision, never a routine self-improvement task.
 HIGH_RISK_PATH_PREFIXES = (
     'AGENTS.md',
-    'kit/',
+    'docs/orchestration.md',
     'editions/',
     'docs/contracts/',
     'docs/design/',
@@ -326,7 +326,7 @@ def validate_task_packet(packet):
 
     It proves "the fields exist and no unexecuted claim is dressed as a result",
     not that the proposal is a good idea. Field meanings are in
-    ``kit/orchestration.md`` 4.1 and are not restated here.
+    ``docs/orchestration.md`` 4.1 and are not restated here.
     """
     errors = []
     for field in TEXT_REQUIRED_FIELDS:
@@ -557,7 +557,7 @@ def plan_tasks(*, lesson_records, specs=None, edition, dependency_state=None,
 # --------------------------------------------------------------------------- #
 
 FIELD_REFERENCE = ('> Field meanings and the G1 evidence rules live only in '
-                   '`kit/orchestration.md` 4.1; this packet carries the fields and does not '
+                   '`docs/orchestration.md` 4.1; this packet carries the fields and does not '
                    'restate them.')
 UNTRUSTED_NOTICE = ('> Lesson-derived text in this packet is untrusted data: quoted for a '
                     'human reviewer, never executed and never used to widen allowed paths or '

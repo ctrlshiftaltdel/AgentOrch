@@ -6,7 +6,7 @@
 
 ## 1. 为什么需要能力登记
 
-C1–C4（[kit/orchestration.md](../kit/orchestration.md) 第 5 节）回答的是“能不能真实 spawn / 隔离 / wait-collect / 区分终局”。但调度还会被更细的边界卡住：
+C1–C4（[docs/orchestration.md](orchestration.md) 第 5 节）回答的是“能不能真实 spawn / 隔离 / wait-collect / 区分终局”。但调度还会被更细的边界卡住：
 
 - spawn 返回的句柄能不能再次定位？失败的 spawn 与排队的 spawn 能不能区分？
 - 两个实例是否共享工作目录、环境变量、凭据？
@@ -177,7 +177,7 @@ git rev-parse 953c194:templates/metrics.md          # dee47b6b717270b2d112ffa3bf
 | 平台强制 required status check | `checks (Python 3.13)` | 同上 | 同上 | 同上 |
 | CI 作业（工作流定义） | `checks (Python 3.12)`、`checks (Python 3.13)`、`checks-macos (Python 3.13)`、`checks-windows (Python 3.13)`：前两个在 `ubuntu-latest`，第三个在 `macos-latest`，第四个在 `windows-latest`，每个作业跑同一组 7 个步骤 | `.github/workflows/ci.yml`（blob `d042171c…` @ `953c194`） | `pull_request`→`main`、`push`→`main`、`workflow_dispatch` | 仅 `github` 底座；平台层只强制前两个，macOS / Windows 的绿由契约 G4 与审查要求覆盖，**不由分支保护强制** |
 | 每个作业内的 7 个步骤 | ① `scripts/validate_kit.py` ② `scripts/architecture/check.py --project . --json`（诊断模式） ③ `unittest discover -s tests` ④ `scripts/run_delivery_scenarios.py --json` ⑤ `scripts/report_metrics.py --gold-sample --since 2026-01-01 --until 2026-02-01 --json` ⑥ 语法检查：`py_compile` 覆盖 **9 个显式文件**（`scripts/orchestrator.py`、`validate_kit.py`、`check_drift.py`、`architecture/check.py`、`contract.py`、`report.py`、`rules.py`、`adapters/python_ast.py`、`adapters/rust.py`）**加两个目录 glob**（`scripts/update_agentorch/*.py`、`scripts/self_improvement/*.py`，在 Python 内展开） ⑦ `scripts/build_release.py` 自检 | 同上 | 同上 | 随所属作业；无 `continue-on-error`、无 `\|\| true` |
-| 项目验证命令（**两个底座都适用**） | 配置原文：`python scripts/validate_kit.py`、`python -m unittest discover -s tests`、`python -m py_compile scripts/orchestrator.py scripts/validate_kit.py`；本环境实跑：`uv run python scripts/validate_kit.py`、`uv run python -m unittest discover -s tests`、`python3 -m py_compile scripts/orchestrator.py scripts/validate_kit.py`（解释器前缀差异，见下方口径）；**合并到主分支后必须执行**：快速测试 + 完整回归 + `python scripts/orchestrator.py backup` + 静态检查 | [docs/PROJECT.md](PROJECT.md)「验证命令」及其中的「合并后必须执行」一条；`kit/orchestration.md`「门禁之后」第 4 条（「合并后运行 `docs/PROJECT.md` 指定的验证命令，保存日志与退出码；全部通过后转 `VERIFIED`」，edition-neutral） | 任务交付时；`MERGED` → `VERIFIED` 之前 | 两个底座都适用；`github` 底座另有「当前 head 的 CI」门（上一行 + G4），二者不能互相替代 |
+| 项目验证命令（**两个底座都适用**） | 配置原文：`python scripts/validate_kit.py`、`python -m unittest discover -s tests`、`python -m py_compile scripts/orchestrator.py scripts/validate_kit.py`；本环境实跑：`uv run python scripts/validate_kit.py`、`uv run python -m unittest discover -s tests`、`python3 -m py_compile scripts/orchestrator.py scripts/validate_kit.py`（解释器前缀差异，见下方口径）；**合并到主分支后必须执行**：快速测试 + 完整回归 + `python scripts/orchestrator.py backup` + 静态检查 | [docs/PROJECT.md](PROJECT.md)「验证命令」及其中的「合并后必须执行」一条；`docs/orchestration.md`「门禁之后」第 4 条（「合并后运行 `docs/PROJECT.md` 指定的验证命令，保存日志与退出码；全部通过后转 `VERIFIED`」，edition-neutral） | 任务交付时；`MERGED` → `VERIFIED` 之前 | 两个底座都适用；`github` 底座另有「当前 head 的 CI」门（上一行 + G4），二者不能互相替代 |
 | 设计目标层验收清单 | `validate_kit`、`unittest`、`py_compile`、`build_release` 自检、证据条目、两个底座当前 head 全绿、计划分层可判定 | [docs/PLAN.md](PLAN.md) §6「可度量的全局验收」 | 阶段 / 设计目标验收 | 设计目标权威，不是平台门 |
 
 **项目验证命令的复现口径**：`docs/PROJECT.md`「验证命令」的原文使用 `python`，并注明「Python 路径按机器调整；文档中以 `python` 指代」。本环境实跑前两条用 `uv run python …`、第三条用 `python3 -m py_compile …`；这是同一组命令的解释器前缀差异，**不是逐项逐字相同**。交付报告与证据矩阵记录的是本环境实跑的命令、输出与退出码。
@@ -189,7 +189,7 @@ git rev-parse 953c194:templates/metrics.md          # dee47b6b717270b2d112ffa3bf
 
 ### 7.3 现行 G1–G6 在 GitHub 载体上的证据映射（AC-1）
 
-门禁定义只以 [kit/orchestration.md](../kit/orchestration.md) §4 与 4.1 为准，本节只记录「在 GitHub 载体上这些证据实际长什么样、本次能算到什么程度」。
+门禁定义只以 [docs/orchestration.md](orchestration.md) §4 与 4.1 为准，本节只记录「在 GitHub 载体上这些证据实际长什么样、本次能算到什么程度」。
 
 | 门 | 契约要求（引用） | GitHub 载体上的实际证据 | 本快照可计算性 |
 | --- | --- | --- | --- |

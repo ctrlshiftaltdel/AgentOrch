@@ -2,7 +2,7 @@
 
 > 状态：**S0 设计契约已冻结**（载体 Issue #47）。本目录只冻结设计，**不包含任何实现**：没有检查器、采集脚本、更新引擎或运行时服务。未实现的能力不得对外宣称已支持。
 > 权威范围：本目录定义“经验来源 / Lesson 生命周期 / 自我完善入口 / 更新安全 / 威胁模型”的**语义**；字段、必填、枚举的**机器权威**在 [`docs/contracts/schemas/`](../contracts/schemas/)；索引与验证方案在 [`docs/contracts/README.md`](../contracts/README.md)。
-> 与核心契约的关系：任务状态机、路径 / 资源锁、证据矩阵、合并门 G1–G6、edition 语义**只在** [`kit/orchestration.md`](../../kit/orchestration.md) 定义，本目录只引用，不复制、不改写。
+> 与核心契约的关系：任务状态机、路径 / 资源锁、证据矩阵、合并门 G1–G6、edition 语义**只在** [`docs/orchestration.md`](../orchestration.md) 定义，本目录只引用，不复制、不改写。
 
 ## 1. 文档地图
 
@@ -28,7 +28,7 @@
 | 状态转换、失败语义、人工决策点 | 本目录对应章节 | schema 中的 `enum` 是它的机器投影；两者不一致视为契约缺陷 |
 | 逐文件分类的默认动作与阻断条件 | [update-safety.md](update-safety.md) §3–§4 | `update-report` schema 只列出枚举，不重写动作表 |
 | 威胁与剩余风险 | [threat-model.md](threat-model.md) | 其它文档只引用威胁 ID |
-| 任务状态、锁、证据矩阵、合并门 | [`kit/orchestration.md`](../../kit/orchestration.md) | 本目录只引用章节号，不复制定义 |
+| 任务状态、锁、证据矩阵、合并门 | [`docs/orchestration.md`](../orchestration.md) | 本目录只引用章节号，不复制定义 |
 | 阶段顺序与状态 | [`docs/implementation-plan.md`](../implementation-plan.md) | 本目录不写任务状态 |
 
 任何 schema 变更都必须新开 Issue 重新冻结，并按 [`templates/contract-decision-log.md`](../../templates/contract-decision-log.md) 记录决策；实现任务不得在实现 PR 里顺手改契约。
@@ -56,7 +56,7 @@
 |---|---|---|
 | #48 | [`architecture-contract.md`](../architecture/architecture-contract.md) 与 `architecture-contract.schema.json` | 新增严重级别、改写豁免语义、对无契约项目施加硬门禁 |
 | #49 | [sources-and-trust.md](sources-and-trust.md)、[lesson-lifecycle.md](lesson-lifecycle.md) 与两个 schema | 新增 Lesson 状态、改变证据等级含义、在代码里写死来源 |
-| #50 | [entrypoints-and-decisions.md](entrypoints-and-decisions.md) 与 `kit/orchestration.md` 引用 | 复制状态机 / 门禁、绕过证据矩阵 |
+| #50 | [entrypoints-and-decisions.md](entrypoints-and-decisions.md) 与 `docs/orchestration.md` 引用 | 复制状态机 / 门禁、绕过证据矩阵 |
 | #51 | [update-safety.md](update-safety.md)、`update-manifest.schema.json`、`update-report.schema.json` | 新增分类、放宽失败关闭、把哈希差异当作覆盖许可 |
 | #52 | [update-safety.md](update-safety.md) §2、§8 与 [entrypoints-and-decisions.md](entrypoints-and-decisions.md) §2 | 只把入口放进不随包发布的 `docs/` |
 | #53 | [threat-model.md](threat-model.md) 全部负向测试列 | 把未执行的场景写成通过 |

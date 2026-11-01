@@ -1,8 +1,8 @@
 # 交付回归场景（合成）
 
-本文件是 `scripts/run_delivery_scenarios.py` 的场景目录。它回答一个文档回答不了的问题：**套件会不会在它声称要拦的地方真的拦住**。字段与状态语义仍只由 [kit/orchestration.md](../../kit/orchestration.md) 4.1 与第 5 节定义，本文只列场景、注入的缺陷与预期拦截门，不复制契约。
+本文件是 `scripts/run_delivery_scenarios.py` 的场景目录。它回答一个文档回答不了的问题：**套件会不会在它声称要拦的地方真的拦住**。字段与状态语义仍只由 [docs/orchestration.md](../orchestration.md) 4.1 与第 5 节定义，本文只列场景、注入的缺陷与预期拦截门，不复制契约。
 
-本文件是**仓库内文档**，不随发行包发布（`build_release.py` 禁止包内出现 `docs` 路径段），因此在 `validate_kit.py` 中登记为 `REQUIRED_DOCS` 而不是 `REQUIRED`；缺失或缺章节同样会让校验失败。
+本文件是**仓库内文档**，不随发行包发布（`build_release.py` 只允许 `docs/orchestration.md` 这一个 `docs/` 路径进入包内，其余 `docs/` 文件一律拒绝），因此在 `validate_kit.py` 中登记为 `REQUIRED_DOCS` 而不是 `REQUIRED`；缺失或缺章节同样会让校验失败。
 
 ## 1. 这套场景回答什么
 
@@ -12,7 +12,7 @@
 - 证明**自我完善闭环的治理门**在真实管线（`scripts/self_improvement/`）上生效：有合成来源证据的经验要经过验证、重新分类与泛化才能形成任务；来源不可达 / 无权限、提示词注入、重复、冲突、未验证缺陷与硬风险都会在计划或登记之前停下。规则见 [self-improvement-loop.md](../self-improvement/self-improvement-loop.md) 与 [sources-and-trust.md](../self-improvement/sources-and-trust.md)；本文件只列场景。
 - 证明**安全更新引擎**（`scripts/update_agentorch/`）在旧版升级、双边冲突、坏清单、路径穿越、未知文件、上游删除、旧版无基线、未提交改动、半更新与回滚失败时要么安全应用、要么零写入停止，并留下可定位报告。语义见 [update-safety.md](../self-improvement/update-safety.md)；本文件只列场景。
 - 证明**交付指标报告**不把空输入算成 0、不把缺事件算成零时长、不给每行丢掉样本量 / 窗口 / 缺失率，也不凭空发明“耦合度 / 内聚度”分数。口径只在 [templates/metrics.md](../../templates/metrics.md)；本文件只验证报告行为。
-- 证明 **Phase D 角色选择链路**（S5）把 S1 scope / Markdown 记录、S2 发现与角色匹配、S3 可选模型数据、S4 本机反馈真正串起来时仍然：C1–C4 未通过就停、缺角色 / Reviewer 就停、外部数据过期或不可用不冒充最新、scope 不隔离或写入失败如实报告、任何选择都不会被读成“已派发”。规则见 [agent-role-discovery-and-model-selection.md](../design/agent-role-discovery-and-model-selection.md) §10–§13 与 [kit/orchestration.md](../../kit/orchestration.md) 第一部分的角色选择入口；本文件只列场景。
+- 证明 **Phase D 角色选择链路**（S5）把 S1 scope / Markdown 记录、S2 发现与角色匹配、S3 可选模型数据、S4 本机反馈真正串起来时仍然：C1–C4 未通过就停、缺角色 / Reviewer 就停、外部数据过期或不可用不冒充最新、scope 不隔离或写入失败如实报告、任何选择都不会被读成“已派发”。规则见 [agent-role-discovery-and-model-selection.md](../design/agent-role-discovery-and-model-selection.md) §10–§13 与 [docs/orchestration.md](../orchestration.md) 第一部分的角色选择入口；本文件只列场景。
 - 给“该失败的地方失败了”留下可复现的证据：每条场景都输出实际断言值与拦截文本。
 - 供套件重大变更时回归：改核心契约、`validate_kit.py`、模板、锁/状态机或发行流程后，必须重跑。
 
@@ -144,7 +144,7 @@ python scripts/run_delivery_scenarios.py --list
 
 - 全部 fixture 在运行时生成到 `tempfile` 目录，**不读取也不写入仓库**；报告只在 `--output` 指定位置落盘。
 - 只用标准库：无网络请求、无凭据、无外部模型、无第三方依赖。
-- 任务包 fixture 的字段由 `validate_kit.py` 从 `kit/orchestration.md` 读回，契约改了 fixture 不会“自动跟随”出一个假通过：证据列名或状态枚举变化会让场景直接失败。
+- 任务包 fixture 的字段由 `validate_kit.py` 从 `docs/orchestration.md` 读回，契约改了 fixture 不会“自动跟随”出一个假通过：证据列名或状态枚举变化会让场景直接失败。
 - 迁移 fixture 是小型 JSON 记录集（v2014 → v2024），跨模块 fixture 是内存事件序列，跨模块状态 / 恢复 fixture 是沙箱内的合成目录树、合成 manifest 与合成模块源码字符串，都不含真实业务数据。
 - 架构契约 fixture 在沙箱内写出合成源码树与一份契约 JSON，然后调用**真实检查器**（只启用 Python 适配器；Rust 适配器既不启用也不宣称）；语义项（证据标签、终局、能力声明）由场景内的小型契约测试判定，并明确标注为合成模型，不代表任何真实运行时。
 - 自我完善 fixture 使用虚构的下游仓库、虚构的 PR / commit / CI 记录与 `_SyntheticGh`（回答真实收集器构造的同一组 `gh api` argv）；`scripts/self_improvement/` 的来源注册、收集、去重、生命周期、规划与闭环代码都是**真实模块**，没有网络、没有令牌、没有第三方模型。
@@ -196,4 +196,4 @@ python scripts/run_delivery_scenarios.py --list
 - 新增或修改核心契约、校验器、模板、锁/状态机、发行流程时：先在本文件补场景行，再在对应组的 `scripts/delivery_scenarios/group_<x>.py` 实现，并在 `scripts/run_delivery_scenarios.py` 的注册表登记，最后跑 `python scripts/run_delivery_scenarios.py --json` 与 `python scripts/validate_kit.py`。
 - 场景表与运行器必须同步：`tests/test_run_delivery_scenarios.py` 会检查每个场景 ID 都出现在本文件的矩阵里。
 - 发现契约本身有问题时，另开 Issue 并先取得授权，**不要**通过放宽场景或删断言把它变成绿色。
-- 本文件与 [kit/orchestration.md](../../kit/orchestration.md) 的 I 段配套：验收程序说“什么时候必须跑”，本文件说“跑什么、期望什么”。
+- 本文件与 [docs/orchestration.md](../orchestration.md) 的 I 段配套：验收程序说“什么时候必须跑”，本文件说“跑什么、期望什么”。

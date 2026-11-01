@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from . import migrate
+
 CLASSES = (
     'UPSTREAM_UNCHANGED',
     'ALREADY_CURRENT',
@@ -57,6 +59,11 @@ PROJECT_OWNED_PREFIXES = (
 
 
 def is_project_owned(path: str) -> bool:
+    # The core contract lives under docs/ but is shipped by the kit, not filled in
+    # by the project: it must stay updatable. This is the single exception to the
+    # docs/ prefix below (see migrate.py).
+    if migrate.is_core_contract(path):
+        return False
     if path in PROJECT_OWNED_FILES:
         return True
     return any(path.startswith(prefix) for prefix in PROJECT_OWNED_PREFIXES)
@@ -129,6 +136,15 @@ def classify_files(baseline: dict[str, str], current: dict[str, str], target: di
         if is_project_owned(path):
             klass, decision = 'PROJECT_OWNED', 'KEPT_LOCAL'
             notes = 'project-owned path: never overwritten by a kit update (report only)'
+        elif _legacy_move_applies(path, b, t, target):
+            klass, decision = 'UPSTREAM_RENAME', 'KEPT_LOCAL'
+            notes = migrate.legacy_note(path, migrate.target_of(path) or '')
+        elif migrate.is_core_contract(path) and c is None and b is None \
+                and migrate.LEGACY_CONTRACT_PATH in current:
+            # The old copy is still on disk: adding the new one would create the
+            # two authorities this migration exists to prevent.
+            klass, decision = 'UPSTREAM_RENAME', 'KEPT_LOCAL'
+            notes = migrate.new_side_note(migrate.LEGACY_CONTRACT_PATH, path)
         elif path in rename_map:
             klass, decision = 'UPSTREAM_RENAME', 'KEPT_LOCAL'
             notes = (f'upstream renamed this path to {rename_map[path]!r} with identical bytes; '
@@ -149,10 +165,23 @@ def classify_files(baseline: dict[str, str], current: dict[str, str], target: di
             result.conflicts.append(path)
         elif klass == 'UPSTREAM_REMOVAL':
             result.removals.append(path)
-        elif klass == 'UPSTREAM_RENAME' and path in rename_map:
+        elif klass == 'UPSTREAM_RENAME' and (path in rename_map or migrate.is_legacy_contract(path)):
             result.renames.append(path)
 
     return result
+
+
+def _legacy_move_applies(path: str, baseline_sha: str | None, target_sha: str | None,
+                         target: dict[str, str]) -> bool:
+    """True for the documented legacy path when the target no longer ships it.
+
+    Unlike ``_rename_pairs`` this does not require identical bytes: the contract
+    was edited while it moved, so "same responsibility, new path" is the signal.
+    """
+    new = migrate.target_of(path)
+    if new is None or baseline_sha is None or target_sha is not None:
+        return False
+    return new in target
 
 
 def _baseline_case(b: str, c: str | None, t: str | None,

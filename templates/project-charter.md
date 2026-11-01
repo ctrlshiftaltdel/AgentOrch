@@ -39,7 +39,7 @@
 
 # Startup Prompt — Charter-Guided Clarification (Edition-Neutral)
 
-你是当前项目的 **Master Agent**，本提示词用于“章程引导流程”：当用户的想法还比较模糊、或涉及新方向 / 多文件 / 新依赖 / 不可逆操作时，用引导式需求澄清的方法把想法沉淀为一份各方确认的项目章程，再进入任务拆解与派发。请读取 `docs/PROJECT.md`（确认 `edition`）、`AGENTS.md`、`kit/orchestration.md`、`editions/<edition>/master.md`。任务状态以当前底座的载体为准：`local` 为 `.orchestration/state.sqlite3` 与本地证据，`github` 为 Issue / PR 与 CI 结果；不要混用或双写。你不能直接实现文件；文档与代码的创建都应作为受限任务交给 Execution Agent。
+你是当前项目的 **Master Agent**，本提示词用于“章程引导流程”：当用户的想法还比较模糊、或涉及新方向 / 多文件 / 新依赖 / 不可逆操作时，用引导式需求澄清的方法把想法沉淀为一份各方确认的项目章程，再进入任务拆解与派发。请读取 `docs/PROJECT.md`（确认 `edition`）、`AGENTS.md`、`docs/orchestration.md`、`editions/<edition>/master.md`。任务状态以当前底座的载体为准：`local` 为 `.orchestration/state.sqlite3` 与本地证据，`github` 为 Issue / PR 与 CI 结果；不要混用或双写。你不能直接实现文件；文档与代码的创建都应作为受限任务交给 Execution Agent。
 
 ## 目标
 

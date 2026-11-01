@@ -1,9 +1,9 @@
 # “进行自我完善”闭环（#50 实现记录）
 
 > **定位**：本文件说明入口与闭环**怎么做**：触发边界、恢复、规划、派发、审查和报告。
-> 任务状态机、路径 / 资源锁、证据矩阵与合并门 G1–G6 **只在** [`kit/orchestration.md`](../../kit/orchestration.md) 定义；字段名、取值与判定规则只在其中 4.1 节定义。本文件只引用章节，不复制、不改写。
+> 任务状态机、路径 / 资源锁、证据矩阵与合并门 G1–G6 **只在** [`docs/orchestration.md`](../orchestration.md) 定义；字段名、取值与判定规则只在其中 4.1 节定义。本文件只引用章节，不复制、不改写。
 > **前置契约**：触发语与人工决策目录 [`entrypoints-and-decisions.md`](entrypoints-and-decisions.md)，来源注册表与信任模型 [`sources-and-trust.md`](sources-and-trust.md)，Lesson 生命周期与去重 [`lesson-lifecycle.md`](lesson-lifecycle.md)。本任务没有修改它们的语义。
-> **包集成**：发行包 `REQUIRED` 清单、`scripts/build_release.py`、CI 与 `docs/README.md` 计数由 #52 统一接入；运行脚本、模板与随包测试已进入 `REQUIRED`，`docs/` 仍不随包发布。包内操作说明见 [`templates/self-improvement/README.md`](../../templates/self-improvement/README.md)。
+> **包集成**：发行包 `REQUIRED` 清单、`scripts/build_release.py`、CI 与 `docs/README.md` 计数由 #52 统一接入；运行脚本、模板与随包测试已进入 `REQUIRED`，`docs/` 除核心契约 `docs/orchestration.md` 外仍不随包发布。包内操作说明见 [`templates/self-improvement/README.md`](../../templates/self-improvement/README.md)。
 
 ## 1. 触发与不触发
 
@@ -50,7 +50,7 @@
 - 只有 `GENERAL_LESSON` + `GENERALIZED` + 无 `OPEN` 冲突的 Lesson 允许生成任务（[`lesson-lifecycle.md`](lesson-lifecycle.md) §7）。
 - `UNVERIFIED_ASSUMPTION`、重复 Lesson（`duplicate_of`）、已被现有契约 / 代码 / 测试覆盖的 Lesson 不生成新任务；只记录证据或建议补测试。
 - `OPEN` 冲突（`CONTRADICTS` / `SUPERSEDES` / `OVERLAPS`）进入 `HD-04`；不得自动选边。
-- 覆盖检查要写清对照对象（`kit/` 章节、源码路径、测试名），不能只写“已覆盖”。
+- 覆盖检查要写清对照对象（`docs/orchestration.md` 章节、源码路径、测试名），不能只写“已覆盖”。
 
 ### 2.4 成本收益与方案
 
@@ -58,13 +58,13 @@
 
 ### 2.5 生成任务包
 
-任务包必须含：单一目标、依赖、允许 / 禁改路径、逐条验收（每条带验证命令）、`negative_cases`、`migration_cases`、`integration_paths`、`unverified_assumptions`、验证命令与证据矩阵占位。字段名与判定规则见 `kit/orchestration.md` 4.1；模板见 [`task-packet.md`](../../templates/self-improvement/task-packet.md)。
+任务包必须含：单一目标、依赖、允许 / 禁改路径、逐条验收（每条带验证命令）、`negative_cases`、`migration_cases`、`integration_paths`、`unverified_assumptions`、验证命令与证据矩阵占位。字段名与判定规则见 `docs/orchestration.md` 4.1；模板见 [`task-packet.md`](../../templates/self-improvement/task-packet.md)。
 
 实现里由 `scripts/self_improvement/planning.py` 的 `plan_tasks()` 把关：缺字段、缺 AC 验证、裸 `N/A`、依赖未 `VERIFIED`、允许路径过宽都会得到 `BLOCKED` / `NO_TASK`，而不是被自动补全。
 
 ### 2.6 按锁与依赖派发
 
-- 依赖必须先 `VERIFIED`；路径 / 资源锁按 `kit/orchestration.md` §3 取得（`local` 原子路径锁，`github` 登记块 + 开放 PR 冲突检查）。
+- 依赖必须先 `VERIFIED`；路径 / 资源锁按 `docs/orchestration.md` §3 取得（`local` 原子路径锁，`github` 登记块 + 开放 PR 冲突检查）。
 - `local` 只写任务库（`task add` / `ready` / `dispatch`）；`github` 只写 Issue / PR。**不双写**，也不把本地 CLI 当成 GitHub 调度。
 - 同一时刻只有一个 Master 派发；没有真实 spawn / wait / collect（C1–C4）时降级为人工交接，不声称已派发。
 
@@ -132,7 +132,7 @@
 
 ## 7. 明确不做
 
-- 不自动采纳 Lesson、不修改 `AGENTS.md` / `kit/` / `editions/` 的权威语义来“吸收教训”。
+- 不自动采纳 Lesson、不修改 `AGENTS.md` / `docs/orchestration.md` / `editions/` 的权威语义来“吸收教训”。
 - 不自动创建 Issue / 任务（实现返回的是可复制 payload 与门禁结果，登记由 Master 在真实载体上执行）。
 - 不自动批准、不自动合并、不关闭 Issue、不标 `VERIFIED`。
 - 不新增状态、锁、门或证据字段；不修改 #49 的 `sources` / `collect` / `lessons` / `pipeline` 语义。

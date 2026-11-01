@@ -48,7 +48,7 @@ DISPATCH_FIELDS = [
 ]
 
 GATE_IDS = ["G1", "G2", "G3", "G4", "G5", "G6"]
-GATE_SOURCE = "kit/orchestration.md"
+GATE_SOURCE = "docs/orchestration.md"
 EXPECTED_KEYS = {
     "exit_code", "diagnostic_code", "floors", "level", "required_rule_ids",
     "forbidden_rule_ids", "required_closure_reasons", "counterfactual_diff_empty",
@@ -210,7 +210,7 @@ class PlannerFixtureTests(unittest.TestCase):
 
         self.assertEqual(payload["policy"], {
             "effect": "current_rules_unchanged",
-            "refs": ["kit/orchestration.md", "editions/local/master.md",
+            "refs": ["docs/orchestration.md", "editions/local/master.md",
                      "editions/github/master.md"],
         })
 

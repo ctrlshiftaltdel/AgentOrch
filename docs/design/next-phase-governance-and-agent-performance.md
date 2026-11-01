@@ -81,7 +81,7 @@
 
 ### 3.1 目标路径
 
-当前 `kit/` 只有 `kit/orchestration.md` 一份文件，因此计划将其迁移为 `docs/orchestration.md`，不为孤立文件建立 `docs/kit/`。未来如出现多个职责一致的 kit 类契约，再依据文件地图统一规划子目录。
+迁移前 `kit/` 只有 `kit/orchestration.md` 一份文件，因此将其迁移为 `docs/orchestration.md`，不为孤立文件建立 `docs/kit/`。未来如出现多个职责一致的 kit 类契约，再依据文件地图统一规划子目录。
 
 迁移任务应通过版本控制重命名 / 移动处理，确保变更可审查，并同时更新源码、手册、模板、测试、构建和发行中的路径。不能在移动后永久维护两份可编辑的权威副本。
 
@@ -98,7 +98,7 @@
 
 必须注意：上游仓库的 `docs/` 目前同时包含仅仓库专有文档，而部分打包逻辑对 `docs/` 有特殊处理。新的核心契约进入 `docs/` 后，必须依据文件映射显式区分“可以随发行包分发的核心契约”和“只属于上游开发仓库的设计 / 历史文档”，不能简单移除全部 `docs/` 禁止规则，也不能将所有文档打入发行包。
 
-旧版本的 `kit/orchestration.md` 若有本地修改、目标路径已存在且内容不同、旧 manifest 缺失或升级基线不可靠，更新引擎必须停止并给出逐文件处理建议。不得直接覆盖、丢弃或伪称自动迁移成功。回滚方案应保留迁移前文件与 manifest 证据。
+旧版本的 `docs/orchestration.md` 若有本地修改、目标路径已存在且内容不同、旧 manifest 缺失或升级基线不可靠，更新引擎必须停止并给出逐文件处理建议。不得直接覆盖、丢弃或伪称自动迁移成功。回滚方案应保留迁移前文件与 manifest 证据。
 
 ## 4. 核心计划清理和生命周期机制
 
@@ -372,7 +372,7 @@ Master 因具有产品目标理解、整体计划、冲突裁决和最终交付�
 | P0 阶段计划登记 | [Issue #149](https://github.com/ctrlshiftaltdel/AgentOrch/issues/149)；登记本阶段、依赖、状态与出口条件 | S0 |
 | P1 DSH 阶段登记 | [Issue #162](https://github.com/ctrlshiftaltdel/AgentOrch/issues/162)；把 DSH 角色工具阶段登记进同一份 `docs/implementation-plan.md` | P0；另有 #162 自身的设计冻结前置 [#161](https://github.com/ctrlshiftaltdel/AgentOrch/issues/161) / PR #168 |
 | GOV-1 文件地图 / 生命周期 | [Issue #150](https://github.com/ctrlshiftaltdel/AgentOrch/issues/150)；文件责任、权威来源与 outdated 退出机制 | S0、P0；与 P1 路径不重叠，可并行 |
-| GOV-2 核心契约迁移 | [Issue #151](https://github.com/ctrlshiftaltdel/AgentOrch/issues/151)；`kit/orchestration.md` → `docs/orchestration.md`，兼容发行 / 更新 | GOV-1、P1；另需共享 `scripts/validate_kit.py` 的 #169 已 `VERIFIED` |
+| GOV-2 核心契约迁移 | [Issue #151](https://github.com/ctrlshiftaltdel/AgentOrch/issues/151)；`docs/orchestration.md` → `docs/orchestration.md`，兼容发行 / 更新 | GOV-1、P1；另需共享 `scripts/validate_kit.py` 的 #169 已 `VERIFIED` |
 | GOV-3 计划精简 | [Issue #152](https://github.com/ctrlshiftaltdel/AgentOrch/issues/152)；历史信息转链 / 归档，保留当前未完成风险 | GOV-1、GOV-2 |
 | I1 旧项目隔离接入 | [Issue #153](https://github.com/ctrlshiftaltdel/AgentOrch/issues/153)；`agentorch/` 布局、根 AGENTS managed block、相对路径、ignore、升级 / 回滚 | GOV-1、GOV-2、GOV-3（与 GOV-3 共享 `docs/README.md`，先完成计划 / 导航清理） |
 | GOV-4 文档一致性门禁 | [Issue #154](https://github.com/ctrlshiftaltdel/AgentOrch/issues/154)；检查文件登记、链接、文档影响、计划状态和发行清单 | GOV-1–GOV-3、I1 |
@@ -398,7 +398,7 @@ Master 因具有产品目标理解、整体计划、冲突裁决和最终交付�
 - `docs/implementation-plan.md`：阶段登记和状态唯一落点；只保留当前推进所需的信息。
 - `docs/PROJECT.md`：只有 AgentOrch 上游仓库自身的适配配置 / 根路径语义有变化时更新，不将下游项目特例写入上游配置。
 - `AGENTS.md`：协作契约或入口路径变化时更新；旧项目接入的合并区块规则必须是增量、幂等、可检测冲突，不得覆盖宿主规则。
-- `docs/orchestration.md`：核心状态、入口 / 门禁定义的唯一权威，**仅在 #151 迁移完成后生效**；迁移前 `kit/orchestration.md` 仍是当前唯一权威（见 §2.1、§3.1）。
+- `docs/orchestration.md`：核心状态、入口 / 门禁定义的唯一权威，**仅在 #151 迁移完成后生效**；迁移前 `docs/orchestration.md` 仍是当前唯一权威（见 §2.1、§3.1）。
 - [repository-map.md](../architecture/repository-map.md) 与 [document-lifecycle.md](../architecture/document-lifecycle.md)：文件职责、路径与生命周期规则的权威定义位置。
 - 发布清单 / 升级文档 / 包内自检：任何文件路径、发行内容或迁移行为变化都必须影响分析。
 

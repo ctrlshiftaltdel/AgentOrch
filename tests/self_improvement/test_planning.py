@@ -49,7 +49,7 @@ class EligibilityGateTests(unittest.TestCase):
     def test_already_covered_lesson_creates_no_duplicate_rule(self):
         record = loop_support.general_lesson()
         coverage = {record['lesson_id']: {'status': 'COVERED',
-                                          'evidence': 'kit/orchestration.md 4.1'}}
+                                          'evidence': 'docs/orchestration.md 4.1'}}
         proposal = plan_one(record, loop_support.spec(), coverage=coverage).proposals[0]
         self.assertEqual(proposal['status'], 'NO_TASK')
         self.assertIn('already covers', proposal['status_reason'])
@@ -65,7 +65,7 @@ class EligibilityGateTests(unittest.TestCase):
 
 class RiskGateTests(unittest.TestCase):
     def test_frozen_governance_path_needs_hd05(self):
-        spec = loop_support.spec(allowed_paths=['kit/orchestration.md'])
+        spec = loop_support.spec(allowed_paths=['docs/orchestration.md'])
         proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
         self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')
         self.assertEqual(proposal['required_human_decision'], 'HD-05')
@@ -78,7 +78,7 @@ class RiskGateTests(unittest.TestCase):
         self.assertEqual(proposal['required_human_decision'], 'HD-05')
 
     def test_high_risk_wins_over_an_incomplete_packet(self):
-        spec = loop_support.spec(allowed_paths=['kit/orchestration.md'])
+        spec = loop_support.spec(allowed_paths=['docs/orchestration.md'])
         spec.pop('validation_commands')
         proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
         self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')

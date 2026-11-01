@@ -1,12 +1,12 @@
 # 跨模块状态 / 并发 / 恢复：任务验收规则（R1–R6）
 
-> **定位**：本文件是**增量验收检查点**，不是第二套契约。任务状态机、路径 / 资源锁、证据矩阵与合并门 G1–G6 **只在** [`kit/orchestration.md`](../../kit/orchestration.md) 定义；字段名、取值与判定规则只在其中 4.1 节定义。本文件只引用、**不复制、不改写**。
+> **定位**：本文件是**增量验收检查点**，不是第二套契约。任务状态机、路径 / 资源锁、证据矩阵与合并门 G1–G6 **只在** [`docs/orchestration.md`](../orchestration.md) 定义；字段名、取值与判定规则只在其中 4.1 节定义。本文件只引用、**不复制、不改写**。
 > **适用**：涉及共享可变状态（manifest / 索引 / 缓存 / 计数）、锁文件、备份与回滚、多阶段提交、目录遍历的任务。
 > **证据来源**：下游项目的公开 Pull Request。本文件只引用链接与自行撰写的泛化摘要，不复制其代码、业务数据、目录结构或受版权文本；所有 fixture 均为合成数据。
 
 ## 1. 怎么用
 
-1. 任务包 / Issue 的 `invariants`、`negative_cases`、`migration_cases`、`integration_paths` 按 [4.1 节](../../kit/orchestration.md)填写；本文件只说明**这些字段应覆盖哪些表面**，不新增字段。
+1. 任务包 / Issue 的 `invariants`、`negative_cases`、`migration_cases`、`integration_paths` 按 [4.1 节](../orchestration.md)填写；本文件只说明**这些字段应覆盖哪些表面**，不新增字段。
 2. 与共享状态有关时，`integration_paths` 里必须有**调用点清单**（见 R2）；`negative_cases` 里必须有**最终状态断言**（见 R3–R6），不能只写“返回错误”。
 3. 小任务确实不涉及这些表面时写 `N/A: <理由>`，理由必须说明“为什么该表面对本任务不存在”，不得只写 `N/A`。
 4. 不适用不等于免检：标为 `Reviewer 判定` 的条目**没有**自动检查，Reviewer 必须逐条给结论；不得把它们写成“已被静态分析覆盖”。
@@ -93,6 +93,6 @@
 
 ## 6. 变更规则
 
-- 本文件只增加验收检查点；与 [`kit/orchestration.md`](../../kit/orchestration.md) 冲突时以核心契约为准，并停下登记冲突，不得各写一套。
+- 本文件只增加验收检查点；与 [`docs/orchestration.md`](../orchestration.md) 冲突时以核心契约为准，并停下登记冲突，不得各写一套。
 - 新增 / 修改场景必须同步更新 [场景目录](../testing/delivery-regression-scenarios.md) 与 `scripts/run_delivery_scenarios.py` 的注册；`tests/test_run_delivery_scenarios.py` 会检查场景 ID 是否在文档中登记。
 - 修改模板中的检查项必须保留“小任务可写 `N/A: <理由>`”的出口；不得把不适用的小任务判为失败。

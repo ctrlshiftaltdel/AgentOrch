@@ -23,17 +23,17 @@ NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
 
 UPSTREAM_15 = {
     'AGENTS.md': b'# AGENTS v1.5\n',
-    'kit/orchestration.md': b'# orchestration v1.5\n',
+    'docs/orchestration.md': b'# orchestration v1.5\n',
     'templates/task-packet.md': b'# packet v1.5\n',
     'editions/github/master.md': b'# master v1.5\n',
 }
 
 UPSTREAM_16 = {
     'AGENTS.md': b'# AGENTS v1.6\n',
-    'kit/orchestration.md': b'# orchestration v1.6\n',
+    'docs/orchestration.md': b'# orchestration v1.6\n',
     'templates/task-packet.md': b'# packet v1.6\n',
     'editions/github/master.md': b'# master v1.6\n',
-    'kit/new-in-16.md': b'# new in 1.6\n',
+    'templates/new-in-16.md': b'# new in 1.6\n',
 }
 
 PROJECT_FILES = {
@@ -127,11 +127,11 @@ class CleanUpgradeTests(unittest.TestCase):
     def test_new_upstream_file_is_created(self):
         with tempfile.TemporaryDirectory() as tmp:
             project, source, _, _ = prepare(tmp)
-            self.assertFalse(project.exists('kit/new-in-16.md'))
+            self.assertFalse(project.exists('templates/new-in-16.md'))
             result = run(project, source)
             self.assertEqual(result['result'], 'APPLIED')
-            self.assertEqual(project.read('kit/new-in-16.md'), b'# new in 1.6\n')
-            self.assertEqual(file_entry(result, 'kit/new-in-16.md')['class'], 'UPSTREAM_UNCHANGED')
+            self.assertEqual(project.read('templates/new-in-16.md'), b'# new in 1.6\n')
+            self.assertEqual(file_entry(result, 'templates/new-in-16.md')['class'], 'UPSTREAM_UNCHANGED')
 
     def test_unknown_local_file_is_kept_and_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -521,7 +521,7 @@ class WorkspaceTests(unittest.TestCase):
             project, source, _, _ = prepare(tmp)
             outside = Path(tmp) / 'outside.txt'
             outside.write_bytes(b'outside data\n')
-            link = project.path('kit/new-in-16.md')
+            link = project.path('templates/new-in-16.md')
             link.symlink_to(outside)
             before = project.snapshot()
 

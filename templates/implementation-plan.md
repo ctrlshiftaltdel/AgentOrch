@@ -2,7 +2,7 @@
 
 > 这是模板：复制到项目的 `docs/` 后再编辑（例如 `docs/IMPLEMENTATION-PLAN.md`）。`python scripts/orchestrator.py init` 不会创建它，也不需要它——没有阶段计划的项目只维护 `docs/PLAN.md`。
 > 本文件只承载**阶段目标与执行路径**：阶段划分、每阶段的交付与出口、任务顺序与依赖、当前状态。
-> 设计目标只在项目 `docs/PLAN.md`（1.4 起位于 `docs/`）；任务包字段、状态取值与合并门语义只在 `kit/orchestration.md`，本文件引用不重述。
+> 设计目标只在项目 `docs/PLAN.md`（1.4 起位于 `docs/`）；任务包字段、状态取值与合并门语义只在 `docs/orchestration.md`，本文件引用不重述。
 > 与 `docs/PLAN.md` 的设计目标冲突时，以设计目标为准，停下对齐，不得各写一套。
 
 ## 计划头部

@@ -455,7 +455,7 @@
             "maxItems": 3,
             "items": [
               {
-                "const": "kit/orchestration.md"
+                "const": "docs/orchestration.md"
               },
               {
                 "const": "editions/local/master.md"
@@ -556,7 +556,7 @@
               ]
             },
             "source_path": {
-              "const": "kit/orchestration.md"
+              "const": "docs/orchestration.md"
             }
           }
         }

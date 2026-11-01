@@ -5,7 +5,7 @@
 - 适用仓库：AgentOrch；首批经验来源为 TalkDND、AgentMgr
 - 上位设计目标：[PLAN.md](PLAN.md)
 - 阶段计划：[implementation-plan.md](implementation-plan.md)
-- 核心协作契约：[AGENTS.md](../AGENTS.md) 与 [kit/orchestration.md](../kit/orchestration.md)
+- 核心协作契约：[AGENTS.md](../AGENTS.md) 与 [docs/orchestration.md](orchestration.md)
 
 ## 1. 目标与范围
 
@@ -189,7 +189,7 @@
 
 ## 7. 规则分层与包内实现原则
 
-- 核心协作、权限、状态机、证据和合并门仍以 `AGENTS.md` / `kit/orchestration.md` 为唯一权威。
+- 核心协作、权限、状态机、证据和合并门仍以 `AGENTS.md` / `docs/orchestration.md` 为唯一权威。
 - 项目专有的经验来源、架构契约、验证命令与豁免配置放在项目配置层，不将 TalkDND / AgentMgr 的业务假设硬编码到核心。
 - 会话触发语、Master 路由和可复用操作指令必须存在于正式发行包所包含的入口 / edition 文件，而不能只放在 `docs/`（`docs/` 不随发行包发布）。
 - 新增的发行功能必须接入 `validate_kit.py` 的必需文件 / 结构校验、发布清单生成、包内自检与 CI；发行包不得包含真实项目源数据、凭据或学习过程中的私有材料。

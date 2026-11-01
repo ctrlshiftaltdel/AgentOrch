@@ -70,7 +70,7 @@ class ClassificationTests(unittest.TestCase):
 
     def test_kit_owned_namespaces_are_not_blanket_project_owned(self):
         for path in ('scripts/orchestrator.py', 'tests/test_orchestrator.py',
-                     'kit/orchestration.md', 'AGENTS.md'):
+                     'docs/orchestration.md', 'AGENTS.md'):
             with self.subTest(path=path):
                 self.assertFalse(classify.is_project_owned(path))
 

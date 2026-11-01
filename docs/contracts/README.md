@@ -33,7 +33,7 @@ docs/contracts/
 | 逐文件分类、项目自有保护、备份 / 回滚、失败关闭 | [`update-safety.md`](../self-improvement/update-safety.md) |
 | 威胁、负向测试、剩余风险 | [`threat-model.md`](../self-improvement/threat-model.md) |
 | 架构模块、严重级别、豁免、未配置语义 | [`architecture-contract.md`](../architecture/architecture-contract.md) |
-| 任务状态机、锁、证据矩阵、合并门 | [`kit/orchestration.md`](../../kit/orchestration.md)（只引用） |
+| 任务状态机、锁、证据矩阵、合并门 | [`docs/orchestration.md`](../orchestration.md)（只引用） |
 
 ## 3. Schema 与 fixtures 对应关系
 

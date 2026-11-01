@@ -8,7 +8,7 @@
 >
 > **Freeze is not permanence.** "Frozen" means downstream tasks may not rewrite the contract on their own; it does not mean the contract can never change. Any change is made by recording a decision in [CONTRACT-DECISION-LOG.md](contract-decision-log.md) with the affected tasks, the before/after text and the evidence, then updating this file.
 >
-> This template deliberately does **not** restate the task state machine, the merge gates G1–G6 or the evidence matrix. Those are defined once in [kit/orchestration.md](../kit/orchestration.md); reference them, never copy them here.
+> This template deliberately does **not** restate the task state machine, the merge gates G1–G6 or the evidence matrix. Those are defined once in [docs/orchestration.md](../docs/orchestration.md); reference them, never copy them here.
 
 ## Scope and non-goals
 

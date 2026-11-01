@@ -52,16 +52,16 @@ EDITION_CONFIG = {
 
 UPSTREAM_15 = {
     'AGENTS.md': b'# AGENTS v1.5\n',
-    'kit/orchestration.md': b'# orchestration v1.5\n',
+    'docs/orchestration.md': b'# orchestration v1.5\n',
     'templates/task-packet.md': b'# packet v1.5\n',
     'editions/github/master.md': b'# master v1.5\n',
 }
 UPSTREAM_16 = {
     'AGENTS.md': b'# AGENTS v1.6\n',
-    'kit/orchestration.md': b'# orchestration v1.6\n',
+    'docs/orchestration.md': b'# orchestration v1.6\n',
     'templates/task-packet.md': b'# packet v1.6\n',
     'editions/github/master.md': b'# master v1.6\n',
-    'kit/new-in-16.md': b'# new in 1.6\n',
+    'templates/new-in-16.md': b'# new in 1.6\n',
 }
 PROJECT_FILES = {
     'src/app.py': b'print("project source")\n',

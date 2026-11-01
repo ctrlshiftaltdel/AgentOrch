@@ -1,7 +1,7 @@
 # Architecture Contract 契约（v1）
 
 > 机器定义：[`architecture-contract.schema.json`](../contracts/schemas/architecture-contract.schema.json)。本文件定义模块职责、接口、允许 / 禁止依赖、严重级别、豁免与**未配置时的只读诊断语义**；schema 与本文件冲突时视为契约缺陷。
-> 任务状态机、路径 / 资源锁、证据矩阵与合并门只在 [`kit/orchestration.md`](../../kit/orchestration.md) 定义，本文件只引用。
+> 任务状态机、路径 / 资源锁、证据矩阵与合并门只在 [`docs/orchestration.md`](../orchestration.md) 定义，本文件只引用。
 > 消费者：#48（检查器实现）、#53（合成回归）。
 
 ## 1. 目的与边界

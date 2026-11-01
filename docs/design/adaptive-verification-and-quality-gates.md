@@ -1,11 +1,11 @@
 # AgentOrch 自适应验证与流程提效：设计与实施计划（提案）
 
 > 状态：PROPOSED / NOT IMPLEMENTED；日期：2026-10-28。本文是专项设计提案，不是新的状态机、合并门或阶段状态权威。
-> 设计目标权威：`docs/PLAN.md`；阶段顺序/状态权威：`docs/implementation-plan.md`；现行状态与 G1–G6 门：`kit/orchestration.md`（完成 #151 迁移后以新路径为准）。在 Owner 批准且相关契约更新合并之前，所有现行检查仍然强制执行。
+> 设计目标权威：`docs/PLAN.md`；阶段顺序/状态权威：`docs/implementation-plan.md`；现行状态与 G1–G6 门：`docs/orchestration.md`（完成 #151 迁移后以新路径为准）。在 Owner 批准且相关契约更新合并之前，所有现行检查仍然强制执行。
 
 ## 1. 背景、证据与目标
 
-当前仓库 `docs/PROJECT.md` 配置了快速校验、完整单测、静态检查及合并后快速校验+完整回归+backup+静态检查；`kit/orchestration.md` G4 要求当前 HEAD 所有必需检查通过，G5 要求真实可定位证据，合并后才能 VERIFIED；`docs/PLAN.md` 将不可绕过门禁、当前 HEAD 证据、两个底座同强度作为设计目标。仓库 2026-10-28 的 `docs/implementation-plan.md` 记录 v1.7.0 1047 tests、71/71 delivery scenarios；这些是历史基线，而不是当前实测。
+当前仓库 `docs/PROJECT.md` 配置了快速校验、完整单测、静态检查及合并后快速校验+完整回归+backup+静态检查；`docs/orchestration.md` G4 要求当前 HEAD 所有必需检查通过，G5 要求真实可定位证据，合并后才能 VERIFIED；`docs/PLAN.md` 将不可绕过门禁、当前 HEAD 证据、两个底座同强度作为设计目标。仓库 2026-10-28 的 `docs/implementation-plan.md` 记录 v1.7.0 1047 tests、71/71 delivery scenarios；这些是历史基线，而不是当前实测。
 
 问题假设：低风险变更重复执行全套测试、修复轮次重复全量审查、角色上下文重复加载，形成非必要成本。**目前没有量化证据证明瓶颈分布**；第 A 阶段先测量，再调整。
 
@@ -79,7 +79,7 @@ AVE 是建议的底座无关逻辑层，并非 Agent Runtime；优先复用现�
 ## 9. 分阶段实施及任务切分
 
 ### A / P0 — 基线测量与规则审计
-- 审计 `AGENTS.md`, `docs/PLAN.md`, `docs/PROJECT.md`, `kit/orchestration.md`, `editions/`, `templates/`, `.github/workflows/`, `scripts/`，列出 *当前必须运行* 的项目检查及所有 G 门映射；核查正在推进的 #146、#150–#158、#174、#176 系列和 DSH #161–#167 的改动范围。
+- 审计 `AGENTS.md`, `docs/PLAN.md`, `docs/PROJECT.md`, `docs/orchestration.md`, `editions/`, `templates/`, `.github/workflows/`, `scripts/`，列出 *当前必须运行* 的项目检查及所有 G 门映射；核查正在推进的 #146、#150–#158、#174、#176 系列和 DSH #161–#167 的改动范围。
 - 在不变更实际门禁的前提下，采集 ≥20 个（若无法达到则说明样本不足）代表性任务/CI 执行事件，产出按风险及任务类型分层的基线，明确瓶颈和错误来源；禁止虚构历史 telemetry。
 - 出口：可审计基线、冲突表、适用范围、明确是否值得实施 B。
 

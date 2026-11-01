@@ -2,7 +2,7 @@
 
 > Run at milestone closeout, by someone other than the executor of the last task, before the milestone is called done. A per-task review (see [REVIEW-CHECKLIST.md](review-checklist.md)) only proves that each task met its own acceptance criteria; it says nothing about whether the parts hold together. This template covers that gap.
 >
-> It does not restate the merge gates G1–G6, the task lifecycle or the evidence matrix — those are defined once in [kit/orchestration.md](../kit/orchestration.md). It also does not decide what "done" means for the milestone: that is fixed by the project charter and the frozen contracts ([DESIGN.md](design.md), [CONTRACT-DECISION-LOG.md](contract-decision-log.md)).
+> It does not restate the merge gates G1–G6, the task lifecycle or the evidence matrix — those are defined once in [docs/orchestration.md](../docs/orchestration.md). It also does not decide what "done" means for the milestone: that is fixed by the project charter and the frozen contracts ([DESIGN.md](design.md), [CONTRACT-DECISION-LOG.md](contract-decision-log.md)).
 
 ## When to use
 

@@ -1,6 +1,6 @@
 # Startup Prompt — Execution Agent (github)
 
-你是 `github` 底座的 Execution Agent。开始前阅读 `AGENTS.md`、`kit/orchestration.md`、`docs/PROJECT.md`、`editions/github/master.md` 和目标 Issue。
+你是 `github` 底座的 Execution Agent。开始前阅读 `AGENTS.md`、`docs/orchestration.md`、`docs/PROJECT.md`、`editions/github/master.md` 和目标 Issue。
 
 ## 开工前
 

@@ -5,7 +5,7 @@ The set of packaged files is not maintained here: it is *derived* from the
 `REQUIRED` list inside scripts/validate_kit.py, which is the single source of
 truth for both (1) this repository's structurally required files and (2) the
 release package manifest. The per-project config is NOT packaged: downstream
-copies kit/templates/project.md to docs/PROJECT.md and fills it in, so a
+copies templates/project.md to docs/PROJECT.md and fills it in, so a
 released kit always ships the unfilled FILL_IN template.
 
 Archived bytes are normalized to LF line endings first. A payload is treated as
@@ -109,7 +109,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 VALIDATOR = ROOT / 'scripts' / 'validate_kit.py'
 PROJECT_TEMPLATE = ROOT / 'templates' / 'project.md'
-PROJECT_CONFIG = 'docs/PROJECT.md'  # project-owned; never packaged (docs/ is forbidden)
+PROJECT_CONFIG = 'docs/PROJECT.md'  # project-owned; never packaged (only the core contract ships)
 DEFAULT_OUTPUT_DIR = 'release'
 
 # The archive stem doubles as the single top-level directory inside the zip.
@@ -161,7 +161,11 @@ FORBIDDEN_REGEXES = [
 
 # Path segments that must never exist inside the package (belt and braces on top
 # of check a, which already pins the file set to REQUIRED).
-FORBIDDEN_SEGMENTS = frozenset({'.orchestration', 'release', 'docs', '.worktrees', '.workbuddy', '.git'})
+FORBIDDEN_SEGMENTS = frozenset({'.orchestration', 'release', '.worktrees', '.workbuddy', '.git'})
+# `docs/` is special: the core contract now lives there and must ship, while every
+# other repository document (design drafts, plans, upgrade notes, contracts) must
+# not. This allowlist is what keeps "all of docs/" from ever being packaged.
+PACKAGE_DOC_PATHS = frozenset({'docs/orchestration.md'})
 FORBIDDEN_PATHS = frozenset({'scripts/build_release.py'})
 
 # Optional per-machine / per-repository additions. Git-ignored (.gitignore keeps
@@ -189,15 +193,21 @@ def read_required():
 def collect_sources(required):
     """Return {relative_path: bytes} for every file that should ship.
 
-    The per-project config is intentionally NOT shipped: docs/ is a forbidden
-    segment, so downstream copies kit/templates/project.md to docs/PROJECT.md
-    and fills it in (self-check c proves --project-ready fails until they do).
+    The per-project config is intentionally NOT shipped: downstream copies
+    templates/project.md to docs/PROJECT.md and fills it in (self-check c proves
+    --project-ready fails until they do). Of the `docs/` tree only the core
+    contract (docs/orchestration.md) is allowed into the package; any other docs
+    path in REQUIRED is a build error rather than a silent widening of the
+    release contents.
     """
     files = {}
     for rel in required:
         source = ROOT / rel
         if not source.is_file():
             raise SystemExit(f'build error: required source missing: {source}')
+        if 'docs' in rel.split('/') and rel not in PACKAGE_DOC_PATHS:
+            raise SystemExit(f'build error: {rel} is a docs/ path that is not '
+                             f'allowed into the package (allowed: {sorted(PACKAGE_DOC_PATHS)})')
         files[rel] = normalize_line_endings(source.read_bytes())
     return files
 
@@ -302,6 +312,9 @@ def run_self_check(zip_path, required, top_dir, extra_patterns=()):
     for rel in sorted(packaged):
         if FORBIDDEN_SEGMENTS.intersection(rel.split('/')):
             failures.append(f'(f) forbidden path segment inside package: {rel}')
+        if 'docs' in rel.split('/') and rel not in PACKAGE_DOC_PATHS:
+            failures.append(f'(f) docs/ path inside package that is not the core '
+                            f'contract: {rel}')
         if rel in FORBIDDEN_PATHS:
             failures.append(f'(f) forbidden file inside package: {rel}')
 
@@ -365,8 +378,9 @@ def run_self_check(zip_path, required, top_dir, extra_patterns=()):
                 failures.append(f'(f) {name}:{lineno}: forbidden pattern {display}: {line}')
 
         # (h) the optional architecture checker must import and degrade to
-        # diagnostic mode inside a package that carries no contract (docs/ is
-        # never packaged). A non-zero exit, a guessed ENFORCE mode or a report
+        # diagnostic mode inside a package that carries no architecture contract
+        # (only docs/orchestration.md ships, no docs/contracts/). A non-zero exit,
+        # a guessed ENFORCE mode or a report
         # without a bound head_sha would mean the shipped checker lies about
         # what it checked.
         checker = pkg_root / 'scripts' / 'architecture' / 'check.py'
@@ -392,7 +406,7 @@ def run_self_check(zip_path, required, top_dir, extra_patterns=()):
                                     '(expected an explicit "unavailable" inside the extracted zip)')
 
         # (i) the natural-language update entry must import and expose its help
-        # inside a package that carries no docs/. A missing package module would
+        # inside a package that carries no repository docs. A missing package module would
         # otherwise only surface when a downstream user tries the trigger.
         rc, out = run([sys.executable, '-m', 'scripts.update_agentorch.entry', '--help'],
                       pkg_root)
@@ -404,7 +418,7 @@ def run_self_check(zip_path, required, top_dir, extra_patterns=()):
 
         # (j) the shipped self-improvement registry example must be one the
         # shipped validator accepts. This keeps the in-package operating note and
-        # the schema from drifting apart after docs/ is stripped.
+        # the schema from drifting apart after the repository docs are stripped.
         probe = (
             'import json\n'
             'from scripts.self_improvement import sources\n'
