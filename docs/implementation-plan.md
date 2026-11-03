@@ -57,7 +57,7 @@
 | [#189](https://github.com/ctrlshiftaltdel/AgentOrch/issues/189) | AVE 双底座发布兼容与校准 | `OPEN` / `PLANNED`，未 READY | #188 已 `VERIFIED`；DSH 按实际进度 |
 | [#191](https://github.com/ctrlshiftaltdel/AgentOrch/issues/191) | Epic：主动式 SemVer 发行节奏与版本治理 | `OPEN`（Epic） | #192–#194 已 `VERIFIED`；#195 开放 |
 | [#195](https://github.com/ctrlshiftaltdel/AgentOrch/issues/195) | 常规发行与 Kit / DSH 同版本交付验证 | `OPEN` / `PLANNED`，未 READY | #193 / #194 已 `VERIFIED`；Owner 预授权与 DSH 实际进度未满足 |
-| [#229](https://github.com/ctrlshiftaltdel/AgentOrch/issues/229) | 自主推进、持续授权与轻量任务边界草案 | `OPEN` / `DISPATCHED`；[提案](design/autonomous-progression-and-lightweight-tasks.md) 为 `PROPOSED` | 无功能硬依赖；Owner 决策待定；#153 锁定的导航路径待协调，不构成权限或常设授权 |
+| [#229](https://github.com/ctrlshiftaltdel/AgentOrch/issues/229) | 自主推进、持续授权与轻量任务边界草案 | `OPEN` / `PR_OPEN`；[Draft PR #234](https://github.com/ctrlshiftaltdel/AgentOrch/pull/234)，[提案](design/autonomous-progression-and-lightweight-tasks.md) 为 `PROPOSED`，未冻结 | 无功能硬依赖；Owner 决策未完成；#153 锁定的导航路径待协调，不构成权限或常设授权 |
 | [#230](https://github.com/ctrlshiftaltdel/AgentOrch/issues/230) | 实现自主推进与轻量任务流程 | `OPEN` / `PLANNED`，未 READY | 依赖 #229 合并并 `VERIFIED`，且具体 Owner 决策可定位；未派发 |
 
 ## 2. 阶段顺序与依赖
