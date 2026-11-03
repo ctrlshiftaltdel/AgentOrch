@@ -16,7 +16,7 @@
 
 **当前推进指针（2026-11-01）**
 
-- **治理收尾（Epic #146）**：[#153](https://github.com/ctrlshiftaltdel/AgentOrch/issues/153) 旧项目隔离接入 → [#154](https://github.com/ctrlshiftaltdel/AgentOrch/issues/154) 文档一致性门禁 → [#158](https://github.com/ctrlshiftaltdel/AgentOrch/issues/158) 端到端回归与发行验收。本任务 #152 完成计划精简后才放行 #153（两者共享 `docs/README.md`）。
+- **治理收尾（Epic #146）**：[#153](https://github.com/ctrlshiftaltdel/AgentOrch/issues/153) 旧项目隔离接入 → [#154](https://github.com/ctrlshiftaltdel/AgentOrch/issues/154) 文档一致性门禁 → [#158](https://github.com/ctrlshiftaltdel/AgentOrch/issues/158) 端到端回归与发行验收。#152 已 `VERIFIED` / `CLOSED`；#153 为 `BLOCKED`，保留活动锁，恢复条件见任务记录。
 - **DSH（Phase E，Epic #160）**：设计已 `FROZEN`，阶段登记 #162 已 `VERIFIED`；[#163](https://github.com/ctrlshiftaltdel/AgentOrch/issues/163) 因本机没有可执行的 DSH 而 `BLOCKED`，运行时能力 `NOT_RUN`；#164–#167 未 READY。
 - **任务驱动拓扑（Epic #176）**：[#179](https://github.com/ctrlshiftaltdel/AgentOrch/issues/179) 处于 `status:in-progress`，PR [#231](https://github.com/ctrlshiftaltdel/AgentOrch/pull/231) 未合并；实机权限 / 隔离链路 `NOT_RUN`。[#181](https://github.com/ctrlshiftaltdel/AgentOrch/issues/181) 随后。
 - **AVE / 主动发行 / 自主推进**：[#189](https://github.com/ctrlshiftaltdel/AgentOrch/issues/189)、[#195](https://github.com/ctrlshiftaltdel/AgentOrch/issues/195)、[#229](https://github.com/ctrlshiftaltdel/AgentOrch/issues/229) / [#230](https://github.com/ctrlshiftaltdel/AgentOrch/issues/230) 分别受其前置与授权边界约束。
@@ -40,9 +40,8 @@
 
 | 任务 | 交付 | 状态 | 依赖 / 阻塞 / 下一步 |
 |---|---|---|---|
-| [#146](https://github.com/ctrlshiftaltdel/AgentOrch/issues/146) | Epic：项目规范治理、旧项目隔离接入与 ETR 驱动评价选型 | `OPEN`（Epic） | #147 / #149 / #150 / #151 与 #155–#157 已 `VERIFIED`；剩余 #152 / #153 / #154 / #158 |
-| [#152](https://github.com/ctrlshiftaltdel/AgentOrch/issues/152) | 精简本文件并治理过期规划文档 | `OPEN` / `status:in-progress`；本任务执行中，未 `VERIFIED` | 前置 #150、#151 已 `VERIFIED`；完成后放行 #153 |
-| [#153](https://github.com/ctrlshiftaltdel/AgentOrch/issues/153) | 旧项目 `agentorch/` 隔离接入与安全升级 | `OPEN` / `PLANNED`，未 READY | 依赖 #150–#152 均 `VERIFIED`；与 #152 共享 `docs/README.md`，必须待本任务收口 |
+| [#146](https://github.com/ctrlshiftaltdel/AgentOrch/issues/146) | Epic：项目规范治理、旧项目隔离接入与 ETR 驱动评价选型 | `OPEN`（Epic） | #147 / #149–#152 与 #155–#157 已 `VERIFIED`；剩余 #153 / #154 / #158 |
+| [#153](https://github.com/ctrlshiftaltdel/AgentOrch/issues/153) | 旧项目 `agentorch/` 隔离接入与安全升级 | `OPEN` / `BLOCKED`；活动锁保留 | 依赖 #150–#152 均已 `VERIFIED`；安全实现与验证仍有缺口，按任务记录恢复，不释放锁 |
 | [#154](https://github.com/ctrlshiftaltdel/AgentOrch/issues/154) | 文件责任、文档影响与计划状态一致性门禁 | `OPEN` / `PLANNED`，未 READY | 依赖 #150–#153；#153 未 `VERIFIED` |
 | [#158](https://github.com/ctrlshiftaltdel/AgentOrch/issues/158) | 新阶段端到端回归、发行验收与文档同步 | `OPEN` / `PLANNED`，未 READY | 依赖 #153、#154 与 #155–#157；#155–#157 与 #73 已 `VERIFIED`，仍待 #153 / #154 |
 | [#160](https://github.com/ctrlshiftaltdel/AgentOrch/issues/160) | Epic：DSH 角色工具适配与独立发行包 | `OPEN`（Epic） | #161 / #162 / #172 已 `VERIFIED`；#163 `BLOCKED`；#164–#167 未 READY |
@@ -66,7 +65,7 @@
 以下是当前仍需推进的依赖边（无环）；已完成边不再重复。
 
 ```text
-#152（本任务） → #153 → #154 → #158
+#153 → #154 → #158
 #163 → #164, #165 → #166 → #167
 #179 → #181
 #229 → #230
@@ -81,8 +80,8 @@
 
 **路径串行**（不新增功能依赖）：
 
-- `docs/implementation-plan.md`：#152 完成后才放行 #153；本文件只经任务分支 + PR 修改。
-- `docs/README.md`：#152 → #153，先完成计划精简与导航清理。
+- `docs/implementation-plan.md`：#152 已 `VERIFIED`；本文件只经任务分支 + PR 修改。
+- `docs/README.md`：#152 已 `VERIFIED`；#153 活动锁保留，其他任务须等待或按契约协调。
 - 其他共享路径按任务登记块的实际 `locked_paths` 串行；计划表的顺序不等于可并行。
 
 ## 3. 阻塞、风险与授权边界
@@ -116,7 +115,7 @@
 | Epic #46 硬化项与后续补丁链 | #71 / #72 / #73 / #85 / #86 / #93 / #95 / #99–#104 / #113 均已 `VERIFIED` | 各 Issue、[docs/upgrade.md](upgrade.md) |
 | 1.6.x 发布链 | v1.6 → v1.6.1 → v1.6.2 → v1.6.3 均已发布 | [Releases](https://github.com/ctrlshiftaltdel/AgentOrch/releases)、[docs/upgrade.md](upgrade.md) §14.1–§14.5 |
 | Phase D（#117–#124） | 全部 `VERIFIED`；随 v1.7.0 发布 | [Epic #119](https://github.com/ctrlshiftaltdel/AgentOrch/issues/119)、[agent-role-discovery-and-model-selection.md](design/agent-role-discovery-and-model-selection.md)、[Release v1.7.0](https://github.com/ctrlshiftaltdel/AgentOrch/releases/tag/v1.7.0) |
-| Epic #146 已完成子项 | #147 / #149 / #150 / #151 与 #155 / #156 / #157 均 `VERIFIED` | 各 Issue；#151 的契约在 [docs/orchestration.md](orchestration.md) |
+| Epic #146 已完成子项 | #147 / #149–#152 与 #155 / #156 / #157 均 `VERIFIED`；#152 已 `CLOSED` | 各 Issue；#151 的契约在 [docs/orchestration.md](orchestration.md)；[#152 验证记录](https://github.com/ctrlshiftaltdel/AgentOrch/issues/152#issuecomment-6551116103) |
 | DSH 设计冻结与阶段登记 | #161 / #172 / #162 `VERIFIED`；运行时未验证 | [Epic #160](https://github.com/ctrlshiftaltdel/AgentOrch/issues/160)、[deepseek-harness-agent-role-tools.md](design/deepseek-harness-agent-role-tools.md)、[#162](https://github.com/ctrlshiftaltdel/AgentOrch/issues/162) |
 | 拓扑 A / B / D | #177 / #178 / #180 `VERIFIED` | [Epic #176](https://github.com/ctrlshiftaltdel/AgentOrch/issues/176) |
 | AVE A–D | #185 / #186 / #187 / #188 `VERIFIED`（#188 为已授权 L0 试点） | [Epic #184](https://github.com/ctrlshiftaltdel/AgentOrch/issues/184) |
