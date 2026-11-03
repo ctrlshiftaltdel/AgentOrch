@@ -34,7 +34,7 @@
 | 任务驱动拓扑（Epic #176） | 部分交付 | #177 / #178 / #180 `VERIFIED`；#179 / #181 开放 |
 | 自适应验证（Epic #184） | 部分交付 | #185–#188 `VERIFIED`；#189 开放 |
 | 主动发行（Epic #191） | 部分交付 | #192–#194 `VERIFIED`；#195 开放 |
-| 自主推进与轻量任务 | 未开始 | #229 → #230 开放 |
+| 自主推进与轻量任务 | 草案进行中，未冻结 | #229 → #230 开放 |
 
 **未完成任务**
 
@@ -58,8 +58,8 @@
 | [#189](https://github.com/ctrlshiftaltdel/AgentOrch/issues/189) | AVE 双底座发布兼容与校准 | `OPEN` / `PLANNED`，未 READY | #188 已 `VERIFIED`；DSH 按实际进度 |
 | [#191](https://github.com/ctrlshiftaltdel/AgentOrch/issues/191) | Epic：主动式 SemVer 发行节奏与版本治理 | `OPEN`（Epic） | #192–#194 已 `VERIFIED`；#195 开放 |
 | [#195](https://github.com/ctrlshiftaltdel/AgentOrch/issues/195) | 常规发行与 Kit / DSH 同版本交付验证 | `OPEN` / `PLANNED`，未 READY | #193 / #194 已 `VERIFIED`；Owner 预授权与 DSH 实际进度未满足 |
-| [#229](https://github.com/ctrlshiftaltdel/AgentOrch/issues/229) | 冻结自主推进、持续授权与轻量任务边界 | `OPEN` / `PLANNED`，未 READY | 无功能硬依赖；需要所有者决策；未派发，不构成权限或常设授权 |
-| [#230](https://github.com/ctrlshiftaltdel/AgentOrch/issues/230) | 实现自主推进与轻量任务流程 | `OPEN` / `PLANNED`，未 READY | 依赖 #229 `VERIFIED`；未派发 |
+| [#229](https://github.com/ctrlshiftaltdel/AgentOrch/issues/229) | 自主推进、持续授权与轻量任务边界草案 | `OPEN` / `DISPATCHED`；[提案](design/autonomous-progression-and-lightweight-tasks.md) 为 `PROPOSED` | 无功能硬依赖；Owner 决策待定；#153 锁定的导航路径待协调，不构成权限或常设授权 |
+| [#230](https://github.com/ctrlshiftaltdel/AgentOrch/issues/230) | 实现自主推进与轻量任务流程 | `OPEN` / `PLANNED`，未 READY | 依赖 #229 合并并 `VERIFIED`，且具体 Owner 决策可定位；未派发 |
 
 ## 2. 阶段顺序与依赖
 
@@ -77,7 +77,7 @@
 - **拓扑链**：#179 需 #178（已 `VERIFIED`）；#181 需 #179 / #180（#180 已 `VERIFIED`）。
 - **AVE 链**：#189 需 #188（已 `VERIFIED`）。
 - **主动发行链**：#195 需 #193 / #194（均已 `VERIFIED`），且 Owner 预授权与 DSH 实际进度满足。
-- **自主推进链**：#230 需 #229 `VERIFIED`。
+- **自主推进链**：#230 需 #229 合并并 `VERIFIED` 及具体 Owner 决策；#146 文档治理、#174 能力探测、#176 拓扑与 #184 验证提效只按实际共享路径和规则协调，不设整个专项为功能硬依赖。
 
 **路径串行**（不新增功能依赖）：
 
@@ -91,7 +91,7 @@
 - **#179 / 真实运行时**：只读交接工具与夹具场景已通过，但真实权限拒绝与上下文隔离仍是 `NOT_RUN`；PR #231 未合并。不得用一句 `PONG` 或夹具冒充实机链路，也不得据此标 `VERIFIED`。
 - **#188 / 风险试点**：Owner 已授权并 `VERIFIED` 的只是 L0 合并后例外；默认仍是“快速测试 + 完整回归 + `backup` + 静态检查”。只有 `verification_profile: risk_pilot` 且调用者用证据证明变更为 L0 时才可省略合并后完整回归；CI 全套、L1–L3、发布 / 安全 / 权限 / 身份 / 迁移 / 锁 / 状态机相关检查一律不减。详见 [docs/PROJECT.md](PROJECT.md)。
 - **设计提案不是现行规则**：[task-driven-agent-topology.md](design/task-driven-agent-topology.md)、[adaptive-verification-and-quality-gates.md](design/adaptive-verification-and-quality-gates.md) 与 [semver-proactive-release-policy.md](design/semver-proactive-release-policy.md) 仍是 `PROPOSED`；冻结子契约（[verification-planner-b-contract.md](design/verification-planner-b-contract.md)、[verification-impact-c-contract.md](design/verification-impact-c-contract.md)）只约束各自的只读工具。
-- **#229 / #230**：自主推进与轻量任务边界尚未冻结；#229 只登记需求，不构成权限、常设授权、自动合并或减检。
+- **#229 / #230**：自主推进与轻量任务边界尚未冻结；[草案](design/autonomous-progression-and-lightweight-tasks.md) 待 Owner 审阅，不构成权限、常设授权、自动合并或减检。#153 持有的导航路径未同步，须协调后处理。
 - **契约唯一路径**：核心编排契约只在 [docs/orchestration.md](orchestration.md)；#151 已完成迁移并 `VERIFIED`。
 - **已知文档不一致**：治理设计文稿 [next-phase-governance-and-agent-performance.md](design/next-phase-governance-and-agent-performance.md) 文件头仍写 `PROPOSED`，但 #147 已 `VERIFIED`；差异登记在 [repository-map.md](architecture/repository-map.md) §9.3，由后续文档治理任务处理，不影响 #147 的结论。
 - **未验证项保留**：历史发布升级只覆盖 [docs/upgrade.md](upgrade.md) §14.5（1.6.2 → 1.6.3）与 §14.6（1.6.3 → 1.7.0）；真实 1.3 / 1.4 资产、真实 1.6.0 / 1.6.1 → 1.6.2、真实断网 / 限速 / DNS、`HD-11`、签名校验（`NOT_APPLICABLE`，无签名资产）与非 GitHub-hosted 平台仍为 `NOT_RUN` / `UNKNOWN` / `NOT_APPLICABLE`。
