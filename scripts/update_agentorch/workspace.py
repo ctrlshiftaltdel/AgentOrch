@@ -446,6 +446,68 @@ class ManagedBlockError(ValueError):
         self.conflict_type = conflict_type
 
 
+# --- platform primitives ----------------------------------------------------
+# The transactional writer is built on POSIX ``dir_fd``-relative opens. The open
+# flags are read through ``getattr`` so importing this module never raises
+# ``AttributeError`` on a platform that does not define them: a missing flag
+# makes the writer fail closed through :class:`PlatformUnsupported` /
+# :class:`OnboardingError` instead (see ``_platform_capability_problems``), and a
+# raw open never silently follows a symlink in place of a kernel-level refusal.
+_O_NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
+_O_DIRECTORY = getattr(os, 'O_DIRECTORY', 0)
+_O_CLOEXEC = getattr(os, 'O_CLOEXEC', 0)
+_MISSING_OPEN_FLAGS = tuple(
+    name for name, value in (('O_NOFOLLOW', _O_NOFOLLOW),
+                             ('O_DIRECTORY', _O_DIRECTORY),
+                             ('O_CLOEXEC', _O_CLOEXEC)) if not value)
+
+
+def _file_identity(info) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` when the platform reports a usable inode identity."""
+    device = getattr(info, 'st_dev', None)
+    inode = getattr(info, 'st_ino', None)
+    if not isinstance(device, int) or not isinstance(inode, int) or inode == 0:
+        return None
+    return device, inode
+
+
+def open_no_follow(path, flags: int, *, label: str, mode: int | None = None) -> int:
+    """Open *path* without following a symlink that appears at open time.
+
+    Where ``O_NOFOLLOW`` exists the kernel refuses a link as part of the open.
+    A platform without it (Windows) cannot ask the kernel, so the entry is
+    ``lstat``-ed first, opened, and the opened descriptor's identity is compared
+    with the inspected identity. When no identity can be compared the open fails
+    closed: following a link that cannot be ruled out is exactly the behaviour
+    this helper exists to prevent.
+    """
+    suffix = () if mode is None else (mode,)
+    if _O_NOFOLLOW:
+        return os.open(path, flags | _O_NOFOLLOW | _O_CLOEXEC, *suffix)
+    try:
+        before = os.lstat(path)
+    except OSError as exc:
+        raise OnboardingError(f'{label} cannot be inspected: {exc}') from exc
+    if stat.S_ISLNK(before.st_mode):
+        raise OnboardingError(f'{label} is a symlink; refusing to open it')
+    expected = _file_identity(before)
+    if expected is None:
+        raise OnboardingError(
+            f'{label} has no verifiable identity on this platform; refusing to open it')
+    descriptor = os.open(path, flags, *suffix)
+    try:
+        opened = _file_identity(os.fstat(descriptor))
+        if opened is None:
+            raise OnboardingError(
+                f'{label} identity cannot be verified after opening; refusing to use it')
+        if opened != expected:
+            raise OnboardingError(f'{label} changed while it was being opened')
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
 @dataclass(frozen=True)
 class SourceBinding:
     """Opaque-in-practice record that a plan came from a verified release package.
@@ -1446,10 +1508,16 @@ def _open_planning_root_fd(root: Path) -> int | None:
     """Open a planning root as a directory descriptor, or ``None`` if absent.
 
     A symlinked root is refused here: the descriptor is the only anchor the
-    component walk below trusts.
+    component walk below trusts. A platform without ``O_DIRECTORY`` /
+    ``O_NOFOLLOW`` cannot give that anchor, so the read fails closed rather than
+    walking a path that a concurrent swap could redirect.
     """
     path = Path(root)
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    if _MISSING_OPEN_FLAGS:
+        raise OnboardingError(
+            f'{path.name} cannot be inspected safely: the platform lacks '
+            f'{", ".join(_MISSING_OPEN_FLAGS)}')
+    flags = os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC
     try:
         return os.open(path, flags)
     except FileNotFoundError:
@@ -1476,8 +1544,8 @@ def _read_regular_file_at(root_fd: int, rel: str, label: str) -> bytes | None:
     try:
         for part in parts[:-1]:
             try:
-                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-                                  | os.O_CLOEXEC, dir_fd=fd)
+                next_fd = os.open(part, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW
+                                  | _O_CLOEXEC, dir_fd=fd)
             except FileNotFoundError:
                 return None
             except OSError as exc:
@@ -1491,8 +1559,8 @@ def _read_regular_file_at(root_fd: int, rel: str, label: str) -> bytes | None:
             os.close(fd)
             fd = next_fd
         try:
-            descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW
-                                 | os.O_NONBLOCK | os.O_CLOEXEC,
+            descriptor = os.open(parts[-1], os.O_RDONLY | _O_NOFOLLOW
+                                 | os.O_NONBLOCK | _O_CLOEXEC,
                                  dir_fd=fd)
         except FileNotFoundError:
             return None
@@ -1523,7 +1591,9 @@ def _read_regular_file(path, label: str) -> bytes | None:
 
     Candidate baselines are attacker-controlled input. ``is_file()`` follows
     symlinks, so a link inside the host could make a diagnostic read an external
-    file. This helper lstat's first and then opens with ``O_NOFOLLOW``; a link or
+    file. This helper lstat's first and then opens without following a link: with
+    ``O_NOFOLLOW`` the kernel refuses it, and without that flag the opened inode
+    is compared with the inspected one (see :func:`open_no_follow`). A link or
     any non-regular entry raises :class:`OnboardingError` *before* any bytes are
     read. A missing path returns ``None``.
     """
@@ -1536,9 +1606,8 @@ def _read_regular_file(path, label: str) -> bytes | None:
         raise OnboardingError(f'{label} cannot be inspected: {exc}') from exc
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise OnboardingError(f'{label} is not a regular file; refusing to read it')
-    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0)
     try:
-        descriptor = os.open(path, flags)
+        descriptor = open_no_follow(path, os.O_RDONLY | _O_CLOEXEC, label=label)
     except OSError as exc:
         raise OnboardingError(f'{label} cannot be opened safely: {exc}') from exc
     chunks: list[bytes] = []
@@ -2179,9 +2248,8 @@ def _platform_capability_problems() -> list[str]:
     if os.name != 'posix':
         problems.append('POSIX dir_fd / O_NOFOLLOW primitives are unavailable on this platform')
         return problems
-    for flag in ('O_NOFOLLOW', 'O_DIRECTORY', 'O_CLOEXEC'):
-        if not hasattr(os, flag):
-            problems.append(f'os.{flag} is unavailable')
+    for flag in _MISSING_OPEN_FLAGS:
+        problems.append(f'os.{flag} is unavailable')
     for function, label in ((os.open, 'open'), (os.mkdir, 'mkdir'),
                              (os.unlink, 'unlink'), (os.rmdir, 'rmdir'),
                              (os.stat, 'stat'), (os.rename, 'rename'),
@@ -2207,7 +2275,7 @@ def _open_host_fd(host_root, expected_identity) -> int:
         raise TransactionConflict(f'host root cannot be inspected: {exc}') from exc
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise TransactionConflict('host root is not a regular directory')
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    flags = os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC
     try:
         fd = os.open(host, flags)
     except OSError as exc:
@@ -2248,7 +2316,7 @@ def _split_rel(rel: str) -> list[str]:
 
 
 def _open_dir_at(parent_fd: int, name: str) -> int:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    flags = os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC
     try:
         return os.open(name, flags, dir_fd=parent_fd)
     except OSError as exc:
@@ -2298,7 +2366,7 @@ def _read_file_at(root_fd: int, rel: str):
     fd = None
     try:
         try:
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            fd = os.open(name, os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC,
                          dir_fd=parent)
         except FileNotFoundError:
             return None, None
@@ -2327,8 +2395,8 @@ def _write_new_file(root_fd: int, rel: str, data: bytes, *, mode: int = 0o644,
     temp_identity = None
     failure = None
     try:
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-                     | os.O_CLOEXEC, mode, dir_fd=parent)
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW
+                     | _O_CLOEXEC, mode, dir_fd=parent)
         if record is not None:
             record['temp_creation_unverified'] = True
         created = os.fstat(fd)
@@ -2559,7 +2627,7 @@ def _append_file(root_fd: int, rel: str, original: bytes, expected: bytes) -> No
         raise TransactionConflict(f'{rel}: target disappeared before append')
     fd = None
     try:
-        fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+        fd = os.open(name, os.O_RDWR | _O_NOFOLLOW | _O_CLOEXEC, dir_fd=parent)
         info = os.fstat(fd)
         problems = _metadata_preservation_problems_for_stat(info, rel)
         if problems:
@@ -2628,7 +2696,7 @@ def _rewrite_file_in_place(root_fd: int, rel: str, original: bytes,
         raise TransactionConflict(f'{rel}: target disappeared before rewrite')
     fd = None
     try:
-        fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+        fd = os.open(name, os.O_RDWR | _O_NOFOLLOW | _O_CLOEXEC, dir_fd=parent)
         info = os.fstat(fd)
         problems = _metadata_preservation_problems_for_stat(info, rel)
         if problems:
@@ -2663,7 +2731,7 @@ def _restore_in_place_at(root_fd: int, rel: str, expected: bytes,
         raise TransactionConflict(f'{rel}: target disappeared during recovery')
     fd = None
     try:
-        fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+        fd = os.open(name, os.O_RDWR | _O_NOFOLLOW | _O_CLOEXEC, dir_fd=parent)
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise TransactionConflict(f'{rel}: target is not a regular file')
@@ -2694,8 +2762,8 @@ def _replace_file_at(root_fd: int, rel: str, expected: bytes, original: bytes) -
     temp = f'.agentorch-restore-{os.getpid()}-{secrets.token_hex(8)}'
     fd = None
     try:
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-                     | os.O_CLOEXEC, stat.S_IMODE(info.st_mode), dir_fd=parent)
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW
+                     | _O_CLOEXEC, stat.S_IMODE(info.st_mode), dir_fd=parent)
         _write_all(fd, original)
         os.fsync(fd)
         os.close(fd)
@@ -2720,7 +2788,7 @@ def _truncate_at(root_fd: int, rel: str, expected: bytes, length: int) -> None:
         raise TransactionConflict(f'{rel}: target disappeared during recovery')
     fd = None
     try:
-        fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+        fd = os.open(name, os.O_RDWR | _O_NOFOLLOW | _O_CLOEXEC, dir_fd=parent)
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise TransactionConflict(f'{rel}: target is not a regular file')
@@ -3243,8 +3311,8 @@ def _replace_file_at_for_write(root_fd: int, rel: str, data: bytes,
     temp = f'.agentorch-write-{os.getpid()}-{secrets.token_hex(8)}'
     fd = None
     try:
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-                     | os.O_CLOEXEC, stat.S_IMODE(info.st_mode), dir_fd=parent)
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW
+                     | _O_CLOEXEC, stat.S_IMODE(info.st_mode), dir_fd=parent)
         _write_all(fd, data)
         os.fsync(fd)
         os.close(fd)

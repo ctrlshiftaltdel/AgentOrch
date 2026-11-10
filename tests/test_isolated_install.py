@@ -175,6 +175,21 @@ def _descriptor_path(descriptor):
     return Path(os.fsdecode(path))
 
 
+def descriptor_path(descriptor):
+    """The path behind *descriptor*, trying procfs first and ``F_GETPATH`` next.
+
+    Both lookups are platform-dependent: Linux has procfs, macOS only has
+    ``F_GETPATH``, and Windows exposes neither. ``None`` means the descriptor
+    cannot be attributed; callers must not fall back to the cwd.
+    """
+    for base in ('/proc/self/fd', '/dev/fd'):
+        try:
+            return Path(os.readlink(f'{base}/{descriptor}'))
+        except OSError:
+            continue
+    return _descriptor_path(descriptor)
+
+
 class XattrUnavailable(RuntimeError):
     """This host platform cannot store an extended attribute right now.
 
@@ -315,12 +330,7 @@ def observe_path_reads():
         ``fcntl(F_GETPATH)``; an unattributable descriptor is never reported as
         a bare name, because resolving it against the cwd would invent a path.
         """
-        for base in ('/proc/self/fd', '/dev/fd'):
-            try:
-                return Path(os.readlink(f'{base}/{directory_fd}'))
-            except OSError:
-                continue
-        return _descriptor_path(directory_fd)
+        return descriptor_path(directory_fd)
 
     def tracked_open(path, *args, **kwargs):
         descriptor = original_open(path, *args, **kwargs)
@@ -837,11 +847,12 @@ class IsolatedInstallTest(unittest.TestCase):
         real_fstat = os.fstat
         observed = []
         def fstat(fd):
-            try:
-                name = os.readlink(f'/proc/self/fd/{fd}')
-            except OSError:
-                name = ''
-            if '.agentorch-write-' in name and Path(name).parent == host:
+            # ``/proc/self/fd`` does not exist on macOS; ``_descriptor_path``
+            # falls back to ``fcntl(F_GETPATH)`` there and returns ``None`` when
+            # the descriptor cannot be attributed at all.
+            name = descriptor_path(fd)
+            if (name is not None and '.agentorch-write-' in name.name
+                    and name.parent == host.resolve()):
                 observed.append(True)
                 raise OSError(errno.EIO, 'synthetic fstat failure')
             return real_fstat(fd)
@@ -1206,14 +1217,22 @@ else:
         cli = [sys.executable, '-I', '-B', str(script)]
         positive = subprocess.run(cli, cwd=self.tmp, capture_output=True, text=True)
         self.assertEqual(positive.returncode, 0, positive.stdout + positive.stderr)
+        # The validator derives its root from ``Path(__file__).resolve()``, so it
+        # enumerates the resolved path. On macOS ``/var`` is a symlink to
+        # ``/private/var`` and on Windows ``TMP`` may be an 8.3 short name, which
+        # makes the lexical path differ from the resolved one. Comparing
+        # ``realpath`` on both sides keeps the injection on the exact directory
+        # the validator scans instead of never firing and letting an earlier
+        # missing-document error stand in for the scan failure.
         injection = r'''
 import os, pathlib, runpy, sys
-script, target, number = sys.argv[1], pathlib.Path(sys.argv[2]), int(sys.argv[3])
+script, target, number = sys.argv[1], sys.argv[2], int(sys.argv[3])
 original = pathlib.Path.iterdir
+real = os.path.realpath
 def injected(path):
-    if path == target:
+    if real(str(path)) == real(target):
         print('INJECTION_REACHED', file=sys.stderr)
-        raise OSError(number, 'synthetic-secret-message', str(target))
+        raise OSError(number, 'synthetic-secret-message', target)
     return original(path)
 pathlib.Path.iterdir = injected
 sys.argv = [script]
@@ -1268,9 +1287,15 @@ runpy.run_path(script, run_name='__main__')
         readable = subprocess.run(cli, cwd=self.tmp, capture_output=True, text=True)
         self.assertNotEqual(readable.returncode, 0)
         self.assertIn('missing required document: docs/PROJECT.md', readable.stdout)
+        # See the edition-case comment above: compare resolved paths so the
+        # injection fires on the directory the validator really scans (macOS
+        # ``/var`` symlink, Windows 8.3 short names).
         wrapper = r'''
 import os,sys,runpy
-script,target,code,phase=sys.argv[1:]; original=os.scandir
+script,target,code,phase=sys.argv[1:]
+real=os.path.realpath
+target=real(target)
+original=os.scandir
 class Broken:
     def __init__(self, inner): self.inner=inner; self.count=0
     def __enter__(self): self.inner.__enter__(); return self
@@ -1283,7 +1308,7 @@ class Broken:
         self.count+=1
         return next(self.inner)
 def scan(path):
-    if str(path)==target:
+    if real(str(path))==target:
         if phase=='open':
             print('INJECTION_REACHED',file=sys.stderr)
             raise OSError(int(code),'synthetic-secret-message',target)
@@ -1343,12 +1368,17 @@ runpy.run_path(script,run_name='__main__')
         visible = subprocess.run(cli, cwd=self.tmp, capture_output=True, text=True)
         self.assertEqual(visible.returncode, 1, visible.stdout + visible.stderr)
         self.assertIn('broken relative link: missing-link.md', visible.stdout)
+        # Same resolved-path comparison as the other injection cases: the second
+        # enumeration must hit the exact directory the validator resolved.
         wrapper = r'''
 import os,sys,runpy,errno
-script,target=sys.argv[1:]; original=os.scandir; count=0
+script,target=sys.argv[1:]
+real=os.path.realpath
+target=real(target)
+original=os.scandir; count=0
 def scan(path):
     global count
-    if str(path)==target:
+    if real(str(path))==target:
         count+=1
         if count>=2:
             print('LATE_EIO',file=sys.stderr)
@@ -4808,6 +4838,100 @@ class IsolatedEntryCommandsTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertTrue((flat / '.orchestration' / 'state.sqlite3').is_file())
         self.assertFalse((flat / '.local' / 'orchestration').exists())
+
+
+class PortableNoFollowTest(unittest.TestCase):
+    """The no-``O_NOFOLLOW`` branch used by platforms without the flag.
+
+    Windows has no ``O_NOFOLLOW`` (and no ``dir_fd``). The portable opener must
+    still refuse a link, refuse an inode that changed between inspection and
+    open, and fail closed when no identity can be compared. Forcing the flag to
+    ``0`` exercises exactly that branch on every platform, so the behaviour is
+    proven here rather than only on a Windows runner.
+    """
+
+    def setUp(self):
+        from unittest.mock import patch
+        self.patch = patch
+        self.tmp_path = Path(tempfile.mkdtemp(prefix='agentorch-nofollow-'))
+        self.addCleanup(shutil.rmtree, self.tmp_path, True)
+        self.addCleanup(setattr, workspace, '_O_NOFOLLOW', workspace._O_NOFOLLOW)
+        workspace._O_NOFOLLOW = 0
+
+    def test_regular_file_opens_without_the_flag(self):
+        target = self.tmp_path / 'plain.txt'
+        target.write_bytes(b'plain-bytes')
+        descriptor = workspace.open_no_follow(
+            target, os.O_RDONLY, label='synthetic plain file')
+        try:
+            self.assertEqual(os.read(descriptor, 64), b'plain-bytes')
+        finally:
+            os.close(descriptor)
+
+    def test_symlink_is_refused_without_opening_it(self):
+        canary = self.tmp_path / 'canary.txt'
+        canary.write_bytes(b'secret')
+        link = self.tmp_path / 'link.txt'
+        link.symlink_to(canary)
+        with observe_path_reads() as reads:
+            with self.assertRaises(workspace.OnboardingError) as raised:
+                workspace.open_no_follow(link, os.O_RDONLY, label='synthetic link')
+        self.assertIn('symlink', str(raised.exception))
+        self.assertNotIn(canary.resolve(), [path.resolve() for path in reads])
+
+    def test_inode_swapped_between_inspection_and_open_is_refused(self):
+        target = self.tmp_path / 'target.txt'
+        target.write_bytes(b'original')
+        other = self.tmp_path / 'other.txt'
+        other.write_bytes(b'other')
+        swapped = os.stat(other)
+        with self.patch.object(workspace.os, 'lstat', return_value=swapped):
+            with self.assertRaises(workspace.OnboardingError) as raised:
+                workspace.open_no_follow(target, os.O_RDONLY, label='synthetic swap')
+        self.assertIn('changed', str(raised.exception))
+
+    def test_unverifiable_identity_fails_closed_before_opening(self):
+        target = self.tmp_path / 'target.txt'
+        target.write_bytes(b'original')
+        real = os.lstat(target)
+        unverifiable = os.stat_result((
+            real.st_mode, 0, real.st_dev, real.st_nlink, real.st_uid,
+            real.st_gid, real.st_size, real.st_atime, real.st_mtime, real.st_ctime))
+        with self.patch.object(workspace.os, 'lstat', return_value=unverifiable):
+            with self.patch.object(workspace.os, 'open', wraps=os.open) as opened:
+                with self.assertRaises(workspace.OnboardingError) as raised:
+                    workspace.open_no_follow(target, os.O_RDONLY, label='synthetic opaque')
+        self.assertIn('identity', str(raised.exception))
+        self.assertEqual(opened.call_count, 0)
+
+    def test_identity_unavailable_after_open_fails_closed(self):
+        target = self.tmp_path / 'target.txt'
+        target.write_bytes(b'original')
+        real = os.lstat(target)
+        unverifiable = os.stat_result((
+            real.st_mode, 0, real.st_dev, real.st_nlink, real.st_uid,
+            real.st_gid, real.st_size, real.st_atime, real.st_mtime, real.st_ctime))
+        with self.patch.object(workspace.os, 'fstat', return_value=unverifiable):
+            with self.assertRaises(workspace.OnboardingError) as raised:
+                workspace.open_no_follow(target, os.O_RDONLY, label='synthetic opaque')
+        self.assertIn('identity', str(raised.exception))
+
+    def test_planning_root_refuses_a_platform_without_the_flags(self):
+        """A platform without ``O_DIRECTORY``/``O_NOFOLLOW`` must stop the read.
+
+        On Windows the flags do not exist at all; planning used to raise
+        ``AttributeError`` from the open call. The refusal has to be an
+        ``OnboardingError`` that callers already turn into a reported problem,
+        and it must name the missing primitives instead of leaking a traceback.
+        """
+        with self.patch.object(workspace, '_MISSING_OPEN_FLAGS',
+                               ('O_NOFOLLOW', 'O_DIRECTORY')):
+            with self.assertRaises(workspace.OnboardingError) as raised:
+                workspace._open_planning_root_fd(self.tmp_path)
+        message = str(raised.exception)
+        self.assertIn('cannot be inspected safely', message)
+        self.assertIn('O_NOFOLLOW', message)
+        self.assertIn('O_DIRECTORY', message)
 
 
 if __name__ == '__main__':
