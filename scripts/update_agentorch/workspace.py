@@ -2382,17 +2382,88 @@ def _write_new_file(root_fd: int, rel: str, data: bytes, *, mode: int = 0o644,
 # the metadata state is unknown, so the caller must fail closed.
 _XATTR_UNSUPPORTED = frozenset({errno.ENOTSUP, getattr(errno, 'EOPNOTSUPP', errno.ENOTSUP)})
 
+# ``listxattr``/``flistxattr`` take a fourth ``options`` argument on macOS; this
+# one refuses to follow a symlink, so a path swapped after the lstat check is
+# reported as an error instead of enumerating the link target.
+_XATTR_NOFOLLOW = 0x0001
+_LIBC = None
+
+
+def _libc():
+    """The libc handle used only when the stdlib does not bind xattr calls."""
+    global _LIBC
+    if _LIBC is None:
+        import ctypes
+        try:
+            _LIBC = ctypes.CDLL(None, use_errno=True)
+        except OSError as exc:
+            raise TransactionConflict(
+                'extended attributes cannot be enumerated on this platform') from exc
+    return _LIBC
+
+
+def _libc_listxattr(path=None, *, fd: int | None = None) -> list[str]:
+    """Enumerate xattrs through the platform libc symbol.
+
+    Only used where ``os.listxattr`` is missing (macOS). The descriptor form uses
+    ``flistxattr`` so no ``/proc`` mount or magic symlink is needed; the path
+    form uses ``listxattr`` with ``XATTR_NOFOLLOW``. A missing symbol or a failed
+    call raises, so the caller keeps failing closed: only a completed call that
+    reports no names - or a filesystem that answers that it cannot store xattrs -
+    proves there is nothing to preserve.
+    """
+    import ctypes
+
+    libc = _libc()
+    if fd is not None:
+        symbol = 'flistxattr'
+        argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char),
+                    ctypes.c_size_t, ctypes.c_int]
+    else:
+        symbol = 'listxattr'
+        argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_char),
+                    ctypes.c_size_t, ctypes.c_int]
+    function = getattr(libc, symbol, None)
+    if function is None:
+        raise TransactionConflict(
+            'extended attributes cannot be enumerated on this platform')
+    function.argtypes = argtypes
+    function.restype = ctypes.c_ssize_t
+
+    def call(buffer, size):
+        if fd is not None:
+            return function(fd, buffer, size, 0)
+        return function(os.fsencode(path), buffer, size, _XATTR_NOFOLLOW)
+
+    def checked(size, *, allow_unsupported=False):
+        if size >= 0:
+            return size
+        code = ctypes.get_errno()
+        if allow_unsupported and code in _XATTR_UNSUPPORTED:
+            return None
+        raise TransactionConflict(
+            f'extended attributes cannot be inspected: {os.strerror(code)}')
+
+    size = checked(call(None, 0), allow_unsupported=True)
+    if not size:
+        return []
+    buffer = ctypes.create_string_buffer(size)
+    written = checked(call(buffer, size))
+    return sorted(os.fsdecode(name) for name in buffer.raw[:written].split(b'\x00') if name)
+
 
 def _xattr_names(path=None, *, fd: int | None = None) -> list[str]:
     """Return the extended-attribute names on *path* or an open *fd*.
 
     ``os.listxattr`` accepts an open descriptor directly, so no ``/proc`` mount
-    or magic symlink is required. When the platform cannot enumerate attributes
-    for a descriptor the metadata state is unproven and this raises; a
-    filesystem that reports xattrs as unsupported simply has none to preserve.
+    or magic symlink is required. Where the stdlib does not bind the xattr calls
+    (macOS), the same libc symbol is reached through ``ctypes``. When neither
+    route can enumerate attributes the metadata state is unproven and this
+    raises; a filesystem that reports xattrs as unsupported simply has none to
+    preserve.
     """
     if not hasattr(os, 'listxattr'):
-        raise TransactionConflict('extended attributes cannot be enumerated on this platform')
+        return _libc_listxattr(path, fd=fd)
     target = fd if fd is not None else path
     try:
         return sorted(os.listxattr(target))

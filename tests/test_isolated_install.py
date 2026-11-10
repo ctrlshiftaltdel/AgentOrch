@@ -8,6 +8,8 @@ project, the real ``.local`` directory or the network.
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -146,6 +148,136 @@ def verified_package(source: Path):
     return result
 
 
+def _descriptor_path(descriptor):
+    """The real path behind an open descriptor, or ``None``.
+
+    ``/proc/self/fd`` is the cheapest route where procfs exists. macOS has no
+    procfs, but ``fcntl(F_GETPATH)`` fills a buffer with the path the kernel
+    holds for the descriptor. ``None`` means the access cannot be attributed,
+    which the callers treat as a bare relative name.
+    """
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - non-POSIX hosts
+        return None
+    getpath = getattr(fcntl, 'F_GETPATH', None)
+    if getpath is None:
+        return None
+    try:
+        raw = fcntl.fcntl(descriptor, getpath, b'\x00' * 1024)
+    except OSError:
+        return None
+    if not isinstance(raw, (bytes, bytearray)):
+        return None
+    path = bytes(raw).split(b'\x00', 1)[0]
+    if not path:
+        return None
+    return Path(os.fsdecode(path))
+
+
+class XattrUnavailable(RuntimeError):
+    """This host platform cannot store an extended attribute right now.
+
+    Raised instead of letting an ``AttributeError`` escape or silently
+    continuing on an attribute that was never set. A negative test that needs a
+    real attribute reports NOT_RUN when this is raised.
+    """
+
+
+def _libc_xattr(name):
+    """The libc xattr entry point, or ``None`` when it is not exposed."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        return None
+    return getattr(libc, name, None)
+
+
+def set_xattr(path, name, value):
+    """Store a user extended attribute with the API this platform exposes.
+
+    ``os.setxattr`` is Linux-only; macOS exposes ``setxattr`` through libc with
+    a four-argument tail (``position`` and ``options``). Anything that stops the
+    attribute from being stored raises :class:`XattrUnavailable` so a test can
+    report NOT_RUN rather than pretend the attribute exists.
+    """
+    if hasattr(os, 'setxattr'):
+        try:
+            os.setxattr(path, name, value)
+        except OSError as exc:
+            raise XattrUnavailable(f'os.setxattr failed: {exc}') from exc
+        return
+    function = _libc_xattr('setxattr')
+    if function is None:
+        raise XattrUnavailable('this platform exposes no setxattr')
+    function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char),
+                         ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+    function.restype = ctypes.c_int
+    payload = ctypes.create_string_buffer(bytes(value), len(value)) if value else None
+    status = function(os.fsencode(path), os.fsencode(name), payload, len(value), 0, 0)
+    if status != 0:
+        raise XattrUnavailable(f'setxattr failed: {os.strerror(ctypes.get_errno())}')
+
+
+def get_xattr(path, name):
+    """Read back a user extended attribute with the API this platform exposes."""
+    if hasattr(os, 'getxattr'):
+        try:
+            return os.getxattr(path, name)
+        except OSError as exc:
+            raise XattrUnavailable(f'os.getxattr failed: {exc}') from exc
+    function = _libc_xattr('getxattr')
+    if function is None:
+        raise XattrUnavailable('this platform exposes no getxattr')
+    function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char),
+                         ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+    function.restype = ctypes.c_ssize_t
+    encoded_path, encoded_name = os.fsencode(path), os.fsencode(name)
+    size = function(encoded_path, encoded_name, None, 0, 0, 0)
+    if size < 0:
+        raise XattrUnavailable(f'getxattr failed: {os.strerror(ctypes.get_errno())}')
+    buffer = ctypes.create_string_buffer(size)
+    written = function(encoded_path, encoded_name, buffer, size, 0, 0)
+    if written < 0:
+        raise XattrUnavailable(f'getxattr failed: {os.strerror(ctypes.get_errno())}')
+    return buffer.raw[:written]
+
+
+def require_xattr(case, target, value, name='user.review'):
+    """Store one real extended attribute or report NOT_RUN.
+
+    A negative case is only meaningful when the attribute actually exists on the
+    target. A platform that cannot store one is reported as NOT_RUN with the
+    reason; it never becomes a passing test on an unset attribute and never
+    raises ``AttributeError``.
+    """
+    try:
+        set_xattr(target, name, value)
+    except XattrUnavailable as exc:
+        case.skipTest(f'NOT_RUN: this platform cannot set extended attributes on '
+                      f'the target: {exc}')
+    try:
+        stored = get_xattr(target, name)
+    except XattrUnavailable as exc:
+        case.skipTest(f'NOT_RUN: the extended attribute could not be read back to '
+                      f'prove it was set: {exc}')
+    case.assertEqual(stored, value, 'the extended attribute was not actually stored')
+
+
+@contextlib.contextmanager
+def without_stdlib_listxattr():
+    """Hide ``os.listxattr`` so the platform fallback is the only route left."""
+    had = hasattr(os, 'listxattr')
+    original = os.listxattr if had else None
+    if had:
+        del os.listxattr
+    try:
+        yield
+    finally:
+        if had:
+            os.listxattr = original
+
+
 @contextlib.contextmanager
 def observe_path_reads():
     """Record every ``Path`` read and every successful raw ``os.open`` in the block.
@@ -177,13 +309,16 @@ def observe_path_reads():
         ``os.readlink`` on the descriptor's proc entry is how the kernel reports
         the path behind the descriptor; a relative open plus ``dir_fd`` must be
         attributed to that directory or an external canary stays invisible.
+        Without procfs (macOS) the descriptor's own path is read from
+        ``fcntl(F_GETPATH)``; an unattributable descriptor is never reported as
+        a bare name, because resolving it against the cwd would invent a path.
         """
         for base in ('/proc/self/fd', '/dev/fd'):
             try:
                 return Path(os.readlink(f'{base}/{directory_fd}'))
             except OSError:
                 continue
-        return None
+        return _descriptor_path(directory_fd)
 
     def tracked_open(path, *args, **kwargs):
         descriptor = original_open(path, *args, **kwargs)
@@ -195,6 +330,10 @@ def observe_path_reads():
                 directory = directory_fd_path(directory_fd)
                 if directory is not None:
                     recorded = directory / decoded
+                else:
+                    # Keep an unattributable descriptor out of the cwd: resolving
+                    # a bare name would invent a path that was never opened.
+                    recorded = Path('<unattributed dir_fd>') / decoded
             if recorded is None:
                 recorded = Path(decoded)
             reads.append(recorded)
@@ -1385,6 +1524,10 @@ runpy.run_path(script,run_name='__main__')
                          SOURCE_FILES['LICENSE.md'].encode())
         self.assertTrue((host / 'AGENTS.md').read_bytes().startswith(original))
 
+    def _require_review_xattr(self, target, value):
+        """Store a real ``user.review`` xattr or report NOT_RUN."""
+        require_xattr(self, target, value)
+
     def _assert_xattr_install_blocked(self, result, host, target, original, info,
                                       snapshot, xattr_value):
         self.assertEqual(result['status'], 'BLOCKED', result)
@@ -1397,7 +1540,7 @@ runpy.run_path(script,run_name='__main__')
         self.assertEqual((after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_gid),
                          (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid))
         self.assertEqual(after.st_mtime_ns, info.st_mtime_ns)
-        self.assertEqual(os.getxattr(target, 'user.review'), xattr_value)
+        self.assertEqual(get_xattr(target, 'user.review'), xattr_value)
 
     def test_review_e2e_install_with_xattr_fails_closed(self):
         from unittest.mock import patch
@@ -1406,7 +1549,7 @@ runpy.run_path(script,run_name='__main__')
         release, payload = self._review_release_transport()
         target = host / 'AGENTS.md'
         target.chmod(0o640)
-        os.setxattr(target, 'user.review', b'preserve-me')
+        self._require_review_xattr(target, b'preserve-me')
         original = target.read_bytes()
         info = target.stat()
         before = raw_snapshot(host, skip_names=('.git',))
@@ -1430,7 +1573,7 @@ runpy.run_path(script,run_name='__main__')
         release, payload = self._review_release_transport()
         target = host / 'AGENTS.md'
         target.chmod(0o640)
-        os.setxattr(target, 'user.review', b'metadata')
+        self._require_review_xattr(target, b'metadata')
         original = target.read_bytes()
         info = target.stat()
         before = raw_snapshot(host, skip_names=('.git',))
@@ -1448,7 +1591,7 @@ runpy.run_path(script,run_name='__main__')
         release, payload = self._review_release_transport()
         target = host / 'AGENTS.md'
         target.chmod(0o640)
-        os.setxattr(target, 'user.review', b'metadata')
+        self._require_review_xattr(target, b'metadata')
         original = target.read_bytes()
         info = target.stat()
         before = raw_snapshot(host, skip_names=('.git',))
@@ -1474,7 +1617,7 @@ runpy.run_path(script,run_name='__main__')
         target = host / 'AGENTS.md'
         original = target.read_bytes()
         target.chmod(0o640)
-        os.setxattr(target, 'user.review', b'preserve-me')
+        self._require_review_xattr(target, b'preserve-me')
         info = target.stat()
         before = raw_snapshot(host, skip_names=('.git',))
         old_umask = os.umask(0o077)
@@ -1495,7 +1638,7 @@ runpy.run_path(script,run_name='__main__')
         release, payload = self._review_release_transport()
         target = host / 'AGENTS.md'
         target.chmod(0o640)
-        os.setxattr(target, 'user.review', b'preserve-me')
+        self._require_review_xattr(target, b'preserve-me')
         original = target.read_bytes()
         info = target.stat()
         with patch.object(sources.GitHubReleaseSource, 'fetch_release', return_value=release), \
@@ -1509,13 +1652,13 @@ runpy.run_path(script,run_name='__main__')
         self.assertEqual((target.stat().st_uid, target.stat().st_gid), (info.st_uid, info.st_gid))
         self.assertEqual((target.stat().st_ino, target.stat().st_mtime_ns),
                          (info.st_ino, info.st_mtime_ns))
-        self.assertEqual(os.getxattr(target, 'user.review'), b'preserve-me')
+        self.assertEqual(get_xattr(target, 'user.review'), b'preserve-me')
 
     def test_review_metadata_low_level_replacement_fails_closed(self):
         target = self.host / 'AGENTS.md'
         original = target.read_bytes()
         target.chmod(0o640)
-        os.setxattr(target, 'user.review', b'preserve-me')
+        self._require_review_xattr(target, b'preserve-me')
         root_fd = os.open(self.host, os.O_RDONLY | os.O_DIRECTORY)
         try:
             with self.assertRaises(workspace.TransactionConflict):
@@ -1526,7 +1669,7 @@ runpy.run_path(script,run_name='__main__')
             os.close(root_fd)
         self.assertEqual(target.read_bytes(), original)
         self.assertEqual(target.stat().st_mode & 0o7777, 0o640)
-        self.assertEqual(os.getxattr(target, 'user.review'), b'preserve-me')
+        self.assertEqual(get_xattr(target, 'user.review'), b'preserve-me')
 
     def test_review_e2e_concurrent_equal_file_survives(self):
         from unittest.mock import patch
@@ -4380,6 +4523,96 @@ with patch.object(sources.GitHubReleaseSource, "fetch_release", return_value=rel
             self.assertEqual(scope.agentorch_root(), ROOT.resolve())
         finally:
             os.chdir(cwd)
+
+
+class PlatformXattrFallbackTest(unittest.TestCase):
+    """The libc xattr enumeration used where the stdlib does not bind it.
+
+    ``os.listxattr`` does not exist on macOS, so the workspace reaches the same
+    libc symbol through ``ctypes``. These cases run that path on any POSIX host
+    and prove it reports a real attribute instead of answering "no xattrs", and
+    that a failing call still refuses to write.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='agentorch-xattr-fallback-'))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.target = self.tmp / 'AGENTS.md'
+        self.target.write_bytes(b'host rules\n')
+
+    def test_plain_file_reports_no_attributes(self):
+        self.assertEqual(workspace._libc_listxattr(self.target), [])
+
+    def test_existing_attribute_is_reported_not_ignored(self):
+        require_xattr(self, self.target, b'preserve-me')
+        self.assertIn('user.review', workspace._libc_listxattr(self.target))
+        descriptor = os.open(self.target, os.O_RDONLY)
+        try:
+            self.assertIn('user.review', workspace._libc_listxattr(fd=descriptor))
+        finally:
+            os.close(descriptor)
+
+    def test_failing_libc_call_fails_closed(self):
+        class Failing:
+            @staticmethod
+            def listxattr(*args):
+                ctypes.set_errno(errno.EIO)
+                return -1
+
+            @staticmethod
+            def flistxattr(*args):
+                ctypes.set_errno(errno.EIO)
+                return -1
+        from unittest.mock import patch
+        descriptor = os.open(self.target, os.O_RDONLY)
+        try:
+            with patch.object(workspace, '_libc', return_value=Failing()):
+                with self.assertRaises(workspace.TransactionConflict):
+                    workspace._libc_listxattr(self.target)
+                with self.assertRaises(workspace.TransactionConflict):
+                    workspace._libc_listxattr(fd=descriptor)
+        finally:
+            os.close(descriptor)
+
+    def test_missing_libc_symbol_fails_closed(self):
+        class NoSymbols:
+            pass
+        from unittest.mock import patch
+        with without_stdlib_listxattr(), \
+             patch.object(workspace, '_libc', return_value=NoSymbols()):
+            with self.assertRaises(workspace.TransactionConflict):
+                workspace._xattr_names(self.target)
+
+    def test_filesystem_that_cannot_store_attributes_has_none_to_preserve(self):
+        class Unsupported:
+            @staticmethod
+            def listxattr(*args):
+                ctypes.set_errno(errno.ENOTSUP)
+                return -1
+
+            @staticmethod
+            def flistxattr(*args):
+                ctypes.set_errno(errno.ENOTSUP)
+                return -1
+        from unittest.mock import patch
+        with patch.object(workspace, '_libc', return_value=Unsupported()):
+            self.assertEqual(workspace._libc_listxattr(self.target), [])
+
+    def test_platform_without_stdlib_listxattr_blocks_an_append_with_xattr(self):
+        """The fallback must still see the attribute before any write happens."""
+        require_xattr(self, self.target, b'preserve-me')
+        original = self.target.read_bytes()
+        root_fd = os.open(self.tmp, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with without_stdlib_listxattr():
+                self.assertIn('user.review', workspace._xattr_names(self.target))
+                with self.assertRaises(workspace.TransactionConflict):
+                    workspace._append_file(root_fd, 'AGENTS.md', original,
+                                           original + b'more\n')
+        finally:
+            os.close(root_fd)
+        self.assertEqual(self.target.read_bytes(), original)
+        self.assertEqual(get_xattr(self.target, 'user.review'), b'preserve-me')
 
 
 class IsolatedEntryCommandsTest(unittest.TestCase):
