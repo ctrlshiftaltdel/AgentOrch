@@ -471,7 +471,7 @@ def _file_identity(info) -> tuple[int, int] | None:
     return device, inode
 
 
-def open_no_follow(path, flags: int, *, label: str, mode: int | None = None) -> int:
+def open_no_follow(path, flags: int, *, label: str) -> int:
     """Open *path* without following a symlink that appears at open time.
 
     Where ``O_NOFOLLOW`` exists the kernel refuses a link as part of the open.
@@ -481,9 +481,8 @@ def open_no_follow(path, flags: int, *, label: str, mode: int | None = None) -> 
     closed: following a link that cannot be ruled out is exactly the behaviour
     this helper exists to prevent.
     """
-    suffix = () if mode is None else (mode,)
     if _O_NOFOLLOW:
-        return os.open(path, flags | _O_NOFOLLOW | _O_CLOEXEC, *suffix)
+        return os.open(path, flags | _O_NOFOLLOW | _O_CLOEXEC)
     try:
         before = os.lstat(path)
     except OSError as exc:
@@ -494,7 +493,7 @@ def open_no_follow(path, flags: int, *, label: str, mode: int | None = None) -> 
     if expected is None:
         raise OnboardingError(
             f'{label} has no verifiable identity on this platform; refusing to open it')
-    descriptor = os.open(path, flags, *suffix)
+    descriptor = os.open(path, flags)
     try:
         opened = _file_identity(os.fstat(descriptor))
         if opened is None:
