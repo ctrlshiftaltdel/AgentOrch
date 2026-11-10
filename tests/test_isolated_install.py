@@ -188,7 +188,9 @@ def _libc_xattr(name):
     """The libc xattr entry point, or ``None`` when it is not exposed."""
     try:
         libc = ctypes.CDLL(None, use_errno=True)
-    except OSError:
+    except (OSError, TypeError):
+        # Windows raises TypeError for CDLL(None); either way there is no libc
+        # symbol to call, which the caller reports as NOT_RUN.
         return None
     return getattr(libc, name, None)
 
@@ -4540,10 +4542,24 @@ class PlatformXattrFallbackTest(unittest.TestCase):
         self.target = self.tmp / 'AGENTS.md'
         self.target.write_bytes(b'host rules\n')
 
+    def _require_platform_listxattr(self):
+        """Report NOT_RUN where the host exposes no xattr enumeration at all.
+
+        Windows has neither ``os.listxattr`` nor a libc symbol; nothing can be
+        enumerated there, so a case that needs the real platform route cannot
+        assert anything meaningful.
+        """
+        if hasattr(os, 'listxattr') or _libc_xattr('listxattr') is not None:
+            return
+        self.skipTest('NOT_RUN: neither os.listxattr nor a libc listxattr symbol '
+                      'exists on this platform')
+
     def test_plain_file_reports_no_attributes(self):
+        self._require_platform_listxattr()
         self.assertEqual(workspace._libc_listxattr(self.target), [])
 
     def test_existing_attribute_is_reported_not_ignored(self):
+        self._require_platform_listxattr()
         require_xattr(self, self.target, b'preserve-me')
         self.assertIn('user.review', workspace._libc_listxattr(self.target))
         descriptor = os.open(self.target, os.O_RDONLY)

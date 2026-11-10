@@ -2396,7 +2396,9 @@ def _libc():
         import ctypes
         try:
             _LIBC = ctypes.CDLL(None, use_errno=True)
-        except OSError as exc:
+        except (OSError, TypeError) as exc:
+            # Windows raises TypeError for ``CDLL(None)``; there is no libc
+            # xattr symbol to reach, so the metadata state stays unproven.
             raise TransactionConflict(
                 'extended attributes cannot be enumerated on this platform') from exc
     return _LIBC
