@@ -36,6 +36,8 @@ python scripts/orchestrator.py task workspace <ID> --branch task/<ID>-<name> --w
 python scripts/orchestrator.py task status <ID> REVIEW_READY --head-sha <sha> --note "实现已交回"
 ```
 
+隔离布局（套件位于 `<host>/agentorch/`）下，任务库在 `agentorch/.local/orchestration/`；从宿主根运行以上命令时改用 `python agentorch/scripts/orchestrator.py --layout isolated <command>`。不带 `--layout isolated` 的裸调用会被拒绝；平铺布局保持原命令。
+
 交付报告：
 
 ```text

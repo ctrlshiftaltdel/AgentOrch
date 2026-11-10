@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Static validation for the Agent-Orchestration kit (core + local/github editions)."""
 from pathlib import Path
-import argparse, importlib.util, json, re, sys
+import argparse, hashlib, importlib.util, json, os, re, runpy, sys
 
 ROOT = Path(__file__).resolve().parents[1]
 # Release package manifest. It exists only in a built package (the repository
@@ -112,6 +112,25 @@ REQUIRED = [
     'tests/update_agentorch/test_package.py',
     'tests/update_agentorch/test_versions_and_sources.py',
 ]
+
+# --- Isolated layout ---------------------------------------------------------
+# An existing project keeps its own files and hosts AgentOrch under
+# ``<host>/agentorch/``. The kit root therefore has no AGENTS.md; the one root
+# entry lives at ``<host>/AGENTS.md`` and carries a single managed block.
+ISOLATED_DIRNAME = 'agentorch'
+ISOLATED_MANAGED_FILE = 'AGENTS.md'
+ISOLATED_EXTRA_FILE = '.gitignore'
+ISOLATED_REQUIRED = [rel for rel in REQUIRED if rel != ISOLATED_MANAGED_FILE]
+ISOLATED_MANIFEST_PATHS = set(ISOLATED_REQUIRED) | {ISOLATED_EXTRA_FILE}
+ISOLATED_PRIVATE_DIRS = frozenset({
+    '.orchestration', '.local', '.worktrees', '.workbuddy', '__pycache__', '.pytest_cache',
+    '.mypy_cache', '.ruff_cache', '.git',
+})
+MANAGED_BEGIN_RE = re.compile(r'^<!-- AGENTORCH:BEGIN(?: v(?P<version>[^ ]+))? -->$')
+MANAGED_END_LINE = '<!-- AGENTORCH:END -->'
+MANAGED_HASH_RE = re.compile(
+    r'^<!-- agentorch:managed-body-sha256: (?P<sha>[0-9a-f]{64}) -->$')
+MANAGED_BODY_HEADING = '# AgentOrch 推进引擎（受管区块）'
 
 # --- Repository-only required documents --------------------------------------
 # These files are required in a checkout but must NOT be added to REQUIRED:
@@ -484,7 +503,201 @@ def audit_conclusion_errors(text, label='milestone audit'):
     return errors
 
 
-def tree_mode(root=ROOT):
+def is_isolated_layout(root=ROOT):
+    """True only when *root* looks like ``<host>/agentorch/`` with a host entry.
+
+    The directory name alone is never enough: the host root must carry a regular
+    ``AGENTS.md`` and the kit must carry both VERSION.md and MANIFEST.json.
+    """
+    root = Path(root)
+    if root.name != ISOLATED_DIRNAME:
+        return False
+    host = root.parent
+    agents = host / ISOLATED_MANAGED_FILE
+    return (agents.is_file() and not agents.is_symlink()
+            and (root / 'VERSION.md').is_file()
+            and (root / 'MANIFEST.json').is_file())
+
+
+def _managed_block_errors(agents_path, expected_version):
+    path = Path(agents_path)
+    if path.is_symlink() or not path.is_file():
+        return [f'host root {ISOLATED_MANAGED_FILE} is not a regular file']
+    try:
+        text = path.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError) as exc:
+        return [f'host root {ISOLATED_MANAGED_FILE} is not readable UTF-8: {exc}']
+    lines = text.split('\n')
+    begins, ends, hashes = [], [], []
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        begin = MANAGED_BEGIN_RE.match(stripped)
+        if begin:
+            begins.append((index, begin.group('version')))
+        elif stripped == MANAGED_END_LINE:
+            ends.append(index)
+        else:
+            digest = MANAGED_HASH_RE.match(stripped)
+            if digest:
+                hashes.append((index, digest.group('sha')))
+    errors = []
+    if len(begins) != 1:
+        errors.append(f'host root {ISOLATED_MANAGED_FILE} must contain exactly one '
+                      f'AgentOrch BEGIN marker, found {len(begins)}')
+    if len(ends) != 1:
+        errors.append(f'host root {ISOLATED_MANAGED_FILE} must contain exactly one '
+                      f'AgentOrch END marker, found {len(ends)}')
+    if errors:
+        return errors
+    begin_index, version = begins[0]
+    end_index = ends[0]
+    if end_index <= begin_index:
+        return [f'host root {ISOLATED_MANAGED_FILE} END marker is not after BEGIN']
+    inner = [(index, sha) for index, sha in hashes if begin_index < index < end_index]
+    if len(inner) != 1:
+        return [f'host root {ISOLATED_MANAGED_FILE} managed block must carry exactly '
+                f'one body hash, found {len(inner)}']
+    hash_index, recorded = inner[0]
+    if hash_index + 1 != end_index:
+        return [f'host root {ISOLATED_MANAGED_FILE} has content between the body hash '
+                f'and the END marker']
+    body_lines = lines[begin_index + 1:hash_index]
+    if not body_lines or body_lines[0].strip() != MANAGED_BODY_HEADING:
+        return [f'host root {ISOLATED_MANAGED_FILE} managed block is not the canonical '
+                f'AgentOrch block']
+    body = '\n'.join(body_lines) + '\n'
+    digest = hashlib.sha256(body.encode('utf-8')).hexdigest()
+    if digest != recorded:
+        errors.append(f'host root {ISOLATED_MANAGED_FILE} managed block body hash '
+                      f'does not match its bytes')
+    try:
+        workspace_path = Path(__file__).resolve().parent / 'update_agentorch' / 'workspace.py'
+        workspace = runpy.run_path(str(workspace_path), run_name='_validator_workspace')
+        canonical = workspace['managed_block'](version or '')
+        canonical_body = '\n'.join(canonical.split('\n')[1:-3]) + '\n'
+        if not version or body != canonical_body:
+            errors.append(f'host root {ISOLATED_MANAGED_FILE} managed block body is not canonical')
+    except Exception as exc:  # noqa: BLE001 - unavailable canonical source fails closed
+        errors.append(f'host root {ISOLATED_MANAGED_FILE} canonical block unavailable: {exc}')
+    if not version or version != expected_version:
+        errors.append(f'host root {ISOLATED_MANAGED_FILE} block version '
+                      f'{version!r} does not match VERSION.md format {expected_version!r}')
+    return errors
+
+
+def isolated_layout_errors(root=ROOT):
+    """Structural checks for ``<host>/agentorch/``; no independent release anchor."""
+    root = Path(root)
+    host = root.parent
+    errors = []
+    if (root / ISOLATED_MANAGED_FILE).exists() or (root / ISOLATED_MANAGED_FILE).is_symlink():
+        errors.append(f'{ISOLATED_DIRNAME}/{ISOLATED_MANAGED_FILE} must not exist in '
+                      f'the isolated layout')
+    drift = _drift_module()
+    if drift is None:
+        return errors + [f'{ISOLATED_DIRNAME} layout needs scripts/check_drift.py']
+    try:
+        suite, version = drift.read_version(root)
+    except Exception as exc:  # noqa: BLE001 - drift raises its own error type
+        return errors + [f'{ISOLATED_DIRNAME}/VERSION.md is unreadable: {exc}']
+    errors.extend(_managed_block_errors(host / ISOLATED_MANAGED_FILE, version))
+
+    manifest_path = root / 'MANIFEST.json'
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        return errors + [f'{ISOLATED_DIRNAME}/MANIFEST.json is unreadable: {exc}']
+    structure = drift.manifest_structure_errors(manifest)
+    if structure:
+        return errors + [f'{ISOLATED_DIRNAME}/MANIFEST.json: {reason}'
+                         for reason in structure]
+    if manifest.get('suite') != suite:
+        errors.append(f'{ISOLATED_DIRNAME}/MANIFEST.json suite does not match VERSION.md')
+    if manifest.get('format_version') != version:
+        errors.append(f'{ISOLATED_DIRNAME}/MANIFEST.json format_version does not match '
+                      f'VERSION.md')
+    listed = set(_listed_manifest_paths(manifest))
+    for rel in sorted(ISOLATED_MANIFEST_PATHS - listed):
+        errors.append(f'{ISOLATED_DIRNAME}/MANIFEST.json does not list required file: {rel}')
+    for rel in sorted(listed - ISOLATED_MANIFEST_PATHS):
+        errors.append(f'{ISOLATED_DIRNAME}/MANIFEST.json lists a file that is not in '
+                      f'the isolated required set: {rel}')
+    errors.extend(f'{ISOLATED_DIRNAME}/MANIFEST.json: {reason}'
+                  for reason in drift.verify_manifest_files(root, manifest))
+
+    expected_dirs = set()
+    for rel in ISOLATED_MANIFEST_PATHS:
+        parts = rel.split('/')[:-1]
+        for index in range(1, len(parts) + 1):
+            expected_dirs.add('/'.join(parts[:index]))
+
+    def walk_error(exc):
+        # Do not include exception text or arbitrary host paths in diagnostics.
+        try:
+            rel = Path(exc.filename).relative_to(root).as_posix()
+        except (TypeError, ValueError):
+            rel = '<unknown>'
+        if rel != '.' and rel not in expected_dirs:
+            rel = '<unknown>'
+        code = exc.errno if isinstance(exc.errno, int) else 'unknown'
+        errors.append(f'cannot enumerate {ISOLATED_DIRNAME}/{rel} (errno {code})')
+
+    for directory, dirnames, filenames in os.walk(root, onerror=walk_error):
+        current = Path(directory)
+        rel_dir = current.relative_to(root).as_posix()
+        keep = []
+        for name in dirnames:
+            rel = name if rel_dir == '.' else f'{rel_dir}/{name}'
+            path = current / name
+            if path.is_symlink():
+                errors.append(f'symlinked directory inside {ISOLATED_DIRNAME}/: {rel}')
+                continue
+            if name in ISOLATED_PRIVATE_DIRS:
+                continue
+            if rel not in expected_dirs:
+                errors.append(f'unknown directory inside {ISOLATED_DIRNAME}/: {rel}')
+            keep.append(name)
+        dirnames[:] = keep
+        for name in filenames:
+            rel = name if rel_dir == '.' else f'{rel_dir}/{name}'
+            path = current / name
+            if path.is_symlink():
+                errors.append(f'symlink inside {ISOLATED_DIRNAME}/: {rel}')
+                continue
+            if rel == 'MANIFEST.json':
+                continue
+            if rel not in ISOLATED_MANIFEST_PATHS:
+                errors.append(f'unknown file inside {ISOLATED_DIRNAME}/: {rel}')
+    return errors
+
+
+def _scan_files(root, start, errors, excluded=()):
+    """Enumerate files without silently treating a failed scan as an empty tree."""
+    root, start = Path(root), Path(start)
+    known_dirs = {'.', 'docs'}
+    for rel in REQUIRED:
+        parts = rel.split('/')[:-1]
+        known_dirs.update('/'.join(parts[:i]) for i in range(1, len(parts) + 1))
+
+    def onerror(exc):
+        try:
+            rel = Path(exc.filename).relative_to(root).as_posix()
+        except (TypeError, ValueError):
+            rel = '<unknown>'
+        if rel not in known_dirs:
+            rel = '<unknown>'
+        code = exc.errno if isinstance(exc.errno, int) else 'unknown'
+        errors.append(f'cannot enumerate {rel} (errno {code})')
+
+    for directory, dirnames, filenames in os.walk(start, onerror=onerror):
+        dirnames[:] = [name for name in dirnames if name not in excluded]
+        for name in filenames:
+            path = Path(directory) / name
+            if path.is_file():
+                yield path
+
+
+def tree_mode(root=ROOT, errors=None):
     """Which of the three supported trees *root* is.
 
     `package`    - a pristine release package: its `docs/` holds nothing but the
@@ -508,7 +721,13 @@ def tree_mode(root=ROOT):
     docs = root / 'docs'
     if not docs.is_dir():
         return TREE_PACKAGE
-    shipped = {path.relative_to(root).as_posix() for path in docs.rglob('*') if path.is_file()}
+    scan_errors = []
+    shipped = {path.relative_to(root).as_posix()
+               for path in _scan_files(root, docs, scan_errors)}
+    if scan_errors:
+        if errors is not None:
+            errors.extend(scan_errors)
+        return TREE_DOWNSTREAM
     return TREE_PACKAGE if shipped <= set(REQUIRED) else TREE_DOWNSTREAM
 
 
@@ -521,11 +740,11 @@ def required_doc_errors(root=ROOT):
     document in `REQUIRED_DOCS`.
     """
     root = Path(root)
-    mode = tree_mode(root)
-    if mode == TREE_PACKAGE:
-        return []
-    documents = REQUIRED_DOCS if mode == TREE_UPSTREAM else PROJECT_DOCS
     errors = []
+    mode = tree_mode(root, errors)
+    if mode == TREE_PACKAGE:
+        return errors
+    documents = REQUIRED_DOCS if mode == TREE_UPSTREAM else PROJECT_DOCS
     for rel, sections in documents.items():
         path = root / rel
         if not path.is_file():
@@ -693,7 +912,7 @@ def _listed_manifest_paths(manifest):
             if isinstance(entry, dict) and isinstance(entry.get('path'), str)]
 
 
-def check_release_manifest(root):
+def check_release_manifest(root, scan_errors=None):
     """Validate MANIFEST.json when the tree carries one (a built package does).
 
     The repository root has no MANIFEST.json, so this returns no errors there and
@@ -719,7 +938,12 @@ def check_release_manifest(root):
     except (OSError, ValueError) as exc:
         return [f'{MANIFEST_DOC} is not valid JSON: {exc}']
     root = Path(root)
-    downstream = tree_mode(root) == TREE_DOWNSTREAM
+    mode_errors = []
+    downstream = tree_mode(root, mode_errors) == TREE_DOWNSTREAM
+    if mode_errors:
+        if scan_errors is not None:
+            scan_errors.extend(mode_errors)
+        return mode_errors
     if downstream:
         errors = [f'{MANIFEST_DOC}: {reason}'
                   for reason in drift.manifest_structure_errors(manifest)]
@@ -771,10 +995,14 @@ def template_structure_errors(root=ROOT):
 def validate_kit(root=ROOT, project_ready=False):
     errors = []
     root = Path(root)
+    isolated = is_isolated_layout(root)
 
-    for rel in REQUIRED:
+    for rel in ISOLATED_REQUIRED if isolated else REQUIRED:
         if not (root / rel).is_file():
             errors.append(f'missing required file: {rel}')
+
+    if isolated:
+        errors.extend(isolated_layout_errors(root))
 
     # Since Format 1.4 the design-goal authority lives at docs/PLAN.md. A root
     # PLAN.md is the legacy (<=1.3) location: it must be moved, not kept, or the
@@ -796,8 +1024,10 @@ def validate_kit(root=ROOT, project_ready=False):
 
     # A built package also carries MANIFEST.json; validate it when present.
     # Hashes are strict in a package and in an upstream checkout, structural
-    # only in a downstream project (see check_release_manifest).
-    errors.extend(check_release_manifest(root))
+    # only in a downstream project (see check_release_manifest). The isolated
+    # layout has its own required set and host-root entry, checked above.
+    if not isolated:
+        errors.extend(check_release_manifest(root))
 
     # The two editions must expose the same public file set; github additionally
     # ships three templates. Comparing the *intersection* catches a file that
@@ -812,7 +1042,13 @@ def validate_kit(root=ROOT, project_ready=False):
             errors.append(f'missing edition directory: editions/{edition}')
             edition_names[edition] = set()
             continue
-        actual = {p.name for p in directory.iterdir() if p.is_file()}
+        try:
+            actual = {p.name for p in directory.iterdir() if p.is_file()}
+        except OSError as exc:
+            code = exc.errno if isinstance(exc.errno, int) else 'unknown'
+            errors.append(f'cannot enumerate editions/{edition} (errno {code})')
+            edition_names[edition] = None
+            continue
         edition_names[edition] = actual
         expected = set(common_edition_files) | (set(github_only_files) if edition == 'github' else set())
         for name in sorted(expected - actual):
@@ -919,7 +1155,8 @@ def validate_kit(root=ROOT, project_ready=False):
     vendored_dirs = {'node_modules'}
     excluded_dirs = {'scripts', '.orchestration', '.git', '__pycache__'} | vendored_dirs
     doc_texts = []
-    for p in root.rglob('*'):
+    private_dirs = ISOLATED_PRIVATE_DIRS if isolated else frozenset()
+    for p in _scan_files(root, root, errors, private_dirs | vendored_dirs):
         if not p.is_file():
             continue
         rel = p.relative_to(root)
@@ -939,7 +1176,9 @@ def validate_kit(root=ROOT, project_ready=False):
     # The contract templates are already link-checked with template-scoped
     # messages by template_structure_errors(), so skip them here to avoid one
     # break being reported twice.
-    for md in root.rglob('*.md'):
+    for md in _scan_files(root, root, errors, private_dirs | vendored_dirs):
+        if not md.match('*.md'):
+            continue
         rel = md.relative_to(root)
         if rel.as_posix() in TEMPLATE_SECTIONS:
             continue
@@ -996,11 +1235,19 @@ def main(argv=None):
         print('VALIDATION FAILED')
         print('\n'.join(f'- {e}' for e in errors))
         return 1
-    mode = tree_mode(ROOT)
+    scan_errors = []
+    mode = tree_mode(ROOT, scan_errors)
+    if scan_errors:
+        print('VALIDATION FAILED')
+        print('\n'.join(f'- {e}' for e in scan_errors))
+        return 1
+    isolated = is_isolated_layout(ROOT)
     documents = 0 if mode == TREE_PACKAGE else len(
         REQUIRED_DOCS if mode == TREE_UPSTREAM else PROJECT_DOCS)
-    print(f'Kit validation passed ({len(REQUIRED)} required files checked; '
-          f'tree mode {mode}; '
+    required_count = len(ISOLATED_REQUIRED) if isolated else len(REQUIRED)
+    layout = 'isolated (host: agentorch/ + root AGENTS.md)' if isolated else f'tree mode {mode}'
+    print(f'Kit validation passed ({required_count} required files checked; '
+          f'{layout}; '
           f'editions local/github share 2 files, github adds 3 templates; '
           f'{documents} repository-only document(s) checked; '
           f'{sample_count} task packet samples validated).')

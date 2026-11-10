@@ -667,7 +667,7 @@ Release 版本与 Format 是两条序列。本仓库更新器现在把第 10 项
 
 ### 13.9 edition 结果形态
 
-- `local`：入口返回任务包 + 分支 / Worktree 交付，`carrier=local_task_database`，`writes=[]`；入口**不写**任务库。用 `scripts/orchestrator.py task add/ready/dispatch` 登记后按 G1–G6 审查。
+- `local`：入口返回任务包 + 分支 / Worktree 交付，`carrier=local_task_database`，`writes=[]`；入口**不写**任务库。平铺布局在项目根用 `python scripts/orchestrator.py task add --id <ID> / ready / dispatch` 登记；隔离布局在宿主根用 `python agentorch/scripts/orchestrator.py --layout isolated task add --id <ID> / ready / dispatch` 登记，任务库位于 `agentorch/.local/orchestration/`。登记后按 G1–G6 审查。
 - `github`：入口返回 Issue 正文 + Draft PR payload，`carrier=issue_and_draft_pr`，`writes=[]`；入口**不调用** `gh`。创建 Issue / Draft PR 并回链，走 `PR_OPEN` → `REVIEW_READY` → G1–G6。
 - 两者共用同一份 gate 记录（`requires_review=true`、`self_approval_allowed=false`、`auto_merge=false`、冲突与 `HD-*` 列表、报告契约校验结果）；差异只在载体，不在门禁。`local` 不得假装具备 GitHub 自动化，`github` 不得写本地任务库。
 
@@ -839,3 +839,14 @@ APPLY 后的可核对事实：
   ```
 
 - **不要这样做**：同时保留 `kit/orchestration.md` 与 `docs/orchestration.md`（两个权威）；把整棵 `docs/` 当成随包内容；只复制旧文件到新路径而不改引用（`validate_kit.py` 的链接扫描会逐个指出断链）。
+
+## 16. 迁移九（#153）：旧项目改为 `agentorch/` 隔离布局
+
+- **状态：受限新安装、“同来源、可重新认证”的升级与受限旧根迁移切片可用；跨进程回滚、真实官方历史 Release 资产、普通非 linked worktree 与跨平台仍未完成，AC-9 未通过。** 套件放在 `agentorch/`，宿主只新增 / 更新根 `AGENTS.md` 的唯一受管区块（旧根迁移切片例外：它不写旧根 `AGENTS.md`）。写入前重新检查官方来源、宿主目标状态与 Git worktree / HEAD。
+- **新安装前提**：使用专属、干净的 Git linked worktree；调用者显式声明没有其他写入者（`--declared-exclusive`，不是强制隔离证明），可用 `--expected-head <sha>` 固定 HEAD；`agentorch/` 不存在或为空；来源必须是固定官方客户端取得并通过十项包校验的字节。`--source` 只作一致性对比，不能提供计划字节或授权。
+- **升级（仅同来源且可重新认证）**：本地 `MANIFEST.json` 的 Format 只作候选 tag 提示（`v<format>` / `v<format>.0`）；安装器用固定官方客户端取回并校验旧版 Release，再把已安装 `agentorch/` 与该 Release 的投影逐文件比对，只有全部匹配才写入与目标不同的文件并替换受管区块。本地清单与哈希不单独授权写入。补丁发行 tag（如 `v1.7.3`）无法从本地清单恢复；同 tag 不同字节、非对象 / 畸形清单、清单路径越界、本地修改与目标删除请求全部失败关闭且零写入。仅受管区块需要更新时，PLAN 用同一份已验证的目标 Release 字节认证基线（前提是 `agentorch/` 已逐文件等于该 Release），APPLY 可完成替换；`agentorch/` 与目标完全一致时是零写入 no-op。
+- **写入与恢复**：只写 `agentorch/**` 与根 `AGENTS.md` 受管区块。相对路径先做纯词法校验；写入使用 `dir_fd` / `O_NOFOLLOW` / 独占创建，平台缺少这些原语时失败关闭。进程内故障按逆序只恢复本次已写且仍与本次写入一致的文件；冲突保留现场并报告，普通协作锁不阻止同权限进程。
+- **显式回滚**：跨进程 `--rollback-backup` 仍为 `BLOCKED`；备份记录是审计材料，不是删除或覆盖授权。自动故障恢复只在同一进程内、仅针对本次写集。
+- **旧根布局（受限迁移切片）**：唯一可写情形是：旧根每个发布成员（含根 `MANIFEST.json`）与安装器在 APPLY 内重新获取并校验的官方历史 Release 逐字节一致、旧根无本地修改、目标 `agentorch/` 不存在或为空、且目标版本不低于历史版本。满足时只新增 `agentorch/**`，旧根文件保留原路径与原字节，不移动、不删除；旧根 `AGENTS.md` 也不写受管区块，因为它本身是旧根文件。任一不匹配、缺失历史资产、目标冲突、清单路径越界或符号链接 / 非普通文件都保持 `STOPPED_CONFLICT` 且零写入。本地 `MANIFEST.json` 与哈希只作候选 tag 提示，不能独立证明归属。
+- **支持边界**：只对已实测遵循新宿主根 `AGENTS.md` 入口的运行时声明支持；直接调用旧路径不受支持，但旧文件仍存在，本套件不声称技术上阻止调用。真实运行时入口链、跨平台能力和真实下游迁移当前 NOT_RUN。
+- **待验证**：宿主 / 写集 / 备份的跨进程可信绑定、并发与符号链接竞态、旧布局迁移在真实下游与真实官方历史 Release 资产上的表现（测试只替换网络传输，不是真实资产证据）、普通非 linked worktree 下的安装、真实入口链及跨平台回滚。隔离布局可由包内 `agentorch/scripts/validate_kit.py` 做结构与哈希自检，但这不构成独立官方来源认证。**AC-9 的完整验收仍未通过**：上述未完成项消除前，不得把 AC-9 记为已通过或 `VERIFIED`。

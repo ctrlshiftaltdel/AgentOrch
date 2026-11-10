@@ -6,7 +6,7 @@
 # (v1). That file is the only authority for their semantics; this module must not
 # restate or extend it. Path-lock behaviour is unchanged.
 from __future__ import annotations
-import argparse, hashlib, json, os, re, socket, sqlite3, sys, unicodedata
+import argparse, hashlib, json, os, re, socket, sqlite3, stat, sys, unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
@@ -32,10 +32,76 @@ TRANSITIONS = {
 
 def now(): return datetime.now(timezone.utc).isoformat(timespec='seconds')
 def root_path(raw): return Path(raw).resolve()
-def db_path(root): return root/'.orchestration'/'state.sqlite3'
-def connect(root):
-    p=db_path(root)
-    if not p.exists(): raise RuntimeError(f'task database not initialized: {p}; run `init` first')
+
+def _display_path(root, path, isolated):
+    """Path text for a diagnostic; flat mode keeps its historical absolute path."""
+    if not isolated:
+        return str(path)
+    try:
+        relative=Path(path).relative_to(Path(root))
+    except (TypeError, ValueError):
+        return Path(path).name
+    return relative.as_posix() or '.'
+
+_ABS_PATH_TOKEN = re.compile(r"(?<![\w.~:-])/(?:[^\s'\"`()\[\]{}<>;:]+)")
+
+def _public_diagnostic(text, root):
+    """Strip host-specific absolute paths from an isolated-mode diagnostic.
+
+    Isolated rejection text travels to public Issue evidence. Rewrite the
+    AgentOrch root to a relative form and any other absolute token to
+    ``<path>``; flat mode never calls this, so its historical text is a fixed
+    compatibility contract.
+    """
+    text=str(text)
+    prefix=str(Path(root))
+    if prefix not in ('/', '.'):
+        text=text.replace(prefix+'/', '').replace(prefix, '.')
+    home=str(Path.home())
+    if home and home not in ('/', '.'):
+        text=text.replace(home+'/', '~/').replace(home, '~')
+    def repl(match):
+        token=match.group(0).rstrip('.,')
+        return '<path>'+match.group(0)[len(token):]
+    return _ABS_PATH_TOKEN.sub(repl, text)
+
+
+# Isolated layout (Issue #153) -------------------------------------------------
+# `<host>/agentorch/` is a *recognisable* shape used only to route the CLI. It is
+# not source authentication and it is not OS-level isolation. Direct library
+# calls keep the historical flat contract: only the CLI may set a separate state
+# root, so existing callers (delivery scenarios, tests) are unchanged.
+LAYOUTS = ('auto', 'flat', 'isolated')
+ISOLATED_DIRNAME = 'agentorch'
+
+class LayoutError(RuntimeError):
+    """A CLI layout/root request that cannot be honoured without guessing."""
+
+def state_dir(root, state_root=None):
+    """Config/state/backups directory for this call.
+
+    The state root is always bound to the caller. A flat call keeps the
+    historical ``<root>/.orchestration``; the isolated CLI passes the explicit
+    root resolved from the scheduler location. There is deliberately no
+    process-global fallback, so concurrent, nested or direct API calls cannot
+    read or write each other's task database.
+    """
+    return Path(state_root) if state_root is not None else root/'.orchestration'
+
+def db_path(root, state_root=None): return state_dir(root, state_root)/'state.sqlite3'
+def connect(root, state_root=None):
+    p=db_path(root, state_root)
+    if state_root is not None:
+        # Defense in depth for direct library callers: the CLI already validated
+        # before dispatch, but an explicit isolated state root must never follow
+        # a linked component either.
+        _validate_isolated_components(root, state_root)
+    if not p.exists():
+        # The flat message keeps its historical absolute path. An isolated
+        # rejection must not expose the host path in public evidence.
+        raise RuntimeError('task database not initialized; run `init` first'
+                           if state_root is not None
+                           else f'task database not initialized: {p}; run `init` first')
     con=sqlite3.connect(p, timeout=15, isolation_level=None)
     con.row_factory=sqlite3.Row
     con.execute('PRAGMA foreign_keys=ON')
@@ -71,10 +137,10 @@ EDITION_LINE = re.compile(r'^\s*[-*]\s*`?edition`?\s*[:：]\s*(?P<value>.*)$', r
 class EditionError(RuntimeError):
     """The authoritative project edition is missing, unreadable or illegal."""
 
-def config_path(root): return root/'.orchestration'/'config.json'
+def config_path(root, state_root=None): return state_dir(root, state_root)/'config.json'
 def project_config_path(root): return root/PROJECT_CONFIG
 
-def _runtime_config(root):
+def _runtime_config(root, state_root=None):
     """retry_cap / local_dir from config.json, with the historical silent fallback.
 
     Unchanged on purpose: a missing file, a missing key, a wrong type, an
@@ -86,7 +152,7 @@ def _runtime_config(root):
     sources={key:'default' for key in RUNTIME_DEFAULTS}
     data=None; state='missing'
     try:
-        data=json.loads(config_path(root).read_text(encoding='utf-8'))
+        data=json.loads(config_path(root, state_root).read_text(encoding='utf-8'))
         state='invalid' if not isinstance(data,dict) else 'ok'
     except FileNotFoundError:
         pass
@@ -104,49 +170,55 @@ def _runtime_config(root):
     cfg['recorded_edition']=data.get('edition') if state=='ok' else None
     return cfg
 
-def read_project_edition(root):
+def read_project_edition(root, isolated=False):
     """Return the edition declared by <root>/docs/PROJECT.md.
 
     This key is the only authority for edition selection. A missing file, a
     missing or duplicated key, an empty value, a wrong type or an unsupported
     value raises EditionError naming the actual content and the file to fix.
     Nothing falls back to 'local'.
+
+    ``isolated`` only changes how the file is named in the diagnostic: an
+    isolated CLI prints the root-relative path so its error text can be pasted
+    into public evidence. The flat contract keeps the absolute path.
     """
     path=project_config_path(root)
+    shown=_display_path(root, path, isolated)
     try:
         text=path.read_text(encoding='utf-8')
     except FileNotFoundError:
-        raise EditionError(f'{PROJECT_CONFIG}: file not found at {path}; add the key `edition` with value local or github') from None
+        raise EditionError(f'{PROJECT_CONFIG}: file not found at {shown}; add the key `edition` with value local or github') from None
     except (OSError,UnicodeDecodeError) as exc:
-        raise EditionError(f'{PROJECT_CONFIG}: cannot read {path} ({exc}); repair the file so its `edition` key is readable') from None
+        detail=_public_diagnostic(exc, root) if isolated else str(exc)
+        raise EditionError(f'{PROJECT_CONFIG}: cannot read {shown} ({detail}); repair the file so its `edition` key is readable') from None
     matches=list(EDITION_LINE.finditer(text))
     if not matches:
-        raise EditionError(f'{PROJECT_CONFIG}: missing required key `edition` in {path}; add one line "- `edition`: local" or "- `edition`: github"')
+        raise EditionError(f'{PROJECT_CONFIG}: missing required key `edition` in {shown}; add one line "- `edition`: local" or "- `edition`: github"')
     if len(matches)>1:
         where=', '.join(str(text.count('\n',0,m.start())+1) for m in matches)
-        raise EditionError(f'{PROJECT_CONFIG}: key `edition` is declared {len(matches)} times (lines {where}) in {path}; keep exactly one declaration')
+        raise EditionError(f'{PROJECT_CONFIG}: key `edition` is declared {len(matches)} times (lines {where}) in {shown}; keep exactly one declaration')
     raw=matches[0].group('value').strip()
     value=raw.strip('`').strip()
     if not value:
-        raise EditionError(f'{PROJECT_CONFIG}: key `edition` is empty in {path}; allowed values are local, github')
+        raise EditionError(f'{PROJECT_CONFIG}: key `edition` is empty in {shown}; allowed values are local, github')
     if value not in EDITIONS:
-        raise EditionError(f"{PROJECT_CONFIG}: key `edition` has unsupported value {raw!r} in {path}; "
+        raise EditionError(f"{PROJECT_CONFIG}: key `edition` has unsupported value {raw!r} in {shown}; "
                            f"allowed values are {', '.join(EDITIONS)} (write the value alone, with no extra text)")
     return value
 
-def read_config(root):
+def read_config(root, state_root=None):
     """Return the effective runtime configuration, its provenance and the edition.
 
     Runtime keys keep their historical silent fallback. The edition is read from
     docs/PROJECT.md and raises EditionError when missing or illegal, so
     routing can never silently run on the wrong task carrier.
     """
-    cfg=_runtime_config(root)
-    cfg['edition']=read_project_edition(root)
+    cfg=_runtime_config(root, state_root)
+    cfg['edition']=read_project_edition(root, isolated=state_root is not None)
     cfg['sources']['edition']=PROJECT_CONFIG
     return cfg
 
-def read_retry_cap(root):
+def read_retry_cap(root, state_root=None):
     """Return the effective review-fix retry cap (integer >= 1, default 3).
 
     Precedence: config.json key "retry_cap" wins when present and valid;
@@ -155,9 +227,9 @@ def read_retry_cap(root):
     the two entry points can never disagree about the cap, while an edition
     problem cannot block this value.
     """
-    return _runtime_config(root)['retry_cap']
+    return _runtime_config(root, state_root)['retry_cap']
 
-def require_local_scheduler(root, action):
+def require_local_scheduler(root, action, state_root=None):
     """Refuse to write local task state unless the project declares the local edition.
 
     The CLI implements the local edition only. Under a github (or broken) edition
@@ -165,42 +237,49 @@ def require_local_scheduler(root, action):
     local: github task state lives in Issues and PRs, and writing the SQLite
     registry would create a second, conflicting source of truth.
     """
-    edition=read_project_edition(root)
+    isolated=state_root is not None
+    edition=read_project_edition(root, isolated=isolated)
     if edition=='local': return
+    where=PROJECT_CONFIG if isolated else project_config_path(root)
     raise EditionError(
-        f'edition is {edition!r} ({project_config_path(root)}); this CLI cannot run `{action}` for the {edition} edition: '
+        f'edition is {edition!r} ({where}); this CLI cannot run `{action}` for the {edition} edition: '
         f'it writes the local SQLite task registry, which is a read-only archive under {edition}. '
         'Next: create or update the task as a GitHub Issue using editions/github/issue-template.md, record the '
         'ORCH-TASK-REGISTRY block before starting, and drive the PR per editions/github/execution.md. '
         'init, backup, config show, task list, task show and task resources stay available.'
     )
 
-def config_show(root):
+def config_show(root, state_root=None):
     """Print the effective configuration, where each value came from, and the edition.
 
     Returns 0 when the project edition is legal, 1 when it is missing or illegal.
     The edition is reported from docs/PROJECT.md only; a leftover
     `edition` key in config.json is shown as ignored, never applied.
     """
-    cfg=_runtime_config(root); path=config_path(root); exists=path.exists()
+    cfg=_runtime_config(root, state_root); path=config_path(root, state_root); exists=path.exists()
+    isolated=state_root is not None
+    shown=_display_path(root, path, isolated)
     edition=None; error=None
-    try: edition=read_project_edition(root)
+    try: edition=read_project_edition(root, isolated=isolated)
     except EditionError as exc: error=exc
-    print(f'Config file: {path}' + ('' if exists else ' (not found; using built-in defaults)'))
+    print(f'Config file: {shown}' + ('' if exists else ' (not found; using built-in defaults)'))
     rows=(('retry_cap',cfg['retry_cap'],cfg['sources']['retry_cap']),
           ('local_dir',cfg['local_dir'],cfg['sources']['local_dir']),
           ('edition',edition or '(invalid)',PROJECT_CONFIG))
     for key,value,source in rows:
         print(f'  {key:<10} = {value!s:<10} (source: {source})')
-    print(f'Edition is selected only by `edition` in {project_config_path(root)}; '
+    edition_source=PROJECT_CONFIG if isolated else project_config_path(root)
+    print(f'Edition is selected only by `edition` in {edition_source}; '
           f'{path.name} holds local CLI runtime parameters (retry_cap, local_dir) and never selects an edition.')
     if cfg['config_state']=='invalid':
-        print(f'Note: {path} is not a readable JSON object; retry_cap and local_dir fall back to the built-in defaults.')
+        print(f'Note: {shown} is not a readable JSON object; retry_cap and local_dir fall back to the built-in defaults.')
     if cfg['recorded_edition'] is not None:
-        print(f'Note: {path} also records edition = {cfg["recorded_edition"]!r}; that legacy key is ignored.')
-    print('Edit .orchestration/config.json to change retry_cap or local_dir; invalid values there fall back to defaults.')
+        print(f'Note: {shown} also records edition = {cfg["recorded_edition"]!r}; that legacy key is ignored.')
+    try: edit_path=path.relative_to(root).as_posix()
+    except ValueError: edit_path=_display_path(root, path, True)
+    print(f'Edit {edit_path} to change retry_cap or local_dir; invalid values there fall back to defaults.')
     if error:
-        print(f'ERROR: {error}',file=sys.stderr)
+        print(f'ERROR: {_public_diagnostic(error, root) if isolated else error}',file=sys.stderr)
         return 1
     if edition!='local':
         print(f'Scheduling commands (task add/ready/dispatch/status/workspace/amend/unlock) are refused under the '
@@ -272,13 +351,110 @@ def init_plan(root):
     print('下一步：填写 docs/PLAN.md 的设计目标（为什么做、做到什么程度、原则与边界）；配图放 docs/images/，在正文中用相对路径引用，Agent 只按文中指引查看图片')
     return 'created'
 
-def init(root):
-    d=root/'.orchestration'; d.mkdir(parents=True,exist_ok=True)
+def _state_relative_to_root(root, state_root):
+    """Root-relative state path, or LayoutError when it has no in-tree form.
+
+    ``init`` prints the backup hint relative to the project root, so a state
+    root outside ``root`` cannot be named. The isolated CLI always derives a
+    descendant of the root; only a direct library caller can pass an outside
+    path. Refusing here keeps init all-or-nothing instead of raising ValueError
+    after the database and config already exist.
+
+    A purely lexical ``relative_to`` is not enough: ``<root>/..`` and
+    ``<root>/.local/../../x`` share the root's leading path parts, and a
+    symlinked in-tree ancestor (``<root>/link -> outside``) is inside the root
+    by spelling but outside it by resolution. Both used to be accepted while the
+    write landed beside or outside the root, so this check runs before the
+    first mkdir/write and rejects ``..`` segments, symlinked or non-directory
+    ancestors, and any path that does not resolve back inside the root.
+    """
+    root=Path(root)
+    state=Path(state_root)
+    if '..' in state.parts:
+        raise LayoutError('state root must not contain ".." path segments; '
+                          'refusing a state directory that can escape the project root') from None
+    real_root=root.resolve()
+    lexical_root=Path(os.path.abspath(root))
+    lexical_state=Path(os.path.abspath(state))
+    try:
+        relative=lexical_state.relative_to(lexical_root)
+    except ValueError:
+        raise LayoutError('state root must be inside the project root; '
+                          'refusing a state directory outside it') from None
+    # Walk the caller's own spelling, not the resolved path: a link that points
+    # back inside the root still means the caller's path traverses a link, and
+    # only an ancestor walk can see it (the final entry is checked elsewhere).
+    current=lexical_root
+    for part in relative.parts:
+        current=current/part
+        try:
+            info=os.lstat(current)
+        except FileNotFoundError:
+            # This component and everything below it are absent, so there is no
+            # link to traverse yet.
+            continue
+        except NotADirectoryError:
+            raise LayoutError('state root must be a directory path inside the project root; '
+                              'a parent component is not a directory') from None
+        if stat.S_ISLNK(info.st_mode):
+            raise LayoutError('state root must not pass through a symlinked directory; '
+                              'refusing a state directory that resolves outside the project root') from None
+        if not stat.S_ISDIR(info.st_mode):
+            raise LayoutError('state root must be a directory path inside the project root; '
+                              'a parent component is not a directory') from None
+    try:
+        relative=state.resolve().relative_to(real_root)
+    except ValueError:
+        raise LayoutError('state root must be inside the project root after resolving links; '
+                          'refusing a state directory outside it') from None
+    return relative
+
+def _validate_git_exclude_target(root):
+    """Fail before any state write when the Git exclude rule cannot be recorded.
+
+    ``init`` appends the machine-local state rule to ``.git/info/exclude``. A
+    ``.git/info`` that exists as a non-directory used to surface only when the
+    append ran, after the database and config were already written, leaving a
+    half-created store behind a FileExistsError. Validate first so the refusal
+    is all-or-nothing. ``.git`` as a regular file is Git's linked-worktree
+    ``gitdir:`` layout: it has no info directory to append to, and it is left
+    untouched, exactly as before.
+    """
+    gitdir=Path(root)/'.git'
+    if not gitdir.is_dir():
+        return
+    info=gitdir/'info'
+    try:
+        entry=os.stat(info)
+    except FileNotFoundError:
+        if os.path.lexists(info):
+            raise LayoutError('.git/info is a dangling link; refusing to write state '
+                              'because the Git exclude rule cannot be recorded') from None
+        return
+    except NotADirectoryError:
+        raise LayoutError('.git/info is not a directory; refusing to write state '
+                          'because the Git exclude rule cannot be recorded') from None
+    if not stat.S_ISDIR(entry.st_mode):
+        raise LayoutError('.git/info exists but is not a directory; refusing to write state '
+                          'because the Git exclude rule cannot be recorded')
+
+def init(root, state_root=None):
+    state_rel=None
+    if state_root is not None:
+        # The CLI validated the isolated tree before dispatch, but a direct
+        # library caller can pass an explicit isolated state root too. Refuse a
+        # linked component here as well, before any state or Git metadata write.
+        _validate_isolated_components(root, state_root)
+        state_rel=_state_relative_to_root(root, state_root)
+    # Both refusals above and this one are all-or-nothing: no state directory,
+    # config or database exists yet when the layout cannot be honoured.
+    _validate_git_exclude_target(root)
+    d=state_dir(root, state_root); d.mkdir(parents=True,exist_ok=True)
     (d/'backups').mkdir(exist_ok=True)
-    cfg=config_path(root)
+    cfg=config_path(root, state_root)
     if not cfg.exists():
         cfg.write_text(json.dumps(RUNTIME_DEFAULTS)+'\n',encoding='utf-8')
-    con=sqlite3.connect(db_path(root))
+    con=sqlite3.connect(db_path(root, state_root))
     con.executescript('''
     PRAGMA journal_mode=WAL;
     PRAGMA foreign_keys=ON;
@@ -302,17 +478,24 @@ def init(root):
     ''')
     ensure_resource_schema(con)
     con.close()
-    # Keep private, machine-local state out of the worktree and commits.
+    # Keep private, machine-local state out of the worktree and commits. Flat
+    # keeps the historical `.orchestration/` text; an isolated call owns a
+    # different directory, so its rule must cover the path it actually writes.
     gi=root/'.git'/'info'/'exclude'
     if (root/'.git').is_dir():
         gi.parent.mkdir(parents=True,exist_ok=True)
         current=gi.read_text(encoding='utf-8',errors='ignore') if gi.exists() else ''
-        if '.orchestration/' not in current.splitlines():
-            with gi.open('a',encoding='utf-8') as f: f.write('\n# Agent-Orchestration machine-local state\n.orchestration/\n')
-    print(f'Initialized local task registry: {db_path(root)}')
-    print(f'Review-fix retry cap: {read_retry_cap(root)} (edit key "retry_cap" in {cfg} to change it)')
+        if state_root is not None:
+            rule=state_rel.as_posix()+'/'
+        else:
+            rule='.orchestration/'
+        if rule not in current.splitlines():
+            with gi.open('a',encoding='utf-8') as f: f.write(f'\n# Agent-Orchestration machine-local state\n{rule}\n')
+    print(f'Initialized local task registry: {db_path(root, state_root)}')
+    print(f'Review-fix retry cap: {read_retry_cap(root, state_root)} (edit key "retry_cap" in {cfg} to change it)')
     print(f'Local task registry only: the edition is read from {project_config_path(root)}, not from this config.')
-    print('Back up .orchestration/ with your project backups.')
+    hint=state_rel if state_rel is not None else d.relative_to(root)
+    print(f'Back up {hint.as_posix()}/ with your project backups.')
     init_plan(root)
 
 def normalize_path(raw):
@@ -331,8 +514,8 @@ def get_task(con, task_id):
     if not row: raise RuntimeError(f'unknown task: {task_id}')
     return row
 
-def task_add(root, args):
-    require_local_scheduler(root,'task add')
+def task_add(root, args, state_root=None):
+    require_local_scheduler(root,'task add',state_root=state_root)
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{1,63}',args.id): raise ValueError('task ID must be 2-64 chars: letters, digits, dot, underscore, hyphen')
     paths=sorted(set(normalize_path(p) for p in args.paths))
     if not paths: raise ValueError('at least one allowed path is required')
@@ -343,7 +526,7 @@ def task_add(root, args):
                for e in parse_resource_specs(getattr(args,'resources',None) or [])]
     depends=sorted(set(args.depends or []))
     if args.id in depends: raise ValueError('task cannot depend on itself')
-    con=connect(root)
+    con=connect(root, state_root)
     try:
         con.execute('BEGIN IMMEDIATE')
         for dep in depends:
@@ -368,8 +551,8 @@ def task_add(root, args):
     print(f'{args.id}: created in PLANNED')
     if resources: print(f'{args.id}: declared resources {", ".join(resources)}')
 
-def task_list(root, args):
-    con=connect(root)
+def task_list(root, args, state_root=None):
+    con=connect(root, state_root)
     try:
         rows=con.execute('SELECT * FROM tasks ORDER BY created_at,id').fetchall()
         for r in rows:
@@ -397,8 +580,8 @@ def resource_blocking_note(row):
         return ' (blocks every new claim on this resource until released)'
     return ' (blocks new exclusive claims on this resource until released)'
 
-def task_show(root, task_id):
-    con=connect(root)
+def task_show(root, task_id, state_root=None):
+    con=connect(root, state_root)
     try:
         r=get_task(con,task_id)
         print(f"# {r['id']} — {r['title']}\n\nStatus: {r['status']}\nDescription: {r['description']}\nAllowed paths:\n"+'\n'.join(f'- {p}' for p in json.loads(r['paths_json']))+'\n\nDependencies:\n'+('\n'.join(f'- {d}' for d in json.loads(r['depends_json'])) or '- None')+'\n\nAcceptance criteria:\n'+'\n'.join(f'- [ ] {x}' for x in json.loads(r['acceptance_json']))+f"\n\nBranch: {r['branch'] or '(unset)'}\nWorktree: {r['worktree'] or '(unset)'}\nHead SHA: {r['head_sha'] or '(unset)'}\nApproved SHA: {r['approved_sha'] or '(unset)'}\nMerge SHA: {r['merged_sha'] or '(unset)'}\nRetries: {r['retries']}\nLast note: {r['last_note'] or '(none)'}")
@@ -430,9 +613,9 @@ def dependency_check(con, row):
         d=get_task(con,dep)
         if d['status']!='VERIFIED': raise RuntimeError(f'dependency {dep} is {d["status"]}, expected VERIFIED')
 
-def task_ready(root, task_id):
-    require_local_scheduler(root,'task ready')
-    con=connect(root)
+def task_ready(root, task_id, state_root=None):
+    require_local_scheduler(root,'task ready',state_root=state_root)
+    con=connect(root, state_root)
     try:
         con.execute('BEGIN IMMEDIATE'); r=get_task(con,task_id)
         if r['status'] not in {'PLANNED','BLOCKED','FAILED','NEEDS_HUMAN_DECISION'}: raise RuntimeError(f'cannot set READY from {r["status"]}')
@@ -465,12 +648,12 @@ def default_holder():
     if override: return override
     return f'{socket.gethostname()}:{os.getpid()}'
 
-def task_dispatch(root, task_id, options=None):
-    require_local_scheduler(root,'task dispatch')
+def task_dispatch(root, task_id, options=None, state_root=None):
+    require_local_scheduler(root,'task dispatch',state_root=state_root)
     # The holder is only validated when the task declares resources, so a
     # path-lock-only dispatch keeps its previous behaviour byte for byte.
     holder=getattr(options,'holder',None) or default_holder()
-    con=connect(root)
+    con=connect(root, state_root)
     acquired=None
     try:
         con.execute('BEGIN IMMEDIATE'); r=get_task(con,task_id)
@@ -497,7 +680,7 @@ def task_dispatch(root, task_id, options=None):
         specs=declared_resources(r)+list(getattr(options,'resource',None) or [])
         if specs:
             holder=validate_holder(holder)
-            entries=resolve_resource_entries(root,specs)
+            entries=resolve_resource_entries(root,specs,state_root)
             acquired=acquire_resource_set(con,task_id,entries,holder,
                                           actor=getattr(options,'actor',None) or 'orchestrator',
                                           reason='dispatch',evidence_ref=getattr(options,'evidence',None) or '(none)')
@@ -523,9 +706,9 @@ def task_dispatch(root, task_id, options=None):
               f'(holder {holder}, fingerprint {acquired["fingerprint"][:12]})')
     print('Now pass the self-contained task packet to a real Execution Agent. This command does not launch agents.')
 
-def set_workspace(root, args):
-    require_local_scheduler(root,'task workspace')
-    con=connect(root)
+def set_workspace(root, args, state_root=None):
+    require_local_scheduler(root,'task workspace',state_root=state_root)
+    con=connect(root, state_root)
     try:
         con.execute('BEGIN IMMEDIATE'); r=get_task(con,args.id)
         if r['status'] in TERMINAL: raise RuntimeError('cannot update workspace for terminal task')
@@ -546,11 +729,11 @@ def set_workspace(root, args):
     finally: con.close()
     print(f'{args.id}: workspace updated')
 
-def task_status(root, args):
-    require_local_scheduler(root,'task status')
+def task_status(root, args, state_root=None):
+    require_local_scheduler(root,'task status',state_root=state_root)
     dest=args.status.upper()
     if dest not in TRANSITIONS: raise ValueError(f'unknown status: {dest}')
-    con=connect(root)
+    con=connect(root, state_root)
     try:
         con.execute('BEGIN IMMEDIATE'); r=get_task(con,args.id); old=r['status']
         if dest in {'APPROVED','MERGED','VERIFIED','BLOCKED','NEEDS_HUMAN_DECISION','FAILED','CANCELED'} and not (args.note or '').strip():
@@ -571,7 +754,7 @@ def task_status(root, args):
                 raise RuntimeError('MERGED requires a full 40-character hex --merge-sha (abbreviated SHAs are refused)')
             args.merge_sha=args.merge_sha.lower()
         if dest=='IN_PROGRESS' and old=='MASTER_REVIEW':
-            retry_cap=read_retry_cap(root)
+            retry_cap=read_retry_cap(root, state_root)
             if r['retries'] >= retry_cap:
                 dest='BLOCKED'
                 retries=r['retries']
@@ -616,7 +799,7 @@ def task_status(root, args):
     if released_resources:
         print(f'{args.id}: released {len(released_resources)} resource lock(s): {", ".join(released_resources)}')
 
-def task_amend(root, args):
+def task_amend(root, args, state_root=None):
     """Audited corrections to task fields that were already recorded.
 
     Two mutually exclusive modes:
@@ -628,19 +811,19 @@ def task_amend(root, args):
       the lock rewrite happen in one BEGIN IMMEDIATE, so a half lock set can
       never be committed.
     """
-    require_local_scheduler(root,'task amend')
+    require_local_scheduler(root,'task amend',state_root=state_root)
     raw_paths=getattr(args,'paths',None)
     if raw_paths is not None and (args.merge_sha or '').strip():
         raise RuntimeError('amend accepts either --paths or --merge-sha, not both')
     if raw_paths is not None:
-        amend_task_paths(root,args,raw_paths); return
+        amend_task_paths(root,args,raw_paths,state_root); return
     sha=(args.merge_sha or '').strip()
     if not re.fullmatch(r'[0-9a-fA-F]{40}', sha):
         raise RuntimeError('amend requires a full 40-character hex --merge-sha')
     if not (args.note or '').strip():
         raise RuntimeError('amend requires --note explaining the merge SHA correction')
     new=sha.lower()
-    con=connect(root)
+    con=connect(root, state_root)
     try:
         con.execute('BEGIN IMMEDIATE'); r=get_task(con,args.id)
         if r['status'] not in {'MERGED','VERIFIED'}:
@@ -654,7 +837,7 @@ def task_amend(root, args):
     finally: con.close()
     print(f'{args.id}: merge SHA amended {old or "(unset)"} -> {new}')
 
-def amend_task_paths(root, args, raw_paths):
+def amend_task_paths(root, args, raw_paths, state_root=None):
     """Re-scope a parked task and rewrite its path locks atomically (kit 3.1 rule 4).
 
     Only states that keep their locks are eligible, so an active task must be
@@ -668,7 +851,7 @@ def amend_task_paths(root, args, raw_paths):
     if not note:
         raise RuntimeError('amend --paths requires --note explaining the reason and the authorisation')
     paths=sorted(set(normalize_path(p) for p in raw_paths))
-    con=connect(root)
+    con=connect(root, state_root)
     try:
         con.execute('BEGIN IMMEDIATE'); r=get_task(con,args.id)
         if r['status'] not in AMENDABLE_PATH_STATES:
@@ -711,9 +894,9 @@ def find_task_resource_lock(con, task_id, reference):
         raise ResourceError('LOCK_NOT_HELD',f'task {task_id} holds no non-RELEASED lock on {resource_id}')
     return rows[0]
 
-def unlock(root, args):
-    require_local_scheduler(root,'task unlock')
-    con=connect(root)
+def unlock(root, args, state_root=None):
+    require_local_scheduler(root,'task unlock',state_root=state_root)
+    con=connect(root, state_root)
     resource=getattr(args,'resource',None)
     try:
         con.execute('BEGIN IMMEDIATE'); r=get_task(con,args.id)
@@ -758,12 +941,12 @@ def lock_line(row, now_stamp=None):
         line+=('\tblocks=exclusive+shared' if row['mode']=='exclusive' else '\tblocks=exclusive')
     return line
 
-def task_resources(root, args):
+def task_resources(root, args, state_root=None):
     """Inspect resource locks: every non-RELEASED row plus its blocking reason."""
-    con=connect(root)
+    con=connect(root, state_root)
     edition=None
     try:
-        edition=read_project_edition(root)
+        edition=read_project_edition(root, isolated=state_root is not None)
     except EditionError:
         edition=None                     # an unreadable edition must not hide the listing
     try:
@@ -792,13 +975,13 @@ def task_resources(root, args):
               'the project edition cannot be read; this listing is read-only and no lease was migrated.')
     finally: con.close()
 
-def task_renew(root, args):
-    require_local_scheduler(root,'task renew')
+def task_renew(root, args, state_root=None):
+    require_local_scheduler(root,'task renew',state_root=state_root)
     holder=validate_holder(getattr(args,'holder',None) or default_holder())
-    con=connect(root)
+    con=connect(root, state_root)
     try:
         con.execute('BEGIN IMMEDIATE')
-        ttl=resource_config(root,require_ttl=True)[LEASE_TTL_KEY]
+        ttl=resource_config(root,require_ttl=True,state_root=state_root)[LEASE_TTL_KEY]
         renewed=renew_resource_locks(con,args.id,holder,ttl,getattr(args,'reason','') or 'periodic renewal',
                                      getattr(args,'evidence',None) or '(none)',actor=holder)
         con.execute('COMMIT')
@@ -807,10 +990,10 @@ def task_renew(root, args):
     finally: con.close()
     print(f'{args.id}: renewed {len(renewed)} resource lock(s) for {ttl}s as holder {holder}')
 
-def task_reclaim(root, args):
-    require_local_scheduler(root,'task reclaim')
-    grace=resource_config(root,require_grace=True)[LEASE_GRACE_KEY]
-    con=connect(root)
+def task_reclaim(root, args, state_root=None):
+    require_local_scheduler(root,'task reclaim',state_root=state_root)
+    grace=resource_config(root,require_grace=True,state_root=state_root)[LEASE_GRACE_KEY]
+    con=connect(root, state_root)
     try:
         con.execute('BEGIN IMMEDIATE'); expire_due_locks(con)
         row=find_task_resource_lock(con,args.id,args.resource)
@@ -822,10 +1005,10 @@ def task_reclaim(root, args):
     finally: con.close()
     print(f'{args.id}: reclaimed {row["resource_id"]} ({row["mode"]}) after a {grace}s cool-down; evidence recorded')
 
-def task_reconcile(root, args):
+def task_reconcile(root, args, state_root=None):
     """Rebuild lock facts without trusting memory; quarantine what cannot be proven."""
-    require_local_scheduler(root,'task reconcile')
-    con=connect(root)
+    require_local_scheduler(root,'task reconcile',state_root=state_root)
+    con=connect(root, state_root)
     try:
         con.execute('BEGIN IMMEDIATE')
         report=reconcile_resource_locks(con,getattr(args,'reason','cross-session recovery'),
@@ -1019,7 +1202,7 @@ def parse_resource_specs(specs):
         entries.append(entry)
     return entries
 
-def resource_config(root, require_ttl=False, require_grace=False):
+def resource_config(root, require_ttl=False, require_grace=False, state_root=None):
     """Read resource_lease_ttl / resource_reclaim_grace from .orchestration/config.json.
 
     Both are explicit configuration: there is no implicit default (§6.2). A task
@@ -1027,7 +1210,7 @@ def resource_config(root, require_ttl=False, require_grace=False):
     """
     data = {}
     try:
-        raw = json.loads(config_path(root).read_text(encoding='utf-8'))
+        raw = json.loads(config_path(root, state_root).read_text(encoding='utf-8'))
         if isinstance(raw, dict):
             data = raw
     except FileNotFoundError:
@@ -1035,6 +1218,10 @@ def resource_config(root, require_ttl=False, require_grace=False):
     except Exception:
         data = {}
     cfg, problems = {}, []
+    isolated = state_root is not None
+    shown = _display_path(root, config_path(root, state_root), isolated)
+    try: state_rel = state_dir(root, state_root).relative_to(Path(root)).as_posix()
+    except ValueError: state_rel = _display_path(root, state_dir(root, state_root), True)
     for key, low, high, required in (
             (LEASE_TTL_KEY, 1, LEASE_TTL_MAX, require_ttl),
             (LEASE_GRACE_KEY, 0, LEASE_GRACE_MAX, require_grace)):
@@ -1043,21 +1230,22 @@ def resource_config(root, require_ttl=False, require_grace=False):
         if valid:
             cfg[key] = value
         elif required:
-            problems.append(f'{key} must be an integer between {low} and {high} in {config_path(root)}')
+            problems.append(f'{key} must be an integer between {low} and {high} in {shown}')
         else:
             cfg[key] = None
     if problems:
         raise ResourceError('RESOURCE_CONFIG_INVALID',
                             'resource lock configuration is missing or illegal: ' + '; '.join(problems) +
-                            '; add it to .orchestration/config.json (a lease without an explicit ttl or cool-down is refused)')
+                            f'; add it to {state_rel}/config.json (a lease without an explicit ttl or cool-down is refused)')
     return cfg
 
-def resolve_resource_entries(root, specs):
+def resolve_resource_entries(root, specs, state_root=None):
     """Validate specs and fill every ttl, sorted by UTF-8 byte order (§4.2)."""
     entries = parse_resource_specs(specs)
     if not entries:
         return []
-    cfg = resource_config(root, require_ttl=any(e['ttl'] is None for e in entries))
+    cfg = resource_config(root, require_ttl=any(e['ttl'] is None for e in entries),
+                          state_root=state_root)
     for entry in entries:
         entry['ttl'] = entry['ttl'] if entry['ttl'] is not None else cfg[LEASE_TTL_KEY]
     return order_resource_entries(entries)
@@ -1414,19 +1602,200 @@ def resource_backend_note(backend='local'):
     return ('local acquires named resource locks atomically inside one SQLite BEGIN IMMEDIATE transaction, '
             'scoped to this database file on this host; it claims no cross-host or shared-filesystem guarantee.')
 
-def backup(root):
-    src=db_path(root)
+def _reject_backup_link(path, label):
+    """Isolated-layout backup link check with the historical symlink wording.
+
+    Only the isolated layout runs this: the published flat CLI keeps its
+    historical link-following behaviour byte for byte. In isolated layout the
+    destination name has one-second granularity, so a pre-existing entry can be
+    a link before the call. Only ``st_nlink`` can reveal a hard link; neither
+    kind may be written through, because both would replace bytes outside the
+    state directory.
+    """
+    try:
+        info=os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode):
+        raise LayoutError(f'refusing to write a backup through a symlinked {label}')
+    if not stat.S_ISDIR(info.st_mode) and info.st_nlink > 1:
+        raise LayoutError(f'refusing to write a backup through a hard-linked {label}')
+
+def backup(root, state_root=None):
+    src=db_path(root, state_root)
+    if state_root is not None:
+        # Direct library callers bypass the CLI's up-front validation; refuse a
+        # linked state slot here, before SQLite opens it and writes the WAL.
+        _validate_isolated_components(root, state_root)
     if not src.exists(): raise RuntimeError('task database is not initialized')
-    outdir=root/'.orchestration'/'backups'; outdir.mkdir(parents=True,exist_ok=True)
+    outdir=state_dir(root, state_root)/'backups'
+    if state_root is not None:
+        # Isolated layout only. The destination name has one-second granularity,
+        # so a hostile or stale entry can exist before this call. Refuse to
+        # follow a symlink or a hard link: writing through either would replace
+        # a database outside the state directory. These are pre-write checks,
+        # not an atomic guarantee against a concurrent same-UID swap. Flat
+        # backup keeps the historical link-following behaviour (CLI parity).
+        _reject_backup_link(outdir, 'backup directory')
+    outdir.mkdir(parents=True,exist_ok=True)
     name='state-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'.sqlite3'; dest=outdir/name
+    if state_root is not None:
+        _reject_backup_link(dest, 'backup destination')
     a=sqlite3.connect(src); b=sqlite3.connect(dest)
     try: a.backup(b)
     finally: b.close(); a.close()
     print(f'Backup created: {dest}')
 
-def main():
+def _script_under_agentorch(path):
+    """True when *path* has the isolated scheduler shape (a hint, not auth)."""
+    path=Path(path)
+    return (path.name=='orchestrator.py'
+            and path.parent.name=='scripts'
+            and path.parent.parent.name==ISOLATED_DIRNAME)
+
+def _reject_component_link(path, label):
+    """Refuse a symlink or a multiply-linked entry before any read/write.
+
+    lstat does not follow the final entry, so a symlink is always visible. A
+    hard link is *not*: it looks like an ordinary file while sharing its inode
+    and bytes with a name outside this tree, so only ``st_nlink`` reveals it.
+    Directories are exempt because their link count includes child directories,
+    not outside aliases. These are pre-write checks, not atomic isolation: a
+    same-UID writer can still swap the entry between this check and the write.
+    Diagnostic text is path-free because it travels to public Issue evidence.
+    """
+    try:
+        info=os.lstat(path)
+    except FileNotFoundError:
+        return
+    except NotADirectoryError:
+        # A non-directory ancestor means the entry cannot exist as a link.
+        # Git's linked-worktree layout is exactly this shape: `.git` is a
+        # regular file holding `gitdir: ...`, so `.git/info` has no lstat.
+        # The ancestor itself is still checked by its own label.
+        return
+    if stat.S_ISLNK(info.st_mode):
+        raise LayoutError(f'isolated layout refuses a symlinked {label}')
+    if not stat.S_ISDIR(info.st_mode) and info.st_nlink > 1:
+        raise LayoutError(f'isolated layout refuses a hard-linked {label}')
+
+def _validate_isolated_components(kit, state):
+    """Fail closed before any read/write when an owned path is a component link.
+
+    These are pre-write checks, not atomic isolation: a same-UID writer can still
+    change the tree between this check and the write. The claim is only that a
+    recognisably isolated CLI invocation does not follow an existing link.
+    """
+    kit=Path(kit); state=Path(state)
+    for label,path in (
+        ('AgentOrch root', kit),
+        ('resource dir scripts', kit/'scripts'),
+        ('resource dir docs', kit/'docs'),
+        ('resource dir templates', kit/'templates'),
+        ('state dir .local', kit/'.local'),
+        ('state root', state),
+    ):
+        _reject_component_link(path, label)
+    for label,path in (
+        ('state database', state/'state.sqlite3'),
+        # SQLite writes the WAL and shared-memory files next to the database.
+        # A preset hard link there is written through just like the database.
+        ('state database write-ahead log', state/'state.sqlite3-wal'),
+        ('state database shared memory', state/'state.sqlite3-shm'),
+        ('runtime config', state/'config.json'),
+        ('backup dir', state/'backups'),
+        # `init` appends its ignore rule to Git metadata. A linked .git tree or
+        # exclude file would send that write into the host repository instead.
+        ('git metadata directory .git', kit/'.git'),
+        ('git metadata directory .git/info', kit/'.git'/'info'),
+        ('git exclude file', kit/'.git'/'info'/'exclude'),
+        ('project config', kit/'docs'/'PROJECT.md'),
+        ('plan of record', kit/'docs'/'PLAN.md'),
+        ('plan template', kit/'templates'/'plan.md'),
+    ):
+        _reject_component_link(path, label)
+
+class _RootOptionAction(argparse.Action):
+    """Record every --root value argparse actually accepted.
+
+    argparse resolves long-option prefixes (``--ro``) and ``--root=VALUE``
+    itself, so scanning raw argv for one spelling let an accepted out-of-bounds
+    or empty value bypass the isolated validation. Recording here keeps the
+    custom check and the parser in agreement for every accepted form.
+    """
+    def __call__(self, parser, namespace, values, option_string=None):
+        history=list(getattr(namespace, 'root_values', None) or [])
+        history.append(values)
+        setattr(namespace, 'root_values', history)
+        setattr(namespace, self.dest, values)
+
+def resolve_cli_layout(layout, args):
+    """Return ``(root, state_root_or_None)`` for the requested CLI layout.
+
+    ``auto`` keeps every historical flat invocation unchanged, but refuses a
+    bare invocation of a scheduler that is itself located under
+    ``*/agentorch/scripts/orchestrator.py``: that is exactly the shape where a
+    damaged isolated install and a legacy flat copy can be byte-identical.
+    ``flat`` is the explicit legacy compatibility override. ``isolated`` requires
+    that recognisable shape and pins the root to the script's AgentOrch root;
+    state/config/backups move under ``<agentorch>/.local/orchestration``.
+    """
+    lexical=Path(os.path.abspath(__file__))
+    actual=Path(__file__).resolve()
+    recognised=_script_under_agentorch(lexical) or _script_under_agentorch(actual)
+    if layout=='auto':
+        if recognised:
+            raise LayoutError(
+                'this scheduler is located under an isolated layout; refusing the bare '
+                'invocation because it cannot be told apart from a flat copy. Re-run with '
+                '`--layout isolated` for an isolated install, or `--layout flat` only for '
+                'a legacy flat checkout that deliberately lives at that path.')
+        return root_path(args.root), None
+    if layout=='flat':
+        return root_path(args.root), None
+    if not recognised:
+        raise LayoutError(
+            '--layout isolated requires a scheduler located at '
+            '<host>/agentorch/scripts/orchestrator.py. Run the flat CLI without '
+            '--layout, or install the kit under the host\'s agentorch/ directory first.')
+    kit=actual.parent.parent
+    if _script_under_agentorch(lexical):
+        lexical_kit=lexical.parent.parent
+        if lexical_kit.is_symlink():
+            raise LayoutError('isolated layout refuses a symlinked AgentOrch root')
+        if lexical_kit.resolve()!=kit:
+            raise LayoutError(
+                'the scheduler path is ambiguous: its lexical path and resolved path '
+                'point at different AgentOrch roots')
+    if kit.is_symlink():
+        raise LayoutError('isolated layout refuses a symlinked AgentOrch root')
+    root_values=list(getattr(args, 'root_values', None) or [])
+    if len(root_values)>1:
+        raise LayoutError(
+            f'--root may be given at most once in isolated layout; got {len(root_values)} values.')
+    if root_values:
+        raw=root_values[0]
+        if raw is None or not raw.strip():
+            raise LayoutError(
+                '--root must not be empty in isolated layout; omit it to use the AgentOrch root.')
+        candidate=Path(raw)
+        if candidate.is_symlink():
+            raise LayoutError('--root must not be a symlink in isolated layout')
+        if candidate.resolve()!=kit:
+            raise LayoutError(
+                '--root is outside the AgentOrch root; isolated layout refuses a root '
+                'it did not resolve from the scheduler location.')
+    state=kit/'.local'/'orchestration'
+    _validate_isolated_components(kit, state)
+    return kit, state
+
+def main(argv=None):
+    raw=list(sys.argv[1:] if argv is None else argv)
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--root',default='.',help='project root (default: current directory)')
+    parser.add_argument('--layout',choices=LAYOUTS,default='auto',
+                        help='root layout: auto keeps the flat CLI unless this script is under */agentorch/scripts, where a bare call is refused; flat is the explicit legacy override; isolated keeps state/config/backups under <agentorch>/.local/orchestration')
+    parser.add_argument('--root',default='.',action=_RootOptionAction,
+                        help='project root (default: current directory)')
     sub=parser.add_subparsers(dest='cmd',required=True)
     sub.add_parser('init',help='initialize the local task database and .orchestration/config.json (retry_cap, local_dir); seed docs/PLAN.md from templates/plan.md when absent')
     sub.add_parser('backup',help='create a consistent SQLite backup')
@@ -1468,30 +1837,41 @@ def main():
     rc.add_argument('--evidence',required=True); rc.add_argument('--actor',default='')
     rf=ts.add_parser('reconcile',help='rebuild resource lock facts from the store; quarantine what cannot be proven')
     rf.add_argument('--reason',default='cross-session recovery'); rf.add_argument('--evidence',default='')
-    args=parser.parse_args(); root=root_path(args.root)
+    args=parser.parse_args(raw)
     if args.cmd=='task' and args.taskcmd=='amend' and args.paths is None:
         # --merge-sha / --note were mandatory options before --paths existed. Keep
         # the pre-existing missing-argument error text and exit code 2 exactly.
         missing=[name for name,value in (('--merge-sha',args.merge_sha),('--note',args.note)) if value is None]
         if missing: am.error('the following arguments are required: '+', '.join(missing))
     try:
-        if args.cmd=='init': init(root)
-        elif args.cmd=='backup': backup(root)
-        elif args.cmd=='config': return config_show(root)
-        elif args.taskcmd=='add': task_add(root,args)
-        elif args.taskcmd=='list': task_list(root,args)
-        elif args.taskcmd=='show': task_show(root,args.id)
-        elif args.taskcmd=='ready': task_ready(root,args.id)
-        elif args.taskcmd=='dispatch': task_dispatch(root,args.id,args)
-        elif args.taskcmd=='status': task_status(root,args)
-        elif args.taskcmd=='amend': task_amend(root,args)
-        elif args.taskcmd=='workspace': set_workspace(root,args)
-        elif args.taskcmd=='unlock': unlock(root,args)
-        elif args.taskcmd=='resources': task_resources(root,args)
-        elif args.taskcmd=='renew': task_renew(root,args)
-        elif args.taskcmd=='reclaim': task_reclaim(root,args)
-        elif args.taskcmd=='reconcile': task_reconcile(root,args)
+        root,state=resolve_cli_layout(args.layout,args)
+    except LayoutError as e:
+        print(f'ERROR: {e}',file=sys.stderr); return 2
+    except OSError as e:
+        # An isolated-mode stat/resolve failure is still public-facing evidence.
+        if args.layout=='isolated':
+            base=Path(os.path.abspath(__file__)).parent.parent
+            print(f'ERROR: {_public_diagnostic(e, base)}',file=sys.stderr); return 2
+        raise
+    try:
+        if args.cmd=='init': init(root,state_root=state)
+        elif args.cmd=='backup': backup(root,state_root=state)
+        elif args.cmd=='config': return config_show(root,state_root=state)
+        elif args.taskcmd=='add': task_add(root,args,state_root=state)
+        elif args.taskcmd=='list': task_list(root,args,state_root=state)
+        elif args.taskcmd=='show': task_show(root,args.id,state_root=state)
+        elif args.taskcmd=='ready': task_ready(root,args.id,state_root=state)
+        elif args.taskcmd=='dispatch': task_dispatch(root,args.id,args,state_root=state)
+        elif args.taskcmd=='status': task_status(root,args,state_root=state)
+        elif args.taskcmd=='amend': task_amend(root,args,state_root=state)
+        elif args.taskcmd=='workspace': set_workspace(root,args,state_root=state)
+        elif args.taskcmd=='unlock': unlock(root,args,state_root=state)
+        elif args.taskcmd=='resources': task_resources(root,args,state_root=state)
+        elif args.taskcmd=='renew': task_renew(root,args,state_root=state)
+        elif args.taskcmd=='reclaim': task_reclaim(root,args,state_root=state)
+        elif args.taskcmd=='reconcile': task_reconcile(root,args,state_root=state)
     except Exception as e:
-        print(f'ERROR: {e}',file=sys.stderr); return 1
+        message=_public_diagnostic(e, root) if state is not None else str(e)
+        print(f'ERROR: {message}',file=sys.stderr); return 1
     return 0
 if __name__=='__main__': raise SystemExit(main())

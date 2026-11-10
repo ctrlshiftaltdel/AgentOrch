@@ -172,12 +172,14 @@ def parse_release_payload(payload: dict, repository: str = OFFICIAL_REPOSITORY) 
 
 
 class GitHubReleaseSource:
-    """Read the latest stable release of the official repository.
+    """Read an official repository release through the fixed allowlist.
 
-    There is deliberately no repository parameter: the source is pinned by the
-    frozen contract. ``GITHUB_TOKEN`` is read from the environment when present
-    (public repositories work without it) and is never written to a report,
-    log or command entry.
+    ``fetch_release()`` reads the latest stable release; ``fetch_release(tag)``
+    reads one explicit tag. Either way the bytes still pass the same ten package
+    checks. There is deliberately no repository parameter: the source is pinned
+    by the frozen contract. ``GITHUB_TOKEN`` is read from the environment when
+    present (public repositories work without it) and is never written to a
+    report, log or command entry.
     """
 
     def __init__(self, token: str | None = None, timeout: float = 30.0):
@@ -192,8 +194,20 @@ class GitHubReleaseSource:
         with urllib.request.urlopen(request, timeout=self._timeout) as response:
             return read_limited(response, limit)
 
-    def fetch_release(self) -> ReleaseInfo:
-        url = f'{OFFICIAL_API}/repos/{OFFICIAL_REPOSITORY}/releases/latest'
+    def fetch_release(self, tag: str | None = None) -> ReleaseInfo:
+        """Read the latest stable release, or one explicit official tag.
+
+        ``tag`` is a *selection* input only: the returned record still goes
+        through :func:`select_asset` and the ten package checks, so an arbitrary
+        caller-supplied tag cannot authenticate unverified bytes.
+        """
+        if tag is None:
+            url = f'{OFFICIAL_API}/repos/{OFFICIAL_REPOSITORY}/releases/latest'
+        else:
+            if versions.parse_tag(tag) is None:
+                raise SourceError('SOURCE_ALLOWLIST',
+                                  f'release tag is not v<major>.<minor>[.<patch>]: {tag!r}')
+            url = f'{OFFICIAL_API}/repos/{OFFICIAL_REPOSITORY}/releases/tags/{tag}'
         raw = self._request(url, authenticate=True, limit=MAX_METADATA_BYTES)
         try:
             payload = json.loads(raw.decode('utf-8'))

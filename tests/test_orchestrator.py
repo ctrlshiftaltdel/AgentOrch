@@ -1,4 +1,5 @@
-import contextlib, io, json, os, sqlite3, subprocess, sys, tempfile, time, unittest
+import contextlib, hashlib, io, json, os, shutil, sqlite3, subprocess, sys, tempfile, threading, time, unittest
+from datetime import datetime as _datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -793,6 +794,14 @@ class ProjectEditionTests(unittest.TestCase):
         self.assertIn('docs/PROJECT.md',msg)
         self.assertIn('file not found',msg)
         self.assertIn(str(self.root),msg)
+
+    def test_flat_missing_project_error_text_is_byte_for_byte_unchanged(self):
+        path = self.root / 'docs' / 'PROJECT.md'
+        expected = (f'docs/PROJECT.md: file not found at {path}; '
+                    'add the key `edition` with value local or github')
+        with self.assertRaises(orch.EditionError) as cm:
+            orch.read_project_edition(self.root)
+        self.assertEqual(str(cm.exception), expected)
 
     def test_missing_edition_key_blocks(self):
         self.project('- `local_dir`：`.local`')
@@ -1762,6 +1771,809 @@ class TaskAddRepeatableOptionTests(unittest.TestCase):
         row = self.row('TASK-9310')
         self.assertEqual(json.loads(row['depends_json']), [])
         self.assertEqual(json.loads(row['resources_json']), [])
+
+
+class IsolatedSchedulerLayoutTests(unittest.TestCase):
+    """Issue #153: isolated root resolution, limited to the scheduler CLI.
+
+    These tests drive the real CLI from a synthetic ``<host>/agentorch`` install.
+    The scheduler's own location is used only to *detect* a layout; it is not
+    source authentication and not OS-level isolation. Direct library calls keep
+    the flat contract, so the isolated path is opt-in at the CLI boundary.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.host = base / 'host'
+        self.host.mkdir()
+        self.kit = self.host / 'agentorch'
+        (self.kit / 'scripts').mkdir(parents=True)
+        shutil.copyfile(SCRIPT, self.kit / 'scripts' / 'orchestrator.py')
+        (self.kit / 'docs').mkdir()
+        (self.kit / 'docs' / 'PROJECT.md').write_text(
+            '# Project\n\n- `edition`：`local`\n', encoding='utf-8')
+        (self.host / 'HOST-README.md').write_text('host owned\n', encoding='utf-8')
+        self.external = base / 'external'
+        self.external.mkdir()
+        self.scheduler = self.kit / 'scripts' / 'orchestrator.py'
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @property
+    def state(self):
+        return self.kit / '.local' / 'orchestration'
+
+    def run_cli(self, *args, cwd=None, scheduler=None):
+        return subprocess.run(
+            [sys.executable, str(scheduler or self.scheduler), *args],
+            cwd=str(cwd or self.host), text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def snapshot(self, root):
+        found = {}
+        for path in sorted(root.rglob('*')):
+            rel = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                found[rel] = ('link', os.readlink(path))
+            elif path.is_dir():
+                found[rel] = ('dir',)
+            else:
+                found[rel] = ('file', hashlib.sha256(path.read_bytes()).hexdigest())
+        return found
+
+    def outside_private_state(self, snapshot):
+        private = 'agentorch/.local'
+        return {rel: value for rel, value in snapshot.items()
+                if rel != private and not rel.startswith(private + '/')}
+
+    def test_bare_isolated_scheduler_is_rejected_before_any_write(self):
+        before_host = self.snapshot(self.host)
+        before_external = self.snapshot(self.external)
+        for cwd in (self.host, self.kit, self.external):
+            for command in (('init',), ('task', 'list')):
+                with self.subTest(cwd=str(cwd), command=' '.join(command)):
+                    result = self.run_cli(*command, cwd=cwd)
+                    self.assertNotEqual(result.returncode, 0,
+                                        result.stdout + result.stderr)
+                    self.assertIn('isolated', result.stderr.lower())
+                    self.assertIn('--layout', result.stderr)
+        self.assertEqual(self.snapshot(self.host), before_host)
+        self.assertEqual(self.snapshot(self.external), before_external)
+        self.assertFalse((self.host / '.orchestration').exists())
+        self.assertFalse((self.kit / '.orchestration').exists())
+        self.assertFalse((self.external / '.orchestration').exists())
+        self.assertFalse(self.state.exists())
+
+    def test_explicit_isolated_mode_uses_kit_state_from_any_cwd(self):
+        before_host = self.snapshot(self.host)
+        for cwd in (self.host, self.kit, self.external):
+            with self.subTest(cwd=str(cwd)):
+                if self.state.exists():
+                    shutil.rmtree(self.state)
+                result = self.run_cli('--layout', 'isolated', 'init', cwd=cwd)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.state / 'state.sqlite3').is_file())
+                self.assertTrue((self.state / 'config.json').is_file())
+                self.assertTrue((self.state / 'backups').is_dir())
+                self.assertFalse((self.host / '.orchestration').exists())
+                self.assertFalse((self.kit / '.orchestration').exists())
+                shown = self.run_cli('--layout', 'isolated', 'config', 'show', cwd=cwd)
+                self.assertEqual(shown.returncode, 0, shown.stderr)
+                self.assertIn('edition', shown.stdout)
+                self.assertIn('local', shown.stdout)
+        # The isolated CLI is a full task-store client, not just an `init` shim.
+        added = self.run_cli('--layout', 'isolated', 'task', 'add', '--id', 'TASK-153',
+                             '--title', 'isolated state', '--paths', 'src/',
+                             '--acceptance', 'works', cwd=self.external)
+        self.assertEqual(added.returncode, 0, added.stderr)
+        listed = self.run_cli('--layout', 'isolated', 'task', 'list', cwd=self.host)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn('TASK-153', listed.stdout)
+        self.assertFalse((self.host / '.orchestration').exists())
+        self.assertEqual(self.outside_private_state(self.snapshot(self.host)),
+                         self.outside_private_state(before_host))
+
+    def test_isolated_explicit_root_is_bounded_and_symlink_refused(self):
+        link = self.host / 'kit-link'
+        link.symlink_to(self.kit, target_is_directory=True)
+        before = self.snapshot(self.host)
+        cases = (
+            ('empty', ['--root', '']),
+            ('host', ['--root', str(self.host)]),
+            ('external', ['--root', str(self.external)]),
+            ('duplicate', ['--root', str(self.kit), '--root', str(self.kit)]),
+            ('symlink', ['--root', str(link)]),
+        )
+        for name, root_args in cases:
+            with self.subTest(case=name):
+                result = self.run_cli('--layout', 'isolated', *root_args, 'init',
+                                      cwd=self.external)
+                self.assertNotEqual(result.returncode, 0,
+                                    result.stdout + result.stderr)
+                self.assertIn('root', result.stderr.lower())
+        self.assertEqual(self.snapshot(self.host), before)
+        self.assertFalse(self.state.exists())
+        accepted = self.run_cli('--layout', 'isolated', '--root', str(self.kit),
+                                'init', cwd=self.external)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertTrue((self.state / 'state.sqlite3').is_file())
+
+    def test_isolated_state_directory_symlink_is_refused(self):
+        outside = Path(self.tmp.name) / 'outside-state'
+        outside.mkdir()
+        (self.kit / '.local').symlink_to(outside, target_is_directory=True)
+        before = self.snapshot(outside)
+        result = self.run_cli('--layout', 'isolated', 'init')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('symlink', result.stderr.lower())
+        self.assertEqual(self.snapshot(outside), before)
+        self.assertFalse((self.host / '.orchestration').exists())
+
+    def test_isolated_mode_never_reads_or_migrates_a_host_old_store(self):
+        old = self.host / '.orchestration'
+        old.mkdir()
+        old_db = old / 'state.sqlite3'
+        sentinel = b'host old store sentinel'
+        old_db.write_bytes(sentinel)
+        bare = self.run_cli('task', 'list', cwd=self.host)
+        self.assertNotEqual(bare.returncode, 0, bare.stdout + bare.stderr)
+        self.assertEqual(old_db.read_bytes(), sentinel)
+        isolated = self.run_cli('--layout', 'isolated', 'init', cwd=self.host)
+        self.assertEqual(isolated.returncode, 0, isolated.stderr)
+        self.assertTrue((self.state / 'state.sqlite3').is_file())
+        self.assertEqual(old_db.read_bytes(), sentinel)
+        self.assertEqual(self.snapshot(old), {
+            'state.sqlite3': ('file', hashlib.sha256(sentinel).hexdigest())})
+
+    def test_isolated_state_file_symlink_is_refused(self):
+        outside = Path(self.tmp.name) / 'outside.sqlite3'
+        outside.write_bytes(b'sentinel')
+        self.state.mkdir(parents=True)
+        (self.state / 'state.sqlite3').symlink_to(outside)
+        result = self.run_cli('--layout', 'isolated', 'init')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('symlink', result.stderr.lower())
+        self.assertEqual(outside.read_bytes(), b'sentinel')
+
+    def test_isolated_resource_component_symlink_is_refused(self):
+        outside = Path(self.tmp.name) / 'outside-docs'
+        outside.mkdir()
+        (outside / 'PROJECT.md').write_text('- `edition`：`local`\n', encoding='utf-8')
+        docs = self.kit / 'docs'
+        shutil.rmtree(docs)
+        docs.symlink_to(outside, target_is_directory=True)
+        result = self.run_cli('--layout', 'isolated', 'config', 'show')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('symlink', result.stderr.lower())
+
+    def test_isolated_mode_requires_agentorch_located_scheduler(self):
+        result = self.run_cli('--layout', 'isolated', 'init',
+                              scheduler=SCRIPT, cwd=self.external)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('agentorch', result.stderr)
+
+    def test_flat_cli_baseline_and_explicit_flat_override_are_unchanged(self):
+        flats = []
+        for name, extra in (('plain', ()), ('explicit', ('--layout', 'flat'))):
+            root = Path(self.tmp.name) / name
+            (root / 'docs').mkdir(parents=True)
+            (root / 'docs' / 'PROJECT.md').write_text(
+                '# Project\n\n- `edition`：`local`\n', encoding='utf-8')
+            result = self.run_cli(*extra, '--root', str(root), 'init',
+                                  scheduler=SCRIPT, cwd=self.external)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((root / '.orchestration' / 'state.sqlite3').is_file())
+            self.assertFalse((root / '.local' / 'orchestration').exists())
+            flats.append((self.snapshot(root), result.stdout.replace(str(root), '<root>'),
+                          (root / '.orchestration' / 'config.json').read_bytes()))
+        self.assertEqual(sorted(flats[0][0]), sorted(flats[1][0]))
+        self.assertEqual(flats[0][1], flats[1][1])
+        self.assertEqual(flats[0][2], flats[1][2])
+        # An explicit flat override is the bounded compatibility exception for a
+        # legacy flat checkout that happens to live under an ``agentorch`` path.
+        legacy = Path(self.tmp.name) / 'legacy'
+        (legacy / 'docs').mkdir(parents=True)
+        (legacy / 'docs' / 'PROJECT.md').write_text(
+            '# Project\n\n- `edition`：`local`\n', encoding='utf-8')
+        result = self.run_cli('--layout', 'flat', '--root', str(legacy), 'init',
+                              cwd=self.external)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((legacy / '.orchestration' / 'state.sqlite3').is_file())
+        self.assertFalse(self.state.exists())
+
+    def test_flat_backup_keeps_following_a_symlinked_backups_directory(self):
+        """Published flat CLI parity: HEAD follows the link and succeeds.
+
+        The isolated-layout link refusal must not leak into flat: the owner
+        froze the flat CLI, so this compatibility behaviour is pinned here.
+        """
+        flat = Path(self.tmp.name) / 'flat-backup-dir-link'
+        self._write_edition(flat)
+        init = self.run_cli('--root', str(flat), 'init', scheduler=SCRIPT,
+                            cwd=self.external)
+        self.assertEqual(init.returncode, 0, init.stderr)
+        outside = Path(self.tmp.name) / 'flat-outside-backups'
+        outside.mkdir()
+        (flat / '.orchestration' / 'backups').rmdir()
+        (flat / '.orchestration' / 'backups').symlink_to(
+            outside, target_is_directory=True)
+        result = self.run_cli('--root', str(flat), 'backup', scheduler=SCRIPT,
+                              cwd=self.external)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        created = list(outside.glob('*.sqlite3'))
+        self.assertEqual(len(created), 1,
+                         'flat backup did not follow the historical directory link')
+        self.assertTrue(created[0].read_bytes().startswith(b'SQLite format 3'))
+        self.assertFalse((flat / '.local' / 'orchestration').exists())
+
+    def test_flat_backup_keeps_following_a_preset_destination_symlink(self):
+        """HEAD writes through a preset destination link; flat must stay identical."""
+        flat = Path(self.tmp.name) / 'flat-backup-dest-link'
+        self._write_edition(flat)
+        init = self.run_cli('--root', str(flat), 'init', scheduler=SCRIPT,
+                            cwd=self.external)
+        self.assertEqual(init.returncode, 0, init.stderr)
+        outside = Path(self.tmp.name) / 'flat-outside-target.sqlite3'
+        outside.write_bytes(b'')
+        destination = (flat / '.orchestration' / 'backups'
+                       / 'state-20260102-030405.sqlite3')
+        destination.symlink_to(outside)
+        rc, _, err = self._main(
+            ['--layout', 'flat', '--root', str(flat), 'backup'],
+            patches=(('datetime', self._fixed_datetime()),))
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(outside.read_bytes().startswith(b'SQLite format 3'),
+                        'flat backup did not follow its historical destination link')
+
+    def test_flat_init_exclude_text_stays_the_historical_rule(self):
+        """A real .git directory gets the frozen flat rule, not the isolated one."""
+        flat = Path(self.tmp.name) / 'flat-exclude'
+        self._write_edition(flat)
+        (flat / '.git' / 'info').mkdir(parents=True)
+        result = self.run_cli('--root', str(flat), 'init', scheduler=SCRIPT,
+                              cwd=self.external)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rules = (flat / '.git' / 'info' / 'exclude').read_text(
+            encoding='utf-8').splitlines()
+        self.assertIn('.orchestration/', rules)
+        self.assertNotIn('.local/orchestration/', rules)
+
+    # --- review #6758453350: local scheduler defects -----------------------
+    def _write_edition(self, root):
+        (root / 'docs').mkdir(parents=True, exist_ok=True)
+        (root / 'docs' / 'PROJECT.md').write_text(
+            '# Project\n\n- `edition`：`local`\n', encoding='utf-8')
+
+    @staticmethod
+    def _fixed_datetime():
+        class Fixed:
+            @staticmethod
+            def now(tz=None):
+                return _datetime(2026, 1, 2, 3, 4, 5, tzinfo=tz)
+        return Fixed
+
+    def _main(self, argv, *, patches=()):
+        """Run the loaded scheduler in-process and return (rc, stdout, stderr)."""
+        out, err = io.StringIO(), io.StringIO()
+        stack = contextlib.ExitStack()
+        with stack:
+            stack.enter_context(mock.patch.object(orch, '__file__', str(self.scheduler)))
+            for target, value in patches:
+                stack.enter_context(mock.patch.object(orch, target, value))
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = orch.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_state_root_is_bound_to_the_call_not_a_process_global(self):
+        """The cross-database global must be gone, not merely restored."""
+        self.assertFalse(hasattr(orch, '_ACTIVE_STATE_DIR'),
+                         'scheduler still exposes a process-global state directory')
+
+    def test_direct_api_during_isolated_cli_uses_its_own_root(self):
+        other = Path(self.tmp.name) / 'other'
+        self._write_edition(other)
+        real_init = orch.init
+        entered = {'done': False}
+
+        def probing_init(root, state_root=None):
+            if Path(root).resolve() == self.kit.resolve() and not entered['done']:
+                entered['done'] = True
+                # A direct library call for a different root, made *during* the
+                # isolated CLI call. It must keep the flat contract for its root.
+                real_init(other)
+            if state_root is None:
+                return real_init(root)
+            return real_init(root, state_root=state_root)
+
+        rc, _, err = self._main(['--layout', 'isolated', 'init'],
+                                patches=(('init', probing_init),))
+        self.assertEqual(rc, 0, err)
+        self.assertTrue((other / '.orchestration' / 'state.sqlite3').is_file(),
+                        'direct API call was routed into the isolated state root')
+        self.assertFalse((other / '.local').exists())
+        self.assertTrue((self.state / 'state.sqlite3').is_file())
+
+    def test_nested_flat_cli_during_isolated_cli_keeps_both_roots(self):
+        other = Path(self.tmp.name) / 'nested'
+        self._write_edition(other)
+        real_init = orch.init
+        entered = {'done': False}
+
+        def nested_init(root, state_root=None):
+            if Path(root).resolve() == self.kit.resolve() and not entered['done']:
+                entered['done'] = True
+                nested_rc, _, nested_err = self._main(
+                    ['--layout', 'flat', '--root', str(other), 'init'])
+                self.assertEqual(nested_rc, 0, nested_err)
+            if state_root is None:
+                return real_init(root)
+            return real_init(root, state_root=state_root)
+
+        rc, _, err = self._main(['--layout', 'isolated', 'init'],
+                                patches=(('init', nested_init),))
+        self.assertEqual(rc, 0, err)
+        self.assertTrue((self.state / 'state.sqlite3').is_file())
+        self.assertTrue((other / '.orchestration' / 'state.sqlite3').is_file())
+        self.assertFalse((self.kit / '.orchestration').exists())
+        self.assertFalse((other / '.local').exists())
+
+    def test_concurrent_isolated_and_flat_cli_calls_keep_their_roots(self):
+        flat_kit = Path(self.tmp.name) / 'flatkit'
+        self._write_edition(flat_kit)
+        a_ready = threading.Event(); b_set_none = threading.Event(); a_done = threading.Event()
+        real_init = orch.init
+        results = {}
+
+        def gated_init(root, state_root=None):
+            root = Path(root).resolve()
+            if root == self.kit.resolve():
+                a_ready.set()
+                self.assertTrue(b_set_none.wait(10), 'flat CLI never reached its init')
+                try:
+                    return real_init(root) if state_root is None else real_init(root, state_root=state_root)
+                finally:
+                    a_done.set()
+            if root == flat_kit.resolve():
+                b_set_none.set()
+                self.assertTrue(a_done.wait(10), 'isolated CLI never reached its init')
+                return real_init(root) if state_root is None else real_init(root, state_root=state_root)
+            return real_init(root) if state_root is None else real_init(root, state_root=state_root)
+
+        def run_isolated():
+            with mock.patch.object(orch, '__file__', str(self.scheduler)), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                results['isolated'] = orch.main(['--layout', 'isolated', 'init'])
+
+        def run_flat():
+            with contextlib.redirect_stdout(io.StringIO()):
+                results['flat'] = orch.main(['--layout', 'flat', '--root', str(flat_kit), 'init'])
+
+        with mock.patch.object(orch, 'init', side_effect=gated_init):
+            first = threading.Thread(target=run_isolated)
+            second = threading.Thread(target=run_flat)
+            first.start(); second.start()
+            first.join(20); second.join(20)
+            self.assertFalse(first.is_alive(), 'isolated CLI thread did not finish')
+            self.assertFalse(second.is_alive(), 'flat CLI thread did not finish')
+
+        self.assertEqual(results.get('isolated'), 0)
+        self.assertEqual(results.get('flat'), 0)
+        self.assertTrue((self.state / 'state.sqlite3').is_file(),
+                        'isolated CLI wrote a flat state database instead')
+        self.assertFalse((self.kit / '.orchestration').exists())
+        self.assertTrue((flat_kit / '.orchestration' / 'state.sqlite3').is_file())
+
+    def test_exception_in_isolated_cli_does_not_leave_a_state_binding(self):
+        other = Path(self.tmp.name) / 'after-failure'
+        self._write_edition(other)
+
+        def boom(root, state_root=None):
+            raise RuntimeError('injected failure')
+
+        rc, _, err = self._main(['--layout', 'isolated', 'init'], patches=(('init', boom),))
+        self.assertNotEqual(rc, 0, err)
+        rc, _, err = self._main(['--layout', 'flat', '--root', str(other), 'init'])
+        self.assertEqual(rc, 0, err)
+        self.assertTrue((other / '.orchestration' / 'state.sqlite3').is_file())
+        self.assertFalse((self.state / 'state.sqlite3').exists())
+
+    def test_backup_refuses_preset_second_named_symlink_target(self):
+        init = self.run_cli('--layout', 'isolated', 'init')
+        self.assertEqual(init.returncode, 0, init.stderr)
+        outside = Path(self.tmp.name) / 'outside.sqlite3'
+        con = sqlite3.connect(outside)
+        con.execute('CREATE TABLE sentinel(v)')
+        con.execute("INSERT INTO sentinel VALUES ('keep-me')")
+        con.commit(); con.close()
+        before = outside.read_bytes()
+        destination = self.state / 'backups' / 'state-20260102-030405.sqlite3'
+        destination.symlink_to(outside)
+        rc, _, err = self._main(['--layout', 'isolated', 'backup'],
+                                patches=(('datetime', self._fixed_datetime()),))
+        self.assertNotEqual(rc, 0, err)
+        self.assertIn('symlink', err.lower())
+        self.assertEqual(outside.read_bytes(), before,
+                         'backup wrote through the symlink into an outside database')
+        self.assertTrue(destination.is_symlink())
+        self.assertNotIn(str(self.tmp.name), err)
+        self.assertNotIn(str(Path.home()), err)
+
+    def test_backup_refuses_symlinked_backup_directory(self):
+        init = self.run_cli('--layout', 'isolated', 'init')
+        self.assertEqual(init.returncode, 0, init.stderr)
+        outside = Path(self.tmp.name) / 'outside-backups'
+        outside.mkdir()
+        before = self.snapshot(outside)
+        (self.state / 'backups').rmdir()
+        (self.state / 'backups').symlink_to(outside, target_is_directory=True)
+        rc, _, err = self._main(['--layout', 'isolated', 'backup'],
+                                patches=(('datetime', self._fixed_datetime()),))
+        self.assertNotEqual(rc, 0, err)
+        self.assertIn('symlink', err.lower())
+        self.assertEqual(self.snapshot(outside), before)
+        self.assertNotIn(str(self.tmp.name), err)
+
+    def test_backup_api_refuses_symlinked_backup_directory(self):
+        """Direct API path also refuses a linked directory (post-impl control)."""
+        init = self.run_cli('--layout', 'isolated', 'init')
+        self.assertEqual(init.returncode, 0, init.stderr)
+        outside = Path(self.tmp.name) / 'outside-api-backups'
+        outside.mkdir()
+        before = self.snapshot(outside)
+        (self.state / 'backups').rmdir()
+        (self.state / 'backups').symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(orch.LayoutError):
+            orch.backup(self.kit, state_root=self.state)
+        self.assertEqual(self.snapshot(outside), before)
+
+    def test_isolated_init_refuses_symlinked_git_directory(self):
+        host_git = self.host / '.git'
+        (host_git / 'info').mkdir(parents=True)
+        exclude = host_git / 'info' / 'exclude'
+        exclude.write_text('host-owned\n', encoding='utf-8')
+        before = self.snapshot(host_git)
+        (self.kit / '.git').symlink_to(host_git, target_is_directory=True)
+        result = self.run_cli('--layout', 'isolated', 'init')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('symlink', result.stderr.lower())
+        self.assertEqual(self.snapshot(host_git), before,
+                         'isolated init followed the .git link into host metadata')
+        self.assertFalse(self.state.exists())
+        self.assertNotIn(str(self.tmp.name), result.stderr)
+        self.assertNotIn(str(Path.home()), result.stderr)
+
+    def test_isolated_init_refuses_symlinked_git_exclude(self):
+        gitdir = self.kit / '.git'
+        (gitdir / 'info').mkdir(parents=True)
+        outside = Path(self.tmp.name) / 'outside-exclude'
+        outside.write_text('host-owned\n', encoding='utf-8')
+        before = outside.read_bytes()
+        (gitdir / 'info' / 'exclude').symlink_to(outside)
+        result = self.run_cli('--layout', 'isolated', 'init')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('symlink', result.stderr.lower())
+        self.assertEqual(outside.read_bytes(), before,
+                         'isolated init wrote through a symlinked git exclude')
+        self.assertFalse(self.state.exists())
+        self.assertNotIn(str(self.tmp.name), result.stderr)
+
+    def test_isolated_init_excludes_the_actual_state_directory(self):
+        """The real .git rule must cover where isolated state actually lands."""
+        (self.kit / '.git').mkdir()
+        result = self.run_cli('--layout', 'isolated', 'init')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        exclude = self.kit / '.git' / 'info' / 'exclude'
+        actual = self.state.relative_to(self.kit).as_posix() + '/'
+        self.assertEqual(actual, '.local/orchestration/')
+        self.assertIn(actual, exclude.read_text(encoding='utf-8').splitlines(),
+                      'isolated init excluded a path it does not write')
+        self.assertTrue((self.state / 'state.sqlite3').is_file())
+        again = self.run_cli('--layout', 'isolated', 'init')
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(
+            exclude.read_text(encoding='utf-8').splitlines().count(actual), 1,
+            'repeated isolated init duplicated its exclude rule')
+        self.assertFalse((self.host / '.orchestration').exists())
+
+    def test_isolated_init_accepts_a_gitdir_file_at_dot_git(self):
+        """A Git linked worktree stores a ``gitdir:`` *file* at ``.git``.
+
+        The component check must not lstat ``.git/info`` through that file
+        (which raises NotADirectoryError); the child paths simply cannot exist,
+        so they are absent. Init still finishes and leaves the gitdir file
+        byte-for-byte unchanged because it is not a directory to append to.
+        """
+        gitdir_text = 'gitdir: ../../.git/worktrees/agentorch\n'
+        (self.kit / '.git').write_text(gitdir_text, encoding='utf-8')
+        result = self.run_cli('--layout', 'isolated', 'init')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.state / 'state.sqlite3').is_file())
+        self.assertEqual((self.kit / '.git').read_text(encoding='utf-8'),
+                         gitdir_text,
+                         'isolated init rewrote the linked-worktree gitdir file')
+
+    def test_direct_init_refuses_state_root_outside_root_without_writing(self):
+        """A direct caller must not get a half-created state outside its root.
+
+        The CLI always derives the state root inside the AgentOrch root; only a
+        direct library caller can pass an outside path. Init must refuse before
+        the config/database/backups exist instead of raising ValueError after
+        the state has already been created.
+        """
+        outside = Path(self.tmp.name) / 'outside-state-root'
+        with self.assertRaises(orch.LayoutError):
+            with contextlib.redirect_stdout(io.StringIO()):
+                orch.init(self.kit, state_root=outside)
+        self.assertFalse(outside.exists(),
+                         'init created state outside the project root before refusing')
+        self.assertFalse(self.state.exists())
+
+    def test_direct_init_accepts_a_state_root_inside_root(self):
+        """The refusal stays bounded: an in-tree explicit state root still works."""
+        inside = self.kit / 'nested-state'
+        with contextlib.redirect_stdout(io.StringIO()):
+            orch.init(self.kit, state_root=inside)
+        self.assertTrue((inside / 'state.sqlite3').is_file())
+        self.assertTrue((inside / 'config.json').is_file())
+        self.assertFalse(self.state.exists())
+
+    def test_direct_init_refuses_parent_segments_that_escape_the_root(self):
+        """A lexical ``..`` must not pass as an in-tree state root.
+
+        ``<root>/..`` and ``<root>/.local/../../x`` both *start* with the root's
+        path parts, so a purely lexical ``relative_to`` accepted them while the
+        write landed beside the root. The refusal must happen before the first
+        mkdir: neither the escape target nor the normal state slot may exist
+        afterwards, and the host tree must be byte-identical.
+        """
+        cases = (
+            ('one-level', self.kit / '..' / 'outside-parent-state'),
+            ('nested', self.kit / '.local' / '..' / '..' / 'escape-parent-state'),
+        )
+        for name, state_root in cases:
+            with self.subTest(case=name):
+                if self.state.exists():
+                    shutil.rmtree(self.state)
+                if state_root.exists():
+                    shutil.rmtree(state_root)
+                before_host = self.snapshot(self.host)
+                with self.assertRaises(orch.LayoutError):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        orch.init(self.kit, state_root=state_root)
+                self.assertFalse(state_root.exists(),
+                                 'init created state through a parent segment before refusing')
+                self.assertFalse(self.state.exists(),
+                                 'init created the normal state slot before refusing')
+                self.assertEqual(self.snapshot(self.host), before_host,
+                                 'init changed the host tree before refusing a parent segment')
+
+    def test_direct_init_refuses_state_root_behind_a_symlinked_ancestor(self):
+        """A linked in-tree ancestor is an out-of-tree write.
+
+        ``<root>/state-link`` is lexically inside the root, but it points at the
+        external directory, so ``<root>/state-link/nested-state`` resolves
+        outside. The link itself is not the final entry, so only an ancestor
+        walk catches it, and it must run before any mkdir.
+        """
+        outside = self.host / 'outside-symlink-state'
+        outside.mkdir()
+        link = self.kit / 'state-link'
+        link.symlink_to(outside, target_is_directory=True)
+        before_outside = self.snapshot(outside)
+        before_host = self.snapshot(self.host)
+        with self.assertRaises(orch.LayoutError):
+            with contextlib.redirect_stdout(io.StringIO()):
+                orch.init(self.kit, state_root=link / 'nested-state')
+        self.assertFalse((outside / 'nested-state').exists(),
+                         'init wrote through a symlinked ancestor to the external directory')
+        self.assertEqual(self.snapshot(outside), before_outside,
+                         'init changed the external directory behind a symlinked ancestor')
+        self.assertFalse(self.state.exists())
+        self.assertEqual(self.snapshot(self.host), before_host,
+                         'init changed the host tree before refusing a symlinked ancestor')
+
+    def test_isolated_init_refuses_non_directory_git_info_before_writing_state(self):
+        """``.git/info`` as a regular file must fail before state exists.
+
+        The exclude append used to run after the database and config were
+        written, so the resulting layout error left a half-created store.
+        """
+        gitdir = self.kit / '.git'
+        gitdir.mkdir()
+        (gitdir / 'info').write_text('not a directory\n', encoding='utf-8')
+        before = self.snapshot(self.host)
+        with self.assertRaises(orch.LayoutError):
+            with contextlib.redirect_stdout(io.StringIO()):
+                orch.init(self.kit, state_root=self.state)
+        self.assertFalse(self.state.exists(),
+                         'init left state behind after refusing a non-directory .git/info')
+        self.assertEqual(self.snapshot(self.host), before,
+                         'init changed the host tree after refusing a non-directory .git/info')
+
+    def test_flat_init_refuses_non_directory_git_info_before_writing_state(self):
+        """The flat layout keeps the same all-or-nothing refusal."""
+        gitdir = self.kit / '.git'
+        gitdir.mkdir()
+        (gitdir / 'info').write_text('not a directory\n', encoding='utf-8')
+        flat_state = self.kit / '.orchestration'
+        before = self.snapshot(self.host)
+        with self.assertRaises(orch.LayoutError):
+            with contextlib.redirect_stdout(io.StringIO()):
+                orch.init(self.kit)
+        self.assertFalse(flat_state.exists(),
+                         'flat init wrote state before refusing a non-directory .git/info')
+        self.assertEqual(self.snapshot(self.host), before,
+                         'flat init changed the host tree after refusing a non-directory .git/info')
+
+    # --- review #6759062862: hard-link escape routes ------------------------
+    def _preset_external_hardlink(self, target, payload=b'external sentinel'):
+        """Hard-link *target* to a name outside the isolated tree."""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        external = Path(self.tmp.name) / ('outside-' + target.name.replace('.', '_'))
+        external.write_bytes(payload)
+        os.link(external, target)
+        return external
+
+    def test_isolated_state_slot_hardlinks_are_refused_without_touching_external(self):
+        """A hard link hides an outside inode behind an ordinary-looking entry."""
+        cases = (
+            ('state.sqlite3', ('task', 'list')),
+            ('state.sqlite3-wal', ('init',)),
+            ('state.sqlite3-shm', ('init',)),
+            ('config.json', ('config', 'show')),
+        )
+        for slot, command in cases:
+            with self.subTest(slot=slot, command=' '.join(command)):
+                if self.state.exists():
+                    shutil.rmtree(self.state)
+                init = self.run_cli('--layout', 'isolated', 'init')
+                self.assertEqual(init.returncode, 0, init.stderr)
+                external = self._preset_external_hardlink(self.state / slot)
+                before = external.stat()
+                result = self.run_cli('--layout', 'isolated', *command)
+                self.assertNotEqual(result.returncode, 0,
+                                    result.stdout + result.stderr)
+                self.assertIn('hard-linked', result.stderr.lower())
+                after = external.stat()
+                self.assertEqual(external.read_bytes(), b'external sentinel',
+                                 'isolated CLI wrote through the hard link')
+                self.assertEqual(
+                    (after.st_ino, after.st_size, after.st_mtime_ns),
+                    (before.st_ino, before.st_size, before.st_mtime_ns),
+                    'external inode or bytes changed')
+                self.assertNotIn(str(self.tmp.name), result.stderr)
+                self.assertNotIn(str(Path.home()), result.stderr)
+
+    def test_isolated_init_refuses_hardlinked_git_exclude(self):
+        gitdir = self.kit / '.git'
+        (gitdir / 'info').mkdir(parents=True)
+        outside = Path(self.tmp.name) / 'outside-exclude'
+        outside.write_bytes(b'host-owned\n')
+        os.link(outside, gitdir / 'info' / 'exclude')
+        before = outside.stat()
+        result = self.run_cli('--layout', 'isolated', 'init')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('hard-linked', result.stderr.lower())
+        after = outside.stat()
+        self.assertEqual(outside.read_bytes(), b'host-owned\n',
+                         'isolated init wrote through a hard-linked git exclude')
+        self.assertEqual((after.st_ino, after.st_mtime_ns),
+                         (before.st_ino, before.st_mtime_ns))
+        self.assertFalse(self.state.exists())
+        self.assertNotIn(str(self.tmp.name), result.stderr)
+        self.assertNotIn(str(Path.home()), result.stderr)
+
+    def test_backup_refuses_hardlinked_second_named_target(self):
+        init = self.run_cli('--layout', 'isolated', 'init')
+        self.assertEqual(init.returncode, 0, init.stderr)
+        outside = Path(self.tmp.name) / 'outside-backup.sqlite3'
+        outside.write_bytes(b'external sentinel')
+        destination = self.state / 'backups' / 'state-20260102-030405.sqlite3'
+        os.link(outside, destination)
+        before = outside.stat()
+        rc, _, err = self._main(['--layout', 'isolated', 'backup'],
+                                patches=(('datetime', self._fixed_datetime()),))
+        self.assertNotEqual(rc, 0, err)
+        self.assertIn('hard-linked', err.lower())
+        after = outside.stat()
+        self.assertEqual(outside.read_bytes(), b'external sentinel',
+                         'backup wrote through the hard link into an outside file')
+        self.assertEqual((after.st_ino, after.st_size, after.st_mtime_ns),
+                         (before.st_ino, before.st_size, before.st_mtime_ns))
+        self.assertNotIn(str(self.tmp.name), err)
+        self.assertNotIn(str(Path.home()), err)
+
+    def test_isolated_edition_errors_have_no_private_path(self):
+        init = self.run_cli('--layout', 'isolated', 'init')
+        self.assertEqual(init.returncode, 0, init.stderr)
+        (self.kit / 'docs' / 'PROJECT.md').write_text(
+            '# Project\n\n- `edition`：`cloud`\n', encoding='utf-8')
+        add = ('task', 'add', '--id', 'TASK-153E', '--title', 'privacy',
+               '--paths', 'src/', '--acceptance', 'works')
+        for command in (add, ('config', 'show')):
+            with self.subTest(command=' '.join(command)):
+                result = self.run_cli('--layout', 'isolated', *command)
+                text = result.stdout + result.stderr
+                self.assertNotEqual(result.returncode, 0, text)
+                self.assertIn('docs/PROJECT.md', text)
+                self.assertIn('cloud', text)
+                self.assertNotIn(str(self.tmp.name), text)
+                self.assertNotIn(str(Path.home()), text)
+        (self.kit / 'docs' / 'PROJECT.md').unlink()
+        result = self.run_cli('--layout', 'isolated', *add)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('file not found', result.stderr)
+        self.assertIn('docs/PROJECT.md', result.stderr)
+        self.assertNotIn(str(self.tmp.name), result.stderr)
+        self.assertNotIn(str(Path.home()), result.stderr)
+
+    def test_isolated_oserror_hides_absolute_paths(self):
+        self.state.mkdir(parents=True)
+        (self.state / 'backups').write_text('occupied by a file', encoding='utf-8')
+        result = self.run_cli('--layout', 'isolated', 'init')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn(str(self.tmp.name), result.stderr)
+        self.assertNotIn(str(Path.home()), result.stderr)
+
+    def test_isolated_root_option_forms_match_custom_validation(self):
+        before_host = self.snapshot(self.host)
+        before_external = self.snapshot(self.external)
+        rejected = (
+            ('abbreviated-outside', ['--ro', str(self.external)]),
+            ('short-abbreviated-outside', ['--r', str(self.external)]),
+            ('abbreviated-equals-outside', [f'--ro={self.external}']),
+            ('mixed-duplicate', ['--root', str(self.kit), '--ro', str(self.external)]),
+            ('abbreviated-empty', ['--ro=']),
+            ('equals-empty', ['--root=']),
+            ('abbreviated-empty-separated', ['--ro', '']),
+        )
+        for name, root_args in rejected:
+            with self.subTest(case=name):
+                if self.state.exists():
+                    shutil.rmtree(self.state)
+                result = self.run_cli('--layout', 'isolated', *root_args, 'init',
+                                      cwd=self.external)
+                self.assertNotEqual(result.returncode, 0,
+                                    result.stdout + result.stderr)
+                self.assertIn('root', result.stderr.lower())
+                self.assertFalse(self.state.exists(),
+                                 'invalid root form was silently ignored and the store was written')
+                self.assertFalse((self.host / '.orchestration').exists())
+                self.assertNotIn(str(self.tmp.name), result.stderr)
+                self.assertNotIn(str(Path.home()), result.stderr)
+        self.assertEqual(self.snapshot(self.host), before_host)
+        self.assertEqual(self.snapshot(self.external), before_external)
+
+        for name, root_args in (('abbreviated-kit', ['--ro', str(self.kit)]),
+                                ('short-abbreviated-kit', ['--r', str(self.kit)]),
+                                ('equals-kit', [f'--root={self.kit}'])):
+            with self.subTest(case=name):
+                if self.state.exists():
+                    shutil.rmtree(self.state)
+                result = self.run_cli('--layout', 'isolated', *root_args, 'init',
+                                      cwd=self.external)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((self.state / 'state.sqlite3').is_file())
+
+    def test_isolated_uninitialized_error_has_no_private_path(self):
+        result = self.run_cli('--layout', 'isolated', 'task', 'list')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('not initialized', result.stderr)
+        self.assertNotIn(str(self.tmp.name), result.stderr)
+        self.assertNotIn(str(Path.home()), result.stderr)
+
+    def test_flat_cli_abbreviated_root_still_works(self):
+        root = Path(self.tmp.name) / 'flat-abbrev'
+        self._write_edition(root)
+        result = self.run_cli('--ro', str(root), 'init', scheduler=SCRIPT,
+                              cwd=self.external)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((root / '.orchestration' / 'state.sqlite3').is_file())
+        self.assertFalse((root / '.local').exists())
 
 
 if __name__=='__main__': unittest.main()
