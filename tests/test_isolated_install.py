@@ -3697,41 +3697,202 @@ runpy.run_path(script,run_name='__main__')
                             for problem in plan.problems), plan.problems)
         self.assertEqual(plan.writes, {})
 
-    def test_ac9_patch_release_tag_is_not_recoverable_from_the_local_manifest(self):
-        """The local manifest only yields v<format> / v<format>.0 candidates."""
-        from unittest.mock import patch
-        patched_source = make_source(
-            self.tmp / 'source-1.7.3', version='1.7',
-            overrides={'README.md': '# AgentOrch 1.7.3 patch\n'})
-        patched, _release, _payload = self._tagged_release(patched_source, 'v1.7.3')
+    def _install_tagged_baseline(self, source, tag):
+        """Write one verified tagged release into ``agentorch/`` as the baseline."""
+        checked, release, payload = self._tagged_release(source, tag)
         plan = workspace.plan_isolated_onboarding(
-            self.host, source_root=patched_source, verified_source=patched)
+            self.host, source_root=source, verified_source=checked)
         self.assertEqual(plan.status, 'PLANNED', plan.problems)
-        self.assertEqual(plan.mode, 'INSTALL')
         for rel, data in plan.writes.items():
             path = self.host / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
         hint, hint_problems = workspace._installed_baseline_hint(self.host / 'agentorch')
-        self.assertEqual(hint_problems, [])
-        self.assertEqual(hint['format_version'], '1.7')
+        self.assertEqual(hint_problems, [], hint)
+        return checked, release, payload
 
-        plain_source = make_source(self.tmp / 'source-1.7-plain', version='1.7')
-        plain, _plain_release, _plain_payload = self._tagged_release(plain_source, 'v1.7')
+    def _listing_transport(self, entries):
+        """In-memory replacement for the official client's two read paths."""
+        payloads = {release.assets[0].download_url: payload
+                    for release, payload in entries.values()}
         attempted = []
 
         def fetch(tag=None):
             attempted.append(tag)
-            if tag in ('v1.7', 'v1.7.0'):
-                return plain
-            raise AssertionError(f'a patch tag must never be requested: {tag!r}')
+            if tag not in entries:
+                raise AssertionError(f'unexpected release tag {tag!r}')
+            return entries[tag][0]
 
+        def download(asset):
+            return payloads[asset.download_url]
+
+        return attempted, fetch, download
+
+    def test_ac9_patch_release_baseline_is_recovered_only_from_the_official_listing(self):
+        """A tree that only matches a patch package is found via the listed tags."""
+        from unittest.mock import patch
+        from scripts.update_agentorch import sources
+        patched_source = make_source(
+            self.tmp / 'source-1.7.3', version='1.7',
+            overrides={'README.md': '# AgentOrch 1.7.3 patch\n'})
+        _checked, patch_release, patch_payload = self._install_tagged_baseline(
+            patched_source, 'v1.7.3')
+        plain_source = make_source(self.tmp / 'source-1.7-plain', version='1.7')
+        _plain, plain_release, plain_payload = self._tagged_release(plain_source, 'v1.7')
+        _plain0, plain0_release, plain0_payload = self._tagged_release(plain_source, 'v1.7.0')
+        attempted, fetch, download = self._listing_transport({
+            'v1.7': (plain_release, plain_payload),
+            'v1.7.0': (plain0_release, plain0_payload),
+            'v1.7.3': (patch_release, patch_payload),
+        })
         before = raw_snapshot(self.host)
-        with patch.object(workspace, 'fetch_verified_onboarding_release', fetch):
+        with patch.object(sources.GitHubReleaseSource, 'fetch_release', side_effect=fetch), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          return_value=('v1.7.3', 'v1.7.0', 'v1.7')):
+            result = workspace.fetch_verified_onboarding_baseline(self.host)
+        self.assertEqual(result.release_tag, 'v1.7.3')
+        self.assertEqual(attempted, ['v1.7', 'v1.7.0', 'v1.7.3'])
+        self.assertEqual(raw_snapshot(self.host), before)
+
+    def test_ac9_exact_base_tag_match_is_not_reported_as_a_patch_tag(self):
+        """When ``v<format>`` matches byte for byte, no patch tag is consulted."""
+        from unittest.mock import patch
+        from scripts.update_agentorch import sources
+        _checked, plain_release, plain_payload = self._install_tagged_baseline(
+            self.source, 'v1.7')
+        _plain0, plain0_release, plain0_payload = self._tagged_release(
+            self.source, 'v1.7.0')
+        attempted, fetch, download = self._listing_transport({
+            'v1.7': (plain_release, plain_payload),
+            'v1.7.0': (plain0_release, plain0_payload),
+        })
+        before = raw_snapshot(self.host)
+        with patch.object(sources.GitHubReleaseSource, 'fetch_release', side_effect=fetch), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          side_effect=AssertionError('the listing must not be consulted')):
+            result = workspace.fetch_verified_onboarding_baseline(self.host)
+        self.assertEqual(result.release_tag, 'v1.7')
+        self.assertEqual(attempted, ['v1.7'])
+        self.assertEqual(raw_snapshot(self.host), before)
+
+    def test_ac9_two_exact_official_matches_are_ambiguous_and_stop(self):
+        """Two listed packages that both equal the tree must not be resolved by order."""
+        from unittest.mock import patch
+        from scripts.update_agentorch import sources
+        patched_source = make_source(
+            self.tmp / 'source-1.7-patch', version='1.7',
+            overrides={'README.md': '# AgentOrch patch line\n'})
+        _checked, first_release, first_payload = self._install_tagged_baseline(
+            patched_source, 'v1.7.1')
+        _second, second_release, second_payload = self._tagged_release(
+            patched_source, 'v1.7.2')
+        plain_source = make_source(self.tmp / 'source-1.7-plain', version='1.7')
+        _plain, plain_release, plain_payload = self._tagged_release(plain_source, 'v1.7')
+        _plain0, plain0_release, plain0_payload = self._tagged_release(plain_source, 'v1.7.0')
+        attempted, fetch, download = self._listing_transport({
+            'v1.7': (plain_release, plain_payload),
+            'v1.7.0': (plain0_release, plain0_payload),
+            'v1.7.1': (first_release, first_payload),
+            'v1.7.2': (second_release, second_payload),
+        })
+        before = raw_snapshot(self.host)
+        with patch.object(sources.GitHubReleaseSource, 'fetch_release', side_effect=fetch), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          return_value=('v1.7.2', 'v1.7.1', 'v1.7.0', 'v1.7')):
             with self.assertRaises(workspace.OnboardingError) as caught:
                 workspace.fetch_verified_onboarding_baseline(self.host)
+        self.assertIn('more than one', str(caught.exception))
+        # Candidate order comes from the official listing, not from a guess.
+        self.assertEqual(attempted, ['v1.7', 'v1.7.0', 'v1.7.2', 'v1.7.1'])
+        self.assertEqual(raw_snapshot(self.host), before)
+
+    def test_ac9_listing_failure_still_fails_closed_without_guessing(self):
+        """A failed enumeration is not evidence that no patch release exists."""
+        from unittest.mock import patch
+        from scripts.update_agentorch import sources
+        patched_source = make_source(
+            self.tmp / 'source-1.7.3', version='1.7',
+            overrides={'README.md': '# AgentOrch 1.7.3 patch\n'})
+        self._install_tagged_baseline(patched_source, 'v1.7.3')
+        plain_source = make_source(self.tmp / 'source-1.7-plain', version='1.7')
+        _plain, plain_release, plain_payload = self._tagged_release(plain_source, 'v1.7')
+        _plain0, plain0_release, plain0_payload = self._tagged_release(plain_source, 'v1.7.0')
+        attempted, fetch, download = self._listing_transport({
+            'v1.7': (plain_release, plain_payload),
+            'v1.7.0': (plain0_release, plain0_payload),
+        })
+        before = raw_snapshot(self.host)
+        with patch.object(sources.GitHubReleaseSource, 'fetch_release', side_effect=fetch), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          side_effect=sources.SourceError(
+                              'SOURCE_ALLOWLIST', 'synthetic listing failure')):
+            with self.assertRaises(workspace.OnboardingError) as caught:
+                workspace.fetch_verified_onboarding_baseline(self.host)
+        self.assertIn('cannot be enumerated', str(caught.exception))
+        self.assertIn('synthetic listing failure', str(caught.exception))
         self.assertEqual(attempted, ['v1.7', 'v1.7.0'])
+        self.assertEqual(raw_snapshot(self.host), before)
+
+    def test_ac9_listing_without_a_matching_candidate_fails_closed(self):
+        """Stable tags of another Format are not candidates for this baseline."""
+        from unittest.mock import patch
+        from scripts.update_agentorch import sources
+        patched_source = make_source(
+            self.tmp / 'source-1.7.3', version='1.7',
+            overrides={'README.md': '# AgentOrch 1.7.3 patch\n'})
+        self._install_tagged_baseline(patched_source, 'v1.7.3')
+        plain_source = make_source(self.tmp / 'source-1.7-plain', version='1.7')
+        _plain, plain_release, plain_payload = self._tagged_release(plain_source, 'v1.7')
+        _plain0, plain0_release, plain0_payload = self._tagged_release(plain_source, 'v1.7.0')
+        attempted, fetch, download = self._listing_transport({
+            'v1.7': (plain_release, plain_payload),
+            'v1.7.0': (plain0_release, plain0_payload),
+        })
+        before = raw_snapshot(self.host)
+        with patch.object(sources.GitHubReleaseSource, 'fetch_release', side_effect=fetch), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          return_value=('v1.6.3', 'v1.6')):
+            with self.assertRaises(workspace.OnboardingError) as caught:
+                workspace.fetch_verified_onboarding_baseline(self.host)
+        self.assertIn('no untried v1.7', str(caught.exception))
+        self.assertEqual(attempted, ['v1.7', 'v1.7.0'])
+        self.assertEqual(raw_snapshot(self.host), before)
+
+    def test_ac9_same_format_listed_bytes_that_differ_are_rejected(self):
+        """A same-Format patch package with different bytes is not a baseline."""
+        from unittest.mock import patch
+        from scripts.update_agentorch import sources
+        patched_source = make_source(
+            self.tmp / 'source-1.7.3', version='1.7',
+            overrides={'README.md': '# AgentOrch 1.7.3 patch\n'})
+        self._install_tagged_baseline(patched_source, 'v1.7.3')
+        other_source = make_source(
+            self.tmp / 'source-1.7.3-other', version='1.7',
+            overrides={'README.md': '# a different 1.7.3 build\n'})
+        _other, other_release, other_payload = self._tagged_release(
+            other_source, 'v1.7.3')
+        plain_source = make_source(self.tmp / 'source-1.7-plain', version='1.7')
+        _plain, plain_release, plain_payload = self._tagged_release(plain_source, 'v1.7')
+        _plain0, plain0_release, plain0_payload = self._tagged_release(plain_source, 'v1.7.0')
+        attempted, fetch, download = self._listing_transport({
+            'v1.7': (plain_release, plain_payload),
+            'v1.7.0': (plain0_release, plain0_payload),
+            'v1.7.3': (other_release, other_payload),
+        })
+        before = raw_snapshot(self.host)
+        with patch.object(sources.GitHubReleaseSource, 'fetch_release', side_effect=fetch), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          return_value=('v1.7.3',)):
+            with self.assertRaises(workspace.OnboardingError) as caught:
+                workspace.fetch_verified_onboarding_baseline(self.host)
         self.assertIn('cannot be authenticated', str(caught.exception))
+        self.assertEqual(attempted, ['v1.7', 'v1.7.0', 'v1.7.3'])
         self.assertEqual(raw_snapshot(self.host), before)
 
     def test_ac9_same_tag_with_different_bytes_cannot_replace_the_baseline(self):

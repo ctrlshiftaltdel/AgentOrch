@@ -1265,7 +1265,7 @@ def _block_version(block: str) -> str | None:
 
 # --- source package ---------------------------------------------------------
 
-def fetch_verified_onboarding_release(tag: str | None = None):
+def fetch_verified_onboarding_release(tag: str | None = None, *, client=None):
     """Fetch verified official release bytes; this does not authorize writes.
 
     Only the fixed official client supplies metadata and asset bytes. ``tag`` may
@@ -1274,10 +1274,14 @@ def fetch_verified_onboarding_release(tag: str | None = None):
     returned bytes to a plan and validate its host and rollback preconditions
     before any future APPLY can be enabled. Transport failures stop immediately
     rather than retrying until a download succeeds.
+
+    ``client`` exists so one read-only baseline discovery can reuse the same
+    pinned client for its listing and its candidate downloads. It cannot change
+    the allowlist: the client has no repository parameter.
     """
     from . import package, sources
 
-    client = sources.GitHubReleaseSource()
+    client = client if client is not None else sources.GitHubReleaseSource()
     try:
         release = client.fetch_release(tag)
         asset = sources.select_asset(release)
@@ -1307,40 +1311,101 @@ def _baseline_tag_candidates(format_version: str) -> list[str]:
     return tags
 
 
+def _baseline_candidate_mismatches(result, hint: dict, target: Path) -> list[str]:
+    """Empty list only when the verified package equals the installed tree.
+
+    A same-Format package with different bytes is a mismatch, not a baseline:
+    ``installed_tree_matches_baseline`` compares every projected byte.
+    """
+    if (result.suite != hint['suite']
+            or result.format_version != hint['format_version']):
+        return [f'official release {getattr(result, "release_tag", "?")} does not match '
+                f'the installed manifest suite / format']
+    try:
+        binding = bind_verified_baseline(result, target)
+    except OnboardingError as exc:
+        return [str(exc)]
+    return installed_tree_matches_baseline(target, binding)
+
+
 def fetch_verified_onboarding_baseline(host_root):
     """Find and verify the official release the installed tree came from.
 
-    The installed ``MANIFEST.json`` is used only to suggest a release tag. The
+    The installed ``MANIFEST.json`` is used only to suggest release tags. The
     returned object is a *verified package result* whose bytes must match the
     installed tree exactly; a local manifest, self-signed hash or caller digest
-    can never authenticate the baseline on its own. Patch release tags that do
-    not equal ``v<format>`` / ``v<format>.0`` are not recoverable from the local
-    manifest, so such baselines stop rather than guessing.
+    can never authenticate the baseline on its own.
+
+    Discovery is ordered, never guessed:
+
+    1. ``v<format>`` and then ``v<format>.0``; the first exact match is accepted.
+    2. otherwise the official client's *read-only* enumeration of stable release
+       tags, filtered by ``tag_matches_format`` and by the tags already tried;
+       every candidate goes through the same ``verify_package`` and item-by-item
+       comparison.
+    3. exactly one exact match is returned. Zero matches, two or more exact
+       matches, or a failed enumeration all fail closed with no write: a
+       listing failure is never reported as "there is no patch release".
     """
+    from . import sources, versions
+
     host = Path(host_root)
     target = host / AGENTORCH_DIRNAME
     hint, hint_problems = _installed_baseline_hint(target)
     if hint is None:
         raise OnboardingError('; '.join(hint_problems) or _BASELINE_MISSING)
+    client = sources.GitHubReleaseSource()
     failures: list[str] = []
+    tried: list[str] = []
     for tag in _baseline_tag_candidates(hint['format_version']):
+        tried.append(tag)
         try:
-            result = fetch_verified_onboarding_release(tag)
+            result = fetch_verified_onboarding_release(tag, client=client)
         except OnboardingError as exc:
             failures.append(str(exc))
             continue
-        if (result.suite != hint['suite']
-                or result.format_version != hint['format_version']):
-            failures.append(f'official release {tag} does not match the installed '
-                            f'manifest suite / format')
-            continue
-        binding = bind_verified_baseline(result, target)
-        mismatches = installed_tree_matches_baseline(target, binding)
+        mismatches = _baseline_candidate_mismatches(result, hint, target)
         if mismatches:
             failures.extend(mismatches[:5])
             continue
         return result
-    detail = failures[-1] if failures else _BASELINE_MISSING
+
+    # The two historical candidates did not match. Ask the official client for
+    # the stable release tags instead of inventing a patch number.
+    try:
+        listed = client.list_stable_release_tags()
+    except (sources.SourceError, OSError) as exc:
+        raise OnboardingError(
+            'the installed baseline cannot be authenticated and the official stable '
+            f'release tags cannot be enumerated: {exc}') from exc
+    candidates = [tag for tag in listed
+                  if tag not in tried
+                  and versions.tag_matches_format(tag, hint['format_version'])]
+    if not candidates:
+        detail = failures[-1] if failures else _BASELINE_MISSING
+        raise OnboardingError(
+            'the installed baseline cannot be authenticated: the official listing has '
+            f'no untried v{hint["format_version"]} release tag ({detail})')
+    matches = []
+    for tag in candidates:
+        try:
+            result = fetch_verified_onboarding_release(tag, client=client)
+        except OnboardingError as exc:
+            failures.append(str(exc))
+            continue
+        mismatches = _baseline_candidate_mismatches(result, hint, target)
+        if mismatches:
+            failures.extend(mismatches[:5])
+            continue
+        matches.append(result)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        tags = ', '.join(sorted(str(getattr(item, 'release_tag', '?')) for item in matches))
+        raise OnboardingError(
+            f'the installed baseline matches more than one official release ({tags}); '
+            'refusing to choose between them and writing nothing')
+    detail = failures[-1] if failures else 'no candidate official release matched'
     raise OnboardingError(f'the installed baseline cannot be authenticated: {detail}')
 
 
