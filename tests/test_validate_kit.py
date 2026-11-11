@@ -960,6 +960,52 @@ class TreeModeTests(unittest.TestCase):
         self.assertEqual(errors, [])
 
     # --- manifest strictness ------------------------------------------------
+    def test_manifest_helper_scan_errors_are_returned_and_never_authorize_drift(self):
+        import errno, os
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.kit_tree(Path(tmp), docs='package')
+            self.emit_manifest(root)
+            (root / 'AGENTS.md').write_text('# tampered\n', encoding='utf-8')
+            real_scandir = os.scandir
+
+            class Broken:
+                def __init__(self, iterator, code):
+                    self.iterator, self.code, self.count = iterator, code, 0
+                def __enter__(self):
+                    self.iterator.__enter__()
+                    return self
+                def __exit__(self, *args):
+                    return self.iterator.__exit__(*args)
+                def __iter__(self):
+                    return self
+                def __next__(self):
+                    if self.count:
+                        raise OSError(self.code, 'synthetic-private', str(root / 'docs'))
+                    self.count += 1
+                    return next(self.iterator)
+
+            for code in (errno.EACCES, errno.EIO):
+                for phase in ('open', 'iterate'):
+                    for with_list in (False, True):
+                        with self.subTest(code=code, phase=phase, with_list=with_list):
+                            def scan(path):
+                                if Path(path) == root / 'docs':
+                                    if phase == 'open':
+                                        raise OSError(code, 'synthetic-private', str(path))
+                                    return Broken(real_scandir(path), code)
+                                return real_scandir(path)
+                            external = []
+                            with patch.object(os, 'scandir', side_effect=scan):
+                                errors = (validate.check_release_manifest(root, external) if with_list
+                                          else validate.check_release_manifest(root))
+                            self.assertTrue(any('cannot enumerate docs' in e and
+                                                f'errno {code}' in e for e in errors), errors)
+                            self.assertNotIn(tmp, '\n'.join(errors))
+                            self.assertNotIn('synthetic-private', '\n'.join(errors))
+                            if with_list:
+                                self.assertTrue(any('cannot enumerate docs' in e for e in external), external)
+
     def test_downstream_manifest_ignores_local_byte_drift(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self.kit_tree(Path(tmp))

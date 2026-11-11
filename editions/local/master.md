@@ -19,10 +19,11 @@
 
 ## 任务载体
 
-- `.orchestration/state.sqlite3` 是唯一任务状态源，由 `scripts/orchestrator.py` 读写。
+- 平铺布局：`.orchestration/state.sqlite3` 是唯一任务状态源，由 `scripts/orchestrator.py` 读写。
+- 隔离布局（套件位于 `<host>/agentorch/`）：`agentorch/.local/orchestration/state.sqlite3` 是唯一任务状态源，由 `agentorch/scripts/orchestrator.py --layout isolated` 读写；不要混用宿主根的 `.orchestration/`。
 - 事件与状态变更记录在同一数据库中；不要手工 `DELETE` / `UPDATE` 绕过 CLI。
-- `init` 会把 `.orchestration/` 加入当前克隆的 `.git/info/exclude`；没有 Git 时需自行加入 `.gitignore`。
-- 备份：`python scripts/orchestrator.py backup`，阶段结束与每日收尾各执行一次。
+- `init` 会把状态目录加入当前克隆的 `.git/info/exclude`（平铺为 `.orchestration/`，隔离为 `agentorch/.local/orchestration/`）；没有 Git 时需自行加入 `.gitignore`。
+- 备份：平铺布局运行 `python scripts/orchestrator.py backup`；隔离布局运行 `python agentorch/scripts/orchestrator.py --layout isolated backup`。阶段结束与每日收尾各执行一次。
 
 ## 锁机制
 
@@ -41,6 +42,15 @@ python scripts/orchestrator.py task dispatch TASK-0001
 python scripts/orchestrator.py task status TASK-0001 REVIEW_READY --head-sha <sha>
 python scripts/orchestrator.py backup
 ```
+
+隔离布局（套件位于 `<host>/agentorch/`）下，任务库、配置与备份在 `agentorch/.local/orchestration/`，不是宿主根的 `.orchestration/`。从宿主根运行上面的命令时，把 `python scripts/orchestrator.py` 换成 `python agentorch/scripts/orchestrator.py --layout isolated`，例如：
+
+```bash
+python agentorch/scripts/orchestrator.py --layout isolated init
+python agentorch/scripts/orchestrator.py --layout isolated task list
+```
+
+不带 `--layout isolated` 的裸调用在隔离布局中会被拒绝；平铺布局继续使用上面的命令（不带 `--layout`，或显式 `--layout flat`）。
 
 `python` 指代当前环境的 Python 3 解释器；本套件不引入第三方依赖。`--paths`、`--depends`、`--acceptance`、`--resources` 可重复出现，也可一次给多个值，二者都会合并保留（`--acceptance` 保序；`--paths` / `--depends` 排序去重）。完整流程见本目录 [master.md](master.md) 与 [execution.md](execution.md)。
 

@@ -161,7 +161,8 @@ FORBIDDEN_REGEXES = [
 
 # Path segments that must never exist inside the package (belt and braces on top
 # of check a, which already pins the file set to REQUIRED).
-FORBIDDEN_SEGMENTS = frozenset({'.orchestration', 'release', '.worktrees', '.workbuddy', '.git'})
+FORBIDDEN_SEGMENTS = frozenset({'.orchestration', 'release', '.worktrees', '.workbuddy',
+                                '.git', '.local'})
 # `docs/` is special: the core contract now lives there and must ship, while every
 # other repository document (design drafts, plans, upgrade notes, contracts) must
 # not. This allowlist is what keeps "all of docs/" from ever being packaged.
@@ -202,6 +203,8 @@ def collect_sources(required):
     """
     files = {}
     for rel in required:
+        if '.orchestration' in rel.split('/'):
+            raise SystemExit(f'build error: private orchestration state cannot ship: {rel}')
         source = ROOT / rel
         if not source.is_file():
             raise SystemExit(f'build error: required source missing: {source}')

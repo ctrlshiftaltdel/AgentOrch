@@ -663,11 +663,11 @@ Release 版本与 Format 是两条序列。本仓库更新器现在把第 10 项
 | 写入失败 | `ROLLED_BACK`，恢复后逐路径 presence / sha256 校验通过 | 已自动恢复；人工复核备份与报告 |
 | 回滚后校验失败 | `BLOCKED`，`rollback.result=FAILED` | `HD-11`：从备份人工恢复 / 保留现场排查 / 重新安装；**不自动重试** |
 
-回滚只用备份与逐路径哈希，不做 `git reset --hard`，也不覆盖项目自有文件。备份位于项目外系统临时目录，重启后可能被清理；需要长期保留时，在审查完成前把 `backup.location` 复制到项目外可持久位置。真实回滚失败场景本任务 `NOT_RUN`（合成测试覆盖）。
+回滚只用 APPLY 写入备份目录的绑定记录、备份副本与逐路径哈希，不做 `git reset --hard`，也不覆盖项目自有文件。绑定记录必须与当前宿主身份、HEAD、记录路径、原始 / 写入哈希和备份副本逐项一致，否则零写入 `BLOCKED`；记录之外的并发文件不触碰，记录一经成功消费即拒绝重放。备份位于项目外系统临时目录，重启后可能被清理；需要长期保留时，在审查完成前把 `backup.location` 复制到项目外可持久位置。真实回滚失败场景本任务 `NOT_RUN`（合成测试覆盖）。
 
 ### 13.9 edition 结果形态
 
-- `local`：入口返回任务包 + 分支 / Worktree 交付，`carrier=local_task_database`，`writes=[]`；入口**不写**任务库。用 `scripts/orchestrator.py task add/ready/dispatch` 登记后按 G1–G6 审查。
+- `local`：入口返回任务包 + 分支 / Worktree 交付，`carrier=local_task_database`，`writes=[]`；入口**不写**任务库。平铺布局在项目根用 `python scripts/orchestrator.py task add --id <ID> / ready / dispatch` 登记；隔离布局在宿主根用 `python agentorch/scripts/orchestrator.py --layout isolated task add --id <ID> / ready / dispatch` 登记，任务库位于 `agentorch/.local/orchestration/`。登记后按 G1–G6 审查。
 - `github`：入口返回 Issue 正文 + Draft PR payload，`carrier=issue_and_draft_pr`，`writes=[]`；入口**不调用** `gh`。创建 Issue / Draft PR 并回链，走 `PR_OPEN` → `REVIEW_READY` → G1–G6。
 - 两者共用同一份 gate 记录（`requires_review=true`、`self_approval_allowed=false`、`auto_merge=false`、冲突与 `HD-*` 列表、报告契约校验结果）；差异只在载体，不在门禁。`local` 不得假装具备 GitHub 自动化，`github` 不得写本地任务库。
 
@@ -839,3 +839,34 @@ APPLY 后的可核对事实：
   ```
 
 - **不要这样做**：同时保留 `kit/orchestration.md` 与 `docs/orchestration.md`（两个权威）；把整棵 `docs/` 当成随包内容；只复制旧文件到新路径而不改引用（`validate_kit.py` 的链接扫描会逐个指出断链）。
+
+## 16. 迁移九（#153）：旧项目改为 `agentorch/` 隔离布局
+
+- **状态：受限新安装、“同来源、可重新认证”的升级、受限旧根迁移切片与受绑定记录约束的跨进程回滚可用；隔离新安装与随后零写入的重复 PLAN 已有一次真实下游观察（§16.1，官方 Release 字节）。真实旧根迁移、本地修改过的旧根、普通非 linked worktree、真实入口链、跨平台、真实下游回滚、同 UID 强隔离与并行进程竞态仍未完成，AC-9 未通过。** 套件放在 `agentorch/`，宿主只新增 / 更新根 `AGENTS.md` 的唯一受管区块（旧根迁移切片例外：它不写旧根 `AGENTS.md`）。写入前重新检查官方来源、宿主目标状态与 Git worktree / HEAD。
+- **新安装前提**：使用专属、干净的 Git linked worktree；调用者显式声明没有其他写入者（`--declared-exclusive`，不是强制隔离证明），可用 `--expected-head <sha>` 固定 HEAD；`agentorch/` 不存在或为空；来源必须是固定官方客户端取得并通过十项包校验的字节。`--source` 只作一致性对比，不能提供计划字节或授权。
+- **升级（仅同来源且可重新认证）**：本地 `MANIFEST.json` 的 Format 只作候选 tag 提示（`v<format>` / `v<format>.0` 两个候选都会试，且都不是权威顺序）；安装器用固定官方客户端取回并校验旧版 Release，再把已安装 `agentorch/` 与该 Release 的投影逐文件比对（文本成员按发行构建器同一套 CRLF 折叠后哈希，二进制成员按原始字节；**CRLF-only 差异当前不会被基线发现拒绝**），只有全部匹配才写入与目标不同的文件并替换受管区块。本地清单与哈希不单独授权写入。补丁发行 tag（如 `v1.7.3`）无法从本地清单推导，因此安装器**总是**用固定官方客户端的只读接口列举官方稳定 Release tag（URL 固定在既有官方主机与仓库允许名单内、不跟随重定向、畸形 JSON / 传输失败 / 列举不完整均失败关闭，不改试其他源）——即使 `v<format>` 或 `v<format>.0` 已与已安装树逐文件匹配也照样列举，因为单个候选匹配不足以证明没有别的 tag 发布同样字节；随后筛出 `tag_matches_format` 为真且尚未试过的候选，逐个走同一 `verify_package` 与逐文件比对。**所有**与已安装树逐文件匹配的官方精确匹配都会被收集，**只有恰好一个**时才接受该基线——补丁 tag 只有在官方包逐文件匹配时才可恢复；零个精确匹配、两个及以上精确匹配（歧义，不挑先试到的 tag）或列举失败时一律失败关闭、零写入，且不把列举失败当成“没有补丁版”，也不把“已有一个候选匹配但列举失败”当成唯一匹配。**已出现在官方稳定列举里的候选若获取、包校验或读取本地树失败，其比对是 `NOT_RUN`**：既不能算不匹配，也不能把另一个“唯一”匹配当成基线，一律失败关闭、零写入；只有官方列举里根本没有该 tag（种子 tag 不存在）时，探测失败才可跳过，不把任意 404 都当成可跳过。格式相同但字节不同必须拒绝；同 tag 不同字节、非对象 / 畸形清单、清单路径越界、本地修改与目标删除请求全部失败关闭且零写入。仅受管区块需要更新时，PLAN 用同一份已验证的目标 Release 字节认证基线（前提是 `agentorch/` 已逐文件等于该 Release），APPLY 可完成替换；`agentorch/` 与目标完全一致时是零写入 no-op。
+- **写入与恢复**：只写 `agentorch/**` 与根 `AGENTS.md` 受管区块。相对路径先做纯词法校验。写入优先使用 `dir_fd` / `O_NOFOLLOW` 的组件锚定后端；平台没有这些原语时改用“打开前拒绝链接 + 打开后复核身份”的路径式后端，**两条后端都拿不出可证明的不跟随打开与身份复核时才失败关闭并零写入**——缺少 `dir_fd` 本身不构成“永远不可安装”。原地追加 / 重写还必须证明扩展属性、备用数据流、硬链接、setuid/setgid 等元数据可存活：POSIX 走 `listxattr` / `flistxattr`，Windows 用标准库 `ctypes` 查询命名数据流（`GetFileInformationByHandleEx` 的 `FileStreamInfo`）与扩展属性块（`NtQueryInformationFile` 的 `FileEaInformation`）；**查询成功且为空才允许写入，API 缺失、调用失败或发现流 / 属性时失败关闭**，不把未知元数据当成空。规划侧读取（旧根 / 已安装清单）同样优先走组件锚定读取；没有 `dir_fd` 时走不跟随链接的路径式读取并逐级复核身份，身份无法证明或读取期间发生变化时失败关闭。进程内故障按逆序只恢复本次已写且仍与本次写入一致的文件；冲突保留现场并报告，普通协作锁不阻止同权限进程。
+- **显式回滚**：`--rollback-backup` 只接受 APPLY 写入备份目录的 `rollback-binding.json`。该记录是固定字段的一次性描述，不是授权：rollback 重新打开并复核宿主身份、HEAD、操作标识、写入路径、原始字节哈希、写入字节哈希与备份副本哈希；记录缺失、重复、已消费，或任一字段、备份副本、当前写入字节不匹配时零写入 `BLOCKED`。全部匹配才把记录中的路径恢复为备份原始字节，记录之外的并发文件不动；成功后写入消费标记，重复回滚被拒绝。公开 JSON 不包含备份目录等绝对路径。**不声称同 UID 强隔离**：同权限进程仍可伪造本地文件，这一边界不在本实现内。自动故障恢复只在同一进程内、仅针对本次写集。
+- **旧根布局（受限迁移切片）**：唯一可写情形是：旧根每个发布成员（含根 `MANIFEST.json`）与安装器在 APPLY 内重新获取并校验的官方历史 Release 逐字节一致、旧根无本地修改、目标 `agentorch/` 不存在或为空、且目标版本不低于历史版本。满足时只新增 `agentorch/**`，旧根文件保留原路径与原字节，不移动、不删除；旧根 `AGENTS.md` 也不写受管区块，因为它本身是旧根文件。任一不匹配、缺失历史资产、目标冲突、清单路径越界或符号链接 / 非普通文件都保持 `STOPPED_CONFLICT` 且零写入。本地 `MANIFEST.json` 与哈希只作候选 tag 提示，不能独立证明归属。旧根候选 tag 的发现与已安装树共用同一套规则：先试 `v<format>` / `v<format>.0` 两个种子，再**总是**列举官方稳定 Release tag 并筛出 `tag_matches_format` 的未试候选；只有恰好一个官方包与旧根逐成员一致时才绑定（例如 Format 1.6 的干净旧根会绑定官方 `v1.6.3`，而不是只凭种子 tag 推断 `v1.6`）；列举失败、已列举候选的获取 / 包校验 / 本地比对失败、零个或两个及以上精确匹配都失败关闭、零写入，不挑先试到的 tag，也不把列举失败当成“没有补丁版”。已安装根的识别要求 `VERSION.md` 为普通文件，且 `docs/orchestration.md`（当前布局）或历史 `kit/orchestration.md`（Format 1.6 / v1.7.0 投影）至少一个为普通文件；符号链接或非普通文件不构成识别依据，仍按目标冲突零写入停止。因此从官方 v1.7.0 字节迁出的 `agentorch/` 在重复运行时会进入零写入 no-op，而不是被判成陌生目录。
+- **支持边界**：只对已实测遵循新宿主根 `AGENTS.md` 入口的运行时声明支持；直接调用旧路径不受支持，但旧文件仍存在，本套件不声称技术上阻止调用。真实下游的隔离新安装有一次观察记录（§16.1）；真实运行时入口链、跨平台能力与真实旧根迁移仍为 `NOT_RUN`。
+- **待验证**：跨进程回滚在真实下游与跨平台上的表现、同 UID 伪造边界、并发与符号链接竞态、旧布局迁移在真实下游与真实官方历史 Release 资产上的表现（测试只替换网络传输，不是真实资产证据）、本地修改过的旧根、普通非 linked worktree 下的安装、真实入口链。**补丁 tag 基线发现（官方稳定 Release 列举 + 逐文件哈希匹配）目前只有合成 transport 证据**：真实官方补丁字节（如已发布的 `v1.6.1`–`v1.6.3` 资产）上恢复已安装的补丁基线仍为 `NOT_RUN`，不因本次实现视为已验证。隔离布局可由包内 `agentorch/scripts/validate_kit.py` 做结构与哈希自检，但这不构成独立官方来源认证。**AC-9 的完整验收仍未通过**：上述未完成项消除前，不得把 AC-9 记为已通过或 `VERIFIED`。
+
+### 16.1 真实隔离新安装与重复 PLAN（#153，2026-11-11 UTC）
+
+环境：Linux x86_64、`github` 底座。安装目标是本仓库之外一个已授权的既有项目；本节不记录该项目的路径、用户名或任何未提交内容。该项目的活动检出在安装前已有未提交改动，这些改动没有被写入。安装对象是该项目一棵干净的 Git linked worktree，调用者显式声明独占（`--declared-exclusive`）并用 `--expected-head` 固定 HEAD；`agentorch/` 在安装前不存在。证据来源为 Issue #153 的派发会话记录。
+
+| # | 步骤 | 前提 | 结果 |
+| --- | --- | --- | --- |
+| 1 | 隔离新安装（APPLY） | 干净 linked worktree；`--declared-exclusive`；`--expected-head` 固定 HEAD；`agentorch/` 不存在；来源为运行当时的官方最新 Release | `APPLIED` / `INSTALL`；写入 119 项，只含 `agentorch/**` 与新建根 `AGENTS.md`；`removed_count=0`；`agentorch/AGENTS.md` 不存在 |
+| 2 | 同一安装重复 PLAN | 同一工作树、同一固定 HEAD | `PLANNED` / `UPGRADE`；`writes=0`；根 `AGENTS.md` 动作 `unchanged` |
+
+可核对事实与边界：
+
+- 第 1 行写入的 119 项只落在 `agentorch/**` 与宿主根新建 `AGENTS.md` 两处；没有任何旧根文件被移动或删除（`removed_count=0`），套件根也没有 `agentorch/AGENTS.md`。
+- 该安装所在的下游分支未推送、未提交：写入结果只存在于那棵工作树，未进入任何发布。
+- 来源是运行当时的官方最新 Release，**不是**本任务分支的未发布树；因此本节不能替代未发布树 / 本分支的发布验证，也不证明已发布客户端包含本分支后续提交。
+- `--declared-exclusive` 只是调用者的显式声明，不是隔离证明；同 UID 强隔离仍不在本实现内。
+- 该官方安装自带的 `validate_kit.py` 按平铺布局自检失败：它要求套件根 `AGENTS.md`（隔离布局把入口放在宿主根），并拒绝清单里的 `.gitignore`。当前分支的校验器能识别 `agentorch/` 隔离布局，但它的必需集（本提交为 130 项）多于那次安装写入的全部条目（119 项），该官方包不可能满足当前必需集，因此**不能**用当前校验器宣布那次官方安装已通过。
+- CI run 43022951858 在提交 `3b1f9cfcce605434247f8252e6c1a48430a6dabf` 上的 `checks (Python 3.12)`、`checks (Python 3.13)`、`checks-macos (Python 3.13)`、`checks-windows (Python 3.13)` 四个 job conclusion 均为 `success`。该结论只覆盖这些 job 的步骤；需要 POSIX `dir_fd` / `O_DIRECTORY` 或 `mkfifo` 的用例在 Windows 上自报 `NOT_RUN` 跳过，**不得**把 Windows job 的 success 读成 FIFO / `dir_fd` 路径已在 Windows 执行。
+
+本节只覆盖一次真实隔离新安装及其零写入的重复 PLAN。真实旧根迁移、本地修改过的旧根、普通非 linked worktree、真实入口链、跨进程回滚在真实下游与跨平台上的表现、同 UID 强隔离与并行进程竞态仍为 `NOT_RUN`。文本成员的 CRLF 折叠保持项目所有者的既有决定（按发行构建器同一套折叠后哈希），本节不改回严格原始字节比较。**AC-9 仍未通过。**

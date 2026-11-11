@@ -41,6 +41,7 @@ __all__ = [
     'NAMESPACE_ENV',
     'MAX_SCOPE_ID_LENGTH',
     'MAX_SCOPE_ID_BYTES',
+    'AGENTORCH_DIRNAME',
     'ScopeError',
     'ScopeIdentityError',
     'UnsafeScopeId',
@@ -48,12 +49,15 @@ __all__ = [
     'resolve_scope',
     'probe_tty_name',
     'validate_scope_id',
+    'agentorch_root',
+    'looks_like_agentorch_root',
     'store_root',
     'scope_directory',
     'identity_digest',
 ]
 
 PROJECT_ROOT_SEGMENTS = ('.local', 'agent-orch')
+AGENTORCH_DIRNAME = 'agentorch'
 NAMESPACE_ENV = 'AGENTORCH_SCOPE_ID'
 
 # Explicit, auditable environment sources. Each entry names the variable and who
@@ -241,17 +245,45 @@ def _project_root(project_root) -> Path:
     return root
 
 
+def agentorch_root(start=None) -> Path:
+    """AgentOrch Root derived from this file's location, never from the cwd.
+
+    A checkout (new-project layout) resolves to the repository root; in an
+    isolated install this module lives at ``<host>/agentorch/scripts/...`` so the
+    same rule resolves to ``<host>/agentorch``.
+    """
+    if start is not None:
+        return Path(start).resolve()
+    return Path(__file__).resolve().parents[2]
+
+
+def looks_like_agentorch_root(path) -> bool:
+    """True when *path* carries the two markers of an AgentOrch root."""
+    path = Path(path)
+    return ((path / 'scripts' / 'orchestrator.py').is_file()
+            and ((path / 'VERSION.md').is_file() or (path / 'MANIFEST.json').is_file()))
+
+
 def store_root(project_root) -> Path:
-    """Return ``<project>/.local/agent-orch`` after refusing symlink escapes."""
+    """Return the local store root, after refusing symlink escapes.
+
+    An isolated install keeps AgentOrch under ``<host>/agentorch/``; its private
+    state belongs to AgentOrch, not to the host project, so the store moves with
+    it. A checkout / new-project layout keeps the historical
+    ``<project>/.local/agent-orch`` so existing callers and tests are unchanged.
+    """
     root = _project_root(project_root)
-    local = root / PROJECT_ROOT_SEGMENTS[0]
+    nested = root / AGENTORCH_DIRNAME
+    base = (nested if nested.is_dir() and not nested.is_symlink()
+            and looks_like_agentorch_root(nested) else root)
+    local = base / PROJECT_ROOT_SEGMENTS[0]
     store = local / PROJECT_ROOT_SEGMENTS[1]
     for component in (local, store):
         if component.is_symlink():
             raise UnsafeScopeId(
                 f'refusing symlinked local store component: '
                 f'{component.relative_to(root).as_posix()}')
-    return root / PROJECT_ROOT_SEGMENTS[0] / PROJECT_ROOT_SEGMENTS[1]
+    return store
 
 
 def scope_directory(project_root, scope_id: str) -> Path:

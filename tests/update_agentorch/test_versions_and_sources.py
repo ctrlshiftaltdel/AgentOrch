@@ -211,5 +211,157 @@ class SourceTests(unittest.TestCase):
         self.assertIsNone(release.assets[0].digest)
 
 
+def _entry(tag, *, prerelease=False, draft=False):
+    return {'tag_name': tag, 'prerelease': prerelease, 'draft': draft}
+
+
+class StableReleaseListingTests(unittest.TestCase):
+    """The read-only enumeration used to discover patch release baselines.
+
+    Every page is synthetic bytes handed to the parser; no case opens a socket.
+    """
+
+    def _client(self, pages):
+        client = sources.GitHubReleaseSource(token=None, timeout=1.0)
+        calls = []
+
+        def page(url):
+            calls.append(url)
+            return pages[len(calls) - 1]
+
+        client._listing_page = page
+        return client, calls
+
+    def test_listing_returns_only_stable_release_tags(self):
+        import json
+        body = json.dumps([
+            _entry('v1.7.0'),
+            _entry('v1.6.3'),
+            _entry('v1.6.2', prerelease=True),
+            _entry('v1.6.1', draft=True),
+        ]).encode('utf-8')
+        client, calls = self._client([body])
+        self.assertEqual(client.list_stable_release_tags(), ('v1.7.0', 'v1.6.3'))
+        self.assertEqual(len(calls), 1)
+        self.assertIn('/repos/ctrlshiftaltdel/AgentOrch/releases', calls[0])
+        self.assertTrue(calls[0].startswith('https://api.github.com/'))
+
+    def test_listing_follows_pages_and_stops_on_a_short_page(self):
+        import json
+        full = json.dumps([_entry('v1.6.3')] * sources.RELEASE_PAGE_SIZE).encode('utf-8')
+        short = json.dumps([_entry('v1.6.2')]).encode('utf-8')
+        client, calls = self._client([full, short])
+        tags = client.list_stable_release_tags()
+        self.assertEqual(tags, ('v1.6.3', 'v1.6.2'))
+        self.assertEqual(len(calls), 2)
+
+    def test_listing_refuses_to_return_a_truncated_enumeration(self):
+        import json
+        full = json.dumps([_entry('v1.6.3')] * sources.RELEASE_PAGE_SIZE).encode('utf-8')
+        client, calls = self._client([full] * sources.MAX_RELEASE_PAGES)
+        with self.assertRaises(sources.SourceError) as caught:
+            client.list_stable_release_tags()
+        self.assertEqual(caught.exception.check, 'SOURCE_ALLOWLIST')
+        self.assertEqual(len(calls), sources.MAX_RELEASE_PAGES)
+
+    def test_listing_rejects_malformed_payloads(self):
+        bodies = (
+            b'{',
+            b'{}',
+            b'null',
+            b'"v1.6.3"',
+            b'[1]',
+            b'[{"prerelease": false, "draft": false}]',
+            b'[{"tag_name": 5, "prerelease": false, "draft": false}]',
+            b'[{"tag_name": "v1.6.3", "prerelease": "no", "draft": false}]',
+            b'\xff\xfe',
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                client, _calls = self._client([body])
+                with self.assertRaises(sources.SourceError) as caught:
+                    client.list_stable_release_tags()
+                self.assertEqual(caught.exception.check, 'SOURCE_ALLOWLIST')
+
+    def test_listing_urls_must_stay_on_the_official_host_and_repository(self):
+        for url in (
+            'http://api.github.com/repos/ctrlshiftaltdel/AgentOrch/releases',
+            'https://evil.example/repos/ctrlshiftaltdel/AgentOrch/releases',
+            'https://api.github.com/repos/someone/AgentOrch/releases',
+            'https://api.github.com/repos/ctrlshiftaltdel/AgentOrch/tarball',
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(sources.SourceError) as caught:
+                    sources._validate_listing_url(url)
+                self.assertEqual(caught.exception.check, 'SOURCE_ALLOWLIST')
+
+    def test_listing_refuses_a_redirect_instead_of_following_it(self):
+        with self.assertRaises(sources.SourceError) as caught:
+            sources._RefuseRedirects().redirect_request(
+                None, None, 302, 'Found', {}, 'https://evil.example/steal')
+        self.assertEqual(caught.exception.check, 'SOURCE_ALLOWLIST')
+
+    def test_listing_page_rejects_a_non_official_final_url(self):
+        from unittest.mock import patch
+
+        class Response:
+            def __init__(self, body, url):
+                self._body = body
+                self._url = url
+
+            def read(self, size=-1):
+                return self._body if size < 0 else self._body[:size]
+
+            def geturl(self):
+                return self._url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class Opener:
+            def __init__(self, response):
+                self.response = response
+                self.calls = 0
+
+            def open(self, request, timeout=None):
+                self.calls += 1
+                return self.response
+
+        url = ('https://api.github.com/repos/ctrlshiftaltdel/AgentOrch/releases'
+               '?per_page=100&page=1')
+        client = sources.GitHubReleaseSource(token=None, timeout=1.0)
+        opener = Opener(Response(b'[]',
+                                 'https://evil.example/repos/ctrlshiftaltdel/'
+                                 'AgentOrch/releases'))
+        with patch.object(sources.urllib.request, 'build_opener', return_value=opener):
+            with self.assertRaises(sources.SourceError) as caught:
+                client._listing_page(url)
+        self.assertEqual(caught.exception.check, 'SOURCE_ALLOWLIST')
+        self.assertEqual(opener.calls, 1)
+
+    def test_listing_page_never_requests_a_non_official_url(self):
+        from unittest.mock import patch
+
+        client = sources.GitHubReleaseSource(token=None, timeout=1.0)
+        with patch.object(sources.urllib.request, 'build_opener',
+                          side_effect=AssertionError('no request may be made')):
+            with self.assertRaises(sources.SourceError):
+                client._listing_page('https://evil.example/repos/ctrlshiftaltdel/'
+                                     'AgentOrch/releases')
+
+    def test_transport_failure_is_not_swallowed(self):
+        client = sources.GitHubReleaseSource(token=None, timeout=1.0)
+
+        def page(_url):
+            raise OSError('synthetic transport failure')
+
+        client._listing_page = page
+        with self.assertRaises(OSError):
+            client.list_stable_release_tags()
+
+
 if __name__ == '__main__':
     unittest.main()

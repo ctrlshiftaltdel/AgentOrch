@@ -91,6 +91,9 @@ class PackageResult:
     version: str | None = None
     format_version: str | None = None
     suite: str | None = None
+    # The exact release tag the verified bytes came from; required to re-fetch
+    # the same authenticated baseline later without trusting local data.
+    release_tag: str | None = None
     failed_check: str | None = None
     detail: str | None = None
 
@@ -367,6 +370,7 @@ def verify_package(release: sources.ReleaseInfo, payload: bytes, *,
         version=version,
         format_version=manifest['format_version'],
         suite=manifest['suite'],
+        release_tag=release.tag_name,
     )
 
 
