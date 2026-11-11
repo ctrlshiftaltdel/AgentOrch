@@ -22,6 +22,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 # Import the module the way a reviewer does: `from scripts.orchestrator import
@@ -561,21 +562,15 @@ class CheckScopeTest(unittest.TestCase):
         self.fx.init_db()
         self.fx.add_task('T-1', ['src/'], head_sha=self.fx.base)
         secret = 'SECRET-FILE-CONTENT-MUST-NOT-LEAK'
-        bindir = Path(self.tmp.name) / 'fake-bin'
-        bindir.mkdir()
-        fake = bindir / 'git'
-        fake.write_text(f'#!/bin/sh\necho "{secret}" >&2\nexit 128\n', encoding='utf-8')
-        os.chmod(fake, 0o755)
-        # Windows resolves git via PATHEXT; provide the same fake there.
-        fake.with_name('git.bat').write_text(
-            f'@echo off\r\necho {secret} 1>&2\r\nexit /b 1\r\n', encoding='utf-8')
-
-        previous = os.environ.get('PATH', '')
-        os.environ['PATH'] = str(bindir) + os.pathsep + previous
-        try:
+        # A failing Git child whose stderr carries material that must never reach
+        # the report. The child result is injected at the module seam: shadowing
+        # ``git`` through ``PATH`` needs an executable named ``git`` on POSIX and
+        # a real ``git.exe`` on Windows, which a standard-library test cannot
+        # build, so the same stimulus is supplied as the captured child result.
+        failing = subprocess.CompletedProcess(['git'], 128, stdout=b'',
+                                              stderr=secret.encode())
+        with mock.patch.object(check.subprocess, 'run', return_value=failing):
             code, out, err = self.run_tool('--task', 'T-1', '--json')
-        finally:
-            os.environ['PATH'] = previous
         self.assertEqual(code, 1)
         self.assertNotIn(secret, out)
         self.assertNotIn(secret, err)
