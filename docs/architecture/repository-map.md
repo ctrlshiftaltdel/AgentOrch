@@ -51,7 +51,7 @@
 - `scripts/verification_impact/` 与 `scripts/verification_planner/` 是 AVE 的只读影子工具，当前不在 `REQUIRED` 中，属于 `implementation` / `仅仓库`；其对外契约在 [`docs/design/verification-impact-c-contract.md`](../design/verification-impact-c-contract.md) 与 [`docs/design/verification-planner-b-contract.md`](../design/verification-planner-b-contract.md)。
 - `scripts/verification_profile.py` 在 `REQUIRED` 中，随包发布；它只读取显式提供的证据，不自行读取宿主工具列表。
 - `tests/fixtures/`、`tests/update_agentorch/test_report.py`、`tests/test_verification_impact.py`、`tests/test_verification_planner.py` 与 `tests/test_verification_profile.py` 属于 `implementation` / `仅仓库`；需要 `docs/` 夹具的测试不得加入 `REQUIRED`。
-- **旧项目隔离安装布局（受限）**：发行内容仍在包内扁平分布；隔离目标是把套件放入 `<宿主根>/agentorch/`。官方校验字节、专属干净 linked worktree、显式独占声明下的新安装可写；同来源且可重新认证的升级（安装器取回旧版官方 Release 并逐文件比对已安装内容）也可写。旧根布局只支持受限迁移切片：旧根与 APPLY 内重新获取并校验的官方历史 Release 逐字节一致、无本地修改、目标 `agentorch/` 不存在或为空时，只新增 `agentorch/` 并保留旧根原路径原字节，不移动、不删除；其他情况失败关闭。跨进程回滚、真实官方历史 Release 资产、普通非 linked worktree 与跨平台能力仍未完成，AC-9 未通过；本地清单不能独立证明归属。详见 [升级指南](../upgrade.md)。
+- **旧项目隔离安装布局（受限）**：发行内容仍在包内扁平分布；隔离目标是把套件放入 `<宿主根>/agentorch/`。官方校验字节、专属干净 linked worktree、显式独占声明下的新安装可写；同来源且可重新认证的升级（安装器取回旧版官方 Release 并逐文件比对已安装内容）也可写。旧根布局只支持受限迁移切片：旧根与 APPLY 内重新获取并校验的官方历史 Release 逐字节一致、无本地修改、目标 `agentorch/` 不存在或为空时，只新增 `agentorch/` 并保留旧根原路径原字节，不移动、不删除；其他情况失败关闭。真实官方历史 Release 资产、真实下游与跨平台的跨进程回滚、普通非 linked worktree 与跨平台能力仍未完成，AC-9 未通过；本地清单不能独立证明归属。详见 [升级指南](../upgrade.md)。
 
 ## 4. `docs/` 关键文档
 

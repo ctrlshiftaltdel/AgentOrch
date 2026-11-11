@@ -4752,12 +4752,16 @@ runpy.run_path(script,run_name='__main__')
         unrelated.write_bytes(concurrent_bytes)
         new_file = self.host / 'notes' / 'concurrent.md'
         new_file.parent.mkdir()
-        new_file.write_text('kept\n', encoding='utf-8')
+        # Byte-mode on both sides: a text write would let the platform pick the
+        # line ending, so the assertion would no longer be about the exact bytes
+        # the rollback must leave alone.
+        new_file_bytes = b'kept\n'
+        new_file.write_bytes(new_file_bytes)
         result = workspace.rollback_isolated_onboarding({
             'host_root': str(self.host), 'backup_location': backup})
         self.assertEqual(result['status'], 'ROLLED_BACK', result)
         self.assertEqual(unrelated.read_bytes(), concurrent_bytes)
-        self.assertEqual(new_file.read_text(encoding='utf-8'), 'kept\n')
+        self.assertEqual(new_file.read_bytes(), new_file_bytes)
         restored = raw_snapshot(self.host, skip_names=('.git',))
         self.assertNotIn('agentorch/README.md', restored)
         self.assertEqual(restored['src/app.py'],

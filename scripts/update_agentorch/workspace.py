@@ -4245,8 +4245,10 @@ def apply_isolated_onboarding(plan: OnboardingPlan, *, now: datetime | None = No
     links before opening and re-checks the opened identity afterwards. New files
     use exclusive creation either way. A failure restores, in reverse order, only
     entries this call wrote whose current bytes still match; anything else is
-    left in place as a conflict. Explicit cross-process rollback deliberately
-    remains blocked.
+    left in place as a conflict. Explicit cross-process rollback restores only
+    after re-checking the backup's binding record against the live host, and
+    fails closed when any check does not match; it does not claim strong
+    isolation from another process running as the same user.
     """
     now = now or datetime.now(timezone.utc)
     host = Path(plan.host_root)

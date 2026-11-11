@@ -24,7 +24,7 @@
   - 清单**不列出自身**（无法嵌入自己的哈希）、**不含时间戳**、条目按路径排序，因此同一仓库状态两次构建得到逐字节相同的清单。
 - **`check_drift.py` 的只读边界**：该脚本随包发布，供下游项目做漂移诊断。它只读取（`read_bytes` / `read_text`）、列目录，**从不创建、重命名、删除或写入项目根下的任何文件**；诊断只报告差异与建议，是否对齐由项目所有者决定。
 - 发布时 `docs/PROJECT.md` 自动替换为待填模板 `templates/project.md`，即分发包总是随附 FILL_IN 模板，首次使用时填写。
-- **安装布局不是包内布局**：zip 保持单一顶层目录与扁平文件集。旧项目隔离布局支持受限新安装、同来源且可重新认证的升级（官方校验字节、专属干净 linked worktree、显式独占声明），以及受限旧根迁移切片（旧根与重新获取并校验的官方历史 Release 逐字节一致、无本地修改、目标为空或不存在时，只新增 `agentorch/` 并保留旧根原路径原字节）；跨进程回滚、真实官方历史 Release 资产、普通非 linked worktree 与跨平台能力仍未完成，AC-9 未通过，见 [docs/upgrade.md](../docs/upgrade.md) 第 16 节。
+- **安装布局不是包内布局**：zip 保持单一顶层目录与扁平文件集。旧项目隔离布局支持受限新安装、同来源且可重新认证的升级（官方校验字节、专属干净 linked worktree、显式独占声明），以及受限旧根迁移切片（旧根与重新获取并校验的官方历史 Release 逐字节一致、无本地修改、目标为空或不存在时，只新增 `agentorch/` 并保留旧根原路径原字节）；真实官方历史 Release 资产、真实下游与跨平台的跨进程回滚、普通非 linked worktree 与跨平台能力仍未完成，AC-9 未通过，见 [docs/upgrade.md](../docs/upgrade.md) 第 16 节。
 - **自我完善与安全更新资产**：`scripts/self_improvement/`（来源注册表、采集、Lesson、规划与闭环）、`scripts/update_agentorch/`（#51 安全更新引擎与 #52「更新 AgentOrch」自然语言入口 `entry.py`）、`templates/self-improvement/`（提案 / 任务包 / 闭环报告模板、`sources.example.json` 注册表示例与包内操作说明 `README.md`）全部进入 `REQUIRED`，随包发布。包内说明与测试只读模板 / 脚本路径，不读 `docs/`。
 - **仓库专属测试（不随包）**：`tests/update_agentorch/test_report.py` 读取冻结 fixture `docs/contracts/fixtures/`，因此保留为 repository-only，不加入 `REQUIRED`；包内仍通过随包发布的 `tests/update_agentorch/`（引擎、分类、依赖、入口合成升级）与 `tests/self_improvement/` 测试已发布入口和引擎。`tests/self_improvement/test_acceptance_report.py` 反过来**随包发布**：它只在存在 `docs/` 的仓库检出时校验场景目录（`skipUnless`，与 `tests/test_run_delivery_scenarios.py` 的既有做法一致），包内的其余断言只读随包发布的 `scripts/` 与 `templates/`，因此发行包里也能真实运行最终场景集与指标口径。
 - 明确排除（不得出现在包内）：
