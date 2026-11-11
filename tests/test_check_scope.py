@@ -35,6 +35,21 @@ from scripts import orchestrator  # noqa: E402
 NEVER = '0' * 40
 
 
+def pin_text_handling(git_command):
+    """Make the fixture's committed bytes the bytes the tool will compare.
+
+    ``scripts/check_scope.py`` runs every Git command with system and global
+    configuration blanked, so it compares the working tree with the index
+    byte-for-byte and sees ``core.autocrlf`` as false. GitHub's Windows runners
+    set ``core.autocrlf=true`` globally, so a fixture that committed through the
+    ambient configuration would store LF while the working tree holds CRLF --
+    every committed text file would then be reported as a worktree change. The
+    repository-local value keeps the fixture and the tool on the same comparison
+    without teaching any assertion to ignore a real out-of-scope path.
+    """
+    git_command('config', 'core.autocrlf', 'false')
+
+
 class GitFixture:
     """A minimal repository with a real task database built by orchestrator.init."""
 
@@ -44,6 +59,7 @@ class GitFixture:
         self.git('config', 'user.name', 'Scope Test')
         self.git('config', 'user.email', 'scope@example.invalid')
         self.git('config', 'commit.gpgsign', 'false')
+        pin_text_handling(self.git)
         self.write('.gitignore', '.orchestration/\n')
         self.write('docs/PROJECT.md', '# Project\n\n- `edition`: `local`\n')
         self.base = self.commit('base')
@@ -600,6 +616,7 @@ def build_host_repo(root):
     _git(root, 'config', 'user.name', 'Scope Test')
     _git(root, 'config', 'user.email', 'scope@example.invalid')
     _git(root, 'config', 'commit.gpgsign', 'false')
+    pin_text_handling(lambda *args: _git(root, *args))
     _write(root, '.gitignore', '.orchestration/\n')
     _write(root, 'AGENTS.md', '# Host rules\n')
     _write(root, 'src/app.py', 'v1\n')

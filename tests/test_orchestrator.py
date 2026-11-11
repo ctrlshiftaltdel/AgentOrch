@@ -1954,6 +1954,24 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('agentorch', result.stderr)
 
+    @staticmethod
+    def _mask_printed_root(output):
+        """Replace the root the CLI resolved with ``<root>``.
+
+        The two init runs live in different directories, so their output can
+        only be compared after masking each run's own root. The CLI resolves
+        ``--root``; that spelling is not guaranteed to equal ``str(root)`` on
+        Windows (case, extended-length prefix, 8.3 name), so the root is read
+        back from the registry path the CLI itself printed.
+        """
+        marker = 'Initialized local task registry: '
+        for line in output.splitlines():
+            if line.startswith(marker):
+                printed_root = Path(line[len(marker):]).parent.parent
+                if str(printed_root) not in ('', '.'):
+                    return output.replace(str(printed_root), '<root>')
+        return output
+
     def test_flat_cli_baseline_and_explicit_flat_override_are_unchanged(self):
         flats = []
         for name, extra in (('plain', ()), ('explicit', ('--layout', 'flat'))):
@@ -1966,7 +1984,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue((root / '.orchestration' / 'state.sqlite3').is_file())
             self.assertFalse((root / '.local' / 'orchestration').exists())
-            flats.append((self.snapshot(root), result.stdout.replace(str(root), '<root>'),
+            flats.append((self.snapshot(root), self._mask_printed_root(result.stdout),
                           (root / '.orchestration' / 'config.json').read_bytes()))
         self.assertEqual(sorted(flats[0][0]), sorted(flats[1][0]))
         self.assertEqual(flats[0][1], flats[1][1])

@@ -192,6 +192,31 @@ def descriptor_path(descriptor):
     return _descriptor_path(descriptor)
 
 
+def require_dir_fd(case, *functions):
+    """Report NOT_RUN when this platform cannot anchor a directory descriptor.
+
+    These cases build their stimulus by opening a directory with ``O_DIRECTORY``
+    and then injecting failures into ``dir_fd``-relative ``os.*`` calls. Windows
+    exposes neither ``O_DIRECTORY`` nor ``dir_fd``; the product correctly uses
+    its path + identity writer there, which cannot express the same stimulus, so
+    a missing primitive is reported as NOT_RUN instead of being misreported as a
+    product failure. The path + identity writer keeps its own executable
+    coverage in :class:`PortableWriteSessionTest` and
+    :class:`PlanningPathReadTest`, and refuse-to-write semantics without either
+    primitive stay covered by
+    ``test_planning_root_refuses_a_platform_without_the_flags`` and
+    ``test_security_platform_without_dir_fd_primitives_fails_closed``.
+    """
+    if os.name != 'posix' or not hasattr(os, 'O_DIRECTORY'):
+        case.skipTest('NOT_RUN: this case needs POSIX dir_fd plus O_DIRECTORY; '
+                      'this platform only has the path + identity writer')
+    missing = [label for function, label in functions
+               if function not in os.supports_dir_fd]
+    if missing:
+        case.skipTest('NOT_RUN: os.' + ', os.'.join(missing)
+                      + ' does not accept dir_fd on this platform')
+
+
 class XattrUnavailable(RuntimeError):
     """This host platform cannot store an extended attribute right now.
 
@@ -682,6 +707,7 @@ class IsolatedInstallTest(unittest.TestCase):
         return host, head
 
     def test_round2_temp_cleanup_failure_never_reports_applied(self):
+        require_dir_fd(self, (os.unlink, 'unlink'))
         import errno
         from unittest.mock import patch
         from scripts.update_agentorch import entry, sources
@@ -710,6 +736,7 @@ class IsolatedInstallTest(unittest.TestCase):
         self.assertNotEqual(prepared['payload']['rollback']['result'], 'SUCCEEDED')
 
     def test_round2_link_fsync_and_unlink_failure_is_not_zero_writes(self):
+        require_dir_fd(self, (os.link, 'link'), (os.unlink, 'unlink'))
         import errno
         from unittest.mock import patch
         from scripts.update_agentorch import entry, sources
@@ -806,6 +833,7 @@ class IsolatedInstallTest(unittest.TestCase):
         self.assertEqual(raw_snapshot(host, skip_names=('.git',)), before)
 
     def test_round2_temp_identity_swap_preserves_foreign_file(self):
+        require_dir_fd(self, (os.link, 'link'), (os.stat, 'stat'))
         from unittest.mock import patch
         from scripts.update_agentorch import entry, sources
         host, head = self._round2_host_no_agents()
@@ -841,6 +869,7 @@ class IsolatedInstallTest(unittest.TestCase):
         self.assertEqual(matches[0].read_bytes(), b'synthetic foreign file')
 
     def test_round2_temp_identity_capture_failure_is_unknown(self):
+        require_dir_fd(self)
         import errno
         from unittest.mock import patch
         from scripts.update_agentorch import entry, sources
@@ -872,6 +901,7 @@ class IsolatedInstallTest(unittest.TestCase):
         self.assertIsNone(prepared['payload']['written_count'])
 
     def test_round2_root_temp_reappears_is_not_silently_accepted(self):
+        require_dir_fd(self, (os.unlink, 'unlink'))
         from unittest.mock import patch
         from scripts.update_agentorch import entry, sources
         host, head = self._round2_host_no_agents()
@@ -905,6 +935,7 @@ class IsolatedInstallTest(unittest.TestCase):
         self.assertEqual((host / inserted[0]).read_bytes(), b'synthetic other writer')
 
     def test_round2_child_temp_unlink_eperm_stays_blocked(self):
+        require_dir_fd(self, (os.unlink, 'unlink'))
         import errno
         from unittest.mock import patch
         from scripts.update_agentorch import entry, sources
@@ -934,6 +965,7 @@ class IsolatedInstallTest(unittest.TestCase):
         self.assertIsNone(prepared['payload']['written_count'])
 
     def test_round2_primary_link_failure_not_hidden_by_cleanup_failure(self):
+        require_dir_fd(self, (os.link, 'link'), (os.unlink, 'unlink'))
         import errno
         from unittest.mock import patch
         from scripts.update_agentorch import entry, sources
@@ -1859,6 +1891,7 @@ runpy.run_path(script,run_name='__main__')
         self.assertNotEqual(result['rollback']['result'], 'SUCCEEDED')
 
     def test_review_partial_append_restores_original(self):
+        require_dir_fd(self, (os.open, 'open'), (os.stat, 'stat'))
         from unittest.mock import patch
         target = self.host / 'AGENTS.md'
         original = target.read_bytes()
@@ -1889,6 +1922,7 @@ runpy.run_path(script,run_name='__main__')
         self.assertEqual(result['result'], 'SUCCEEDED')
 
     def test_review_transaction_eexist_never_deletes_unowned_inode(self):
+        require_dir_fd(self, (os.open, 'open'), (os.stat, 'stat'))
         rel = 'agentorch/race.txt'
         target = self.host / rel
         target.parent.mkdir()
@@ -1907,6 +1941,7 @@ runpy.run_path(script,run_name='__main__')
         self.assertEqual(result['result'], 'FAILED')
 
     def test_review_transaction_short_write_preserves_original(self):
+        require_dir_fd(self, (os.open, 'open'), (os.stat, 'stat'))
         from unittest.mock import patch
         target = self.host / 'AGENTS.md'
         original = target.read_bytes()
@@ -1936,6 +1971,7 @@ runpy.run_path(script,run_name='__main__')
         self.assertEqual(result['result'], 'SUCCEEDED')
 
     def test_review_transaction_created_inode_is_rolled_back(self):
+        require_dir_fd(self, (os.open, 'open'), (os.stat, 'stat'))
         rel = 'agentorch/created.txt'
         record = {'rel': rel, 'kind': 'create', 'original': None, 'expected': b'ours'}
         root_fd = os.open(self.host, os.O_RDONLY | os.O_DIRECTORY)
@@ -1949,6 +1985,7 @@ runpy.run_path(script,run_name='__main__')
         self.assertEqual(result['result'], 'SUCCEEDED')
 
     def test_review_transaction_append_failure_restores_original_in_place(self):
+        require_dir_fd(self, (os.open, 'open'), (os.stat, 'stat'))
         from unittest.mock import patch
         target = self.host / 'AGENTS.md'
         original = target.read_bytes()
@@ -1979,6 +2016,7 @@ runpy.run_path(script,run_name='__main__')
         self.assertEqual(result['result'], 'SUCCEEDED')
 
     def test_review_transaction_append_conflict_preserves_other_bytes(self):
+        require_dir_fd(self, (os.open, 'open'), (os.stat, 'stat'))
         from unittest.mock import patch
         target = self.host / 'AGENTS.md'
         original = target.read_bytes()
@@ -2009,6 +2047,7 @@ runpy.run_path(script,run_name='__main__')
         self.assertEqual(result['result'], 'FAILED')
 
     def test_review_transaction_restore_failure_is_reported(self):
+        require_dir_fd(self, (os.open, 'open'), (os.stat, 'stat'))
         from unittest.mock import patch
         target = self.host / 'AGENTS.md'
         original = target.read_bytes()
@@ -3955,6 +3994,13 @@ runpy.run_path(script,run_name='__main__')
         non-regular leaf before any content is read.
         """
         import subprocess
+        if not hasattr(os, 'mkfifo'):
+            self.skipTest(
+                'NOT_RUN: this platform cannot create a FIFO (os.mkfifo is '
+                'absent), so the blocking-open stimulus was not executed; the '
+                'non-regular-leaf refusal stays covered by '
+                'test_ac9_legacy_manifest_entry_directory_is_rejected_without_read '
+                'and by PortableWriteSessionTest')
         self._make_legacy_install()
         entry_path = self.host / 'README.md'
         entry_path.unlink()
@@ -3984,6 +4030,7 @@ runpy.run_path(script,run_name='__main__')
         external canary opened through a directory descriptor would look like a
         benign relative open. This positive control proves the spy can see it.
         """
+        require_dir_fd(self, (os.open, 'open'))
         external = self.tmp / 'external-dir-fd-control'
         external.mkdir()
         canary = external / 'canary.txt'
@@ -4007,6 +4054,7 @@ runpy.run_path(script,run_name='__main__')
         pre-check can be the thing that rejects the symlinked ``docs/``; the
         component open itself must fail before the external canary is read.
         """
+        require_dir_fd(self, (os.open, 'open'), (os.stat, 'stat'))
         self._make_legacy_install()
         external = self.tmp / 'external-fd-walk-docs'
         shutil.move(str(self.host / 'docs'), str(external))
