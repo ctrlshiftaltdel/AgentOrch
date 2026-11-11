@@ -105,6 +105,16 @@ DB_DIR = '.orchestration'
 DB_NAME = 'state.sqlite3'
 TASK_COLUMNS = 'id,status,title,paths_json,approved_sha,head_sha'
 
+# Open flags are read through ``getattr``: importing this module must not raise
+# on a platform that does not define them, and an absent ``O_NOFOLLOW`` must not
+# degrade into a plain open that follows a link. Where the flag is missing the
+# entry is inspected before the open and the opened descriptor's identity must
+# equal the inspected one; an identity the platform cannot report is a stop.
+_O_NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
+_O_BINARY = getattr(os, 'O_BINARY', 0)
+_O_CLOEXEC = getattr(os, 'O_CLOEXEC', 0)
+_O_NONBLOCK = getattr(os, 'O_NONBLOCK', 0)
+
 AGENTORCH_DIRNAME = ISOLATED_DIRNAME
 ISOLATED_STATE_DIR = ('.local', 'orchestration')
 LAYOUT_FLAT = 'flat'
@@ -170,11 +180,87 @@ def _dir_listing(path):
         raise ScopeError(f'cannot list the task-database directory: {exc}')
 
 
-def _digest_file(path):
+def _file_identity(info):
+    """``(st_dev, st_ino)`` when the platform reports a usable inode identity."""
+    device = getattr(info, 'st_dev', None)
+    inode = getattr(info, 'st_ino', None)
+    if not isinstance(device, int) or not isinstance(inode, int) or inode == 0:
+        return None
+    return device, inode
+
+
+def _inspect_regular_file(path, label):
+    """``lstat`` *path* and refuse a symlink; ``(None, None)`` when it is absent.
+
+    This is the only existence check the task database gets. ``Path.is_file()``
+    follows a link, so its answer cannot stand in for "a regular file that was
+    not reached through a link": a link to a readable SQLite database would be
+    reported as the task database. The returned identity is what a later open
+    must match when the kernel cannot refuse the link itself.
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        raise ScopeError(f'cannot inspect the {label}: {exc.strerror or exc}')
+    if stat.S_ISLNK(info.st_mode):
+        raise ScopeError(f'the {label} is a symlink; refusing to follow it')
+    if not stat.S_ISREG(info.st_mode):
+        raise ScopeError(f'the {label} is not a regular file')
+    return info, _file_identity(info)
+
+
+def _open_regular_file(source, label):
+    """Open *source* read-only and prove no final-component link was followed.
+
+    With ``O_NOFOLLOW`` the kernel refuses the link as part of the open. Without
+    it, the entry is inspected first and the opened descriptor's identity must
+    equal the inspected one; when the platform reports no identity the call
+    fails closed before a byte is read. "Cannot prove it was not followed" is
+    never "may follow".
+
+    The descriptor is returned already proved regular, together with its
+    ``fstat``, so the caller's before/after comparison has a real baseline.
+    """
+    expected = None
+    if not _O_NOFOLLOW:
+        info, expected = _inspect_regular_file(source, label)
+        if info is None:
+            raise ScopeError(f'the {label} disappeared before it could be read')
+        if expected is None:
+            raise ScopeError(
+                f'cannot prove the {label} was opened without following a link: '
+                'this platform reports no file identity')
+    flags = os.O_RDONLY | _O_BINARY | _O_NOFOLLOW | _O_CLOEXEC | _O_NONBLOCK
+    try:
+        descriptor = os.open(source, flags)
+    except FileNotFoundError:
+        raise ScopeError(f'the {label} disappeared before it could be read')
+    except OSError as exc:
+        raise ScopeError(f'cannot read the {label}: {exc.strerror or exc}')
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ScopeError(f'the {label} is not a regular file')
+        if expected is not None and _file_identity(before) != expected:
+            raise ScopeError(f'the {label} changed while it was being opened')
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, before
+
+
+def _digest_file(path, label='task database'):
+    """SHA-256 of *path*, read through the same no-follow open as the copy."""
+    descriptor, _ = _open_regular_file(path, label)
     digest = hashlib.sha256()
-    with open(path, 'rb') as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-            digest.update(chunk)
+    try:
+        with os.fdopen(descriptor, 'rb', closefd=False) as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(chunk)
+    finally:
+        os.close(descriptor)
     return digest.hexdigest()
 
 
@@ -218,28 +304,37 @@ def _validate_isolated_store(roots):
 
 
 def _copy_regular_file(source, destination, label):
-    """Copy one regular file, refusing links, and prove the bytes stayed put.
+    """Copy one regular file into a path this call creates, refusing links.
 
-    ``O_NOFOLLOW`` closes the final-component race at open time. The fstat
-    before/after comparison proves only that the source was not observed to
-    change during this copy - it is not a lock and not a claim about a same-UID
-    writer.
+    The source is opened by ``_open_regular_file``: ``O_NOFOLLOW`` closes the
+    final-component race at open time, and without the flag the inspected
+    identity must match the opened one or the copy never starts. The destination
+    is created exclusively (``O_CREAT`` / ``O_EXCL``) in the private temporary
+    directory ``load_tasks`` owns, so a link planted at that path is refused
+    rather than followed out of the directory, and an existing entry is never
+    truncated. The fstat before/after comparison proves only that the source was
+    not observed to change during this copy - it is not a lock and not a claim
+    about a same-UID writer.
     """
-    flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0)
-    try:
-        descriptor = os.open(source, flags)
-    except OSError as exc:
-        raise ScopeError(f'cannot read the {label}: {exc.strerror or exc}')
+    descriptor, before = _open_regular_file(source, label)
     digest = hashlib.sha256()
     try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise ScopeError(f'the {label} is not a regular file')
-        with os.fdopen(descriptor, 'rb', closefd=False) as stream, \
-                open(destination, 'wb') as copy:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-                digest.update(chunk)
-                copy.write(chunk)
+        copy_flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY
+                      | _O_NOFOLLOW | _O_CLOEXEC)
+        try:
+            copy_descriptor = os.open(destination, copy_flags, 0o600)
+        except OSError as exc:
+            raise ScopeError(
+                'cannot create the private copy of the '
+                f'{label}: {exc.strerror or exc}')
+        try:
+            with os.fdopen(descriptor, 'rb', closefd=False) as stream, \
+                    os.fdopen(copy_descriptor, 'wb', closefd=False) as copy:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(chunk)
+                    copy.write(chunk)
+        finally:
+            os.close(copy_descriptor)
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
@@ -262,17 +357,20 @@ def load_tasks(roots):
 
     The source must be observed unchanged while it is copied and while the copy
     is read; otherwise the answer is "undeterminable", never a snapshot that
-    might silently omit the newest rows. A live write-ahead log or rollback
-    journal is refused before any copy: the files would be copied one at a time,
-    and a same-UID writer can replace them between copies, so no answer can
-    prove they are one commit state. A mixed snapshot is never reported as
-    in-scope.
+    might silently omit the newest rows. The source is opened without following
+    a final-component link: ``O_NOFOLLOW`` where the platform has it, otherwise
+    an inspected identity that the opened descriptor must match - and a platform
+    that reports no identity is itself "undeterminable". A live write-ahead log
+    or rollback journal is refused before any copy: the files would be copied one
+    at a time, and a same-UID writer can replace them between copies, so no
+    answer can prove they are one commit state. A mixed snapshot is never
+    reported as in-scope.
     """
     path = roots.database
     display = roots.database_label if roots.layout == LAYOUT_ISOLATED else str(path)
     if roots.layout == LAYOUT_ISOLATED:
         _validate_isolated_store(roots)
-    if not path.is_file():
+    if _inspect_regular_file(path, 'task database')[0] is None:
         raise ScopeError(
             f'task database not found: {display}; this check reads the local registry '
             f'({DB_DIR}/{DB_NAME}) and never creates it')

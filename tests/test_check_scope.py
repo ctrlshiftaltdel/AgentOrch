@@ -899,5 +899,168 @@ class IsolatedLayoutTest(unittest.TestCase):
         self.assertFalse((state / 'state.sqlite3-shm').exists())
 
 
+class NoFollowFallbackTest(unittest.TestCase):
+    """A platform without ``O_NOFOLLOW`` must fail closed, never follow a link.
+
+    ``O_NOFOLLOW`` is what lets the kernel refuse a final-component symlink at
+    open time. Where it is absent the fallback is ``lstat`` before the open plus
+    an identity comparison after it; an identity that cannot be reported is a
+    stop, because "cannot prove it was not followed" is not "may follow". These
+    tests hide both the module flag and ``os.O_NOFOLLOW`` so a regression to a
+    plain ``os.open`` cannot pass as a supported platform.
+    """
+
+    def setUp(self):
+        self.repo_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.repo_tmp.cleanup)
+        self.fx = GitFixture(self.repo_tmp.name)
+        # The canary lives outside the fixture repository: it is neither part of
+        # the change report nor reachable by a relative allowed path.
+        self.outside = Path(tempfile.mkdtemp(prefix='scope-canary-'))
+        self.addCleanup(shutil.rmtree, self.outside, True)
+
+    # --- helpers ------------------------------------------------------------
+    def hide_no_follow(self):
+        saved = getattr(os, 'O_NOFOLLOW', None)
+        if saved is not None:
+            del os.O_NOFOLLOW
+            self.addCleanup(setattr, os, 'O_NOFOLLOW', saved)
+        patcher = mock.patch.object(check, '_O_NOFOLLOW', 0, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def canary(self, name='canary.sqlite3'):
+        """A valid task database whose allowed paths would read as in-scope."""
+        path = self.outside / name
+        create_task_db(path, [('T-CANARY', 'DISPATCHED', ['.'], self.fx.base)])
+        return path
+
+    def place_database_symlink(self, target):
+        state = self.fx.root / '.orchestration'
+        state.mkdir(parents=True, exist_ok=True)
+        link = state / 'state.sqlite3'
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        os.symlink(target, link)
+        return link
+
+    def run_tool(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = check.main(['--root', str(self.fx.root), *args])
+        return code, out.getvalue(), err.getvalue()
+
+    def assert_canary_untouched(self, canary, canary_bytes, canary_listing):
+        self.assertEqual(canary.read_bytes(), canary_bytes)
+        self.assertEqual(sorted(p.name for p in canary.parent.iterdir()),
+                         canary_listing)
+
+    # --- the missing-flag fallback ------------------------------------------
+    def test_without_o_nofollow_a_symlinked_database_fails_closed(self):
+        canary = self.canary()
+        canary_bytes = canary.read_bytes()
+        canary_listing = sorted(p.name for p in canary.parent.iterdir())
+        link = self.place_database_symlink(canary)
+        self.fx.write('docs/notes.md', 'out of scope\n')
+        self.hide_no_follow()
+
+        code, out, err = self.run_tool('--json', '--base', self.fx.base)
+        self.assertEqual(code, 1, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload['status'], 'error')
+        self.assertIn('symlink', payload['error'].lower())
+        self.assertNotIn('T-CANARY', out)
+        self.assertNotIn('T-CANARY', err)
+        self.assertNotIn('in-scope', out)
+        self.assert_canary_untouched(canary, canary_bytes, canary_listing)
+        self.assertFalse(Path(str(link) + '-shm').exists())
+        self.assertFalse(Path(str(link) + '-wal').exists())
+
+    def test_without_o_nofollow_a_regular_database_is_still_read(self):
+        # The fallback is not a blanket refusal: a real regular database reads
+        # exactly as it does with the flag.
+        self.hide_no_follow()
+        self.fx.init_db()
+        self.fx.add_task('T-1', ['src/'], head_sha=self.fx.base)
+        self.fx.write('src/app.py', 'x\n')
+        code, out, err = self.run_tool('--json', '--task', 'T-1')
+        self.assertEqual(code, 0, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload['task']['id'], 'T-1')
+        self.assertIn('src/app.py', payload['in_scope'])
+
+    def test_without_o_nofollow_an_unprovable_identity_fails_closed(self):
+        # No (device, inode) means the opened descriptor cannot be proven to be
+        # the inspected entry. That is a stop before any byte is read.
+        self.hide_no_follow()
+        self.fx.init_db()
+        self.fx.add_task('T-1', ['src/'], head_sha=self.fx.base)
+        db_bytes = self.fx.db_path.read_bytes()
+        with mock.patch.object(check, '_file_identity', return_value=None,
+                               create=True):
+            code, out, err = self.run_tool('--json', '--task', 'T-1')
+        self.assertEqual(code, 1, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload['status'], 'error')
+        self.assertIn('identity', payload['error'].lower())
+        self.assertEqual(self.fx.db_path.read_bytes(), db_bytes)
+
+    def test_without_o_nofollow_a_mismatched_identity_is_refused(self):
+        # Simulate the swap window directly: the entry inspected as a regular
+        # file is replaced by another inode before the open completes. The
+        # pre-open inspection and the opened descriptor disagree, so no byte may
+        # be copied.
+        self.hide_no_follow()
+        source = self.canary('source.sqlite3')
+        source_bytes = source.read_bytes()
+        real = check._file_identity(os.lstat(source))
+        self.assertIsNotNone(real)
+        calls = []
+
+        def identity(info):
+            calls.append(info)
+            if len(calls) == 1:
+                return real
+            return (real[0], real[1] + 1)
+
+        with mock.patch.object(check, '_file_identity', side_effect=identity,
+                               create=True):
+            with self.assertRaises(check.ScopeError) as caught:
+                check._open_regular_file(source, 'task database')
+        self.assertIn('changed while it was being opened', str(caught.exception))
+        self.assertEqual(source.read_bytes(), source_bytes)
+
+    def test_with_o_nofollow_a_symlinked_database_is_refused_in_the_flat_layout(self):
+        # The existing refusal semantics must not regress where the flag exists,
+        # and the flat layout must not rely on ``Path.is_file()`` following the
+        # link to discover an ordinary file.
+        canary = self.canary()
+        canary_bytes = canary.read_bytes()
+        canary_listing = sorted(p.name for p in canary.parent.iterdir())
+        link = self.place_database_symlink(canary)
+        code, out, err = self.run_tool('--json', '--base', self.fx.base)
+        self.assertEqual(code, 1, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload['status'], 'error')
+        self.assertNotIn('T-CANARY', out)
+        self.assertNotIn('in-scope', out)
+        self.assert_canary_untouched(canary, canary_bytes, canary_listing)
+        self.assertFalse(Path(str(link) + '-shm').exists())
+
+    def test_the_private_copy_is_created_exclusively(self):
+        # The destination is in the private temporary directory. A pre-existing
+        # entry there (a link planted by another same-UID process) must be
+        # refused rather than truncated: writing through it would put the copy
+        # outside the temporary directory.
+        source = self.canary('source.sqlite3')
+        written = self.outside / 'written-through'
+        destination = self.outside / 'copy.sqlite3'
+        os.symlink(written, destination)
+        with self.assertRaises(check.ScopeError):
+            check._copy_regular_file(source, destination, 'task database')
+        self.assertFalse(written.exists(),
+                         'the copy must not write through a link at its own path')
+
+
 if __name__ == '__main__':
     unittest.main()
