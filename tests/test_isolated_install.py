@@ -460,7 +460,11 @@ def object_snapshot(root: Path, *, skip_names=()) -> dict[str, tuple]:
     - regular file -> ``('file', sha256(raw bytes))``;
     - symlink -> ``('symlink', os.readlink(path))``: the stored target string,
       never ``read_bytes`` and never ``resolve``, so following the link cannot
-      hide a change and an external target is never opened;
+      hide a change and an external target is never opened. The stored string
+      is what the OS saved, which need not be the string handed to
+      ``os.symlink``: Windows rewrites an absolute target with a ``\\\\?\\``
+      prefix, so callers compare against a ``readlink`` taken right after
+      creation instead of the requested target;
     - directory -> ``('dir',)``: presence only, which is what makes an empty
       directory observable at all.
 
@@ -2387,20 +2391,35 @@ runpy.run_path(script,run_name='__main__')
         preservation, so this raises ``SkipTest('NOT_RUN: ...')``: the runner
         records a skip, not a passing case. A warning inside a still-passing
         test would let the exit code claim success for work that never ran.
-        Returns the ``relative path -> symlink target`` map actually staged.
+        Returns the ``relative path -> stored target`` map actually staged,
+        using the string ``os.readlink`` reports immediately after creation.
+        That string is the platform's own record of the target, not the one
+        passed to ``os.symlink``: Windows stores an absolute target as a
+        ``\\\\?\\`` extended-length path and may normalise others, so asserting
+        against the requested string would fail before any install ran. No
+        target is resolved here; a followed copy would still read back as a
+        different object.
         """
         wanted = {
             'host-note-link.md': 'docs/NOTES.md',
             'external-canary-link.txt': str(canary),
         }
+        staged = {}
         for rel, target in wanted.items():
+            path = self.host / rel
             try:
-                os.symlink(target, self.host / rel)
+                os.symlink(target, path)
             except (AttributeError, NotImplementedError, OSError) as exc:
                 self.skipTest(
                     f'NOT_RUN: symlink stimulus {rel} could not be created, so '
                     f'link preservation was not exercised on this platform: {exc}')
-        return wanted
+            try:
+                staged[rel] = os.readlink(path)
+            except OSError as exc:
+                self.skipTest(
+                    f'NOT_RUN: symlink stimulus {rel} could not be read back, so '
+                    f'link preservation was not exercised on this platform: {exc}')
+        return staged
 
     def _git_env(self):
         return {**os.environ, 'GIT_AUTHOR_NAME': 'Synthetic Test',
@@ -3891,8 +3910,11 @@ runpy.run_path(script,run_name='__main__')
         links = self._stage_host_symlinks(canary)
         canary_bytes = canary.read_bytes()
         before = object_snapshot(self.host, skip_names=('.git',))
-        for rel, target in links.items():
-            self.assertEqual(before[rel], ('symlink', target), rel)
+        # ``links`` holds the target each link stores, read back with
+        # ``os.readlink`` after creation: Windows rewrites an absolute target
+        # with a ``\\?\`` prefix, and the snapshot records the stored string.
+        for rel, saved in links.items():
+            self.assertEqual(before[rel], ('symlink', saved), rel)
 
         # Positive controls: a read *through* the link must be attributed to its
         # target. The built-in ``open`` path is the one the previous spy missed.
@@ -3920,9 +3942,14 @@ runpy.run_path(script,run_name='__main__')
         after = object_snapshot(self.host, skip_names=('agentorch', 'AGENTS.md', '.git'))
         expected = {key: value for key, value in before.items() if key != 'AGENTS.md'}
         self.assertEqual(after, expected)
-        # Still a link with the same target string, not a followed copy.
-        for rel, target in links.items():
-            self.assertEqual(os.readlink(self.host / rel), target, rel)
+        # Still a link with the same stored target string, not a followed copy.
+        # ``lstat`` is what tells the two apart: a copy that points at the same
+        # final file would pass a ``resolve()`` comparison, so none is used.
+        for rel, saved in links.items():
+            path = self.host / rel
+            self.assertTrue(stat.S_ISLNK(os.lstat(path).st_mode), rel)
+            self.assertEqual(after[rel], ('symlink', saved), rel)
+            self.assertEqual(os.readlink(path), saved, rel)
 
     def test_ac4_failure_path_object_snapshot_keeps_empty_dirs_and_regular_files(self):
         # Same structural snapshot on the fail-closed path for the stimuli every
@@ -3961,8 +3988,8 @@ runpy.run_path(script,run_name='__main__')
         links = self._stage_host_symlinks(canary)
         canary_bytes = canary.read_bytes()
         before = object_snapshot(self.host)
-        for rel, target in links.items():
-            self.assertEqual(before[rel], ('symlink', target), rel)
+        for rel, saved in links.items():
+            self.assertEqual(before[rel], ('symlink', saved), rel)
         with observe_path_reads() as reads:
             plan = self.plan()
             self.assertEqual(plan.status, 'STOPPED_CONFLICT', plan.problems)
@@ -3975,8 +4002,12 @@ runpy.run_path(script,run_name='__main__')
         self.assertFalse(
             read_touches(reads, canary, self.host / 'external-canary-link.txt'),
             'a blocked plan must not read the external canary nor follow its link')
-        for rel, target in links.items():
-            self.assertEqual(os.readlink(self.host / rel), target, rel)
+        # Same stored target string and still a link, per ``lstat``; a copy that
+        # resolves to the same final file must not pass.
+        for rel, saved in links.items():
+            path = self.host / rel
+            self.assertTrue(stat.S_ISLNK(os.lstat(path).st_mode), rel)
+            self.assertEqual(os.readlink(path), saved, rel)
         self.assertEqual(agents.read_bytes(), duplicate)
         self.assertFalse((self.host / 'agentorch').exists())
 
