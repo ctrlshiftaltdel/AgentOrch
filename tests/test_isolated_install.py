@@ -150,6 +150,32 @@ def verified_package(source: Path):
     return result
 
 
+def make_historical_kit_source(root: Path, *, version: str = FORMAT_VERSION) -> Path:
+    """Synthetic Format-1.6-shaped source whose contract is ``kit/orchestration.md``.
+
+    Official v1.7.0 and older packages ship the contract at ``kit/``; an
+    isolated tree migrated from one of them carries
+    ``agentorch/kit/orchestration.md`` and no ``agentorch/docs/orchestration.md``.
+    """
+    make_source(root, version=version)
+    (root / 'kit').mkdir()
+    (root / 'docs' / 'orchestration.md').rename(root / 'kit' / 'orchestration.md')
+    (root / 'docs').rmdir()
+    for name in ('README.md', 'AGENTS.md'):
+        path = root / name
+        path.write_text(
+            path.read_text(encoding='utf-8').replace(
+                'docs/orchestration.md', 'kit/orchestration.md'),
+            encoding='utf-8', newline='\n')
+    files = {}
+    for path in sorted(root.rglob('*')):
+        if path.is_file() and path.name != 'MANIFEST.json':
+            files[path.relative_to(root).as_posix()] = path.read_bytes()
+    (root / 'MANIFEST.json').write_bytes(
+        workspace._manifest_bytes(files, SUITE, version))
+    return root
+
+
 def _descriptor_path(descriptor):
     """The real path behind an open descriptor, or ``None``.
 
@@ -3683,6 +3709,126 @@ runpy.run_path(script,run_name='__main__')
         self.assertTrue(any('agentorch' in problem for problem in plan.problems))
         self.assertEqual((self.host / 'agentorch' / 'user-data.md').read_text(encoding='utf-8'),
                          'mine\n')
+
+    def _write_installed_projection(self, *, host=None, source=None):
+        """Stage the exact projected install bytes without running APPLY."""
+        host = Path(host) if host is not None else self.host
+        source = Path(source) if source is not None else self.source
+        files = {}
+        manifest = json.loads((source / 'MANIFEST.json').read_text(encoding='utf-8'))
+        for entry in manifest['files']:
+            files[entry['path']] = (source / entry['path']).read_bytes()
+        projection = workspace._installed_projection(files, SUITE, FORMAT_VERSION, host)
+        target = host / 'agentorch'
+        for rel, data in projection.items():
+            path = target / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        return target
+
+    def _write_current_managed_block(self, *, host=None):
+        """Stage a canonical managed block so a later plan is a pure no-op."""
+        host = Path(host) if host is not None else self.host
+        agents = host / 'AGENTS.md'
+        update = workspace._agents_update(
+            agents.read_text(encoding='utf-8'), workspace.managed_block(FORMAT_VERSION))
+        agents.write_bytes(update['text'].encode('utf-8'))
+
+    def test_ac5_current_docs_contract_tree_is_recognized_as_an_install(self):
+        self._write_current_managed_block()
+        target = self._write_installed_projection()
+        self.assertTrue(workspace.looks_like_agentorch_root(target))
+        before = raw_snapshot(self.host)
+        plan = self.plan()
+        self.assertEqual(plan.status, 'PLANNED', plan.problems)
+        self.assertEqual(plan.mode, 'UPGRADE')
+        self.assertEqual(plan.writes, {})
+        result = workspace.apply_isolated_onboarding(plan)
+        self.assertEqual(result['status'], 'PLANNED', result)
+        self.assertEqual(result.get('written') or [], [], result)
+        self.assertEqual(raw_snapshot(self.host), before)
+
+    def test_ac5_historical_kit_contract_tree_is_recognized_on_repeat(self):
+        kit_source = make_historical_kit_source(self.tmp / 'source-kit')
+        verified = verified_package(kit_source)
+        self._write_current_managed_block()
+        target = self._write_installed_projection(source=kit_source)
+        self.assertTrue((target / 'kit' / 'orchestration.md').is_file())
+        self.assertFalse((target / 'docs' / 'orchestration.md').exists())
+        self.assertTrue(workspace.looks_like_agentorch_root(target))
+        before = raw_snapshot(self.host)
+        plan = workspace.plan_isolated_onboarding(
+            self.host, source_root=kit_source, verified_source=verified)
+        self.assertEqual(plan.status, 'PLANNED', plan.problems)
+        self.assertEqual(plan.mode, 'UPGRADE')
+        self.assertEqual(plan.writes, {})
+        result = workspace.apply_isolated_onboarding(plan)
+        self.assertEqual(result['status'], 'PLANNED', result)
+        self.assertEqual(result.get('written') or [], [], result)
+        self.assertEqual(raw_snapshot(self.host), before)
+
+    def test_ac5_root_markers_must_be_regular_files_to_count_as_an_install(self):
+        canary = self.tmp / 'marker-canary.md'
+        canary.write_bytes(b'canary bytes that must never be read\n')
+        kit_source = make_historical_kit_source(self.tmp / 'source-kit-markers')
+        cases = {}
+
+        def fresh(name):
+            host = copy_host(self.tmp / f'host-{name}')
+            return host, self._write_installed_projection(host=host)
+
+        host, target = fresh('version-link')
+        marker = target / 'VERSION.md'
+        marker.unlink()
+        marker.symlink_to(canary)
+        cases['version-link'] = host
+
+        host, target = fresh('docs-link')
+        marker = target / 'docs' / 'orchestration.md'
+        marker.unlink()
+        marker.symlink_to(canary)
+        cases['docs-link'] = host
+
+        host, target = fresh('kit-link')
+        # Replace the current tree with the historical one so kit/ is the only
+        # contract candidate; a link there must not be accepted either.
+        shutil.rmtree(target)
+        target = self._write_installed_projection(host=host, source=kit_source)
+        marker = target / 'kit' / 'orchestration.md'
+        marker.unlink()
+        marker.symlink_to(canary)
+        cases['kit-link'] = host
+
+        host, target = fresh('docs-directory')
+        marker = target / 'docs' / 'orchestration.md'
+        marker.unlink()
+        marker.mkdir()
+        cases['docs-directory'] = host
+
+        host = copy_host(self.tmp / 'host-version-only')
+        (host / 'agentorch').mkdir()
+        (host / 'agentorch' / 'VERSION.md').write_bytes(b'# kit\n')
+        cases['version-only'] = host
+
+        host = copy_host(self.tmp / 'host-random')
+        (host / 'agentorch').mkdir()
+        (host / 'agentorch' / 'notes.md').write_text('host data\n', encoding='utf-8')
+        cases['random-directory'] = host
+
+        for label, host in cases.items():
+            with self.subTest(case=label):
+                before = raw_snapshot(host)
+                plan = workspace.plan_isolated_onboarding(
+                    host, source_root=self.source, verified_source=self.verified)
+                self.assertEqual(plan.status, 'STOPPED_CONFLICT', plan.problems)
+                self.assertTrue(any('not an AgentOrch install' in problem
+                                    for problem in plan.problems), plan.problems)
+                self.assertEqual(plan.writes, {})
+                result = workspace.apply_isolated_onboarding(plan)
+                self.assertNotEqual(result['status'], 'APPLIED', result)
+                self.assertEqual(result.get('written') or [], [], result)
+                self.assertEqual(raw_snapshot(host), before)
+        self.assertEqual(canary.read_bytes(), b'canary bytes that must never be read\n')
 
     # --- AC-6 -------------------------------------------------------------
     def test_ac6_paths_resolve_from_any_cwd_and_writes_stay_inside_host(self):

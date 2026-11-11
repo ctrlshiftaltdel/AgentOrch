@@ -1083,12 +1083,18 @@ def detect_install_scenario(host_root) -> str:
 def looks_like_agentorch_root(path) -> bool:
     """True when *path* carries the kit markers (no scheduler import involved).
 
+    The contract may be at ``docs/orchestration.md`` (current layout) or at the
+    historical ``kit/orchestration.md`` (Format 1.6 / v1.7.0 projections). A
+    tree installed from those releases must stay recognizable on the next run,
+    otherwise a repeat would be misreported as a foreign directory.
+
     Symlinked or non-regular markers do not qualify: the caller would otherwise
     treat an attacker-controlled link as an installed kit tree.
     """
     path = Path(path)
     return (_is_regular_path(path / 'VERSION.md')
-            and _is_regular_path(path / 'docs' / 'orchestration.md'))
+            and (_is_regular_path(path / 'docs' / 'orchestration.md')
+                 or _is_regular_path(path / 'kit' / 'orchestration.md')))
 
 
 def managed_block(version: str) -> str:
