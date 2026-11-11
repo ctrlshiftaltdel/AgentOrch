@@ -1338,14 +1338,17 @@ def fetch_verified_onboarding_baseline(host_root):
 
     Discovery is ordered, never guessed:
 
-    1. ``v<format>`` and then ``v<format>.0``; the first exact match is accepted.
-    2. otherwise the official client's *read-only* enumeration of stable release
-       tags, filtered by ``tag_matches_format`` and by the tags already tried;
-       every candidate goes through the same ``verify_package`` and item-by-item
-       comparison.
-    3. exactly one exact match is returned. Zero matches, two or more exact
-       matches, or a failed enumeration all fail closed with no write: a
-       listing failure is never reported as "there is no patch release".
+    1. ``v<format>`` and ``v<format>.0`` are always both probed.
+    2. the official client's *read-only* enumeration of stable release tags is
+       always consulted, filtered by ``tag_matches_format`` and by the tags
+       already tried; every candidate goes through the same ``verify_package``
+       and item-by-item comparison.
+    3. every exact match is collected, and exactly one is returned. Zero
+       matches, two or more exact matches, or a failed enumeration all fail
+       closed with no write. A seed tag that already matched is not proof that
+       no other official release publishes the same bytes, so a listing failure
+       is never reported as a unique baseline (nor as "there is no patch
+       release").
     """
     from . import sources, versions
 
@@ -1357,21 +1360,27 @@ def fetch_verified_onboarding_baseline(host_root):
     client = sources.GitHubReleaseSource()
     failures: list[str] = []
     tried: list[str] = []
-    for tag in _baseline_tag_candidates(hint['format_version']):
+    matches: list = []
+
+    def _consider(tag: str) -> None:
         tried.append(tag)
         try:
             result = fetch_verified_onboarding_release(tag, client=client)
         except OnboardingError as exc:
             failures.append(str(exc))
-            continue
+            return
         mismatches = _baseline_candidate_mismatches(result, hint, target)
         if mismatches:
             failures.extend(mismatches[:5])
-            continue
-        return result
+            return
+        matches.append(result)
 
-    # The two historical candidates did not match. Ask the official client for
-    # the stable release tags instead of inventing a patch number.
+    for tag in _baseline_tag_candidates(hint['format_version']):
+        _consider(tag)
+
+    # Ask the official client for the stable release tags instead of inventing
+    # a patch number. This runs even when a seed candidate already matched: an
+    # exact match is only unique once no other official tag can match as well.
     try:
         listed = client.list_stable_release_tags()
     except (sources.SourceError, OSError) as exc:
@@ -1381,23 +1390,8 @@ def fetch_verified_onboarding_baseline(host_root):
     candidates = [tag for tag in listed
                   if tag not in tried
                   and versions.tag_matches_format(tag, hint['format_version'])]
-    if not candidates:
-        detail = failures[-1] if failures else _BASELINE_MISSING
-        raise OnboardingError(
-            'the installed baseline cannot be authenticated: the official listing has '
-            f'no untried v{hint["format_version"]} release tag ({detail})')
-    matches = []
     for tag in candidates:
-        try:
-            result = fetch_verified_onboarding_release(tag, client=client)
-        except OnboardingError as exc:
-            failures.append(str(exc))
-            continue
-        mismatches = _baseline_candidate_mismatches(result, hint, target)
-        if mismatches:
-            failures.extend(mismatches[:5])
-            continue
-        matches.append(result)
+        _consider(tag)
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -1405,6 +1399,11 @@ def fetch_verified_onboarding_baseline(host_root):
         raise OnboardingError(
             f'the installed baseline matches more than one official release ({tags}); '
             'refusing to choose between them and writing nothing')
+    if not candidates:
+        detail = failures[-1] if failures else _BASELINE_MISSING
+        raise OnboardingError(
+            'the installed baseline cannot be authenticated: the official listing has '
+            f'no untried v{hint["format_version"]} release tag ({detail})')
     detail = failures[-1] if failures else 'no candidate official release matched'
     raise OnboardingError(f'the installed baseline cannot be authenticated: {detail}')
 

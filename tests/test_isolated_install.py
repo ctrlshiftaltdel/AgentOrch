@@ -3264,7 +3264,7 @@ runpy.run_path(script,run_name='__main__')
 
     def _upgrade_transport(self, upgraded_source):
         """Route the fixed official client to the old and new synthetic releases."""
-        from scripts.update_agentorch import package
+        from scripts.update_agentorch import package, sources
         baseline_release, baseline_payload = self._release_transport_from(self.source)
         target_release, target_payload = self._release_transport_from(upgraded_source)
         baseline = package.verify_package(
@@ -3281,6 +3281,11 @@ runpy.run_path(script,run_name='__main__')
                 return baseline_release
             if tag is None or tag == target_release.tag_name:
                 return target_release
+            if tag == baseline_release.tag_name + '.0':
+                # Baseline discovery always probes v<format> and v<format>.0;
+                # this synthetic repository publishes only the exact tag.
+                raise sources.SourceError(
+                    'SOURCE_HTTP', f'synthetic 404 for the .0 alias of {tag}')
             raise AssertionError(f'unexpected release tag {tag!r}')
 
         def download(asset):
@@ -3355,7 +3360,9 @@ runpy.run_path(script,run_name='__main__')
         _baseline, target, _baseline_release, _target_release, fetch, download = \
             self._upgrade_transport(upgraded)
         with patch.object(sources.GitHubReleaseSource, 'fetch_release', side_effect=fetch), \
-             patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download):
+             patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          return_value=('v1.7',)):
             prepared = entry.prepare_isolated_install(
                 self.host, source_root=upgraded, mode='APPLY',
                 declared_exclusive=True, expected_head=head)
@@ -3756,25 +3763,30 @@ runpy.run_path(script,run_name='__main__')
         self.assertEqual(raw_snapshot(self.host), before)
 
     def test_ac9_exact_base_tag_match_is_not_reported_as_a_patch_tag(self):
-        """When ``v<format>`` matches byte for byte, no patch tag is consulted."""
+        """A byte-matching ``v<format>`` is returned once the listing confirms it is unique."""
         from unittest.mock import patch
         from scripts.update_agentorch import sources
         _checked, plain_release, plain_payload = self._install_tagged_baseline(
             self.source, 'v1.7')
-        _plain0, plain0_release, plain0_payload = self._tagged_release(
-            self.source, 'v1.7.0')
+        other_source = make_source(
+            self.tmp / 'source-1.7.0-other', version='1.7',
+            overrides={'README.md': '# a different 1.7.0 build\n'})
+        _other, other_release, other_payload = self._tagged_release(
+            other_source, 'v1.7.0')
         attempted, fetch, download = self._listing_transport({
             'v1.7': (plain_release, plain_payload),
-            'v1.7.0': (plain0_release, plain0_payload),
+            'v1.7.0': (other_release, other_payload),
         })
         before = raw_snapshot(self.host)
         with patch.object(sources.GitHubReleaseSource, 'fetch_release', side_effect=fetch), \
              patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download), \
              patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
-                          side_effect=AssertionError('the listing must not be consulted')):
+                          return_value=('v1.7.0', 'v1.7')):
             result = workspace.fetch_verified_onboarding_baseline(self.host)
         self.assertEqual(result.release_tag, 'v1.7')
-        self.assertEqual(attempted, ['v1.7'])
+        # Both seeds are probed before the listing; a same-Format package with
+        # different bytes stays a mismatch, not a second match.
+        self.assertEqual(attempted, ['v1.7', 'v1.7.0'])
         self.assertEqual(raw_snapshot(self.host), before)
 
     def test_ac9_two_exact_official_matches_are_ambiguous_and_stop(self):
@@ -3807,6 +3819,70 @@ runpy.run_path(script,run_name='__main__')
         self.assertIn('more than one', str(caught.exception))
         # Candidate order comes from the official listing, not from a guess.
         self.assertEqual(attempted, ['v1.7', 'v1.7.0', 'v1.7.2', 'v1.7.1'])
+        self.assertEqual(raw_snapshot(self.host), before)
+
+    def test_ac9_two_byte_identical_official_tags_fail_closed_even_when_a_seed_matched(self):
+        """A seed tag that matches is not unique until the whole listing is read.
+
+        ``v1.6`` and ``v1.6.2`` publish byte-identical packages, so the installed
+        tree matches both. Accepting the first one the ordered probe happens to
+        reach would pick a tag by trial order, which the contract forbids.
+        """
+        from unittest.mock import patch
+        from scripts.update_agentorch import sources
+        source = make_source(self.tmp / 'source-1.6', version='1.6')
+        _checked, base_release, base_payload = self._install_tagged_baseline(
+            source, 'v1.6')
+        _patch, patch_release, patch_payload = self._tagged_release(
+            source, 'v1.6.2')
+        other_source = make_source(
+            self.tmp / 'source-1.6-other', version='1.6',
+            overrides={'README.md': '# a different 1.6.0 build\n'})
+        _other, other_release, other_payload = self._tagged_release(
+            other_source, 'v1.6.0')
+        attempted, fetch, download = self._listing_transport({
+            'v1.6': (base_release, base_payload),
+            'v1.6.0': (other_release, other_payload),
+            'v1.6.2': (patch_release, patch_payload),
+        })
+        before = raw_snapshot(self.host)
+        with patch.object(sources.GitHubReleaseSource, 'fetch_release', side_effect=fetch), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          return_value=('v1.6.2', 'v1.6.0', 'v1.6')):
+            with self.assertRaises(workspace.OnboardingError) as caught:
+                workspace.fetch_verified_onboarding_baseline(self.host)
+        self.assertIn('more than one', str(caught.exception))
+        self.assertEqual(attempted, ['v1.6', 'v1.6.0', 'v1.6.2'])
+        self.assertEqual(raw_snapshot(self.host), before)
+
+    def test_ac9_listing_failure_after_a_seed_match_still_fails_closed(self):
+        """A matched seed tag is not proof that no other release has those bytes."""
+        from unittest.mock import patch
+        from scripts.update_agentorch import sources
+        source = make_source(self.tmp / 'source-1.6', version='1.6')
+        _checked, base_release, base_payload = self._install_tagged_baseline(
+            source, 'v1.6')
+        other_source = make_source(
+            self.tmp / 'source-1.6-other', version='1.6',
+            overrides={'README.md': '# a different 1.6.0 build\n'})
+        _other, other_release, other_payload = self._tagged_release(
+            other_source, 'v1.6.0')
+        attempted, fetch, download = self._listing_transport({
+            'v1.6': (base_release, base_payload),
+            'v1.6.0': (other_release, other_payload),
+        })
+        before = raw_snapshot(self.host)
+        with patch.object(sources.GitHubReleaseSource, 'fetch_release', side_effect=fetch), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          side_effect=sources.SourceError(
+                              'SOURCE_ALLOWLIST', 'synthetic listing failure')):
+            with self.assertRaises(workspace.OnboardingError) as caught:
+                workspace.fetch_verified_onboarding_baseline(self.host)
+        self.assertIn('cannot be enumerated', str(caught.exception))
+        self.assertIn('synthetic listing failure', str(caught.exception))
+        self.assertEqual(attempted, ['v1.6', 'v1.6.0'])
         self.assertEqual(raw_snapshot(self.host), before)
 
     def test_ac9_listing_failure_still_fails_closed_without_guessing(self):
