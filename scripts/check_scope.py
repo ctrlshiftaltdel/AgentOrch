@@ -31,9 +31,12 @@ Exit codes mirror ``scripts/check_drift.py``:
 
 Read-only guarantee: the task database is copied into a private temporary
 directory and read there, so not even SQLite's ``-shm`` sidecar appears next to
-the original registry. A copy is accepted only when the source is observed
-unchanged while it is copied and SQLite's ``integrity_check`` accepts the copy;
-otherwise the answer is ``error`` (exit 1), never ``in-scope``. A live
+the original registry. The copy's destination is proved absent before it is
+created and proved to be the file just created after it, so a link planted at
+that path is never followed and its target is never created. A copy is accepted
+only when the source is observed unchanged while it is copied and SQLite's
+``integrity_check`` accepts the copy; otherwise the answer is ``error``
+(exit 1), never ``in-scope``. A live
 write-ahead log or rollback journal is refused outright: each file would have to
 be copied separately, which cannot prove that both belong to one commit state,
 and a mixed snapshot must never be reported as ``in-scope``.
@@ -354,15 +357,105 @@ def _validate_isolated_store(roots):
         _reject_component_link(path, label, is_dir=is_dir)
 
 
+def _prove_copy_path_is_free(destination, label):
+    """Require *destination* to be provably absent before an exclusive create.
+
+    ``O_CREAT`` / ``O_EXCL`` refuses an existing *file*, but it is not a
+    no-follow proof where the kernel lacks ``O_NOFOLLOW``: a *dangling* symlink
+    planted at the destination is not an existing file to the create, so the
+    exclusive create succeeds at the link target and the copy lands outside the
+    private directory. The entry is therefore inspected first, and its absence
+    is proved three ways - ``lstat``, ``lexists``, and the parent listing -
+    because a platform whose ``lstat`` quietly follows a dangling link reports
+    exactly what a missing file reports. Any entry at all (symlink, file,
+    directory) and any inspection that cannot be completed is a stop before the
+    create; a link is never followed and its target is never created.
+    """
+    destination = Path(destination)
+    try:
+        info = os.lstat(destination)
+    except FileNotFoundError:
+        info = None
+    except OSError as exc:
+        raise ScopeError(
+            'cannot prove the private copy path of the '
+            f'{label} is free: {exc.strerror or exc}')
+    if info is not None:
+        raise ScopeError(
+            f'the private copy path of the {label} already exists; refusing to '
+            'create it, because an existing entry there may be a link out of the '
+            'private directory')
+    try:
+        present = os.path.lexists(destination)
+    except OSError as exc:
+        raise ScopeError(
+            'cannot prove the private copy path of the '
+            f'{label} is free: {exc.strerror or exc}')
+    if present:
+        raise ScopeError(
+            f'cannot prove the private copy path of the {label} is free: an entry '
+            'is present that lstat did not report')
+    try:
+        names = [item.name for item in destination.parent.iterdir()]
+    except OSError as exc:
+        raise ScopeError(
+            'cannot list the private copy directory of the '
+            f'{label}: {exc.strerror or exc}')
+    if destination.name in names:
+        raise ScopeError(
+            f'cannot prove the private copy path of the {label} is free: the '
+            'directory already lists that name')
+
+
+def _prove_copy_written_in_place(descriptor, destination, label):
+    """Require the entry at *destination* to be the regular file just created.
+
+    Written bytes are not proof of where they went: a create that followed a
+    link would also produce a file. Without ``O_NOFOLLOW`` the kernel never
+    refused a link at the destination, so the path's own entry must be
+    inspected after the create and must be the descriptor's own inode. A link, a
+    non-regular entry, or an identity this platform cannot report is a stop -
+    "the content looks right" is never accepted as evidence of the write target.
+    """
+    created = os.fstat(descriptor)
+    if not stat.S_ISREG(created.st_mode):
+        raise ScopeError(f'the private copy of the {label} is not a regular file')
+    try:
+        entry = os.lstat(destination)
+    except OSError as exc:
+        raise ScopeError(
+            f'cannot prove the private copy of the {label} was written to its own '
+            f'path: {exc.strerror or exc}')
+    if stat.S_ISLNK(entry.st_mode):
+        raise ScopeError(
+            f'cannot prove the private copy of the {label} was written to its own '
+            'path: the destination is a symlink')
+    if not stat.S_ISREG(entry.st_mode):
+        raise ScopeError(f'the private copy of the {label} is not a regular file')
+    if not _O_NOFOLLOW:
+        if _file_identity(created) is None or _file_identity(entry) is None:
+            raise ScopeError(
+                f'cannot prove the private copy of the {label} was written to its '
+                'own path: this platform reports no file identity')
+        if _file_identity(entry) != _file_identity(created):
+            raise ScopeError(
+                f'cannot prove the private copy of the {label} was written to its '
+                'own path: the destination entry is not the file just created')
+
+
 def _copy_regular_file(source, destination, label):
     """Copy one regular file into a path this call creates, refusing links.
 
     The source is opened by ``_open_regular_file``: ``O_NOFOLLOW`` closes the
     final-component race at open time, and without the flag the inspected
     identity must match the opened one or the copy never starts. The destination
-    is created exclusively (``O_CREAT`` / ``O_EXCL``) in the private temporary
-    directory ``load_tasks`` owns, so a link planted at that path is refused
-    rather than followed out of the directory, and an existing entry is never
+    is proved absent before it is created (``_prove_copy_path_is_free``) and the
+    create is exclusive (``O_CREAT`` / ``O_EXCL``) in the private temporary
+    directory ``load_tasks`` owns. ``O_EXCL`` alone is not enough on a platform
+    without ``O_NOFOLLOW``: a dangling link at the destination is not an
+    existing file to the create, so the copy would be written at the link
+    target. The entry is therefore inspected before the create and again after
+    it (``_prove_copy_written_in_place``), and an existing entry is never
     truncated. The fstat before/after comparison proves only that the source was
     not observed to change during this copy - it is not a lock and not a claim
     about a same-UID writer.
@@ -372,6 +465,7 @@ def _copy_regular_file(source, destination, label):
     try:
         copy_flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY
                       | _O_NOFOLLOW | _O_CLOEXEC)
+        _prove_copy_path_is_free(destination, label)
         try:
             copy_descriptor = os.open(destination, copy_flags, 0o600)
         except OSError as exc:
@@ -379,6 +473,7 @@ def _copy_regular_file(source, destination, label):
                 'cannot create the private copy of the '
                 f'{label}: {exc.strerror or exc}')
         try:
+            _prove_copy_written_in_place(copy_descriptor, destination, label)
             with os.fdopen(descriptor, 'rb', closefd=False) as stream, \
                     os.fdopen(copy_descriptor, 'wb', closefd=False) as copy:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b''):

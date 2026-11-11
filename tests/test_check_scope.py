@@ -1203,6 +1203,77 @@ class NoFollowFallbackTest(unittest.TestCase):
         self.assertFalse(written.exists(),
                          'the copy must not write through a link at its own path')
 
+    def test_an_existing_file_at_the_private_copy_path_is_refused(self):
+        # Any existing entry is a stop, not something to truncate: the file's
+        # bytes are unrelated to this copy and must survive untouched.
+        source = self.canary('source.sqlite3')
+        destination = self.outside / 'copy.sqlite3'
+        destination.write_bytes(b'not-a-copy')
+        with self.assertRaises(check.ScopeError) as caught:
+            check._copy_regular_file(source, destination, 'task database')
+        self.assertIn('already exists', str(caught.exception))
+        self.assertEqual(destination.read_bytes(), b'not-a-copy')
+
+    def test_a_dangling_destination_link_is_refused_when_lstat_follows_it(self):
+        # Windows has no ``O_NOFOLLOW``, so ``O_EXCL`` alone is the only kernel
+        # guard left - and a dangling link is not an "existing file" to an
+        # exclusive create, so the create would be satisfied by the link target
+        # and the copy would land outside the private directory. Simulate the
+        # worst case: the platform's ``lstat`` follows the dangling link and
+        # reports "no such file". The parent listing must still refuse it, and
+        # the link target must not be created.
+        source = self.canary('source.sqlite3')
+        written = self.outside / 'written-through'
+        destination = self.outside / 'copy.sqlite3'
+        os.symlink(written, destination)
+        real_lstat = os.lstat
+
+        def blind_lstat(path, *args, **kwargs):
+            if Path(path) == destination:
+                raise FileNotFoundError(2, 'No such file or directory', str(path))
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(os, 'lstat', blind_lstat):
+            with self.assertRaises(check.ScopeError) as caught:
+                check._copy_regular_file(source, destination, 'task database')
+        self.assertIn('is free', str(caught.exception))
+        self.assertFalse(written.exists(),
+                         'the copy must not write through a link at its own path')
+        self.assertTrue(destination.is_symlink())
+
+    def test_a_destination_replaced_by_a_link_after_the_create_is_refused(self):
+        # Written bytes are not proof of where they went. If the entry at the
+        # destination is a link after the create, the write target is unproven
+        # and the copy must not be accepted on content alone.
+        real = self.outside / 'real.sqlite3'
+        real.write_bytes(b'real')
+        elsewhere = self.outside / 'elsewhere.sqlite3'
+        elsewhere.write_bytes(b'elsewhere')
+        descriptor = os.open(real, os.O_RDWR)
+        self.addCleanup(os.close, descriptor)
+        real.unlink()
+        os.symlink(elsewhere, real)
+
+        with self.assertRaises(check.ScopeError) as caught:
+            check._prove_copy_written_in_place(descriptor, real, 'task database')
+        self.assertIn('symlink', str(caught.exception))
+        self.assertEqual(elsewhere.read_bytes(), b'elsewhere')
+
+    def test_a_copy_identity_that_cannot_be_reported_is_refused(self):
+        # Without ``O_NOFOLLOW`` the destination identity is the only proof that
+        # the bytes went to the path this call created. No identity is a stop.
+        self.hide_no_follow()
+        destination = self.outside / 'copy.sqlite3'
+        destination.write_bytes(b'copy')
+        descriptor = os.open(destination, os.O_RDWR)
+        self.addCleanup(os.close, descriptor)
+        with mock.patch.object(check, '_file_identity', return_value=None,
+                               create=True):
+            with self.assertRaises(check.ScopeError) as caught:
+                check._prove_copy_written_in_place(
+                    descriptor, destination, 'task database')
+        self.assertIn('identity', str(caught.exception))
+
 
 if __name__ == '__main__':
     unittest.main()
