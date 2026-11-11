@@ -17,6 +17,7 @@ import posixpath
 import re
 import secrets
 import stat
+import struct
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -1001,12 +1002,25 @@ def legacy_root_matches_baseline(host_root, binding: BaselineBinding) -> list[st
     if binding._seal is not _SOURCE_BINDING_SEAL:
         return ['the legacy baseline binding is not sealed by a verified package result']
     host = Path(host_root)
-    try:
-        root_fd = _open_planning_root_fd(host)
-    except OnboardingError as exc:
-        return [str(exc)]
-    if root_fd is None:
-        return ['the old root does not exist or is not a directory']
+    root_fd = None
+    if _dir_fd_reads_available():
+        try:
+            root_fd = _open_planning_root_fd(host)
+        except OnboardingError as exc:
+            return [str(exc)]
+        if root_fd is None:
+            return ['the old root does not exist or is not a directory']
+    else:
+        try:
+            info = os.lstat(host)
+        except FileNotFoundError:
+            return ['the old root does not exist or is not a directory']
+        except OSError as exc:
+            return [f'the old root cannot be inspected: {exc}']
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return ['the old root does not exist or is not a directory']
+        if _file_identity(info) is None:
+            return ['the old root has no verifiable identity on this platform']
     expected = dict(binding.installed_sha256)
     problems: list[str] = []
     try:
@@ -1017,7 +1031,10 @@ def legacy_root_matches_baseline(host_root, binding: BaselineBinding) -> list[st
                 problems.append(f'the historical release lists an unsafe path: {exc}')
                 continue
             try:
-                data = _read_regular_file_at(root_fd, rel, f'old root {rel}')
+                if root_fd is not None:
+                    data = _read_regular_file_at(root_fd, rel, f'old root {rel}')
+                else:
+                    data = _read_regular_file_path(host, rel, f'old root {rel}')
             except OnboardingError as exc:
                 problems.append(str(exc))
                 continue
@@ -1027,7 +1044,8 @@ def legacy_root_matches_baseline(host_root, binding: BaselineBinding) -> list[st
             if hashlib.sha256(data).hexdigest() != expected[rel]:
                 problems.append(f'local modification in old root install: {rel}')
     finally:
-        os.close(root_fd)
+        if root_fd is not None:
+            os.close(root_fd)
     strict_prefixes = {'scripts', 'editions', 'templates'}
     owned = {PurePosixPath(rel).parts[0] for rel in expected
              if len(PurePosixPath(rel).parts) > 1}
@@ -1535,6 +1553,13 @@ def _open_planning_root_fd(root: Path) -> int | None:
         raise OnboardingError(f'{path.name} cannot be opened safely: {exc}') from exc
 
 
+def _dir_fd_reads_available() -> bool:
+    """True when the component-anchored planning reader can run here."""
+    if _MISSING_OPEN_FLAGS:
+        return False
+    return os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd
+
+
 def _read_regular_file_at(root_fd: int, rel: str, label: str) -> bytes | None:
     """Read *rel* by opening each component below *root_fd* with ``O_NOFOLLOW``.
 
@@ -1593,6 +1618,71 @@ def _read_regular_file_at(root_fd: int, rel: str, label: str) -> bytes | None:
         os.close(fd)
 
 
+def _read_regular_file_path(root: Path, rel: str, label: str) -> bytes | None:
+    """Read *rel* below *root* without ``dir_fd``, proving every step.
+
+    Used where the platform cannot anchor a directory descriptor. The root and
+    each parent component are inspected before the descent: a symlink, a
+    non-directory, or an entry whose identity the platform cannot report stops
+    the read. The leaf itself goes through :func:`_read_regular_file`, which
+    lstat's it and then requires the opened descriptor to be that same inode.
+    After the read the parent chain is re-inspected; a component whose identity
+    changed makes the bytes unusable and the caller fails closed. A missing path
+    returns ``None``.
+    """
+    lexical_rel_path(rel)
+    root = Path(root)
+    parts = rel.split('/')
+    chain: list[tuple[Path, tuple[int, int]]] = []
+    current = root
+    try:
+        info = os.lstat(root)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise OnboardingError(f'{label} cannot be inspected: {exc}') from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise OnboardingError(f'{label} root is not a regular directory')
+    root_identity = _file_identity(info)
+    if root_identity is None:
+        raise OnboardingError(
+            f'{label} root has no verifiable identity on this platform')
+    for part in parts[:-1]:
+        candidate = current / part
+        try:
+            info = os.lstat(candidate)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise OnboardingError(f'{label} cannot be inspected: {exc}') from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise OnboardingError(
+                f'{label} passes through a symlink or non-directory: {part}')
+        identity = _file_identity(info)
+        if identity is None:
+            raise OnboardingError(
+                f'{label} passes through an entry without a verifiable identity: {part}')
+        chain.append((candidate, identity))
+        current = candidate
+    data = _read_regular_file(current / parts[-1], label)
+    try:
+        root_now = os.lstat(root)
+    except OSError as exc:
+        raise OnboardingError(f'{label} root changed while reading: {exc}') from exc
+    if _file_identity(root_now) != root_identity:
+        raise OnboardingError(f'{label} root changed while reading')
+    for candidate, identity in chain:
+        try:
+            current_info = os.lstat(candidate)
+        except OSError as exc:
+            raise OnboardingError(
+                f'{label} parent changed while reading: {exc}') from exc
+        if _file_identity(current_info) != identity:
+            raise OnboardingError(
+                f'{label} parent changed while reading: {candidate.name}')
+    return data
+
+
 def _read_regular_file(path, label: str) -> bytes | None:
     """Read a file only after proving it is a regular, non-symlink inode.
 
@@ -1614,7 +1704,8 @@ def _read_regular_file(path, label: str) -> bytes | None:
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise OnboardingError(f'{label} is not a regular file; refusing to read it')
     try:
-        descriptor = open_no_follow(path, os.O_RDONLY | _O_CLOEXEC, label=label)
+        descriptor = open_no_follow(path, os.O_RDONLY | _O_BINARY | _O_CLOEXEC,
+                                   label=label)
     except OSError as exc:
         raise OnboardingError(f'{label} cannot be opened safely: {exc}') from exc
     chunks: list[bytes] = []
@@ -1665,6 +1756,23 @@ def _read_installed_manifest_at(root_fd: int, root: Path) -> tuple[dict | None, 
     return (payload, None) if isinstance(payload, dict) else (None, None)
 
 
+def _read_installed_manifest_path(root: Path) -> tuple[dict | None, str | None]:
+    """Read one root's MANIFEST.json through the path + identity reader."""
+    root = Path(root)
+    label = f'{root.name}/MANIFEST.json'
+    try:
+        data = _read_regular_file_path(root, 'MANIFEST.json', label)
+    except OnboardingError as exc:
+        return None, str(exc)
+    if data is None:
+        return None, None
+    try:
+        payload = json.loads(data.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError):
+        return None, None
+    return (payload, None) if isinstance(payload, dict) else (None, None)
+
+
 def _read_installed_manifest(root: Path) -> tuple[dict | None, str | None]:
     """Read the installed MANIFEST.json as an untrusted object.
 
@@ -1672,8 +1780,12 @@ def _read_installed_manifest(root: Path) -> tuple[dict | None, str | None]:
     return ``(None, None)``: the caller must then treat the baseline as unknown
     and stop instead of calling ``.get`` on attacker-controlled data. A symlink
     or non-regular entry returns ``(None, <problem>)`` without reading it.
+    Where the platform cannot anchor a directory descriptor the same read runs
+    through the path + identity reader instead of refusing every diagnostic.
     """
     root = Path(root)
+    if not _dir_fd_reads_available():
+        return _read_installed_manifest_path(root)
     try:
         root_fd = _open_planning_root_fd(root)
     except OnboardingError as exc:
@@ -1787,6 +1899,8 @@ def _preserve_legacy_agents(plan: OnboardingPlan) -> None:
 def _check_legacy_root(host_root: Path) -> tuple[list[str], dict[str, dict], list[str]]:
     """Problems, baseline entries and the proven kit-owned paths to remove."""
     root = Path(host_root)
+    if not _dir_fd_reads_available():
+        return _check_legacy_root_path(root)
     try:
         root_fd = _open_planning_root_fd(root)
     except OnboardingError as exc:
@@ -1799,6 +1913,65 @@ def _check_legacy_root(host_root: Path) -> tuple[list[str], dict[str, dict], lis
         return _check_legacy_root_at(root_fd, root)
     finally:
         os.close(root_fd)
+
+
+def _check_legacy_root_path(
+        host_root: Path) -> tuple[list[str], dict[str, dict], list[str]]:
+    """Inspect an old root through the path + identity reader instead of ``dir_fd``."""
+    baseline, manifest_problem = _read_installed_manifest_path(host_root)
+    if baseline is None:
+        problems = [manifest_problem] if manifest_problem else []
+        problems.append('no root MANIFEST.json: the old install has no trusted '
+                        'baseline; migration must stop and be reviewed manually')
+        return (problems, {}, [])
+    entries = _manifest_map(baseline)
+    if not entries:
+        return (['root MANIFEST.json does not list any files; the baseline is unusable'], {}, [])
+    problems: list[str] = []
+    removals: list[str] = []
+    for rel, entry in entries.items():
+        try:
+            lexical_rel_path(rel)
+        except OnboardingError as exc:
+            problems.append(f'root MANIFEST.json lists an unsafe path: {exc}')
+            continue
+        try:
+            data = _read_regular_file_path(host_root, rel, f'old root {rel}')
+        except OnboardingError as exc:
+            problems.append(str(exc))
+            continue
+        if data is None:
+            problems.append(f'baseline file is missing from the old install: {rel}')
+            continue
+        if sha256_bytes(data) != entry.get('sha256'):
+            problems.append(f'local modification in old root install: {rel}')
+            continue
+        if entry.get('category') in ('core', 'edition', 'template') \
+                and rel not in ('AGENTS.md', 'MANIFEST.json'):
+            removals.append(rel)
+    strict_prefixes = {'scripts', 'editions', 'templates'}
+    owned_prefixes = {PurePosixPath(rel).parts[0] for rel in entries
+                      if len(PurePosixPath(rel).parts) > 1}
+    for prefix in sorted(owned_prefixes & strict_prefixes):
+        directory = host_root / prefix
+        if not directory.exists() and not directory.is_symlink():
+            continue
+        if directory.is_symlink() or not directory.is_dir():
+            problems.append(f'old root {prefix}/ is not a regular directory')
+            continue
+        for path in directory.rglob('*'):
+            rel = path.relative_to(host_root).as_posix()
+            if path.is_symlink():
+                problems.append(f'symlink inside a kit-owned namespace: {rel}')
+                continue
+            if path.is_dir():
+                continue
+            if not path.is_file():
+                problems.append(f'non-regular entry inside a kit-owned namespace: {rel}')
+                continue
+            if rel not in entries:
+                problems.append(f'untracked file inside a kit-owned namespace: {rel}')
+    return problems, entries, removals
 
 
 def _check_legacy_root_at(
@@ -2545,16 +2718,254 @@ def _libc_listxattr(path=None, *, fd: int | None = None) -> list[str]:
     return sorted(os.fsdecode(name) for name in buffer.raw[:written].split(b'\x00') if name)
 
 
-def _xattr_names(path=None, *, fd: int | None = None) -> list[str]:
+# --- Windows metadata -------------------------------------------------------
+# Windows exposes neither ``os.listxattr`` nor a libc xattr symbol. In-place
+# metadata that must be proved preserved is still representable: named alternate
+# data streams (ADS) and the per-file extended-attributes (EA) block. Both are
+# queried through the Win32 API with ``ctypes``. Only a completed call that
+# reports no named stream and an EA size of zero proves there is nothing to
+# preserve; a missing API, a failed call or a discovered stream/attribute makes
+# the caller fail closed instead of treating "unknown" as "empty".
+_FILE_STREAM_INFO_CLASS = 7        # GetFileInformationByHandleEx FileStreamInfo
+_FILE_EA_INFORMATION_CLASS = 7     # NtQueryInformationFile FileEaInformation
+_FILE_STREAM_INFO_HEADER = 24      # 4 + 4 + 8 + 8 before the variable name
+_DEFAULT_STREAM_NAMES = frozenset({'', '::$DATA', ':$DATA'})
+_GENERIC_READ = 0x80000000
+_FILE_SHARE_ALL = 0x00000007
+_OPEN_EXISTING = 3
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_ERROR_MORE_DATA = 234
+
+
+def _windows_stream_names(buffer: bytes) -> list[str]:
+    """Named data streams in a ``FILE_STREAM_INFO`` buffer.
+
+    Pure parser so the layout can be exercised with synthetic bytes on any
+    platform. The default unnamed data stream is returned by NTFS as
+    ``::$DATA`` (and by other filesystems as an empty name); it is the file's
+    own bytes, not metadata that an append could drop, so it is not reported.
+    Anything malformed raises: a buffer this parser cannot understand is an
+    unproven metadata state, not an empty one.
+    """
+    names: list[str] = []
+    offset = 0
+    total = len(buffer)
+    entries = 0
+    while True:
+        if total - offset < _FILE_STREAM_INFO_HEADER:
+            raise TransactionConflict(
+                'Windows alternate data stream information is truncated')
+        next_offset, name_length = struct.unpack_from('<II', buffer, offset)
+        name_end = offset + _FILE_STREAM_INFO_HEADER + name_length
+        if name_length % 2 or name_end > total:
+            raise TransactionConflict(
+                'Windows alternate data stream information is malformed')
+        raw = buffer[offset + _FILE_STREAM_INFO_HEADER:name_end]
+        name = raw.decode('utf-16-le', errors='replace')
+        if name and name.upper() not in _DEFAULT_STREAM_NAMES:
+            names.append(name)
+        entries += 1
+        if next_offset == 0:
+            return names
+        if next_offset < _FILE_STREAM_INFO_HEADER or offset + next_offset >= total:
+            raise TransactionConflict(
+                'Windows alternate data stream information is malformed')
+        offset += next_offset
+        if entries > 100000:
+            raise TransactionConflict(
+                'Windows alternate data stream information is unbounded')
+
+
+def _windows_ea_size(buffer: bytes) -> int:
+    """The ``EaSize`` in a ``FILE_EA_INFORMATION`` buffer (pure parser)."""
+    if len(buffer) < 4:
+        raise TransactionConflict('Windows extended attribute information is truncated')
+    return struct.unpack_from('<I', buffer, 0)[0]
+
+
+def _windows_query_streams(kernel32, wintypes, handle) -> list[str]:
+    """Enumerate named data streams through ``GetFileInformationByHandleEx``."""
+    import ctypes
+
+    function = getattr(kernel32, 'GetFileInformationByHandleEx', None)
+    if function is None:
+        raise TransactionConflict(
+            'extended attributes cannot be enumerated on this platform')
+    function.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                         wintypes.DWORD]
+    function.restype = wintypes.BOOL
+    size = 1024
+    while size <= 16 * 1024 * 1024:
+        buffer = ctypes.create_string_buffer(size)
+        if function(handle, _FILE_STREAM_INFO_CLASS, buffer, size):
+            return _windows_stream_names(buffer.raw[:size])
+        error = ctypes.get_last_error()
+        if error == _ERROR_MORE_DATA:
+            size *= 2
+            continue
+        raise TransactionConflict(
+            f'extended attributes cannot be enumerated: {ctypes.WinError(error)}')
+    raise TransactionConflict(
+        'extended attributes cannot be enumerated: the stream list is too large')
+
+
+def _windows_query_ea_size(ntdll, wintypes, handle) -> int:
+    """Read the EA block size through ``NtQueryInformationFile``."""
+    import ctypes
+
+    function = getattr(ntdll, 'NtQueryInformationFile', None)
+    if function is None:
+        raise TransactionConflict(
+            'extended attributes cannot be enumerated on this platform')
+
+    class _IoStatusBlock(ctypes.Structure):
+        _fields_ = [('Status', ctypes.c_void_p),
+                    ('Information', ctypes.c_size_t)]
+
+    class _FileEaInformation(ctypes.Structure):
+        _fields_ = [('EaSize', wintypes.ULONG)]
+
+    function.argtypes = [wintypes.HANDLE, ctypes.POINTER(_IoStatusBlock),
+                         ctypes.c_void_p, wintypes.ULONG, ctypes.c_int]
+    function.restype = ctypes.c_long
+    status_block = _IoStatusBlock()
+    payload = _FileEaInformation()
+    status = function(handle, ctypes.byref(status_block), ctypes.byref(payload),
+                      ctypes.sizeof(payload), _FILE_EA_INFORMATION_CLASS)
+    if status != 0:
+        raise TransactionConflict(
+            'extended attributes cannot be enumerated: '
+            f'NtQueryInformationFile status 0x{status & 0xffffffff:08x}')
+    return _windows_ea_size(bytes(payload))
+
+
+def _windows_verify_identity(kernel32, wintypes, handle, expected_identity) -> None:
+    """Require the opened handle to be the entry that was inspected."""
+    import ctypes
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ('dwFileAttributes', wintypes.DWORD),
+            ('ftCreationTime', wintypes.FILETIME),
+            ('ftLastAccessTime', wintypes.FILETIME),
+            ('ftLastWriteTime', wintypes.FILETIME),
+            ('dwVolumeSerialNumber', wintypes.DWORD),
+            ('nFileSizeHigh', wintypes.DWORD),
+            ('nFileSizeLow', wintypes.DWORD),
+            ('nNumberOfLinks', wintypes.DWORD),
+            ('nFileIndexHigh', wintypes.DWORD),
+            ('nFileIndexLow', wintypes.DWORD),
+        ]
+
+    function = getattr(kernel32, 'GetFileInformationByHandle', None)
+    if function is None:
+        raise TransactionConflict(
+            'file identity cannot be verified on this platform')
+    function.argtypes = [wintypes.HANDLE,
+                         ctypes.POINTER(_ByHandleFileInformation)]
+    function.restype = wintypes.BOOL
+    info = _ByHandleFileInformation()
+    if not function(handle, ctypes.byref(info)):
+        raise TransactionConflict(
+            'file identity cannot be verified: '
+            f'{ctypes.WinError(ctypes.get_last_error())}')
+    identity = (int(info.dwVolumeSerialNumber),
+                (int(info.nFileIndexHigh) << 32) | int(info.nFileIndexLow))
+    if identity[1] == 0:
+        raise TransactionConflict(
+            'file identity cannot be verified on this platform')
+    if expected_identity is not None and identity != tuple(expected_identity):
+        raise TransactionConflict('target changed while metadata was being inspected')
+
+
+def _windows_open_metadata_handle(kernel32, wintypes, path, fd):
+    """Return ``(handle, owned)`` for the metadata query."""
+    import ctypes
+
+    if fd is not None:
+        try:
+            import msvcrt
+            return msvcrt.get_osfhandle(fd), False
+        except (ImportError, OSError, ValueError) as exc:
+            raise TransactionConflict(
+                'the open descriptor has no Windows file handle') from exc
+    if path is None:
+        raise TransactionConflict('no path or descriptor was supplied for metadata')
+    create = getattr(kernel32, 'CreateFileW', None)
+    if create is None:
+        raise TransactionConflict(
+            'extended attributes cannot be enumerated on this platform')
+    create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                       ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                       wintypes.HANDLE]
+    create.restype = wintypes.HANDLE
+    handle = create(os.fspath(path), _GENERIC_READ, _FILE_SHARE_ALL, None,
+                    _OPEN_EXISTING,
+                    _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+                    None)
+    if handle in (None, ctypes.c_void_p(-1).value):
+        raise TransactionConflict(
+            'extended attributes cannot be enumerated: '
+            f'{ctypes.WinError(ctypes.get_last_error())}')
+    return handle, True
+
+
+def _windows_xattr_names(path=None, *, fd: int | None = None,
+                         expected_identity=None) -> list[str]:
+    """Enumerate Windows named streams and the EA block, or fail closed.
+
+    The Win32 calls are only reachable on Windows. Any missing symbol, failed
+    call or identity mismatch raises :class:`TransactionConflict`, so the caller
+    never treats an unproven state as "no metadata"; only an empty successful
+    answer allows an in-place write.
+    """
+    if os.name != 'nt':
+        raise TransactionConflict(
+            'Windows metadata queries are unavailable on this platform')
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        ntdll = ctypes.WinDLL('ntdll', use_last_error=True)
+    except (OSError, AttributeError) as exc:
+        raise TransactionConflict(
+            'extended attributes cannot be enumerated on this platform') from exc
+    handle, owned = _windows_open_metadata_handle(kernel32, wintypes, path, fd)
+    close_handle = getattr(kernel32, 'CloseHandle', None)
+    if close_handle is None:
+        raise TransactionConflict(
+            'the metadata handle cannot be closed on this platform')
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    try:
+        _windows_verify_identity(kernel32, wintypes, handle, expected_identity)
+        names = _windows_query_streams(kernel32, wintypes, handle)
+        ea_size = _windows_query_ea_size(ntdll, wintypes, handle)
+    finally:
+        if owned:
+            close_handle(handle)
+    if ea_size:
+        names.append('$EA')
+    return sorted(names)
+
+
+def _xattr_names(path=None, *, fd: int | None = None,
+                 expected_identity=None) -> list[str]:
     """Return the extended-attribute names on *path* or an open *fd*.
 
     ``os.listxattr`` accepts an open descriptor directly, so no ``/proc`` mount
     or magic symlink is required. Where the stdlib does not bind the xattr calls
-    (macOS), the same libc symbol is reached through ``ctypes``. When neither
-    route can enumerate attributes the metadata state is unproven and this
-    raises; a filesystem that reports xattrs as unsupported simply has none to
-    preserve.
+    (macOS), the same libc symbol is reached through ``ctypes``. Windows has
+    neither route, so named data streams and the EA block are queried through
+    Win32 (see :func:`_windows_xattr_names`). When no route can enumerate the
+    metadata state is unproven and this raises; a filesystem that reports xattrs
+    as unsupported simply has none to preserve.
     """
+    if os.name == 'nt':
+        return _windows_xattr_names(path, fd=fd,
+                                    expected_identity=expected_identity)
     if not hasattr(os, 'listxattr'):
         return _libc_listxattr(path, fd=fd)
     target = fd if fd is not None else path
@@ -2604,7 +3015,7 @@ def _target_metadata_problems(host: Path, rel: str) -> list[str]:
     if problems:
         return problems
     try:
-        names = _xattr_names(path)
+        names = _xattr_names(path, expected_identity=_file_identity(info))
     except TransactionConflict as exc:
         return [f'{rel}: {exc}']
     if names:
@@ -2665,7 +3076,8 @@ def _append_open_file(descriptor: int, rel: str, original: bytes,
     problems = _metadata_preservation_problems_for_stat(info, rel)
     if problems:
         raise TransactionConflict('; '.join(problems))
-    names = _xattr_names(fd=descriptor)
+    names = _xattr_names(fd=descriptor,
+                         expected_identity=_file_identity(info))
     if names:
         raise TransactionConflict(
             f'{rel}: target carries extended attributes or ACLs ({", ".join(names)}); '
@@ -2740,7 +3152,8 @@ def _rewrite_open_file(descriptor: int, rel: str, original: bytes,
     problems = _metadata_preservation_problems_for_stat(info, rel)
     if problems:
         raise TransactionConflict('; '.join(problems))
-    names = _xattr_names(fd=descriptor)
+    names = _xattr_names(fd=descriptor,
+                         expected_identity=_file_identity(info))
     if names:
         raise TransactionConflict(
             f'{rel}: target carries extended attributes or ACLs ({", ".join(names)}); '

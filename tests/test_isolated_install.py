@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import stat
+import struct
 import sys
 import tempfile
 import unittest
@@ -4641,6 +4642,59 @@ with patch.object(sources.GitHubReleaseSource, "fetch_release", return_value=rel
         self.assertEqual(sorted(outside.iterdir()), [])
 
 
+class WindowsMetadataParseTest(unittest.TestCase):
+    """``FILE_STREAM_INFO`` / ``FILE_EA_INFORMATION`` parsing with synthetic buffers.
+
+    The real Win32 calls only run on the Windows runner (through ``ctypes``).
+    These cases cover the layout parsing and the "unknown is not empty" contract
+    on every platform without pretending a Win32 call happened here.
+    """
+
+    @staticmethod
+    def _stream_buffer(names):
+        entries = []
+        for name in names:
+            raw = name.encode('utf-16-le')
+            entry = bytearray(struct.pack('<II', 0, len(raw)) + b'\x00' * 16 + raw)
+            entry.extend(b'\x00' * ((-len(entry)) % 8))
+            entries.append(bytes(entry))
+        buffer = b''
+        for index, entry in enumerate(entries):
+            next_offset = len(entry) if index + 1 < len(entries) else 0
+            buffer += struct.pack('<I', next_offset) + entry[4:]
+        return buffer
+
+    def test_default_data_stream_is_not_metadata(self):
+        self.assertEqual(
+            workspace._windows_stream_names(self._stream_buffer(['::$DATA'])), [])
+        self.assertEqual(
+            workspace._windows_stream_names(self._stream_buffer([''])), [])
+
+    def test_named_stream_is_reported(self):
+        names = workspace._windows_stream_names(
+            self._stream_buffer(['::$DATA', ':secret:$DATA']))
+        self.assertEqual(names, [':secret:$DATA'])
+
+    def test_truncated_stream_buffer_fails_closed(self):
+        buffer = self._stream_buffer([':secret:$DATA'])
+        with self.assertRaises(workspace.TransactionConflict):
+            workspace._windows_stream_names(buffer[:40])
+
+    def test_malformed_stream_offset_fails_closed(self):
+        buffer = bytearray(self._stream_buffer([':secret:$DATA']))
+        struct.pack_into('<I', buffer, 0, 4)
+        with self.assertRaises(workspace.TransactionConflict):
+            workspace._windows_stream_names(bytes(buffer))
+
+    def test_ea_size_is_reported(self):
+        self.assertEqual(workspace._windows_ea_size(struct.pack('<I', 0)), 0)
+        self.assertEqual(workspace._windows_ea_size(struct.pack('<I', 12)), 12)
+
+    def test_truncated_ea_buffer_fails_closed(self):
+        with self.assertRaises(workspace.TransactionConflict):
+            workspace._windows_ea_size(b'\x00\x01')
+
+
 class PlatformXattrFallbackTest(unittest.TestCase):
     """The libc xattr enumeration used where the stdlib does not bind it.
 
@@ -4708,6 +4762,15 @@ class PlatformXattrFallbackTest(unittest.TestCase):
         class NoSymbols:
             pass
         from unittest.mock import patch
+        if os.name == 'nt':
+            # Windows has no libc route; the equivalent "symbol missing" failure
+            # is the Win32 metadata query, which must fail closed as well.
+            with patch.object(workspace, '_windows_xattr_names',
+                              side_effect=workspace.TransactionConflict(
+                                  'no Win32 metadata symbol')):
+                with self.assertRaises(workspace.TransactionConflict):
+                    workspace._xattr_names(self.target)
+            return
         with without_stdlib_listxattr(), \
              patch.object(workspace, '_libc', return_value=NoSymbols()):
             with self.assertRaises(workspace.TransactionConflict):
@@ -5072,15 +5135,40 @@ class PortableWriteSessionTest(unittest.TestCase):
         try:
             set_xattr(target, 'user.review', b'preserve-me')
         except XattrUnavailable:
-            # No platform API can store an attribute here, so the writer can
-            # only fail closed because it cannot enumerate at all (Windows).
-            pass
-        else:
-            self.assertIn('user.review', workspace._xattr_names(target))
+            # This platform (Windows) cannot store a POSIX attribute, so there is
+            # nothing to preserve here. It must still prove that with a completed
+            # enumeration that reports no name; only then may the append proceed.
+            # The "discovered metadata -> zero write" contract is asserted by the
+            # branch below and by the synthetic-stream case.
+            self.assertEqual(workspace._xattr_names(target), [])
+            self.session.append('AGENTS.md', b'host\n', b'host\nmore\n')
+            self.assertEqual(target.read_bytes(), b'host\nmore\n')
+            return
+        self.assertIn('user.review', workspace._xattr_names(target))
         with self.assertRaises(workspace.TransactionConflict) as raised:
             self.session.append('AGENTS.md', b'host\n', b'host\nmore\n')
         self.assertIn('extended attributes', str(raised.exception))
         self.assertEqual(target.read_bytes(), b'host\n')
+
+    def test_discovered_stream_blocks_the_append_with_zero_write(self):
+        """A reported stream is never treated as an absent one."""
+        target = self.root / 'AGENTS.md'
+        target.write_bytes(b'host\n')
+        with self.patch.object(workspace, '_xattr_names',
+                               return_value=[':secret:$DATA']):
+            with self.assertRaises(workspace.TransactionConflict) as raised:
+                self.session.append('AGENTS.md', b'host\n', b'host\nmore\n')
+        self.assertIn('extended attributes', str(raised.exception))
+        self.assertEqual(target.read_bytes(), b'host\n')
+
+    def test_plan_time_check_reports_a_discovered_stream(self):
+        target = self.root / 'AGENTS.md'
+        target.write_bytes(b'host\n')
+        with self.patch.object(workspace, '_xattr_names',
+                               return_value=[':secret:$DATA']):
+            problems = workspace._target_metadata_problems(self.root, 'AGENTS.md')
+        self.assertTrue(any('extended attributes' in problem for problem in problems),
+                        problems)
 
     def test_rollback_removes_only_what_this_transaction_created(self):
         created_dirs: list[dict] = []
@@ -5233,6 +5321,128 @@ class PortableNoFollowTest(unittest.TestCase):
         self.assertIn('cannot be inspected safely', message)
         self.assertIn('O_NOFOLLOW', message)
         self.assertIn('O_DIRECTORY', message)
+
+
+class PlanningPathReadTest(unittest.TestCase):
+    """The path + identity reader used by planning when ``dir_fd`` is absent.
+
+    Windows has no ``dir_fd`` anchor. Planning still has to read the installed
+    manifest and the old root for upgrade / migration diagnostics, so the read
+    runs through the existing path + identity helper instead of refusing every
+    platform without descriptors. A symlinked component or a changed identity
+    must still fail closed.
+    """
+
+    def setUp(self):
+        from unittest.mock import patch
+        self.patch = patch
+        self.tmp = Path(tempfile.mkdtemp(prefix='agentorch-planning-path-'))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.addCleanup(setattr, workspace, '_MISSING_OPEN_FLAGS',
+                        workspace._MISSING_OPEN_FLAGS)
+        self.addCleanup(setattr, workspace, '_O_NOFOLLOW',
+                        workspace._O_NOFOLLOW)
+
+    def _force_path_backend(self):
+        workspace._MISSING_OPEN_FLAGS = ('O_NOFOLLOW', 'O_DIRECTORY')
+        workspace._O_NOFOLLOW = 0
+
+    def test_manifest_is_read_through_the_path_backend(self):
+        root = self.tmp / 'agentorch'
+        root.mkdir()
+        payload = {'format_version': '1.7', 'suite': 'Synthetic', 'files': []}
+        (root / 'MANIFEST.json').write_text(json.dumps(payload), encoding='utf-8')
+        self._force_path_backend()
+        manifest, problem = workspace._read_installed_manifest(root)
+        self.assertIsNone(problem)
+        self.assertEqual(manifest['format_version'], '1.7')
+
+    def test_symlinked_manifest_is_refused_in_path_mode(self):
+        root = self.tmp / 'agentorch'
+        root.mkdir()
+        canary = self.tmp / 'canary.json'
+        canary.write_text('{"format_version": "9"}', encoding='utf-8')
+        (root / 'MANIFEST.json').symlink_to(canary)
+        self._force_path_backend()
+        manifest, problem = workspace._read_installed_manifest(root)
+        self.assertIsNone(manifest)
+        self.assertTrue(problem and ('symlink' in problem or 'regular file' in problem),
+                        problem)
+
+    def test_symlinked_parent_is_rejected_before_any_read(self):
+        host = self.tmp / 'host'
+        host.mkdir()
+        external = self.tmp / 'external'
+        external.mkdir()
+        secret = external / 'orchestration.md'
+        secret.write_text('SYNTHETIC_PRIVATE_CANARY_153_PLANNING\n', encoding='utf-8')
+        (host / 'docs').symlink_to(external, target_is_directory=True)
+        self._force_path_backend()
+        with observe_path_reads() as reads:
+            with self.assertRaises(workspace.OnboardingError) as raised:
+                workspace._read_regular_file_path(
+                    host, 'docs/orchestration.md', 'old root docs/orchestration.md')
+        self.assertIn('symlink', str(raised.exception))
+        self.assertNotIn(secret.resolve(), [path.resolve() for path in reads])
+
+    def test_leaf_identity_change_fails_closed(self):
+        root = self.tmp / 'agentorch'
+        root.mkdir()
+        target = root / 'MANIFEST.json'
+        target.write_bytes(b'{"a": 1}')
+        other = self.tmp / 'other.json'
+        other.write_bytes(b'{"b": 2}')
+        self._force_path_backend()
+        real_open = os.open
+
+        def swapped(path, flags, *args, **kwargs):
+            if os.fspath(path) == os.fspath(target):
+                return real_open(other, os.O_RDONLY)
+            return real_open(path, flags, *args, **kwargs)
+
+        with self.patch.object(workspace.os, 'open', side_effect=swapped):
+            with self.assertRaises(workspace.OnboardingError) as raised:
+                workspace._read_regular_file_path(
+                    root, 'MANIFEST.json', 'agentorch/MANIFEST.json')
+        self.assertIn('changed', str(raised.exception))
+
+    def test_legacy_baseline_match_reads_through_the_path_backend(self):
+        host = self.tmp / 'legacy-match'
+        host.mkdir()
+        data = b'# Synthetic old root\n'
+        (host / 'README.md').write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        binding = workspace.BaselineBinding(
+            release_tag='v1.7', asset_sha256='0' * 64, manifest_sha256='0' * 64,
+            suite='Synthetic', format_version='1.7',
+            source_sha256={'README.md': digest},
+            installed_sha256={'README.md': digest},
+            _seal=workspace._SOURCE_BINDING_SEAL, kind='LEGACY_ROOT')
+        self._force_path_backend()
+        self.assertEqual(workspace.legacy_root_matches_baseline(host, binding), [])
+
+    def test_legacy_root_diagnostic_reads_through_the_path_backend(self):
+        host = self.tmp / 'legacy'
+        host.mkdir()
+        files = {
+            'VERSION.md': b'# Synthetic\n\n- Format version: 1.7\n',
+            'docs/orchestration.md': b'# Core\n',
+        }
+        entries = []
+        for rel, data in files.items():
+            path = host / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            entries.append({'path': rel, 'category': 'core',
+                            'sha256': hashlib.sha256(data).hexdigest()})
+        (host / 'MANIFEST.json').write_text(json.dumps({
+            'schema_version': 1, 'suite': 'Synthetic', 'format_version': '1.7',
+            'files': entries}), encoding='utf-8')
+        self._force_path_backend()
+        problems, recorded, removals = workspace._check_legacy_root(host)
+        self.assertEqual(problems, [])
+        self.assertEqual(set(recorded), set(files))
+        self.assertEqual(set(removals), set(files))
 
 
 if __name__ == '__main__':
