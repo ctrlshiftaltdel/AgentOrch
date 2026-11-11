@@ -20,7 +20,6 @@ import struct
 import sys
 import tempfile
 import unittest
-import warnings
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -351,20 +350,35 @@ def without_stdlib_listxattr():
 
 @contextlib.contextmanager
 def observe_path_reads():
-    """Record every ``Path`` read and every successful raw ``os.open`` in the block.
+    """Record ``Path`` reads, built-in ``open`` and successful raw ``os.open``.
 
     A candidate baseline read is only proven rejected when the external canary
     path never appears here, so tests patch the read entry points themselves
-    instead of trusting a status string. ``os.open`` is recorded too because the
-    hardened byte reader opens descriptors directly; patching only ``Path``
-    methods would miss a followed symlink. A relative ``os.open`` with
-    ``dir_fd`` is resolved against the directory descriptor's real path.
+    instead of trusting a status string. ``os.open`` and the built-in ``open``
+    are recorded too because a reader can reach a followed symlink through
+    either one; patching only ``Path`` methods would miss both. A relative
+    ``os.open`` with ``dir_fd`` is resolved against the directory descriptor's
+    real path.
+
+    What this recorder still does **not** see, so a passing block must never be
+    reported as "the canary was not read by any means":
+
+    - ``mmap.mmap`` over a descriptor: the bytes are mapped without a read call;
+    - ``os.read``/``os.pread`` on a descriptor that was opened before the block
+      or by code that bypasses the entry points patched here;
+    - ``io.FileIO``/``os.fdopen`` and other constructors that do not go through
+      the built-in ``open`` name;
+    - a built-in ``open`` of an already-open descriptor, which is recorded as
+      ``<fd N>`` because the descriptor cannot be attributed to a path;
+    - C extensions and subprocesses that read the file for themselves.
     """
+    import builtins
     from unittest.mock import patch
     reads: list[Path] = []
     original_bytes = Path.read_bytes
     original_text = Path.read_text
-    original_open = os.open
+    original_os_open = os.open
+    original_builtin_open = builtins.open
 
     def tracked_bytes(path):
         reads.append(path)
@@ -373,6 +387,15 @@ def observe_path_reads():
     def tracked_text(path, *args, **kwargs):
         reads.append(path)
         return original_text(path, *args, **kwargs)
+
+    def tracked_builtin_open(file, *args, **kwargs):
+        try:
+            reads.append(Path(os.fsdecode(file)))
+        except TypeError:
+            # ``open(fd)`` wraps an existing descriptor; there is no path to
+            # attribute, so record a marker instead of inventing one.
+            reads.append(Path(f'<fd {file}>'))
+        return original_builtin_open(file, *args, **kwargs)
 
     def directory_fd_path(directory_fd):
         """The real directory a ``dir_fd`` was opened on, or ``None``.
@@ -387,7 +410,7 @@ def observe_path_reads():
         return descriptor_path(directory_fd)
 
     def tracked_open(path, *args, **kwargs):
-        descriptor = original_open(path, *args, **kwargs)
+        descriptor = original_os_open(path, *args, **kwargs)
         try:
             decoded = os.fsdecode(path)
             recorded = None
@@ -409,6 +432,7 @@ def observe_path_reads():
 
     with patch.object(Path, 'read_bytes', tracked_bytes), \
          patch.object(Path, 'read_text', tracked_text), \
+         patch.object(builtins, 'open', tracked_builtin_open), \
          patch.object(os, 'open', tracked_open):
         yield reads
 
@@ -2339,16 +2363,13 @@ runpy.run_path(script,run_name='__main__')
         return git_at(self.host, 'rev-parse', 'HEAD')
 
     def _stage_host_objects(self):
-        """Stage the object-snapshot stimuli in the host project.
+        """Stage the stimuli every platform can stage; return the canary.
 
-        Returns ``(canary, links, unexecuted)``: the external canary file, the
-        ``relative path -> symlink target`` map this platform actually staged,
-        and one ``NOT_RUN: ...`` reason per symlink that could not be created.
-
-        A platform without symlink support must not turn this into a pass *or*
-        a whole-case skip: the reason is returned so the caller announces it,
-        and the empty-directory stimulus is staged unconditionally so the
-        snapshot still runs everywhere.
+        The empty directory and the external regular-file canary need no
+        platform primitive, so the cases that own them must always run and
+        pass. Symlink stimuli are staged separately by
+        :meth:`_stage_host_symlinks`, which reports NOT_RUN when the platform
+        cannot create them.
         """
         empty = self.host / 'empty-host-dir'
         empty.mkdir()
@@ -2357,22 +2378,29 @@ runpy.run_path(script,run_name='__main__')
         canary_dir.mkdir()
         canary = canary_dir / 'canary.txt'
         canary.write_bytes(b'outside the write set: no install may read this\n')
+        return canary
+
+    def _stage_host_symlinks(self, canary):
+        """Stage the symlink stimuli or report the case as skipped/NOT_RUN.
+
+        A platform that cannot create the stimulus has not exercised link
+        preservation, so this raises ``SkipTest('NOT_RUN: ...')``: the runner
+        records a skip, not a passing case. A warning inside a still-passing
+        test would let the exit code claim success for work that never ran.
+        Returns the ``relative path -> symlink target`` map actually staged.
+        """
         wanted = {
             'host-note-link.md': 'docs/NOTES.md',
             'external-canary-link.txt': str(canary),
         }
-        links: dict[str, str] = {}
-        unexecuted: list[str] = []
         for rel, target in wanted.items():
-            link = self.host / rel
             try:
-                os.symlink(target, link)
+                os.symlink(target, self.host / rel)
             except (AttributeError, NotImplementedError, OSError) as exc:
-                unexecuted.append(
-                    f'NOT_RUN: symlink stimulus {rel} was not exercised: {exc}')
-                continue
-            links[rel] = target
-        return canary, links, unexecuted
+                self.skipTest(
+                    f'NOT_RUN: symlink stimulus {rel} could not be created, so '
+                    f'link preservation was not exercised on this platform: {exc}')
+        return wanted
 
     def _git_env(self):
         return {**os.environ, 'GIT_AUTHOR_NAME': 'Synthetic Test',
@@ -3819,41 +3847,68 @@ runpy.run_path(script,run_name='__main__')
         self.assertEqual(text.count(workspace.MANAGED_BEGIN_PREFIX), 1)
         self.assertEqual(text.count(workspace.MANAGED_END), 1)
 
-    def test_ac4_ac10_object_snapshot_keeps_symlinks_and_empty_dirs(self):
+    def test_ac4_ac10_object_snapshot_keeps_empty_dirs_and_regular_files(self):
         # raw_snapshot skips symlinks and never records directories, so the AC-4
         # "nothing outside the allowed area changes" assertion was blind to a
-        # replaced link and to a removed empty directory. This case snapshots the
-        # objects themselves (link target string, directory presence, raw file
-        # bytes) across a real APPLIED install.
-        canary, links, unexecuted = self._stage_host_objects()
-        for reason in unexecuted:
-            # NOT_RUN is announced, never folded into a pass, and never skips the
-            # case: the empty-directory and regular-file stimuli below still run.
-            warnings.warn(reason, RuntimeWarning, stacklevel=2)
-        for rel in ('host-note-link.md', 'external-canary-link.txt'):
-            self.assertTrue(
-                rel in links or any(rel in reason for reason in unexecuted),
-                f'{rel} must be staged or reported NOT_RUN with a reason')
+        # removed empty directory. This case stages only stimuli every platform
+        # can create, so it must always execute and pass.
+        canary = self._stage_host_objects()
         canary_bytes = canary.read_bytes()
         before = object_snapshot(self.host, skip_names=('.git',))
         self.assertEqual(before['empty-host-dir'], ('dir',))
-        for rel, target in links.items():
-            self.assertEqual(before[rel], ('symlink', target), rel)
 
-        # Positive controls: the recorder really does see a direct read of the
-        # canary and a read *through* the link. Without them a silent install
+        # Positive controls: the recorder must see a direct Path read and a
+        # direct built-in ``open`` of the canary. Without them a silent install
         # could pass by leaving the detector blind.
         with observe_path_reads() as control:
             canary.read_bytes()
         self.assertTrue(read_touches(control, canary), 'direct canary read must be recorded')
-        if links:
-            with observe_path_reads() as control:
-                (self.host / 'external-canary-link.txt').read_bytes()
-            self.assertTrue(read_touches(control, canary),
-                            'a read through the link must be attributed to its target')
+        with observe_path_reads() as control:
+            with open(canary, 'rb') as handle:
+                self.assertEqual(handle.read(), canary_bytes)
+        self.assertTrue(read_touches(control, canary),
+                        'a built-in open of the canary must be recorded')
 
         with observe_path_reads() as reads:
             plan, result = self.install()
+        self.assertTrue(reads, 'the detector recorded no read at all, so its silence proves nothing')
+        self.assertEqual(result['status'], 'APPLIED', result)
+        self.assertTrue(result['written'])
+        for rel in result['written']:
+            self.assertTrue(rel == 'AGENTS.md' or rel.startswith('agentorch/'), rel)
+        self.assertEqual(canary.read_bytes(), canary_bytes)
+        self.assertFalse(
+            read_touches(reads, canary),
+            'the install must not read the external canary')
+        after = object_snapshot(self.host, skip_names=('agentorch', 'AGENTS.md', '.git'))
+        expected = {key: value for key, value in before.items() if key != 'AGENTS.md'}
+        self.assertEqual(after, expected)
+
+    def test_ac4_ac10_object_snapshot_keeps_symlinks(self):
+        # Symlink preservation is its own case: a platform that cannot create
+        # the stimulus must report skipped/NOT_RUN, not a passing case.
+        canary = self._stage_host_objects()
+        links = self._stage_host_symlinks(canary)
+        canary_bytes = canary.read_bytes()
+        before = object_snapshot(self.host, skip_names=('.git',))
+        for rel, target in links.items():
+            self.assertEqual(before[rel], ('symlink', target), rel)
+
+        # Positive controls: a read *through* the link must be attributed to its
+        # target. The built-in ``open`` path is the one the previous spy missed.
+        with observe_path_reads() as control:
+            with open(self.host / 'external-canary-link.txt', 'rb') as handle:
+                self.assertEqual(handle.read(), canary_bytes)
+        self.assertTrue(read_touches(control, canary),
+                        'a built-in open through the link must reach the canary')
+        with observe_path_reads() as control:
+            (self.host / 'external-canary-link.txt').read_bytes()
+        self.assertTrue(read_touches(control, canary),
+                        'a Path read through the link must reach the canary')
+
+        with observe_path_reads() as reads:
+            plan, result = self.install()
+        self.assertTrue(reads, 'the detector recorded no read at all, so its silence proves nothing')
         self.assertEqual(result['status'], 'APPLIED', result)
         self.assertTrue(result['written'])
         for rel in result['written']:
@@ -3869,18 +3924,41 @@ runpy.run_path(script,run_name='__main__')
         for rel, target in links.items():
             self.assertEqual(os.readlink(self.host / rel), target, rel)
 
-    def test_ac4_failure_path_object_snapshot_keeps_symlinks_and_empty_dirs(self):
-        # Same structural snapshot on the fail-closed path: a blocked plan must
-        # leave links, directory presence and the external canary untouched.
+    def test_ac4_failure_path_object_snapshot_keeps_empty_dirs_and_regular_files(self):
+        # Same structural snapshot on the fail-closed path for the stimuli every
+        # platform can stage: a blocked plan must leave the empty directory and
+        # the external regular-file canary untouched.
         agents = self.host / 'AGENTS.md'
         original = agents.read_bytes()
         duplicate = original + b'\n' + workspace.managed_block(FORMAT_VERSION).encode('utf-8') * 2
         agents.write_bytes(duplicate)
-        canary, links, unexecuted = self._stage_host_objects()
-        for reason in unexecuted:
-            warnings.warn(reason, RuntimeWarning, stacklevel=2)
-        staged = object_snapshot(self.host)
-        self.assertEqual(staged['empty-host-dir'], ('dir',))
+        canary = self._stage_host_objects()
+        canary_bytes = canary.read_bytes()
+        before = object_snapshot(self.host)
+        self.assertEqual(before['empty-host-dir'], ('dir',))
+        with observe_path_reads() as reads:
+            plan = self.plan()
+            self.assertEqual(plan.status, 'STOPPED_CONFLICT', plan.problems)
+            result = workspace.apply_isolated_onboarding(plan)
+        self.assertTrue(reads, 'the detector recorded no read at all, so its silence proves nothing')
+        self.assertNotEqual(result['status'], 'APPLIED', result)
+        self.assertEqual(result['written'], [])
+        self.assertEqual(object_snapshot(self.host), before)
+        self.assertEqual(canary.read_bytes(), canary_bytes)
+        self.assertFalse(read_touches(reads, canary),
+                         'a blocked plan must not read the external canary')
+        self.assertEqual(agents.read_bytes(), duplicate)
+        self.assertFalse((self.host / 'agentorch').exists())
+
+    def test_ac4_failure_path_object_snapshot_keeps_symlinks(self):
+        # The symlink half of the fail-closed snapshot: skipped/NOT_RUN when the
+        # platform cannot create the stimulus, never a silent pass.
+        agents = self.host / 'AGENTS.md'
+        original = agents.read_bytes()
+        duplicate = original + b'\n' + workspace.managed_block(FORMAT_VERSION).encode('utf-8') * 2
+        agents.write_bytes(duplicate)
+        canary = self._stage_host_objects()
+        links = self._stage_host_symlinks(canary)
         canary_bytes = canary.read_bytes()
         before = object_snapshot(self.host)
         for rel, target in links.items():
@@ -3889,12 +3967,16 @@ runpy.run_path(script,run_name='__main__')
             plan = self.plan()
             self.assertEqual(plan.status, 'STOPPED_CONFLICT', plan.problems)
             result = workspace.apply_isolated_onboarding(plan)
+        self.assertTrue(reads, 'the detector recorded no read at all, so its silence proves nothing')
         self.assertNotEqual(result['status'], 'APPLIED', result)
         self.assertEqual(result['written'], [])
         self.assertEqual(object_snapshot(self.host), before)
         self.assertEqual(canary.read_bytes(), canary_bytes)
-        self.assertFalse(read_touches(reads, canary),
-                         'a blocked plan must not read the external canary')
+        self.assertFalse(
+            read_touches(reads, canary, self.host / 'external-canary-link.txt'),
+            'a blocked plan must not read the external canary nor follow its link')
+        for rel, target in links.items():
+            self.assertEqual(os.readlink(self.host / rel), target, rel)
         self.assertEqual(agents.read_bytes(), duplicate)
         self.assertFalse((self.host / 'agentorch').exists())
 
