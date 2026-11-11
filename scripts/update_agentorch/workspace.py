@@ -59,6 +59,13 @@ def normalize_line_endings(data: bytes) -> bytes:
 
 
 def sha256_bytes(data: bytes) -> str:
+    """Digest with the release builder's text folding, not raw bytes.
+
+    Text (valid UTF-8 without NUL) is hashed after ``\r\n`` -> ``\n`` folding;
+    binary data is hashed as-is. This is deliberately *not* a strict byte
+    equality test for text: two files that differ only by CRLF line endings
+    produce the same digest, including in baseline discovery.
+    """
     return hashlib.sha256(normalize_line_endings(data)).hexdigest()
 
 
@@ -842,7 +849,11 @@ def _installed_baseline_hint(target: Path) -> tuple[dict | None, list[str]]:
 
 
 def bind_verified_baseline(result, target: Path) -> BaselineBinding:
-    """Seal a verified old release and its exact projected installed bytes."""
+    """Seal a verified old release and its projected installed bytes.
+
+    The sealed digests use :func:`sha256_bytes`, so text members are compared
+    after the release builder's CRLF folding and binary members as raw bytes.
+    """
     if result is None or not getattr(result, 'ok', False):
         raise OnboardingError('a verified baseline release package is required')
     checks = {item.get('check'): item for item in getattr(result, 'checks', [])}
@@ -949,7 +960,13 @@ def _baseline_binding_matches(first: BaselineBinding | None,
 
 def installed_tree_matches_baseline(target: Path,
                                     binding: BaselineBinding) -> list[str]:
-    """Read-only item-by-item match of ``agentorch/`` against a sealed baseline."""
+    """Read-only item-by-item match of ``agentorch/`` against a sealed baseline.
+
+    Comparison is not strict byte equality for text: both the expected and the
+    installed data go through :func:`sha256_bytes`, i.e. the release builder's
+    CRLF folding for text and raw bytes for binary. A CRLF-only difference in a
+    text file is therefore accepted here.
+    """
     target = Path(target)
     expected = dict(binding.installed_sha256)
     problems: list[str] = []
@@ -1315,7 +1332,10 @@ def _baseline_candidate_mismatches(result, hint: dict, target: Path) -> list[str
     """Empty list only when the verified package equals the installed tree.
 
     A same-Format package with different bytes is a mismatch, not a baseline:
-    ``installed_tree_matches_baseline`` compares every projected byte.
+    ``installed_tree_matches_baseline`` compares every projected file. Text
+    files are compared through ``sha256_bytes`` (CRLF-folded), binaries as raw
+    bytes, so a CRLF-only text difference is not reported as a mismatch; a read
+    failure propagates as ``OSError`` rather than becoming a mismatch.
     """
     if (result.suite != hint['suite']
             or result.format_version != hint['format_version']):
@@ -1332,9 +1352,9 @@ def fetch_verified_onboarding_baseline(host_root):
     """Find and verify the official release the installed tree came from.
 
     The installed ``MANIFEST.json`` is used only to suggest release tags. The
-    returned object is a *verified package result* whose bytes must match the
-    installed tree exactly; a local manifest, self-signed hash or caller digest
-    can never authenticate the baseline on its own.
+    returned object is a *verified package result* whose projected bytes must
+    match the installed tree; a local manifest, self-signed hash or caller
+    digest can never authenticate the baseline on its own.
 
     Discovery is ordered, never guessed:
 
@@ -1349,6 +1369,18 @@ def fetch_verified_onboarding_baseline(host_root):
        no other official release publishes the same bytes, so a listing failure
        is never reported as a unique baseline (nor as "there is no patch
        release").
+
+    A probed tag that cannot be fetched or verified only counts as *absent*
+    when the official listing does not publish it at all. A tag the listing
+    publishes but whose metadata, asset, verification or local comparison fails
+    stays unresolved: its comparison is NOT_RUN, so it can neither be counted
+    as a mismatch nor be excluded from uniqueness, and discovery fails closed
+    even when exactly one other candidate matched.
+
+    The item-by-item comparison is not a strict byte comparison for text: both
+    sides are hashed with :func:`sha256_bytes`, which applies the release
+    builder's CRLF folding to text files and leaves binary files as raw bytes.
+    A CRLF-only difference in a text file is therefore not rejected here.
     """
     from . import sources, versions
 
@@ -1361,15 +1393,26 @@ def fetch_verified_onboarding_baseline(host_root):
     failures: list[str] = []
     tried: list[str] = []
     matches: list = []
+    # Tags whose package could not be obtained or verified. They are only
+    # skippable when the official listing proves the tag does not exist.
+    unresolved: dict[str, str] = {}
 
     def _consider(tag: str) -> None:
         tried.append(tag)
         try:
             result = fetch_verified_onboarding_release(tag, client=client)
+            mismatches = _baseline_candidate_mismatches(result, hint, target)
         except OnboardingError as exc:
-            failures.append(str(exc))
+            detail = str(exc)
+            failures.append(detail)
+            unresolved[tag] = detail
             return
-        mismatches = _baseline_candidate_mismatches(result, hint, target)
+        except OSError as exc:
+            # A local read failure while comparing proves neither a match nor a
+            # mismatch, so it can never be resolved by trying another tag.
+            raise OnboardingError(
+                f'the installed tree could not be read while verifying official '
+                f'release {tag}: {exc}') from exc
         if mismatches:
             failures.extend(mismatches[:5])
             return
@@ -1387,11 +1430,24 @@ def fetch_verified_onboarding_baseline(host_root):
         raise OnboardingError(
             'the installed baseline cannot be authenticated and the official stable '
             f'release tags cannot be enumerated: {exc}') from exc
+    listed_tags = set(listed)
     candidates = [tag for tag in listed
                   if tag not in tried
                   and versions.tag_matches_format(tag, hint['format_version'])]
     for tag in candidates:
         _consider(tag)
+    # A seed tag missing from the listing is officially absent and may be
+    # skipped. A tag the listing does publish but whose bytes could not be
+    # fetched / verified leaves the comparison NOT_RUN: no remaining match can
+    # then be called unique.
+    unverified = [tag for tag in unresolved if tag in listed_tags]
+    if unverified:
+        tag = unverified[0]
+        raise OnboardingError(
+            f'the installed baseline cannot be authenticated: official release {tag} '
+            f'is published in the official stable listing but could not be fetched '
+            f'or verified ({unresolved[tag]}); refusing to report a unique baseline '
+            'and writing nothing')
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:

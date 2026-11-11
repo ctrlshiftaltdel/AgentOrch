@@ -3718,19 +3718,35 @@ runpy.run_path(script,run_name='__main__')
         self.assertEqual(hint_problems, [], hint)
         return checked, release, payload
 
-    def _listing_transport(self, entries):
-        """In-memory replacement for the official client's two read paths."""
+    def _listing_transport(self, entries, *, fail_fetch=(), fail_download=()):
+        """In-memory replacement for the official client's two read paths.
+
+        ``fail_fetch`` / ``fail_download`` name tags whose release metadata or
+        asset bytes are unavailable, so a tag can be *listed* while its package
+        cannot be obtained. That is different from a tag the official listing
+        does not publish at all.
+        """
+        from scripts.update_agentorch import sources
         payloads = {release.assets[0].download_url: payload
                     for release, payload in entries.values()}
+        failed_downloads = {entries[tag][0].assets[0].download_url
+                            for tag in fail_download}
         attempted = []
 
         def fetch(tag=None):
             attempted.append(tag)
+            if tag in fail_fetch:
+                raise sources.SourceError(
+                    'SOURCE_ALLOWLIST', f'synthetic fetch failure for {tag}')
             if tag not in entries:
                 raise AssertionError(f'unexpected release tag {tag!r}')
             return entries[tag][0]
 
         def download(asset):
+            if asset.download_url in failed_downloads:
+                raise sources.SourceError(
+                    'SOURCE_ALLOWLIST',
+                    f'synthetic download failure for {asset.download_url}')
             return payloads[asset.download_url]
 
         return attempted, fetch, download
@@ -3969,6 +3985,128 @@ runpy.run_path(script,run_name='__main__')
                 workspace.fetch_verified_onboarding_baseline(self.host)
         self.assertIn('cannot be authenticated', str(caught.exception))
         self.assertEqual(attempted, ['v1.7', 'v1.7.0', 'v1.7.3'])
+        self.assertEqual(raw_snapshot(self.host), before)
+
+    def test_ac9_listed_patch_download_failure_cannot_leave_a_unique_match(self):
+        """A listed patch tag whose asset cannot be fetched is not a mismatch.
+
+        ``v1.6`` matches the installed tree, but ``v1.6.2`` is published by the
+        official listing and its download fails. ``v1.6.2`` was never compared,
+        so returning ``v1.6`` as the *unique* baseline would treat NOT_RUN as a
+        proven difference.
+        """
+        from unittest.mock import patch
+        from scripts.update_agentorch import sources
+        source = make_source(self.tmp / 'source-1.6', version='1.6')
+        _checked, base_release, base_payload = self._install_tagged_baseline(
+            source, 'v1.6')
+        _patch, patch_release, patch_payload = self._tagged_release(source, 'v1.6.2')
+        other_source = make_source(
+            self.tmp / 'source-1.6-other', version='1.6',
+            overrides={'README.md': '# a different 1.6.0 build\n'})
+        _other, other_release, other_payload = self._tagged_release(
+            other_source, 'v1.6.0')
+        attempted, fetch, download = self._listing_transport({
+            'v1.6': (base_release, base_payload),
+            'v1.6.0': (other_release, other_payload),
+            'v1.6.2': (patch_release, patch_payload),
+        }, fail_download=('v1.6.2',))
+        before = raw_snapshot(self.host)
+        with patch.object(sources.GitHubReleaseSource, 'fetch_release', side_effect=fetch), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          return_value=('v1.6.2', 'v1.6.0', 'v1.6')):
+            with self.assertRaises(workspace.OnboardingError) as caught:
+                workspace.fetch_verified_onboarding_baseline(self.host)
+        self.assertIn('v1.6.2', str(caught.exception))
+        self.assertIn('could not be fetched or verified', str(caught.exception))
+        self.assertEqual(attempted, ['v1.6', 'v1.6.0', 'v1.6.2'])
+        self.assertEqual(raw_snapshot(self.host), before)
+
+    def test_ac9_listed_seed_fetch_failure_cannot_leave_a_unique_match(self):
+        """A *listed* seed tag that cannot be fetched is unresolved, not absent."""
+        from unittest.mock import patch
+        from scripts.update_agentorch import sources
+        source = make_source(self.tmp / 'source-1.6', version='1.6')
+        _checked, base_release, base_payload = self._install_tagged_baseline(
+            source, 'v1.6')
+        _patch, patch_release, patch_payload = self._tagged_release(source, 'v1.6.2')
+        other_source = make_source(
+            self.tmp / 'source-1.6-other', version='1.6',
+            overrides={'README.md': '# a different 1.6.0 build\n'})
+        _other, other_release, other_payload = self._tagged_release(
+            other_source, 'v1.6.0')
+        attempted, fetch, download = self._listing_transport({
+            'v1.6': (base_release, base_payload),
+            'v1.6.0': (other_release, other_payload),
+            'v1.6.2': (patch_release, patch_payload),
+        }, fail_download=('v1.6',))
+        before = raw_snapshot(self.host)
+        with patch.object(sources.GitHubReleaseSource, 'fetch_release', side_effect=fetch), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          return_value=('v1.6.2', 'v1.6.0', 'v1.6')):
+            with self.assertRaises(workspace.OnboardingError) as caught:
+                workspace.fetch_verified_onboarding_baseline(self.host)
+        self.assertIn('v1.6', str(caught.exception))
+        self.assertIn('could not be fetched or verified', str(caught.exception))
+        self.assertEqual(attempted, ['v1.6', 'v1.6.0', 'v1.6.2'])
+        self.assertEqual(raw_snapshot(self.host), before)
+
+    def test_ac9_listed_candidate_read_failure_cannot_leave_a_unique_match(self):
+        """A read error while comparing a listed candidate proves nothing either."""
+        from unittest.mock import patch
+        from scripts.update_agentorch import sources
+        source = make_source(self.tmp / 'source-1.6', version='1.6')
+        _checked, base_release, base_payload = self._install_tagged_baseline(
+            source, 'v1.6')
+        _patch, patch_release, patch_payload = self._tagged_release(source, 'v1.6.2')
+        attempted, fetch, download = self._listing_transport({
+            'v1.6': (base_release, base_payload),
+            'v1.6.2': (patch_release, patch_payload),
+        }, fail_fetch=('v1.6.0',))
+        original = workspace.installed_tree_matches_baseline
+
+        def flaky(target, binding):
+            if binding.release_tag == 'v1.6.2':
+                raise OSError('synthetic read failure for v1.6.2')
+            return original(target, binding)
+
+        before = raw_snapshot(self.host)
+        with patch.object(sources.GitHubReleaseSource, 'fetch_release', side_effect=fetch), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          return_value=('v1.6.2', 'v1.6')), \
+             patch.object(workspace, 'installed_tree_matches_baseline', side_effect=flaky):
+            with self.assertRaises(workspace.OnboardingError) as caught:
+                workspace.fetch_verified_onboarding_baseline(self.host)
+        self.assertIn('could not be read', str(caught.exception))
+        self.assertIn('v1.6.2', str(caught.exception))
+        self.assertEqual(attempted, ['v1.6', 'v1.6.0', 'v1.6.2'])
+        self.assertEqual(raw_snapshot(self.host), before)
+
+    def test_ac9_absent_seed_tag_may_be_skipped_when_the_listing_omits_it(self):
+        """A seed tag the official listing never publishes is absent, not unresolved.
+
+        ``v1.6`` / ``v1.6.0`` do not exist upstream and their probes fail; the
+        listing publishes only ``v1.6.2``, which matches, so discovery succeeds.
+        """
+        from unittest.mock import patch
+        from scripts.update_agentorch import sources
+        source = make_source(self.tmp / 'source-1.6', version='1.6')
+        _checked, patch_release, patch_payload = self._install_tagged_baseline(
+            source, 'v1.6.2')
+        attempted, fetch, download = self._listing_transport({
+            'v1.6.2': (patch_release, patch_payload),
+        }, fail_fetch=('v1.6', 'v1.6.0'))
+        before = raw_snapshot(self.host)
+        with patch.object(sources.GitHubReleaseSource, 'fetch_release', side_effect=fetch), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          return_value=('v1.6.2',)):
+            result = workspace.fetch_verified_onboarding_baseline(self.host)
+        self.assertEqual(result.release_tag, 'v1.6.2')
+        self.assertEqual(attempted, ['v1.6', 'v1.6.0', 'v1.6.2'])
         self.assertEqual(raw_snapshot(self.host), before)
 
     def test_ac9_same_tag_with_different_bytes_cannot_replace_the_baseline(self):
