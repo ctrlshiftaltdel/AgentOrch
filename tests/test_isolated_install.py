@@ -4746,19 +4746,22 @@ runpy.run_path(script,run_name='__main__')
     def test_cross_process_rollback_preserves_concurrent_changes_outside_backup(self):
         head, before, backup = self._apply_isolated_for_rollback()
         unrelated = self.host / 'src' / 'app.py'
-        unrelated.write_text('concurrent host edit\n', encoding='utf-8')
+        # Pin the exact bytes: text-mode writes translate LF to CRLF on Windows,
+        # which would change the hash this test checks.
+        concurrent_bytes = b'concurrent host edit\n'
+        unrelated.write_bytes(concurrent_bytes)
         new_file = self.host / 'notes' / 'concurrent.md'
         new_file.parent.mkdir()
         new_file.write_text('kept\n', encoding='utf-8')
         result = workspace.rollback_isolated_onboarding({
             'host_root': str(self.host), 'backup_location': backup})
         self.assertEqual(result['status'], 'ROLLED_BACK', result)
-        self.assertEqual(unrelated.read_text(encoding='utf-8'), 'concurrent host edit\n')
+        self.assertEqual(unrelated.read_bytes(), concurrent_bytes)
         self.assertEqual(new_file.read_text(encoding='utf-8'), 'kept\n')
         restored = raw_snapshot(self.host, skip_names=('.git',))
         self.assertNotIn('agentorch/README.md', restored)
-        self.assertEqual(restored['src/app.py'], hashlib.sha256(
-            b'concurrent host edit\n').hexdigest())
+        self.assertEqual(restored['src/app.py'],
+                         hashlib.sha256(concurrent_bytes).hexdigest())
 
     def test_cross_process_rollback_blocks_when_an_applied_file_changed(self):
         head, before, backup = self._apply_isolated_for_rollback()
