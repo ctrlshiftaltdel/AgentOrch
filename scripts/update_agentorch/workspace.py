@@ -2730,11 +2730,6 @@ _FILE_STREAM_INFO_CLASS = 7        # GetFileInformationByHandleEx FileStreamInfo
 _FILE_EA_INFORMATION_CLASS = 7     # NtQueryInformationFile FileEaInformation
 _FILE_STREAM_INFO_HEADER = 24      # 4 + 4 + 8 + 8 before the variable name
 _DEFAULT_STREAM_NAMES = frozenset({'', '::$DATA', ':$DATA'})
-_GENERIC_READ = 0x80000000
-_FILE_SHARE_ALL = 0x00000007
-_OPEN_EXISTING = 3
-_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
-_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 _ERROR_MORE_DATA = 234
 
 
@@ -2840,85 +2835,14 @@ def _windows_query_ea_size(ntdll, wintypes, handle) -> int:
     return _windows_ea_size(bytes(payload))
 
 
-def _windows_verify_identity(kernel32, wintypes, handle, expected_identity) -> None:
-    """Require the opened handle to be the entry that was inspected."""
-    import ctypes
+def _windows_xattr_names(*, fd: int) -> list[str]:
+    """Enumerate named streams and the EA block for an open descriptor.
 
-    class _ByHandleFileInformation(ctypes.Structure):
-        _fields_ = [
-            ('dwFileAttributes', wintypes.DWORD),
-            ('ftCreationTime', wintypes.FILETIME),
-            ('ftLastAccessTime', wintypes.FILETIME),
-            ('ftLastWriteTime', wintypes.FILETIME),
-            ('dwVolumeSerialNumber', wintypes.DWORD),
-            ('nFileSizeHigh', wintypes.DWORD),
-            ('nFileSizeLow', wintypes.DWORD),
-            ('nNumberOfLinks', wintypes.DWORD),
-            ('nFileIndexHigh', wintypes.DWORD),
-            ('nFileIndexLow', wintypes.DWORD),
-        ]
-
-    function = getattr(kernel32, 'GetFileInformationByHandle', None)
-    if function is None:
-        raise TransactionConflict(
-            'file identity cannot be verified on this platform')
-    function.argtypes = [wintypes.HANDLE,
-                         ctypes.POINTER(_ByHandleFileInformation)]
-    function.restype = wintypes.BOOL
-    info = _ByHandleFileInformation()
-    if not function(handle, ctypes.byref(info)):
-        raise TransactionConflict(
-            'file identity cannot be verified: '
-            f'{ctypes.WinError(ctypes.get_last_error())}')
-    identity = (int(info.dwVolumeSerialNumber),
-                (int(info.nFileIndexHigh) << 32) | int(info.nFileIndexLow))
-    if identity[1] == 0:
-        raise TransactionConflict(
-            'file identity cannot be verified on this platform')
-    if expected_identity is not None and identity != tuple(expected_identity):
-        raise TransactionConflict('target changed while metadata was being inspected')
-
-
-def _windows_open_metadata_handle(kernel32, wintypes, path, fd):
-    """Return ``(handle, owned)`` for the metadata query."""
-    import ctypes
-
-    if fd is not None:
-        try:
-            import msvcrt
-            return msvcrt.get_osfhandle(fd), False
-        except (ImportError, OSError, ValueError) as exc:
-            raise TransactionConflict(
-                'the open descriptor has no Windows file handle') from exc
-    if path is None:
-        raise TransactionConflict('no path or descriptor was supplied for metadata')
-    create = getattr(kernel32, 'CreateFileW', None)
-    if create is None:
-        raise TransactionConflict(
-            'extended attributes cannot be enumerated on this platform')
-    create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                       ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
-                       wintypes.HANDLE]
-    create.restype = wintypes.HANDLE
-    handle = create(os.fspath(path), _GENERIC_READ, _FILE_SHARE_ALL, None,
-                    _OPEN_EXISTING,
-                    _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
-                    None)
-    if handle in (None, ctypes.c_void_p(-1).value):
-        raise TransactionConflict(
-            'extended attributes cannot be enumerated: '
-            f'{ctypes.WinError(ctypes.get_last_error())}')
-    return handle, True
-
-
-def _windows_xattr_names(path=None, *, fd: int | None = None,
-                         expected_identity=None) -> list[str]:
-    """Enumerate Windows named streams and the EA block, or fail closed.
-
-    The Win32 calls are only reachable on Windows. Any missing symbol, failed
-    call or identity mismatch raises :class:`TransactionConflict`, so the caller
-    never treats an unproven state as "no metadata"; only an empty successful
-    answer allows an in-place write.
+    The Win32 calls are only reachable on Windows. The descriptor is the anchor:
+    it was already proved to be the inspected entry when it was opened, so the
+    query cannot be redirected by a path swap. A missing symbol or a failed call
+    raises :class:`TransactionConflict`, so the caller never treats an unproven
+    state as "no metadata"; only an empty successful answer allows a write.
     """
     if os.name != 'nt':
         raise TransactionConflict(
@@ -2929,43 +2853,44 @@ def _windows_xattr_names(path=None, *, fd: int | None = None,
     try:
         kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
         ntdll = ctypes.WinDLL('ntdll', use_last_error=True)
-    except (OSError, AttributeError) as exc:
+        import msvcrt
+        handle = msvcrt.get_osfhandle(fd)
+    except (OSError, AttributeError, ImportError, ValueError) as exc:
         raise TransactionConflict(
-            'extended attributes cannot be enumerated on this platform') from exc
-    handle, owned = _windows_open_metadata_handle(kernel32, wintypes, path, fd)
-    close_handle = getattr(kernel32, 'CloseHandle', None)
-    if close_handle is None:
-        raise TransactionConflict(
-            'the metadata handle cannot be closed on this platform')
-    close_handle.argtypes = [wintypes.HANDLE]
-    close_handle.restype = wintypes.BOOL
-    try:
-        _windows_verify_identity(kernel32, wintypes, handle, expected_identity)
-        names = _windows_query_streams(kernel32, wintypes, handle)
-        ea_size = _windows_query_ea_size(ntdll, wintypes, handle)
-    finally:
-        if owned:
-            close_handle(handle)
+            'the open descriptor has no Windows file handle') from exc
+    names = _windows_query_streams(kernel32, wintypes, handle)
+    ea_size = _windows_query_ea_size(ntdll, wintypes, handle)
     if ea_size:
         names.append('$EA')
     return sorted(names)
 
 
-def _xattr_names(path=None, *, fd: int | None = None,
-                 expected_identity=None) -> list[str]:
+def _xattr_names(path=None, *, fd: int | None = None) -> list[str]:
     """Return the extended-attribute names on *path* or an open *fd*.
 
     ``os.listxattr`` accepts an open descriptor directly, so no ``/proc`` mount
     or magic symlink is required. Where the stdlib does not bind the xattr calls
     (macOS), the same libc symbol is reached through ``ctypes``. Windows has
-    neither route, so named data streams and the EA block are queried through
-    Win32 (see :func:`_windows_xattr_names`). When no route can enumerate the
-    metadata state is unproven and this raises; a filesystem that reports xattrs
-    as unsupported simply has none to preserve.
+    neither route, so the path form is opened through :func:`open_no_follow`
+    first and named data streams plus the EA block are queried on that verified
+    descriptor (see :func:`_windows_xattr_names`). When no route can enumerate
+    the metadata state is unproven and this raises; a filesystem that reports
+    xattrs as unsupported simply has none to preserve.
     """
     if os.name == 'nt':
-        return _windows_xattr_names(path, fd=fd,
-                                    expected_identity=expected_identity)
+        if fd is not None:
+            return _windows_xattr_names(fd=fd)
+        descriptor = None
+        try:
+            descriptor = open_no_follow(
+                Path(path), os.O_RDONLY | _O_BINARY,
+                label='metadata target')
+        except OnboardingError as exc:
+            raise TransactionConflict(str(exc)) from exc
+        try:
+            return _windows_xattr_names(fd=descriptor)
+        finally:
+            os.close(descriptor)
     if not hasattr(os, 'listxattr'):
         return _libc_listxattr(path, fd=fd)
     target = fd if fd is not None else path
@@ -3015,7 +2940,7 @@ def _target_metadata_problems(host: Path, rel: str) -> list[str]:
     if problems:
         return problems
     try:
-        names = _xattr_names(path, expected_identity=_file_identity(info))
+        names = _xattr_names(path)
     except TransactionConflict as exc:
         return [f'{rel}: {exc}']
     if names:
@@ -3076,8 +3001,7 @@ def _append_open_file(descriptor: int, rel: str, original: bytes,
     problems = _metadata_preservation_problems_for_stat(info, rel)
     if problems:
         raise TransactionConflict('; '.join(problems))
-    names = _xattr_names(fd=descriptor,
-                         expected_identity=_file_identity(info))
+    names = _xattr_names(fd=descriptor)
     if names:
         raise TransactionConflict(
             f'{rel}: target carries extended attributes or ACLs ({", ".join(names)}); '
@@ -3152,8 +3076,7 @@ def _rewrite_open_file(descriptor: int, rel: str, original: bytes,
     problems = _metadata_preservation_problems_for_stat(info, rel)
     if problems:
         raise TransactionConflict('; '.join(problems))
-    names = _xattr_names(fd=descriptor,
-                         expected_identity=_file_identity(info))
+    names = _xattr_names(fd=descriptor)
     if names:
         raise TransactionConflict(
             f'{rel}: target carries extended attributes or ACLs ({", ".join(names)}); '
