@@ -4109,6 +4109,118 @@ runpy.run_path(script,run_name='__main__')
         self.assertEqual(attempted, ['v1.6', 'v1.6.0', 'v1.6.2'])
         self.assertEqual(raw_snapshot(self.host), before)
 
+    def _install_flat_root(self, source):
+        """Copy one synthetic release to the host root as a flat old install."""
+        manifest = json.loads((source / 'MANIFEST.json').read_text(encoding='utf-8'))
+        for entry in manifest['files']:
+            rel = entry['path']
+            target = self.host / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((source / rel).read_bytes())
+        (self.host / 'MANIFEST.json').write_bytes(
+            (source / 'MANIFEST.json').read_bytes())
+        return manifest
+
+    def test_ac9_flat_old_root_patch_release_is_recovered_from_the_official_listing(self):
+        """A clean old root is bound to the listed patch tag, never to ``v1.6``.
+
+        The root ``MANIFEST.json`` only says ``format_version`` 1.6, so the two
+        seed tags are ``v1.6`` and ``v1.6.0``. The installed bytes equal the
+        official ``v1.6.3`` package and differ from ``v1.6``, and ``v1.6.0`` was
+        never published. Old-root discovery must use the same official stable
+        listing as the installed-tree path instead of guessing only the seeds.
+        """
+        from unittest.mock import patch
+        from scripts.update_agentorch import sources
+        legacy_source = make_source(
+            self.tmp / 'source-1.6.3-legacy', version='1.6',
+            overrides={'README.md': '# AgentOrch 1.6.3 old root\n'})
+        self._install_flat_root(legacy_source)
+        _checked, patch_release, patch_payload = self._tagged_release(
+            legacy_source, 'v1.6.3')
+        plain_source = make_source(
+            self.tmp / 'source-1.6-plain', version='1.6',
+            overrides={'README.md': '# a different 1.6 build\n'})
+        _plain, plain_release, plain_payload = self._tagged_release(
+            plain_source, 'v1.6')
+        attempted, fetch, download = self._listing_transport({
+            'v1.6': (plain_release, plain_payload),
+            'v1.6.3': (patch_release, patch_payload),
+        }, fail_fetch=('v1.6.0',))
+        before = raw_snapshot(self.host)
+        with patch.object(sources.GitHubReleaseSource, 'fetch_release', side_effect=fetch), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          return_value=('v1.6.3',)):
+            result = workspace.fetch_verified_onboarding_legacy_baseline(self.host)
+        self.assertEqual(result.release_tag, 'v1.6.3')
+        self.assertNotEqual(result.release_tag, 'v1.6')
+        self.assertEqual(attempted, ['v1.6', 'v1.6.0', 'v1.6.3'])
+        self.assertEqual(raw_snapshot(self.host), before)
+
+    def test_ac9_modified_flat_old_root_stays_stopped_with_zero_writes(self):
+        """The listed patch tag cannot authenticate a locally modified old root."""
+        from unittest.mock import patch
+        from scripts.update_agentorch import entry, sources
+        legacy_source = make_source(
+            self.tmp / 'source-1.6.3-legacy', version='1.6',
+            overrides={'README.md': '# AgentOrch 1.6.3 old root\n'})
+        self._install_flat_root(legacy_source)
+        _checked, patch_release, patch_payload = self._tagged_release(
+            legacy_source, 'v1.6.3')
+        plain_source = make_source(
+            self.tmp / 'source-1.6-plain', version='1.6',
+            overrides={'README.md': '# a different 1.6 build\n'})
+        _plain, plain_release, plain_payload = self._tagged_release(
+            plain_source, 'v1.6')
+        _target, target_release, target_payload = self._tagged_release(
+            self.source, 'v1.7')
+        (self.host / 'README.md').write_text(
+            '# locally modified old root\n', encoding='utf-8')
+        attempted, fetch, download = self._listing_transport({
+            'v1.6': (plain_release, plain_payload),
+            'v1.6.3': (patch_release, patch_payload),
+        }, fail_fetch=('v1.6.0',))
+        before = raw_snapshot(self.host)
+        with patch.object(sources.GitHubReleaseSource, 'fetch_release', side_effect=fetch), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset', side_effect=download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          return_value=('v1.6.3',)):
+            with self.assertRaises(workspace.OnboardingError) as caught:
+                workspace.fetch_verified_onboarding_legacy_baseline(self.host)
+        self.assertIn('old root baseline cannot be authenticated', str(caught.exception))
+        self.assertIn('v1.6.3', attempted)
+        self.assertEqual(raw_snapshot(self.host), before)
+
+        payloads = {target_release.assets[0].download_url: target_payload,
+                    plain_release.assets[0].download_url: plain_payload,
+                    patch_release.assets[0].download_url: patch_payload}
+
+        def with_latest(tag=None):
+            return target_release if tag is None else fetch(tag)
+
+        def any_download(asset):
+            if asset.download_url in payloads:
+                return payloads[asset.download_url]
+            return download(asset)
+
+        with patch.object(sources.GitHubReleaseSource, 'fetch_release',
+                          side_effect=with_latest), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset',
+                          side_effect=any_download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          return_value=('v1.6.3',)):
+            prepared = entry.prepare_isolated_install(self.host, mode='PLAN')
+        self.assertEqual(prepared['payload']['status'], 'STOPPED_CONFLICT',
+                         prepared['payload'])
+        self.assertEqual(prepared['payload']['mode'], 'MIGRATE')
+        self.assertEqual(prepared['plan'].legacy_removals, [])
+        self.assertTrue(any('README.md' in problem
+                            for problem in prepared['plan'].problems),
+                        prepared['plan'].problems)
+        self.assertFalse((self.host / 'agentorch').exists())
+        self.assertEqual(raw_snapshot(self.host), before)
+
     def test_ac9_same_tag_with_different_bytes_cannot_replace_the_baseline(self):
         _plan, installed = self.install()
         self.assertEqual(installed['status'], 'APPLIED', installed)
@@ -5397,7 +5509,9 @@ runpy.run_path(script,run_name='__main__')
         with patch.object(sources.GitHubReleaseSource, 'fetch_release',
                           side_effect=fetch), \
              patch.object(sources.GitHubReleaseSource, 'download_asset',
-                          side_effect=download):
+                          side_effect=download), \
+             patch.object(sources.GitHubReleaseSource, 'list_stable_release_tags',
+                          return_value=(_baseline_release.tag_name,)):
             prepared = entry.prepare_isolated_install(
                 self.host, source_root=upgraded, mode='APPLY',
                 declared_exclusive=True, expected_head=head)

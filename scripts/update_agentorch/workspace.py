@@ -1348,13 +1348,14 @@ def _baseline_candidate_mismatches(result, hint: dict, target: Path) -> list[str
     return installed_tree_matches_baseline(target, binding)
 
 
-def fetch_verified_onboarding_baseline(host_root):
-    """Find and verify the official release the installed tree came from.
+def _discover_verified_baseline(hint: dict, compare, *, label: str,
+                                read_subject: str, absent_detail: str):
+    """Shared ordered baseline discovery for an installed tree or a flat old root.
 
-    The installed ``MANIFEST.json`` is used only to suggest release tags. The
-    returned object is a *verified package result* whose projected bytes must
-    match the installed tree; a local manifest, self-signed hash or caller
-    digest can never authenticate the baseline on its own.
+    ``hint`` comes from a local manifest and is only a tag suggestion. ``compare``
+    receives a verified package result and returns the list of item-by-item
+    mismatches (empty when the tree matches); it raises ``OnboardingError`` for
+    a package that cannot be bound and ``OSError`` for a local read failure.
 
     Discovery is ordered, never guessed:
 
@@ -1365,10 +1366,7 @@ def fetch_verified_onboarding_baseline(host_root):
        and item-by-item comparison.
     3. every exact match is collected, and exactly one is returned. Zero
        matches, two or more exact matches, or a failed enumeration all fail
-       closed with no write. A seed tag that already matched is not proof that
-       no other official release publishes the same bytes, so a listing failure
-       is never reported as a unique baseline (nor as "there is no patch
-       release").
+       closed with no write.
 
     A probed tag that cannot be fetched or verified only counts as *absent*
     when the official listing does not publish it at all. A tag the listing
@@ -1376,19 +1374,9 @@ def fetch_verified_onboarding_baseline(host_root):
     stays unresolved: its comparison is NOT_RUN, so it can neither be counted
     as a mismatch nor be excluded from uniqueness, and discovery fails closed
     even when exactly one other candidate matched.
-
-    The item-by-item comparison is not a strict byte comparison for text: both
-    sides are hashed with :func:`sha256_bytes`, which applies the release
-    builder's CRLF folding to text files and leaves binary files as raw bytes.
-    A CRLF-only difference in a text file is therefore not rejected here.
     """
     from . import sources, versions
 
-    host = Path(host_root)
-    target = host / AGENTORCH_DIRNAME
-    hint, hint_problems = _installed_baseline_hint(target)
-    if hint is None:
-        raise OnboardingError('; '.join(hint_problems) or _BASELINE_MISSING)
     client = sources.GitHubReleaseSource()
     failures: list[str] = []
     tried: list[str] = []
@@ -1401,7 +1389,7 @@ def fetch_verified_onboarding_baseline(host_root):
         tried.append(tag)
         try:
             result = fetch_verified_onboarding_release(tag, client=client)
-            mismatches = _baseline_candidate_mismatches(result, hint, target)
+            mismatches = compare(result)
         except OnboardingError as exc:
             detail = str(exc)
             failures.append(detail)
@@ -1411,7 +1399,7 @@ def fetch_verified_onboarding_baseline(host_root):
             # A local read failure while comparing proves neither a match nor a
             # mismatch, so it can never be resolved by trying another tag.
             raise OnboardingError(
-                f'the installed tree could not be read while verifying official '
+                f'the {read_subject} could not be read while verifying official '
                 f'release {tag}: {exc}') from exc
         if mismatches:
             failures.extend(mismatches[:5])
@@ -1428,7 +1416,7 @@ def fetch_verified_onboarding_baseline(host_root):
         listed = client.list_stable_release_tags()
     except (sources.SourceError, OSError) as exc:
         raise OnboardingError(
-            'the installed baseline cannot be authenticated and the official stable '
+            f'the {label} cannot be authenticated and the official stable '
             f'release tags cannot be enumerated: {exc}') from exc
     listed_tags = set(listed)
     candidates = [tag for tag in listed
@@ -1444,7 +1432,7 @@ def fetch_verified_onboarding_baseline(host_root):
     if unverified:
         tag = unverified[0]
         raise OnboardingError(
-            f'the installed baseline cannot be authenticated: official release {tag} '
+            f'the {label} cannot be authenticated: official release {tag} '
             f'is published in the official stable listing but could not be fetched '
             f'or verified ({unresolved[tag]}); refusing to report a unique baseline '
             'and writing nothing')
@@ -1453,15 +1441,45 @@ def fetch_verified_onboarding_baseline(host_root):
     if len(matches) > 1:
         tags = ', '.join(sorted(str(getattr(item, 'release_tag', '?')) for item in matches))
         raise OnboardingError(
-            f'the installed baseline matches more than one official release ({tags}); '
+            f'the {label} matches more than one official release ({tags}); '
             'refusing to choose between them and writing nothing')
     if not candidates:
-        detail = failures[-1] if failures else _BASELINE_MISSING
+        detail = failures[-1] if failures else absent_detail
         raise OnboardingError(
-            'the installed baseline cannot be authenticated: the official listing has '
+            f'the {label} cannot be authenticated: the official listing has '
             f'no untried v{hint["format_version"]} release tag ({detail})')
     detail = failures[-1] if failures else 'no candidate official release matched'
-    raise OnboardingError(f'the installed baseline cannot be authenticated: {detail}')
+    raise OnboardingError(f'the {label} cannot be authenticated: {detail}')
+
+
+def fetch_verified_onboarding_baseline(host_root):
+    """Find and verify the official release the installed tree came from.
+
+    The installed ``MANIFEST.json`` is used only to suggest release tags. The
+    returned object is a *verified package result* whose projected bytes must
+    match the installed tree; a local manifest, self-signed hash or caller
+    digest can never authenticate the baseline on its own.
+
+    Discovery ordering and fail-closed rules live in
+    :func:`_discover_verified_baseline` and are shared with the flat old-root
+    path, so a patch release like ``v1.6.3`` is found from the official stable
+    listing instead of only the two seed tags.
+
+    The item-by-item comparison is not a strict byte comparison for text: both
+    sides are hashed with :func:`sha256_bytes`, which applies the release
+    builder's CRLF folding to text files and leaves binary files as raw bytes.
+    A CRLF-only difference in a text file is therefore not rejected here.
+    """
+    host = Path(host_root)
+    target = host / AGENTORCH_DIRNAME
+    hint, hint_problems = _installed_baseline_hint(target)
+    if hint is None:
+        raise OnboardingError('; '.join(hint_problems) or _BASELINE_MISSING)
+    return _discover_verified_baseline(
+        hint,
+        lambda result: _baseline_candidate_mismatches(result, hint, target),
+        label='installed baseline', read_subject='installed tree',
+        absent_detail=_BASELINE_MISSING)
 
 
 def _legacy_baseline_hint(host_root: Path) -> tuple[dict | None, list[str]]:
@@ -1485,41 +1503,47 @@ def _legacy_baseline_hint(host_root: Path) -> tuple[dict | None, list[str]]:
     return {'format_version': format_version, 'suite': suite}, []
 
 
+def _legacy_candidate_mismatches(result, hint: dict, host: Path) -> list[str]:
+    """Empty list only when the verified release equals the flat old root.
+
+    Same shape as :func:`_baseline_candidate_mismatches`: a package for another
+    suite / Format or one that cannot be sealed is a mismatch, and a read
+    failure while comparing propagates instead of becoming a mismatch.
+    """
+    if (result.suite != hint['suite']
+            or result.format_version != hint['format_version']):
+        return [f'official release {getattr(result, "release_tag", "?")} does not '
+                f'match the old root manifest suite / format']
+    try:
+        binding = bind_verified_legacy_baseline(result)
+    except OnboardingError as exc:
+        return [str(exc)]
+    return legacy_root_matches_baseline(host, binding)
+
+
 def fetch_verified_onboarding_legacy_baseline(host_root):
     """Find and verify the official Release the flat old root came from.
 
     The root ``MANIFEST.json`` only suggests candidate tags. The returned object
     must be a verified package whose members and manifest equal the old root
     byte for byte; a local manifest or hash never authenticates migration.
+
+    Discovery reuses :func:`_discover_verified_baseline`: the two seed tags, the
+    official client's read-only stable listing, one exact match only, and the
+    same fail-closed rules for a listed-but-unverifiable candidate and for
+    multiple exact matches. A patch release the old root came from (for example
+    ``v1.6.3`` with Format ``1.6``) is therefore recovered from the listing
+    instead of failing on the seeds alone.
     """
     host = Path(host_root)
     hint, hint_problems = _legacy_baseline_hint(host)
     if hint is None:
         raise OnboardingError('; '.join(hint_problems))
-    failures: list[str] = []
-    for tag in _baseline_tag_candidates(hint['format_version']):
-        try:
-            result = fetch_verified_onboarding_release(tag)
-        except OnboardingError as exc:
-            failures.append(str(exc))
-            continue
-        if (result.suite != hint['suite']
-                or result.format_version != hint['format_version']):
-            failures.append(f'official release {tag} does not match the old root '
-                            f'manifest suite / format')
-            continue
-        try:
-            binding = bind_verified_legacy_baseline(result)
-        except OnboardingError as exc:
-            failures.append(str(exc))
-            continue
-        mismatches = legacy_root_matches_baseline(host, binding)
-        if mismatches:
-            failures.extend(mismatches[:5])
-            continue
-        return result
-    detail = failures[-1] if failures else 'no candidate historical release matched'
-    raise OnboardingError(f'the old root baseline cannot be authenticated: {detail}')
+    return _discover_verified_baseline(
+        hint,
+        lambda result: _legacy_candidate_mismatches(result, hint, host),
+        label='old root baseline', read_subject='old root',
+        absent_detail='no candidate historical release matched')
 
 
 def _read_version(source_root: Path) -> tuple[str, str]:
