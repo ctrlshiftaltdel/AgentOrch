@@ -1201,10 +1201,9 @@ class VendoredTreeScanTests(unittest.TestCase):
 
             errors, _ = validate.validate_kit(root)
 
-            # The validator renders the relative path with the platform
-            # separator, so the expectation has to be built the same way
-            # (`scripts\README.md` on Windows, `scripts/README.md` elsewhere).
-            expected = f'{Path("scripts") / "README.md"}: broken relative link: missing.md'
+            # The validator renders the relative path in POSIX form on every
+            # platform, so the expectation must not use the host separator.
+            expected = 'scripts/README.md: broken relative link: missing.md'
             self.assertTrue(any(expected in error for error in errors), errors)
 
     def test_node_modules_markdown_cannot_supply_governance_concepts(self):

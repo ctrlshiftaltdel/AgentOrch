@@ -1736,7 +1736,11 @@ def validate_kit(root=ROOT, project_ready=False):
                 continue
             target = target.split('#', 1)[0]
             if target and not (md.parent / target).exists():
-                errors.append(f'{md.relative_to(root)}: broken relative link: {target}')
+                # Report the repository-relative path in POSIX form on every
+                # platform: the error text is an assertion target, and a host
+                # separator (Windows `\`) would make the same break look like a
+                # different document.
+                errors.append(f'{rel.as_posix()}: broken relative link: {target}')
     if project_ready:
         cfg_path = root / 'docs' / 'PROJECT.md'
         if not cfg_path.is_file():
