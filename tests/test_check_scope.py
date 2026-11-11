@@ -1245,17 +1245,26 @@ class NoFollowFallbackTest(unittest.TestCase):
         # Written bytes are not proof of where they went. If the entry at the
         # destination is a link after the create, the write target is unproven
         # and the copy must not be accepted on content alone.
+        #
+        # The post-create state is staged directly rather than by swapping the
+        # entry in after the open: Windows refuses to remove a directory entry
+        # while a descriptor on that file is still open (WinError 32), so the
+        # open-then-replace sequence cannot be staged there. What the product
+        # inspects is the same on every platform - the descriptor names one
+        # regular file and the destination path is a link to another regular
+        # file - and the assertions below are unchanged.
         real = self.outside / 'real.sqlite3'
         real.write_bytes(b'real')
         elsewhere = self.outside / 'elsewhere.sqlite3'
         elsewhere.write_bytes(b'elsewhere')
+        destination = self.outside / 'copy.sqlite3'
         descriptor = os.open(real, os.O_RDWR)
         self.addCleanup(os.close, descriptor)
-        real.unlink()
-        os.symlink(elsewhere, real)
+        os.symlink(elsewhere, destination)
 
         with self.assertRaises(check.ScopeError) as caught:
-            check._prove_copy_written_in_place(descriptor, real, 'task database')
+            check._prove_copy_written_in_place(descriptor, destination,
+                                               'task database')
         self.assertIn('symlink', str(caught.exception))
         self.assertEqual(elsewhere.read_bytes(), b'elsewhere')
 
