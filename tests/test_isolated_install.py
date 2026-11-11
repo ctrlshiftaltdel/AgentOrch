@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import unittest
@@ -2710,11 +2711,17 @@ runpy.run_path(script,run_name='__main__')
         from unittest.mock import patch
         plan = self.plan()
         before = raw_snapshot(self.host)
+        # The portable writer exists for platforms without dir_fd, so the stop
+        # must be reported when neither writer can run; the reason of each is
+        # listed instead of the platform being abstractly refused.
         with patch.object(workspace, '_platform_capability_problems',
-                          return_value=['synthetic platform lacks dir_fd']):
+                          return_value=['synthetic platform lacks dir_fd']), \
+             patch.object(workspace, '_path_backend_problems',
+                          return_value=['synthetic platform lacks path primitives']):
             result = workspace.apply_isolated_onboarding(plan)
         self.assertEqual(result['status'], 'BLOCKED', result)
         self.assertIn('synthetic platform lacks dir_fd', result['problems'], result)
+        self.assertIn('synthetic platform lacks path primitives', result['problems'], result)
         self.assertEqual(raw_snapshot(self.host), before)
 
     def test_security_symlink_swap_after_plan_does_not_write_outside(self):
@@ -4556,6 +4563,83 @@ with patch.object(sources.GitHubReleaseSource, "fetch_release", return_value=rel
         finally:
             os.chdir(cwd)
 
+    # --- portable writer (no dir_fd) --------------------------------------
+    def portable_apply(self, plan, head, **kwargs):
+        """Apply *plan* with the descriptor-primitive probe reporting no support.
+
+        Only the platform capability report changes: the product then takes the
+        same branch a platform without ``dir_fd`` takes, and nothing inside that
+        branch is relaxed. This is a patch of the product's own report, not a
+        test-only bypass of a check.
+        """
+        from unittest.mock import patch
+        from scripts.update_agentorch import sources
+
+        def descriptor_writer_used(*args, **kwargs):
+            raise AssertionError('the dir_fd writer must not run in a portable case')
+
+        release, payload = self._review_release_transport()
+        with patch.object(workspace, '_platform_capability_problems',
+                          return_value=['synthetic platform without dir_fd']), \
+             patch.object(workspace, '_FdWriteSession', side_effect=descriptor_writer_used), \
+             patch.object(sources.GitHubReleaseSource, 'fetch_release', return_value=release), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset', return_value=payload):
+            return workspace.apply_isolated_onboarding(
+                plan, declared_exclusive=True, expected_head=head, **kwargs)
+
+    def test_portable_writer_installs_without_dir_fd(self):
+        head = self._install_linked_worktree()
+        agents = self.host / 'AGENTS.md'
+        before = agents.read_bytes()
+        before_info = os.lstat(agents)
+        plan = self.plan()
+        self.assertEqual(plan.status, 'PLANNED', plan.problems)
+        result = self.portable_apply(plan, head)
+        self.assertEqual(result['status'], 'APPLIED', result)
+        target = self.host / 'agentorch'
+        self.assertTrue((target / 'VERSION.md').is_file())
+        self.assertTrue((target / 'MANIFEST.json').is_file())
+        self.assertFalse((target / 'AGENTS.md').exists(), 'a second AGENTS.md is forbidden')
+        self.assertIn('AGENTS.md', result['written'])
+        after = agents.read_bytes()
+        self.assertEqual(after, plan.writes['AGENTS.md'])
+        self.assertTrue(after.startswith(before), 'the host prefix must be byte-identical')
+        after_info = os.lstat(agents)
+        self.assertEqual((after_info.st_dev, after_info.st_ino, after_info.st_mode),
+                         (before_info.st_dev, before_info.st_ino, before_info.st_mode),
+                         'the append must keep the host inode and mode')
+
+    def test_portable_writer_rolls_back_a_failed_write(self):
+        head = self._install_linked_worktree()
+        plan = self.plan()
+        self.assertEqual(plan.status, 'PLANNED', plan.problems)
+        before = raw_snapshot(self.host)
+
+        class Fault:
+            count = 0
+
+            def before_write(self, rel):
+                self.count += 1
+                if self.count == 3:
+                    raise RuntimeError('synthetic portable write failure')
+
+        result = self.portable_apply(plan, head, fault_injector=Fault())
+        self.assertEqual(result['status'], 'ROLLED_BACK', result)
+        self.assertEqual(result['rollback']['result'], 'SUCCEEDED', result)
+        self.assertEqual(raw_snapshot(self.host), before)
+
+    def test_portable_writer_stops_on_a_symlinked_target(self):
+        head = self._install_linked_worktree()
+        outside = self.tmp / 'portable-outside'
+        outside.mkdir()
+        plan = self.plan()
+        self.assertEqual(plan.status, 'PLANNED', plan.problems)
+        (self.host / 'agentorch').symlink_to(outside, target_is_directory=True)
+        new_head = self._commit_all(self.host, 'portable symlinked target')
+        result = self.portable_apply(plan, new_head)
+        self.assertEqual(result['status'], 'BLOCKED', result)
+        self.assertEqual(sorted(outside.iterdir()), [])
+
 
 class PlatformXattrFallbackTest(unittest.TestCase):
     """The libc xattr enumeration used where the stdlib does not bind it.
@@ -4838,6 +4922,226 @@ class IsolatedEntryCommandsTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertTrue((flat / '.orchestration' / 'state.sqlite3').is_file())
         self.assertFalse((flat / '.local' / 'orchestration').exists())
+
+
+class PortableWriteSessionTest(unittest.TestCase):
+    """The path + identity writer that replaces ``dir_fd`` where it is missing.
+
+    Windows has neither ``dir_fd`` nor ``O_NOFOLLOW``, so the transaction is
+    expressed with paths: the entry is inspected before the open and the opened
+    descriptor's identity must match the inspected one. These cases exercise the
+    writer directly on every platform, so its refusals and its success path are
+    proven here rather than only on a Windows runner.
+    """
+
+    def setUp(self):
+        from unittest.mock import patch
+        self.patch = patch
+        self.tmp_path = Path(tempfile.mkdtemp(prefix='agentorch-pathwriter-'))
+        self.addCleanup(shutil.rmtree, self.tmp_path, True)
+        self.root = self.tmp_path / 'host'
+        self.root.mkdir()
+        self.session = workspace._PathWriteSession(
+            self.root, workspace._file_identity(os.lstat(self.root)))
+
+    def test_new_file_is_created_readable_and_byte_exact(self):
+        self.session.write_new_file('docs/note.md', b'line\r\nline\x1a\n')
+        created = self.root / 'docs' / 'note.md'
+        self.assertEqual(created.read_bytes(), b'line\r\nline\x1a\n')
+        data, info = self.session.read_file('docs/note.md')
+        self.assertEqual(data, b'line\r\nline\x1a\n')
+        self.assertTrue(stat.S_ISREG(info.st_mode))
+
+    def test_append_keeps_the_inode_mode_and_original_prefix(self):
+        target = self.root / 'AGENTS.md'
+        target.write_bytes(b'host line\r\n')
+        before = os.lstat(target)
+        self.session.append('AGENTS.md', b'host line\r\n', b'host line\r\nmore\n')
+        self.assertEqual(target.read_bytes(), b'host line\r\nmore\n')
+        after = os.lstat(target)
+        self.assertEqual((after.st_dev, after.st_ino, after.st_mode),
+                         (before.st_dev, before.st_ino, before.st_mode))
+
+    def test_rewrite_keeps_the_inode(self):
+        target = self.root / 'AGENTS.md'
+        target.write_bytes(b'host\nold-block\n')
+        before = os.lstat(target)
+        self.session.rewrite('AGENTS.md', b'host\nold-block\n', b'host\nnew-block\n')
+        self.assertEqual(target.read_bytes(), b'host\nnew-block\n')
+        after = os.lstat(target)
+        self.assertEqual((after.st_dev, after.st_ino), (before.st_dev, before.st_ino))
+
+    def test_symlinked_directory_component_stops_before_any_write(self):
+        outside = self.tmp_path / 'outside'
+        outside.mkdir()
+        (self.root / 'agentorch').symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(workspace.TransactionConflict) as raised:
+            self.session.write_new_file('agentorch/VERSION.md', b'x')
+        self.assertIn('not a regular directory', str(raised.exception))
+        self.assertEqual(sorted(outside.iterdir()), [])
+
+    def test_symlinked_leaf_is_refused_before_reading(self):
+        canary = self.tmp_path / 'canary.txt'
+        canary.write_bytes(b'original')
+        (self.root / 'AGENTS.md').symlink_to(canary)
+        with self.assertRaises(workspace.TransactionConflict) as raised:
+            self.session.read_file('AGENTS.md')
+        self.assertIn('symlink', str(raised.exception))
+
+    def test_symlinked_leaf_is_refused_before_appending(self):
+        canary = self.tmp_path / 'canary.txt'
+        canary.write_bytes(b'original')
+        (self.root / 'AGENTS.md').symlink_to(canary)
+        with self.assertRaises(workspace.TransactionConflict):
+            self.session.append('AGENTS.md', b'original', b'originalmore')
+        self.assertEqual(canary.read_bytes(), b'original')
+
+    def test_non_regular_entries_are_refused_without_being_opened(self):
+        (self.root / 'entry').mkdir()
+        with self.assertRaises(workspace.TransactionConflict) as raised:
+            self.session.read_file('entry')
+        self.assertIn('not a regular file', str(raised.exception))
+        if hasattr(os, 'mkfifo'):
+            os.mkfifo(self.root / 'pipe')
+            with self.assertRaises(workspace.TransactionConflict) as raised:
+                self.session.read_file('pipe')
+            self.assertIn('not a regular file', str(raised.exception))
+
+    def test_identity_swap_between_inspection_and_open_is_refused(self):
+        target = self.root / 'target.txt'
+        target.write_bytes(b'original')
+        other = self.tmp_path / 'other.txt'
+        other.write_bytes(b'other')
+        info, identity = workspace._inspect_no_link(target, label='synthetic target')
+        real_open = os.open
+        with self.patch.object(workspace.os, 'open',
+                               side_effect=lambda *args, **kwargs: real_open(
+                                   other, os.O_RDONLY)):
+            with self.assertRaises(workspace.TransactionConflict) as raised:
+                workspace._open_verified(target, os.O_RDONLY, label='synthetic target',
+                                         expected_identity=identity, inspected=info)
+        self.assertIn('changed', str(raised.exception))
+
+    def test_unverifiable_identity_fails_closed_before_opening(self):
+        target = self.root / 'target.txt'
+        target.write_bytes(b'original')
+        real = os.lstat(target)
+        unverifiable = os.stat_result((
+            real.st_mode, 0, real.st_dev, real.st_nlink, real.st_uid,
+            real.st_gid, real.st_size, real.st_atime, real.st_mtime, real.st_ctime))
+        with self.patch.object(workspace.os, 'lstat', return_value=unverifiable):
+            with self.patch.object(workspace.os, 'open', wraps=os.open) as opened:
+                with self.assertRaises(workspace.TransactionConflict) as raised:
+                    workspace._open_verified(target, os.O_RDONLY, label='synthetic opaque')
+        self.assertIn('identity', str(raised.exception))
+        self.assertEqual(opened.call_count, 0)
+
+    def test_identity_unavailable_after_open_fails_closed(self):
+        target = self.root / 'target.txt'
+        target.write_bytes(b'original')
+        real = os.lstat(target)
+        unverifiable = os.stat_result((
+            real.st_mode, 0, real.st_dev, real.st_nlink, real.st_uid,
+            real.st_gid, real.st_size, real.st_atime, real.st_mtime, real.st_ctime))
+        with self.patch.object(workspace.os, 'fstat', return_value=unverifiable):
+            with self.assertRaises(workspace.TransactionConflict) as raised:
+                workspace._open_verified(target, os.O_RDONLY, label='synthetic opaque')
+        self.assertIn('identity', str(raised.exception))
+
+    def test_exclusive_creation_never_overwrites_an_existing_entry(self):
+        target = self.root / 'VERSION.md'
+        target.write_bytes(b'host-owned')
+        with self.assertRaises(workspace.TransactionConflict) as raised:
+            self.session.write_new_file('VERSION.md', b'kit')
+        self.assertIn('appeared before write', str(raised.exception))
+        self.assertEqual(target.read_bytes(), b'host-owned')
+        self.assertEqual(sorted(path.name for path in self.root.iterdir()), ['VERSION.md'])
+
+    def test_append_refuses_a_hard_linked_target(self):
+        target = self.root / 'AGENTS.md'
+        target.write_bytes(b'host\n')
+        os.link(target, self.tmp_path / 'second-link')
+        with self.assertRaises(workspace.TransactionConflict) as raised:
+            self.session.append('AGENTS.md', b'host\n', b'host\nmore\n')
+        self.assertIn('hard links', str(raised.exception))
+        self.assertEqual(target.read_bytes(), b'host\n')
+
+    def test_append_refuses_metadata_it_cannot_prove(self):
+        target = self.root / 'AGENTS.md'
+        target.write_bytes(b'host\n')
+        if hasattr(os, 'setxattr'):
+            try:
+                os.setxattr(target, b'user.synthetic', b'1')
+            except OSError as exc:
+                unsupported = {errno.ENOTSUP, getattr(errno, 'EOPNOTSUPP', errno.ENOTSUP)}
+                if exc.errno not in unsupported:
+                    raise
+                # The filesystem proved it stores no extended attributes, so
+                # there is nothing an append could fail to preserve.
+                self.assertEqual(workspace._xattr_names(target), [])
+                return
+        with self.assertRaises(workspace.TransactionConflict) as raised:
+            self.session.append('AGENTS.md', b'host\n', b'host\nmore\n')
+        self.assertIn('extended attributes', str(raised.exception))
+        self.assertEqual(target.read_bytes(), b'host\n')
+
+    def test_rollback_removes_only_what_this_transaction_created(self):
+        created_dirs: list[dict] = []
+        record = {'rel': 'agentorch/VERSION.md', 'kind': 'create', 'expected': b'kit',
+                  'original': None}
+        self.session.write_new_file('agentorch/VERSION.md', b'kit',
+                                    created_dirs=created_dirs, record=record)
+        self.assertEqual([item['rel'] for item in created_dirs], ['agentorch'])
+        result = workspace._rollback_records(self.session, [record], created_dirs, None)
+        self.assertEqual(result['result'], 'SUCCEEDED', result)
+        self.assertFalse((self.root / 'agentorch').exists())
+
+    def test_rollback_preserves_a_concurrently_changed_file(self):
+        created_dirs: list[dict] = []
+        record = {'rel': 'agentorch/VERSION.md', 'kind': 'create', 'expected': b'kit',
+                  'original': None}
+        self.session.write_new_file('agentorch/VERSION.md', b'kit',
+                                    created_dirs=created_dirs, record=record)
+        (self.root / 'agentorch' / 'VERSION.md').write_bytes(b'foreign')
+        result = workspace._rollback_records(self.session, [record], created_dirs, None)
+        self.assertEqual(result['result'], 'FAILED', result)
+        self.assertIn('agentorch/VERSION.md', result['conflicts'])
+        self.assertEqual((self.root / 'agentorch' / 'VERSION.md').read_bytes(), b'foreign')
+
+    def test_replace_writes_the_planned_bytes_and_rolls_back(self):
+        target = self.root / 'docs' / 'note.md'
+        target.parent.mkdir()
+        target.write_bytes(b'old')
+        self.session.replace_file('docs/note.md', b'new', b'old')
+        self.assertEqual(target.read_bytes(), b'new')
+        record = {'rel': 'docs/note.md', 'kind': 'replace', 'expected': b'new',
+                  'original': b'old'}
+        result = workspace._rollback_records(self.session, [record], [], None)
+        self.assertEqual(result['result'], 'SUCCEEDED', result)
+        self.assertEqual(target.read_bytes(), b'old')
+
+    def test_rollback_truncates_an_append_back_in_place(self):
+        target = self.root / 'AGENTS.md'
+        target.write_bytes(b'host\n')
+        before = os.lstat(target)
+        self.session.append('AGENTS.md', b'host\n', b'host\nmore\n')
+        record = {'rel': 'AGENTS.md', 'kind': 'append', 'original': b'host\n',
+                  'expected': b'host\nmore\n'}
+        result = workspace._rollback_records(self.session, [record], [], None)
+        self.assertEqual(result['result'], 'SUCCEEDED', result)
+        self.assertEqual(target.read_bytes(), b'host\n')
+        after = os.lstat(target)
+        self.assertEqual((after.st_dev, after.st_ino), (before.st_dev, before.st_ino))
+
+    def test_rollback_restores_an_inplace_rewrite(self):
+        target = self.root / 'AGENTS.md'
+        target.write_bytes(b'host\nold\n')
+        self.session.rewrite('AGENTS.md', b'host\nold\n', b'host\nnew\n')
+        record = {'rel': 'AGENTS.md', 'kind': 'inplace', 'original': b'host\nold\n',
+                  'expected': b'host\nnew\n'}
+        result = workspace._rollback_records(self.session, [record], [], None)
+        self.assertEqual(result['result'], 'SUCCEEDED', result)
+        self.assertEqual(target.read_bytes(), b'host\nold\n')
 
 
 class PortableNoFollowTest(unittest.TestCase):

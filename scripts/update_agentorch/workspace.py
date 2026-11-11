@@ -447,15 +447,23 @@ class ManagedBlockError(ValueError):
 
 
 # --- platform primitives ----------------------------------------------------
-# The transactional writer is built on POSIX ``dir_fd``-relative opens. The open
+# The transactional writer prefers POSIX ``dir_fd``-relative opens. The open
 # flags are read through ``getattr`` so importing this module never raises
 # ``AttributeError`` on a platform that does not define them: a missing flag
-# makes the writer fail closed through :class:`PlatformUnsupported` /
-# :class:`OnboardingError` instead (see ``_platform_capability_problems``), and a
-# raw open never silently follows a symlink in place of a kernel-level refusal.
+# makes the ``dir_fd`` writer unavailable (see
+# ``_platform_capability_problems``) and a raw open never silently follows a
+# symlink in place of a kernel-level refusal. Where those primitives do not
+# exist at all (Windows) the same write set runs through the inspect-then-open
+# path writer in ``_PathWriteSession``; when neither can run the transaction
+# reports ``BLOCKED`` and writes nothing.
 _O_NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
 _O_DIRECTORY = getattr(os, 'O_DIRECTORY', 0)
 _O_CLOEXEC = getattr(os, 'O_CLOEXEC', 0)
+# Windows opens in text mode unless told otherwise, and a text-mode descriptor
+# translates newlines and treats \x1a as end-of-file: that would corrupt the
+# byte-exact content this writer must preserve. The flag is ``0`` on POSIX, so
+# the ``dir_fd`` flag sets above are unchanged.
+_O_BINARY = getattr(os, 'O_BINARY', 0)
 _MISSING_OPEN_FLAGS = tuple(
     name for name, value in (('O_NOFOLLOW', _O_NOFOLLOW),
                              ('O_DIRECTORY', _O_DIRECTORY),
@@ -2266,6 +2274,22 @@ def _platform_capability_problems() -> list[str]:
     return problems
 
 
+def _path_backend_problems() -> list[str]:
+    """Refuse the path + identity writer when its primitives are missing.
+
+    This probe describes the *fallback* writer only. It is consulted when the
+    ``dir_fd`` writer cannot run, and a platform that can anchor descriptors
+    never reaches it.
+    """
+    problems = []
+    for label in ('lstat', 'stat', 'fstat', 'open', 'close', 'read', 'write',
+                  'lseek', 'ftruncate', 'fsync', 'mkdir', 'rmdir', 'unlink',
+                  'replace', 'link', 'scandir', 'listdir'):
+        if not callable(getattr(os, label, None)):
+            problems.append(f'os.{label} is unavailable for a path-based write set')
+    return problems
+
+
 def _open_host_fd(host_root, expected_identity) -> int:
     host = Path(host_root)
     try:
@@ -2627,37 +2651,43 @@ def _append_file(root_fd: int, rel: str, original: bytes, expected: bytes) -> No
     fd = None
     try:
         fd = os.open(name, os.O_RDWR | _O_NOFOLLOW | _O_CLOEXEC, dir_fd=parent)
-        info = os.fstat(fd)
-        problems = _metadata_preservation_problems_for_stat(info, rel)
-        if problems:
-            raise TransactionConflict('; '.join(problems))
-        names = _xattr_names(fd=fd)
-        if names:
-            raise TransactionConflict(
-                f'{rel}: target carries extended attributes or ACLs ({", ".join(names)}); '
-                'an in-place append cannot prove they survive')
-        os.lseek(fd, 0, os.SEEK_SET)
-        current = _read_all(fd)
-        if current != original:
-            raise TransactionConflict(f'{rel}: target changed before append')
-        try:
-            os.lseek(fd, len(original), os.SEEK_SET)
-            _write_all(fd, expected[len(original):])
-            # Verify before truncating: a concurrent writer may have replaced the
-            # bytes, and truncating to our expected size would then corrupt them.
-            os.lseek(fd, 0, os.SEEK_SET)
-            written = _read_all(fd)
-            if written != expected:
-                raise TransactionConflict(f'{rel}: target changed during append')
-            os.ftruncate(fd, len(expected))
-            os.fsync(fd)
-        except BaseException:
-            _restore_appended_prefix(fd, original, expected)
-            raise
+        _append_open_file(fd, rel, original, expected)
     finally:
         if fd is not None:
             os.close(fd)
         os.close(parent)
+
+
+def _append_open_file(descriptor: int, rel: str, original: bytes,
+                      expected: bytes) -> None:
+    """The in-place append body shared by both writers; the caller owns ``descriptor``."""
+    info = os.fstat(descriptor)
+    problems = _metadata_preservation_problems_for_stat(info, rel)
+    if problems:
+        raise TransactionConflict('; '.join(problems))
+    names = _xattr_names(fd=descriptor)
+    if names:
+        raise TransactionConflict(
+            f'{rel}: target carries extended attributes or ACLs ({", ".join(names)}); '
+            'an in-place append cannot prove they survive')
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    current = _read_all(descriptor)
+    if current != original:
+        raise TransactionConflict(f'{rel}: target changed before append')
+    try:
+        os.lseek(descriptor, len(original), os.SEEK_SET)
+        _write_all(descriptor, expected[len(original):])
+        # Verify before truncating: a concurrent writer may have replaced the
+        # bytes, and truncating to our expected size would then corrupt them.
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        written = _read_all(descriptor)
+        if written != expected:
+            raise TransactionConflict(f'{rel}: target changed during append')
+        os.ftruncate(descriptor, len(expected))
+        os.fsync(descriptor)
+    except BaseException:
+        _restore_appended_prefix(descriptor, original, expected)
+        raise
 
 
 def _overwrite_fd(fd: int, data: bytes) -> None:
@@ -2696,31 +2726,37 @@ def _rewrite_file_in_place(root_fd: int, rel: str, original: bytes,
     fd = None
     try:
         fd = os.open(name, os.O_RDWR | _O_NOFOLLOW | _O_CLOEXEC, dir_fd=parent)
-        info = os.fstat(fd)
-        problems = _metadata_preservation_problems_for_stat(info, rel)
-        if problems:
-            raise TransactionConflict('; '.join(problems))
-        names = _xattr_names(fd=fd)
-        if names:
-            raise TransactionConflict(
-                f'{rel}: target carries extended attributes or ACLs ({", ".join(names)}); '
-                'an in-place rewrite cannot prove they survive')
-        os.lseek(fd, 0, os.SEEK_SET)
-        current = _read_all(fd)
-        if current != original:
-            raise TransactionConflict(f'{rel}: target changed before rewrite')
-        try:
-            _overwrite_fd(fd, expected)
-            os.lseek(fd, 0, os.SEEK_SET)
-            if _read_all(fd) != expected:
-                raise TransactionConflict(f'{rel}: target changed during rewrite')
-        except BaseException:
-            _restore_fd_in_place(fd, expected, original)
-            raise
+        _rewrite_open_file(fd, rel, original, expected)
     finally:
         if fd is not None:
             os.close(fd)
         os.close(parent)
+
+
+def _rewrite_open_file(descriptor: int, rel: str, original: bytes,
+                       expected: bytes) -> None:
+    """The in-place rewrite body shared by both writers; the caller owns ``descriptor``."""
+    info = os.fstat(descriptor)
+    problems = _metadata_preservation_problems_for_stat(info, rel)
+    if problems:
+        raise TransactionConflict('; '.join(problems))
+    names = _xattr_names(fd=descriptor)
+    if names:
+        raise TransactionConflict(
+            f'{rel}: target carries extended attributes or ACLs ({", ".join(names)}); '
+            'an in-place rewrite cannot prove they survive')
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    current = _read_all(descriptor)
+    if current != original:
+        raise TransactionConflict(f'{rel}: target changed before rewrite')
+    try:
+        _overwrite_fd(descriptor, expected)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if _read_all(descriptor) != expected:
+            raise TransactionConflict(f'{rel}: target changed during rewrite')
+    except BaseException:
+        _restore_fd_in_place(descriptor, expected, original)
+        raise
 
 
 def _restore_in_place_at(root_fd: int, rel: str, expected: bytes,
@@ -2731,20 +2767,26 @@ def _restore_in_place_at(root_fd: int, rel: str, expected: bytes,
     fd = None
     try:
         fd = os.open(name, os.O_RDWR | _O_NOFOLLOW | _O_CLOEXEC, dir_fd=parent)
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise TransactionConflict(f'{rel}: target is not a regular file')
-        os.lseek(fd, 0, os.SEEK_SET)
-        current = _read_all(fd)
-        if current == original:
-            return
-        if current != expected:
-            raise TransactionConflict(f'{rel}: current content no longer matches this operation')
-        _overwrite_fd(fd, original)
+        _restore_in_place_open(fd, rel, expected, original)
     finally:
         if fd is not None:
             os.close(fd)
         os.close(parent)
+
+
+def _restore_in_place_open(descriptor: int, rel: str, expected: bytes,
+                           original: bytes) -> None:
+    """Shared in-place recovery body; the caller owns ``descriptor``."""
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode):
+        raise TransactionConflict(f'{rel}: target is not a regular file')
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    current = _read_all(descriptor)
+    if current == original:
+        return
+    if current != expected:
+        raise TransactionConflict(f'{rel}: current content no longer matches this operation')
+    _overwrite_fd(descriptor, original)
 
 
 def _replace_file_at(root_fd: int, rel: str, expected: bytes, original: bytes) -> None:
@@ -2788,17 +2830,22 @@ def _truncate_at(root_fd: int, rel: str, expected: bytes, length: int) -> None:
     fd = None
     try:
         fd = os.open(name, os.O_RDWR | _O_NOFOLLOW | _O_CLOEXEC, dir_fd=parent)
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise TransactionConflict(f'{rel}: target is not a regular file')
-        if _read_all(fd) != expected:
-            raise TransactionConflict(f'{rel}: current content no longer matches this operation')
-        os.ftruncate(fd, length)
-        os.fsync(fd)
+        _truncate_open(fd, rel, expected, length)
     finally:
         if fd is not None:
             os.close(fd)
         os.close(parent)
+
+
+def _truncate_open(descriptor: int, rel: str, expected: bytes, length: int) -> None:
+    """Shared truncate body; the caller owns ``descriptor``."""
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode):
+        raise TransactionConflict(f'{rel}: target is not a regular file')
+    if _read_all(descriptor) != expected:
+        raise TransactionConflict(f'{rel}: current content no longer matches this operation')
+    os.ftruncate(descriptor, length)
+    os.fsync(descriptor)
 
 
 def _unlink_at(root_fd: int, rel: str) -> None:
@@ -2888,8 +2935,593 @@ def _tree_files_at(root_fd: int, rel: str = AGENTORCH_DIRNAME) -> set[str]:
     return files
 
 
+def _inspect_no_link(path, *, label: str):
+    """``lstat`` *path* and refuse a symlink or an entry with no identity.
+
+    Platforms without ``O_NOFOLLOW`` cannot delegate the refusal to the kernel,
+    so the entry is inspected first and its identity is required: an identity
+    that cannot be read means the caller cannot later prove it opened the entry
+    it inspected, and that is a stop, not a warning.
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise TransactionConflict(f'{label} cannot be inspected: {exc}') from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise TransactionConflict(f'{label} is a symlink; refusing to use it')
+    identity = _file_identity(info)
+    if identity is None:
+        raise TransactionConflict(
+            f'{label} has no verifiable identity on this platform; refusing to use it')
+    return info, identity
+
+
+def _open_verified(path, flags: int, *, label: str, expected_identity=None,
+                   inspected=None):
+    """Open *path* and require the descriptor to be the inspected inode.
+
+    The inspect-then-open order alone would leave a swap window, so the opened
+    descriptor's identity must equal the inspected one. A mismatch, or an
+    identity the platform cannot report, closes the descriptor and raises: no
+    caller ever writes through a descriptor that is not provably the inspected
+    entry.
+    """
+    if inspected is None:
+        inspected, inspected_identity = _inspect_no_link(path, label=label)
+        if expected_identity is None:
+            expected_identity = inspected_identity
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise TransactionConflict(f'{label} cannot be opened safely: {exc}') from exc
+    try:
+        opened = os.fstat(descriptor)
+    except OSError as exc:
+        os.close(descriptor)
+        raise TransactionConflict(
+            f'{label} cannot be inspected after opening: {exc}') from exc
+    opened_identity = _file_identity(opened)
+    if opened_identity is None:
+        os.close(descriptor)
+        raise TransactionConflict(
+            f'{label} identity cannot be verified after opening; refusing to use it')
+    if opened_identity != expected_identity:
+        os.close(descriptor)
+        raise TransactionConflict(f'{label} changed while it was being opened')
+    return descriptor, opened
+
+
+class _FdWriteSession:
+    """The ``dir_fd`` writer: every operation is anchored to one descriptor.
+
+    Each method is a thin delegation to the module-level ``dir_fd`` helper, so a
+    caller that already holds a host descriptor keeps using exactly that code.
+    """
+
+    kind = 'DIR_FD'
+
+    def __init__(self, root_fd: int, *, owns_root: bool = False):
+        self.root = root_fd
+        self._owns_root = owns_root
+
+    def close(self) -> None:
+        if self._owns_root:
+            os.close(self.root)
+
+    def read_file(self, rel):
+        return _read_file_at(self.root, rel)
+
+    def write_new_file(self, rel, data, *, mode=0o644, created_dirs=None,
+                       record=None) -> None:
+        _write_new_file(self.root, rel, data, mode=mode, created_dirs=created_dirs,
+                        record=record)
+
+    def append(self, rel, original, expected) -> None:
+        _append_file(self.root, rel, original, expected)
+
+    def rewrite(self, rel, original, expected) -> None:
+        _rewrite_file_in_place(self.root, rel, original, expected)
+
+    def replace_file(self, rel, data, original) -> None:
+        _replace_file_at_for_write(self.root, rel, data, original)
+
+    def unlink(self, rel) -> None:
+        _unlink_at(self.root, rel)
+
+    def truncate(self, rel, expected, length) -> None:
+        _truncate_at(self.root, rel, expected, length)
+
+    def restore_in_place(self, rel, expected, original) -> None:
+        _restore_in_place_at(self.root, rel, expected, original)
+
+    def restore_replace(self, rel, expected, original) -> None:
+        _replace_file_at(self.root, rel, expected, original)
+
+    def remove_dir(self, rel, identity=None) -> None:
+        _remove_dir_at(self.root, rel, identity)
+
+    def tree_files(self):
+        return _tree_files_at(self.root)
+
+    def ensure_target(self, plan) -> None:
+        _ensure_agentorch_target(self.root, plan)
+
+    def verify_originals(self, plan) -> None:
+        _verify_originals(self.root, plan)
+
+
+class _PathWriteSession:
+    """Path + identity writer for platforms that have no ``dir_fd``.
+
+    Every operation descends from the host root and proves each step: the root
+    identity is the one planning captured, each intermediate component must be a
+    real directory, a leaf that is a link or the wrong kind of entry is refused
+    before it is opened, and every opened or created file is matched against the
+    identity of the entry that was inspected. Unknown identity, a changed
+    identity, a broken parent chain or a temporary file that cannot be accounted
+    for all raise, and the transaction then reports ``BLOCKED`` with the host
+    left as it was.
+
+    Directory ``fsync`` has no equivalent here (a directory cannot be opened on
+    these platforms), so the durability of the entry-producing rename/link is
+    not claimed. Recovery verifies content and identity instead of durability.
+    """
+
+    kind = 'PATH_IDENTITY'
+
+    def __init__(self, root: Path, identity):
+        self.root = root
+        self.identity = identity
+
+    @classmethod
+    def open(cls, host_root, expected_identity):
+        host = Path(host_root)
+        try:
+            inspected = os.lstat(host)
+        except OSError as exc:
+            raise TransactionConflict(f'host root cannot be inspected: {exc}') from exc
+        if stat.S_ISLNK(inspected.st_mode) or not stat.S_ISDIR(inspected.st_mode):
+            raise TransactionConflict('host root is not a regular directory')
+        identity = _file_identity(inspected)
+        if identity is None:
+            raise TransactionConflict(
+                'host root has no verifiable identity on this platform; refusing to write')
+        if expected_identity is not None and identity != expected_identity:
+            raise TransactionConflict('host root identity changed since planning')
+        return cls(host, identity)
+
+    def close(self) -> None:
+        return None
+
+    def _verify_root(self) -> None:
+        try:
+            info = os.lstat(self.root)
+        except FileNotFoundError:
+            raise TransactionConflict('host root disappeared during the transaction') from None
+        except OSError as exc:
+            raise TransactionConflict(f'host root cannot be inspected: {exc}') from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise TransactionConflict('host root is no longer a regular directory')
+        if _file_identity(info) != self.identity:
+            raise TransactionConflict('host root identity changed during the transaction')
+
+    def _descend(self, parts, *, create: bool, created_dirs=None) -> Path:
+        """Return the directory holding the leaf, proving every step below root."""
+        self._verify_root()
+        current = self.root
+        prefix = ''
+        for part in parts:
+            prefix = f'{prefix}/{part}' if prefix else part
+            candidate = current / part
+            created = False
+            try:
+                info = os.lstat(candidate)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(candidate, 0o755)
+                except FileExistsError:
+                    info = os.lstat(candidate)
+                else:
+                    info = os.lstat(candidate)
+                    created = True
+            except OSError as exc:
+                raise TransactionConflict(f'{prefix} cannot be inspected: {exc}') from exc
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise TransactionConflict(f'{prefix}: not a regular directory')
+            if created:
+                identity = _file_identity(info)
+                if identity is None:
+                    raise TransactionConflict(
+                        f'{prefix}: created directory identity is unverifiable')
+                if created_dirs is not None:
+                    created_dirs.append({'rel': prefix, 'identity': identity})
+            current = candidate
+        return current
+
+    def _leaf(self, rel: str, *, create: bool, created_dirs=None):
+        parts = _split_rel(rel)
+        parent = self._descend(parts[:-1], create=create, created_dirs=created_dirs)
+        return parent, parts[-1]
+
+    def read_file(self, rel):
+        parts = _split_rel(rel)
+        try:
+            parent = self._descend(parts[:-1], create=False)
+        except FileNotFoundError:
+            return None, None
+        path = parent / parts[-1]
+        try:
+            inspected, identity = _inspect_no_link(path, label=rel)
+        except FileNotFoundError:
+            return None, None
+        if not stat.S_ISREG(inspected.st_mode):
+            raise TransactionConflict(f'{rel}: target is not a regular file')
+        descriptor, info = _open_verified(
+            path, os.O_RDONLY | _O_BINARY, label=rel, expected_identity=identity,
+            inspected=inspected)
+        try:
+            return _read_all(descriptor), info
+        finally:
+            os.close(descriptor)
+
+    def ensure_target(self, plan) -> None:
+        self._verify_root()
+        target = self.root / AGENTORCH_DIRNAME
+        try:
+            info = os.lstat(target)
+        except FileNotFoundError:
+            if plan.target_present:
+                raise TransactionConflict('agentorch/ disappeared since planning') from None
+            return
+        except OSError as exc:
+            raise TransactionConflict(f'agentorch/ cannot be inspected: {exc}') from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise TransactionConflict('agentorch/: not a regular directory')
+        if not plan.target_present:
+            raise TransactionConflict('agentorch/ appeared since planning')
+        if plan.mode == 'UPGRADE':
+            # The upgrade's per-file originals are verified separately; the
+            # directory itself must simply still exist and be a regular directory.
+            return
+        try:
+            entries = os.listdir(target)
+        except OSError as exc:
+            raise TransactionConflict(f'agentorch/ cannot be listed: {exc}') from exc
+        if entries:
+            raise TransactionConflict('agentorch/ is no longer empty')
+
+    def verify_originals(self, plan) -> None:
+        for rel, original in plan.originals.items():
+            current, _ = self.read_file(rel)
+            if original is None:
+                if current is not None:
+                    raise TransactionConflict(f'{rel}: appeared since planning')
+            elif current != original:
+                raise TransactionConflict(f'{rel}: changed since planning')
+
+    def tree_files(self):
+        self._verify_root()
+        target = self.root / AGENTORCH_DIRNAME
+        try:
+            info = os.lstat(target)
+        except FileNotFoundError:
+            return set()
+        except OSError as exc:
+            raise TransactionConflict(
+                f'{AGENTORCH_DIRNAME}/ cannot be inspected: {exc}') from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise TransactionConflict(f'{AGENTORCH_DIRNAME}/: not a regular directory')
+        files: set[str] = set()
+        stack = [(target, '')]
+        while stack:
+            directory, prefix = stack.pop()
+            try:
+                entries = list(os.scandir(directory))
+            except OSError as exc:
+                raise TransactionConflict(
+                    f'{AGENTORCH_DIRNAME}/ cannot be enumerated: {exc}') from exc
+            for entry in entries:
+                entry_rel = f'{prefix}/{entry.name}' if prefix else entry.name
+                if entry.is_symlink():
+                    files.add(f'{AGENTORCH_DIRNAME}/{entry_rel}')
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    if entry.name in ISOLATED_PRIVATE_DIRS:
+                        continue
+                    stack.append((Path(entry.path), entry_rel))
+                else:
+                    files.add(f'{AGENTORCH_DIRNAME}/{entry_rel}')
+        return files
+
+    def _unlink_verified(self, path: Path, identity, label: str) -> None:
+        """Remove *path* only while it is still the inode this transaction made."""
+        try:
+            current = os.lstat(path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise TransactionConflict(f'{label} cannot be inspected: {exc}') from exc
+        if stat.S_ISLNK(current.st_mode):
+            raise TransactionConflict(f'{label} is a symlink; refusing to remove it')
+        if _file_identity(current) != identity:
+            raise TransactionConflict(f'{label} identity changed')
+        os.unlink(path)
+
+    def write_new_file(self, rel, data, *, mode=0o644, created_dirs=None,
+                       record=None) -> None:
+        """Create a complete file exclusively; a partial file never reaches *rel*.
+
+        The bytes go to an exclusive temporary entry in the same directory and
+        are linked into place, so the destination is either absent or complete.
+        """
+        parent, name = self._leaf(rel, create=True, created_dirs=created_dirs)
+        temp = f'.agentorch-write-{os.getpid()}-{secrets.token_hex(8)}'
+        temp_path = parent / temp
+        fd = None
+        temp_identity = None
+        failure = None
+        cleanup_error = None
+        try:
+            try:
+                fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                             | _O_BINARY, mode)
+            except OSError as exc:
+                raise TransactionConflict(
+                    f'{rel}: temporary file cannot be created: {exc}') from exc
+            if record is not None:
+                record['temp_creation_unverified'] = True
+            created = os.fstat(fd)
+            temp_identity = _file_identity(created)
+            if temp_identity is None:
+                raise TransactionConflict(f'{rel}: temporary file identity is unverified')
+            if record is not None:
+                record['temp_identity'] = temp_identity
+                record['temp_rel'] = '/'.join(rel.split('/')[:-1] + [temp])
+                record['temp_creation_unverified'] = False
+            _write_all(fd, data)
+            os.fsync(fd)
+            os.close(fd)
+            fd = None
+            try:
+                os.link(temp_path, parent / name)
+            except FileExistsError as exc:
+                raise TransactionConflict(f'{rel}: target appeared before write') from exc
+            except OSError as exc:
+                raise TransactionConflict(
+                    f'{rel}: target cannot be placed atomically: {exc}') from exc
+            if record is not None:
+                record['created_identity'] = temp_identity
+        except BaseException as exc:  # preserve the original failure if cleanup also fails
+            failure = exc
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if temp_identity is not None:
+                try:
+                    self._unlink_verified(temp_path, temp_identity, rel)
+                    if record is not None:
+                        record['temp_removed'] = True
+                except (OSError, TransactionConflict) as exc:
+                    cleanup_error = exc
+                    if record is not None:
+                        record['temp_cleanup_failed'] = True
+        if failure is not None:
+            raise failure
+        if cleanup_error is not None:
+            raise TransactionConflict('temporary file cleanup failed') from cleanup_error
+
+    def _open_existing(self, rel: str):
+        parent, name = self._leaf(rel, create=False)
+        path = parent / name
+        try:
+            inspected, identity = _inspect_no_link(path, label=rel)
+        except FileNotFoundError:
+            raise TransactionConflict(f'{rel}: target disappeared') from None
+        if not stat.S_ISREG(inspected.st_mode):
+            raise TransactionConflict(f'{rel}: target is not a regular file')
+        return _open_verified(path, os.O_RDWR | _O_BINARY, label=rel,
+                              expected_identity=identity, inspected=inspected)
+
+    def append(self, rel, original, expected) -> None:
+        if not expected.startswith(original):
+            raise TransactionConflict(
+                f'{rel}: planned append does not preserve the original bytes')
+        descriptor, _info = self._open_existing(rel)
+        try:
+            _append_open_file(descriptor, rel, original, expected)
+        finally:
+            os.close(descriptor)
+
+    def rewrite(self, rel, original, expected) -> None:
+        descriptor, _info = self._open_existing(rel)
+        try:
+            _rewrite_open_file(descriptor, rel, original, expected)
+        finally:
+            os.close(descriptor)
+
+    def replace_file(self, rel, data, original) -> None:
+        if rel == ALLOWED_ROOT_ENTRY:
+            raise TransactionConflict(
+                'root AGENTS.md replacement disabled: metadata preservation is not established')
+        current, info = self.read_file(rel)
+        if current is None or current != original or info is None:
+            raise TransactionConflict(f'{rel}: changed before write')
+        parent, name = self._leaf(rel, create=False)
+        path = parent / name
+        temp = f'.agentorch-write-{os.getpid()}-{secrets.token_hex(8)}'
+        temp_path = parent / temp
+        fd = None
+        try:
+            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | _O_BINARY, stat.S_IMODE(info.st_mode))
+            _write_all(fd, data)
+            os.fsync(fd)
+            os.close(fd)
+            fd = None
+            # The entry is proved to be the inode whose bytes were verified
+            # immediately before it is replaced.
+            inspected, identity = _inspect_no_link(path, label=rel)
+            if not stat.S_ISREG(inspected.st_mode):
+                raise TransactionConflict(f'{rel}: target is not a regular file')
+            if identity != _file_identity(info):
+                raise TransactionConflict(f'{rel}: target changed before write')
+            os.replace(temp_path, path)
+        finally:
+            if fd is not None:
+                os.close(fd)
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+    def unlink(self, rel) -> None:
+        parts = _split_rel(rel)
+        try:
+            parent = self._descend(parts[:-1], create=False)
+        except FileNotFoundError:
+            return
+        path = parent / parts[-1]
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise TransactionConflict(f'{rel} cannot be inspected: {exc}') from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise TransactionConflict(f'{rel} is a symlink; refusing to remove it')
+        os.unlink(path)
+
+    def truncate(self, rel, expected, length) -> None:
+        descriptor, _info = self._open_existing(rel)
+        try:
+            _truncate_open(descriptor, rel, expected, length)
+        finally:
+            os.close(descriptor)
+
+    def restore_in_place(self, rel, expected, original) -> None:
+        descriptor, _info = self._open_existing(rel)
+        try:
+            _restore_in_place_open(descriptor, rel, expected, original)
+        finally:
+            os.close(descriptor)
+
+    def restore_replace(self, rel, expected, original) -> None:
+        if rel == ALLOWED_ROOT_ENTRY:
+            raise TransactionConflict(
+                'root AGENTS.md recovery disabled: metadata preservation is not established')
+        current, info = self.read_file(rel)
+        if current is None or current != expected or info is None:
+            raise TransactionConflict(
+                f'{rel}: current content no longer matches this operation')
+        parent, name = self._leaf(rel, create=False)
+        path = parent / name
+        temp = f'.agentorch-restore-{os.getpid()}-{secrets.token_hex(8)}'
+        temp_path = parent / temp
+        fd = None
+        try:
+            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | _O_BINARY, stat.S_IMODE(info.st_mode))
+            _write_all(fd, original)
+            os.fsync(fd)
+            os.close(fd)
+            fd = None
+            inspected, identity = _inspect_no_link(path, label=rel)
+            if not stat.S_ISREG(inspected.st_mode):
+                raise TransactionConflict(f'{rel}: target is not a regular file')
+            if identity != _file_identity(info):
+                raise TransactionConflict(f'{rel}: target changed during recovery')
+            os.replace(temp_path, path)
+        finally:
+            if fd is not None:
+                os.close(fd)
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+    def remove_dir(self, rel, identity=None) -> None:
+        parts = _split_rel(rel)
+        try:
+            parent = self._descend(parts[:-1], create=False)
+        except FileNotFoundError:
+            return
+        path = parent / parts[-1]
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise TransactionConflict(f'{rel} cannot be inspected: {exc}') from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise TransactionConflict(f'{rel}: created directory changed')
+        if identity is None or _file_identity(info) != identity:
+            raise TransactionConflict(f'{rel}: created directory identity changed')
+        # A non-empty directory raises here and is reported as a conflict by the
+        # caller instead of deleting someone else's content.
+        os.rmdir(path)
+
+
+def _write_backend_problems() -> list[str]:
+    """All reasons no writer can run here; empty when at least one can.
+
+    A platform that can anchor descriptors never reports the path writer's
+    limits, and a platform that cannot keeps the ``dir_fd`` reason visible next
+    to the path reason instead of hiding the stronger anchor's absence.
+    """
+    dir_fd_problems = _platform_capability_problems()
+    if not dir_fd_problems:
+        return []
+    path_problems = _path_backend_problems()
+    if not path_problems:
+        return []
+    return list(dir_fd_problems) + list(path_problems)
+
+
+def _write_session(plan: OnboardingPlan):
+    """Return the writer for this plan as ``(session, problems)``.
+
+    The ``dir_fd`` writer is used whenever the platform has the primitives: it is
+    the stronger anchor and is never replaced by the weaker one. Only a platform
+    that cannot anchor a descriptor at all falls through to the path + identity
+    writer, and when neither writer is available the caller reports ``BLOCKED``.
+    """
+    dir_fd_problems = _platform_capability_problems()
+    if not dir_fd_problems:
+        try:
+            return _FdWriteSession(_open_host_fd(plan.host_root, plan.host_identity),
+                                   owns_root=True), []
+        except (OSError, OnboardingError) as exc:
+            return None, [str(exc)]
+    path_problems = _path_backend_problems()
+    if path_problems:
+        return None, list(dir_fd_problems) + list(path_problems)
+    try:
+        return _PathWriteSession.open(plan.host_root, plan.host_identity), []
+    except (OSError, OnboardingError) as exc:
+        return None, [str(exc)]
+
+
 def _rollback_transaction(root_fd: int, records: list[dict],
                           created_dirs: list[dict], fault_injector) -> dict:
+    """Roll back a transaction through a directory descriptor.
+
+    Kept as the descriptor-shaped entry point for callers that already hold one;
+    the shared recovery below runs against either writer.
+    """
+    return _rollback_records(_FdWriteSession(root_fd), records, created_dirs,
+                             fault_injector)
+
+
+def _rollback_records(session, records: list[dict],
+                      created_dirs: list[dict], fault_injector) -> dict:
     conflicts, failures = [], []
     for record in reversed(records):
         rel = record['rel']
@@ -2900,7 +3532,7 @@ def _rollback_transaction(root_fd: int, records: list[dict],
         if record.get('temp_sync_failed'):
             failures.append('temporary file cleanup durability is unverified')
         try:
-            current, info = _read_file_at(root_fd, rel)
+            current, info = session.read_file(rel)
             if kind == 'create':
                 if current is None:
                     pass  # never created, or already removed; still inspect temp
@@ -2909,7 +3541,7 @@ def _rollback_transaction(root_fd: int, records: list[dict],
                         or current != record['expected']):
                     conflicts.append(rel)
                 else:
-                    _unlink_at(root_fd, rel)
+                    session.unlink(rel)
             elif kind == 'append':
                 if current == original:
                     pass  # append never happened
@@ -2918,42 +3550,43 @@ def _rollback_transaction(root_fd: int, records: list[dict],
                 else:
                     # Truncate in place: recovery must keep the original inode,
                     # mode and owner, not replace them with a new file.
-                    _truncate_at(root_fd, rel, record['expected'], len(original or b''))
+                    session.truncate(rel, record['expected'], len(original or b''))
             elif kind == 'inplace':
                 if current == original:
                     pass  # rewrite never happened
                 elif current != record['expected']:
                     conflicts.append(rel)
                 else:
-                    _restore_in_place_at(root_fd, rel, record['expected'],
-                                         original or b'')
+                    session.restore_in_place(rel, record['expected'],
+                                             original or b'')
             else:
                 if current == original:
                     pass  # replacement never happened
                 elif current != record['expected']:
                     conflicts.append(rel)
                 else:
-                    _replace_file_at(root_fd, rel, record['expected'], original or b'')
+                    session.restore_replace(rel, record['expected'],
+                                            original or b'')
         except (OSError, TransactionConflict) as exc:
             failures.append(f'{rel}: {exc}')
         temp_rel = record.get('temp_rel')
         if temp_rel and record.get('temp_removed'):
             try:
-                current, _ = _read_file_at(root_fd, temp_rel)
+                current, _ = session.read_file(temp_rel)
                 if current is not None:
                     conflicts.append(temp_rel)
             except (OSError, TransactionConflict) as exc:
                 failures.append(f'temporary file verification failed: {type(exc).__name__}')
         if temp_rel and not record.get('temp_removed'):
             try:
-                current, info = _read_file_at(root_fd, temp_rel)
+                current, info = session.read_file(temp_rel)
                 if (info is None or current is None
                         or (info.st_dev, info.st_ino) != record.get('temp_identity')
                         or not record['expected'].startswith(current)):
                     conflicts.append(temp_rel)
                 else:
-                    _unlink_at(root_fd, temp_rel)
-                    after, _ = _read_file_at(root_fd, temp_rel)
+                    session.unlink(temp_rel)
+                    after, _ = session.read_file(temp_rel)
                     if after is not None:
                         conflicts.append(temp_rel)
                     else:
@@ -2964,7 +3597,7 @@ def _rollback_transaction(root_fd: int, records: list[dict],
     for record in records:
         rel = record['rel']
         try:
-            current, _ = _read_file_at(root_fd, rel)
+            current, _ = session.read_file(rel)
         except (OSError, TransactionConflict) as exc:
             failures.append(f'{rel}: cannot verify recovery: {exc}')
             continue
@@ -2977,7 +3610,7 @@ def _rollback_transaction(root_fd: int, records: list[dict],
     for directory in sorted(created_dirs, key=lambda item: item['rel'].count('/'), reverse=True):
         rel = directory['rel']
         try:
-            _remove_dir_at(root_fd, rel, directory.get('identity'))
+            session.remove_dir(rel, directory.get('identity'))
         except (OSError, TransactionConflict):
             # A non-empty directory means a concurrent writer left content:
             # preserve the scene instead of deleting someone else's file.
@@ -2997,11 +3630,15 @@ def apply_isolated_onboarding(plan: OnboardingPlan, *, now: datetime | None = No
                               declared_exclusive=False, expected_head=None) -> dict:
     """Apply a verified isolated onboarding inside one guarded transaction.
 
-    Only ``agentorch/**`` and the root ``AGENTS.md`` are written. Every path is
-    opened relative to a directory descriptor with ``O_NOFOLLOW``; new files use
-    exclusive creation. A failure restores, in reverse order, only entries this
-    call wrote whose current bytes still match; anything else is left in place as
-    a conflict. Explicit cross-process rollback deliberately remains blocked.
+    Only ``agentorch/**`` and the root ``AGENTS.md`` are written. On a platform
+    with ``dir_fd`` every path is opened relative to a directory descriptor with
+    ``O_NOFOLLOW``; where those primitives do not exist the same write set runs
+    through the path + identity writer (:class:`_PathWriteSession`), which refuses
+    links before opening and re-checks the opened identity afterwards. New files
+    use exclusive creation either way. A failure restores, in reverse order, only
+    entries this call wrote whose current bytes still match; anything else is
+    left in place as a conflict. Explicit cross-process rollback deliberately
+    remains blocked.
     """
     now = now or datetime.now(timezone.utc)
     host = Path(plan.host_root)
@@ -3065,7 +3702,7 @@ def apply_isolated_onboarding(plan: OnboardingPlan, *, now: datetime | None = No
     # Verify the host before fetching, then rebuild the write set from the
     # fixed official client's verified bytes within this write boundary.
     from . import entry
-    platform_problems = _platform_capability_problems()
+    platform_problems = _write_backend_problems()
     if platform_problems:
         result['status'] = 'BLOCKED'
         result['problems'].extend(platform_problems)
@@ -3151,10 +3788,14 @@ def apply_isolated_onboarding(plan: OnboardingPlan, *, now: datetime | None = No
             return result
 
     try:
-        root_fd = _open_host_fd(plan.host_root, plan.host_identity)
+        session, session_problems = _write_session(plan)
     except (OSError, OnboardingError) as exc:
         result['status'] = 'BLOCKED'
         result['problems'].append(str(exc))
+        return result
+    if session is None:
+        result['status'] = 'BLOCKED'
+        result['problems'].extend(session_problems)
         return result
 
     records: list[dict] = []
@@ -3162,8 +3803,8 @@ def apply_isolated_onboarding(plan: OnboardingPlan, *, now: datetime | None = No
     failure: BaseException | None = None
     try:
         try:
-            _ensure_agentorch_target(root_fd, plan)
-            _verify_originals(root_fd, plan)
+            session.ensure_target(plan)
+            session.verify_originals(plan)
             _invoke_hook(fault_injector, 'before_backup')
             backup = create_backup(
                 host, sorted(writes), now=now,
@@ -3181,8 +3822,8 @@ def apply_isolated_onboarding(plan: OnboardingPlan, *, now: datetime | None = No
                 raise TransactionConflict('worktree or host changed before writing')
             if precondition is not None and precondition() is not True:
                 raise TransactionConflict('host preconditions changed before writing')
-            _ensure_agentorch_target(root_fd, plan)
-            _verify_originals(root_fd, plan)
+            session.ensure_target(plan)
+            session.verify_originals(plan)
         except BaseException as exc:  # noqa: BLE001 - no write has happened yet
             failure = exc
             result['status'] = 'BLOCKED'
@@ -3212,14 +3853,14 @@ def apply_isolated_onboarding(plan: OnboardingPlan, *, now: datetime | None = No
                 records.append({'rel': rel, 'kind': kind, 'expected': data,
                                 'original': original})
                 if kind == 'create':
-                    _write_new_file(root_fd, rel, data, created_dirs=created_dirs,
-                                    record=records[-1])
+                    session.write_new_file(rel, data, created_dirs=created_dirs,
+                                           record=records[-1])
                 elif kind == 'append':
-                    _append_file(root_fd, rel, original, data)
+                    session.append(rel, original, data)
                 elif kind == 'inplace':
-                    _rewrite_file_in_place(root_fd, rel, original, data)
+                    session.rewrite(rel, original, data)
                 else:
-                    _replace_file_at_for_write(root_fd, rel, data, original)
+                    session.replace_file(rel, data, original)
                 result['written'].append(rel)
                 _invoke_hook(fault_injector, 'after_write', rel)
 
@@ -3228,11 +3869,11 @@ def apply_isolated_onboarding(plan: OnboardingPlan, *, now: datetime | None = No
             for record in records:
                 temp_rel = record.get('temp_rel')
                 if temp_rel:
-                    current, _ = _read_file_at(root_fd, temp_rel)
+                    current, _ = session.read_file(temp_rel)
                     if current is not None:
                         raise TransactionConflict('temporary file reappeared before finalization')
             for rel, data in writes.items():
-                current, _ = _read_file_at(root_fd, rel)
+                current, _ = session.read_file(rel)
                 if current is None or _raw_sha(current) != _raw_sha(data):
                     raise TransactionConflict(f'post-write hash mismatch: {rel}')
             expected_tree = {rel for rel in writes if rel.startswith(f'{AGENTORCH_DIRNAME}/')}
@@ -3242,7 +3883,7 @@ def apply_isolated_onboarding(plan: OnboardingPlan, *, now: datetime | None = No
                 expected_tree |= {f'{AGENTORCH_DIRNAME}/{rel}'
                                   for rel in plan.baseline_binding.installed_sha256}
             if expected_tree:
-                actual_tree = _tree_files_at(root_fd)
+                actual_tree = session.tree_files()
                 unexpected = sorted(actual_tree - expected_tree)
                 if unexpected:
                     raise TransactionConflict(
@@ -3265,8 +3906,8 @@ def apply_isolated_onboarding(plan: OnboardingPlan, *, now: datetime | None = No
                 result['rollback'] = {'required': False, 'attempted': False,
                                       'result': 'NOT_NEEDED'}
             if failure is not None and records:
-                rollback = _rollback_transaction(root_fd, records, created_dirs,
-                                                 fault_injector)
+                rollback = _rollback_records(session, records, created_dirs,
+                                             fault_injector)
                 _invoke_hook(fault_injector, 'after_restore', host)
                 result['rollback'] = {'required': True, 'attempted': True, **rollback}
                 if rollback.get('result') == 'SUCCEEDED':
@@ -3283,7 +3924,7 @@ def apply_isolated_onboarding(plan: OnboardingPlan, *, now: datetime | None = No
                         for item in (rollback.get('failures') or [])[:5]]
                 result['created_dirs'] = sorted({item['rel'] for item in created_dirs})
         finally:
-            os.close(root_fd)
+            session.close()
 
     if failure is not None:
         if not isinstance(failure, Exception):
