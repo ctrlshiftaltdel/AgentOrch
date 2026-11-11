@@ -17,6 +17,7 @@
 
 - 只含通用可复用产出；不得包含本仓库特有的演进决策、任务记录或个人环境信息。`docs/` 下**只有**核心契约 `docs/orchestration.md` 随包分发，其余 `docs/` 路径一律拒绝（`build_release.py` 的 `PACKAGE_DOC_PATHS` 白名单）。
 - 包内文件集合 == `scripts/validate_kit.py` 中的 `REQUIRED` 列表 **+ 构建时生成的 `MANIFEST.json`**（数量与名称都一致，即 `len(REQUIRED) + 1` 个文件）。`REQUIRED` 是分发内容的唯一来源，构建脚本直接解析它，不再维护第二份清单；`MANIFEST.json` 是唯一不来自 `REQUIRED` 的成员。
+- **规则一致性由检查保证**：`REQUIRED` 中的 `docs/` 路径必须全部在白名单 `PACKAGE_DOC_PATHS` 内，白名单只能列 `docs/` 文件，`scripts/build_release.py` 与 `.orchestration` / `release` / `.worktrees` / `.workbuddy` 必须列为禁止项；`scripts/validate_kit.py` 的文档一致性门禁逐条核对，本文件也必须记录这三条规则（`REQUIRED`、`PACKAGE_DOC_PATHS`、`MANIFEST.json`），口径见 `docs/testing/document-consistency-gates.md` §6（仓库文档，不随包发布）。上游设计、架构与归档文档因此不会被自动塞进发行包。
 - **`MANIFEST.json`（机器可读清单）**：由 `scripts/check_drift.py` 生成，构建脚本导入该模块而不另写一份规则，因此分类只有一处实现。字段固定为：
   - 顶层 `schema_version`（清单格式版本）、`suite`（套件名，取自 `VERSION.md`）、`format_version`（套件格式版本，当前 `1.7`）、`files[]`；
   - 条目 `path`、`category`、`sha256`、`size`（`sha256` 与 `size` 按包内实际字节计算，文本已按 LF 归一）；

@@ -18,6 +18,9 @@
 - **Migration cases:**
 - **Integration paths:**
 - **Unverified assumptions:**
+- **Documentation impact:**
+  | path | status | change or reason |
+  |------|--------|------------------|
 - **Validation commands:**
 - **Baseline branch / commit:**
 - **Expected branch / Worktree:**
@@ -36,6 +39,7 @@
 - **Structured scenario fields.** Both editions use the same five names: `invariants`, `negative_cases`, `migration_cases`, `integration_paths`, `unverified_assumptions`. Meaning, requiredness and value rules live in `docs/orchestration.md` 4.1; this template only carries the fields. Small tasks write `N/A: <reason>`; empty or a bare `N/A` counts as a missing field.
 - **`declared_resources` is optional.** It is the task's named resource set, written as `<resource_id>:<mode>[:<ttl>]` separated by commas (`db:test/mysql-main:exclusive,svc:build/win-01:shared:600`). Empty (or omitted) means the task takes no resource lock and behaves exactly like a path-lock-only task. Semantics live only in `docs/design/resource-locks.md`; the shape here is only what the carrier needs to record. A resource set is acquired atomically at dispatch, so any conflict fails the whole dispatch instead of taking a partial set. `local` acquires these locks atomically inside one SQLite transaction; `github` only records an advisory reservation and claims no atomicity.
 - **Evidence matrix.** Column order is fixed: `ac_id`, `method`, `expected`, `actual`, `status`, `environment`, `commit_sha`, `evidence_ref`, `notes` (meaning and rules: 4.1, not restated here). Every AC needs at least one row, and every `commit_sha` must equal `Evidence head SHA` except on `NOT_APPLICABLE` rows.
+- **Documentation impact.** Every task records one row per affected document, with `UPDATE`, `NO_CHANGE` or `NOT_APPLICABLE` and a short reason; `UPDATE` must have a real change in the same delivery, and the other two must say why the document stays as it is. The record is checked structurally (field, columns, status vocabulary, non-empty reason) by `scripts/validate_kit.py`; whether the diff really matches is a review item, not a machine claim. Rule background: `docs/architecture/document-lifecycle.md` §10.
 - **`Risks / human decisions` depth.** Always required. When none of the triggers listed in the `docs/orchestration.md` G6 detail applies, write `none identified` (Sample A). When one applies, that G6 detail — not this template — defines what must be written and where the extra review's evidence is recorded; do not keep a second trigger list or a second wording here.
 - **Why not always maximal.** What is enforced is "field present + rules apply", not volume: a field that truly does not apply gets `N/A: <reason>`, and scenarios must not be invented to fill the format.
 
@@ -82,6 +86,11 @@ Applies when the task touches shared mutable state, a lock file, a backup / roll
 - **Migration cases:** N/A: no persisted data, configuration or file format changes.
 - **Integration paths:** N/A: output goes to stdout only; no other module or service consumes it.
 - **Unverified assumptions:** N/A: AC-1 and AC-2 cover the whole change; nothing is left open.
+- **Documentation impact:**
+  | path | status | change or reason |
+  |------|--------|------------------|
+  | `docs/README.md` | UPDATE | documents the new `--dry-run` flag and its exit codes |
+  | `AGENTS.md` | NO_CHANGE | no role, gate or evidence rule changed |
 - **Validation commands:** `uv run python -m unittest tests.test_export`
 - **Baseline branch / commit:** `main` @ `1111111`
 - **Expected branch / Worktree:** `task/1001-dry-run` / `.worktrees/1001-dry-run`
@@ -115,6 +124,11 @@ Applies when the task touches shared mutable state, a lock file, a backup / roll
 - **Migration cases:** version 2 to version 3 fills the new field with its documented default; a save with no version marker is treated as version 1 and must fail closed instead of guessing; rollback keeps the original file.
 - **Integration paths:** loader is called by the CLI import path and by the autosave loop; both must surface the typed error unchanged.
 - **Unverified assumptions:** autosave retries never run while a migration is in progress. Not yet verified; if false, AC-2's no-mutation guarantee needs a lock.
+- **Documentation impact:**
+  | path | status | change or reason |
+  |------|--------|------------------|
+  | `docs/README.md` | UPDATE | adds the version 2 → 3 migration and the fail-closed error |
+  | `docs/architecture/document-lifecycle.md` | NOT_APPLICABLE | no file responsibility, lifecycle or distribution scope changed |
 - **Validation commands:** `uv run python -m unittest tests.saves`
 - **Baseline branch / commit:** `main` @ `2222222`
 - **Expected branch / Worktree:** `task/1002-loader-versions` / `.worktrees/1002-loader-versions`

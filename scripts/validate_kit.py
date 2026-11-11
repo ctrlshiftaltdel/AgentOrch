@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Static validation for the Agent-Orchestration kit (core + local/github editions)."""
 from pathlib import Path
-import argparse, hashlib, importlib.util, json, os, re, runpy, sys
+import argparse, fnmatch, hashlib, importlib.util, json, os, posixpath, re, runpy, sys
 
 ROOT = Path(__file__).resolve().parents[1]
 # Release package manifest. It exists only in a built package (the repository
@@ -174,6 +174,10 @@ UPSTREAM_DOCS = {
     'docs/design/resource-locks.md': ('冲突',),
     'docs/testing/delivery-regression-scenarios.md': (
         '场景矩阵', '运行方式', 'Fixture 规则', '正负组', '未验证范围', '清理',
+    ),
+    'docs/testing/document-consistency-gates.md': (
+        '适用范围', '关键文件责任', '文档影响记录', '计划状态', '发行包规则',
+        '隔离布局', '未覆盖范围',
     ),
 }
 # Union kept under the historical name: existing callers and tests read it as
@@ -776,7 +780,8 @@ def extract_packet_samples(text):
     return samples
 
 
-def validate_task_packet(text, canonical_fields, status_values, label='task packet', structured_fields=()):
+def validate_task_packet(text, canonical_fields, status_values, label='task packet',
+                         structured_fields=(), require_docs_impact=False):
     """Return structural errors for one filled task packet; empty list means valid."""
     if not canonical_fields:
         return [f'{label}: canonical evidence fields are unavailable in {CORE_DOC}']
@@ -885,6 +890,8 @@ def validate_task_packet(text, canonical_fields, status_values, label='task pack
         if not any(r.get('status', '').upper() == 'PASS' for r in ac_rows):
             errors.append(f'{label}: acceptance criterion {ac_id} is marked as met without PASS evidence')
     errors.extend(resource_declaration_errors(text, label))
+    if require_docs_impact:
+        errors.extend(docs_impact_errors(text, label))
     return errors
 
 
@@ -992,6 +999,537 @@ def template_structure_errors(root=ROOT):
     return errors
 
 
+# --- Document consistency gates (Issue #154) ----------------------------------
+# Deterministic, report-only checks: they never rewrite a document, never read
+# the network and never guess a GitHub Issue state. A task status that cannot be
+# proved from repository content is printed for manual verification instead of
+# being counted as verified. The gate contract is described in
+# docs/testing/document-consistency-gates.md.
+REPO_MAP_DOC = 'docs/architecture/repository-map.md'
+LIFECYCLE_DOC = 'docs/architecture/document-lifecycle.md'
+PLAN_DOC = 'docs/implementation-plan.md'
+RELEASE_DOC = 'release/README.md'
+REVIEW_CHECKLIST_DOC = 'templates/review-checklist.md'
+
+# `mixed` marks a container row (today `docs/`) that indexes a per-section
+# inventory; it proves nothing by itself, so every document below it is still
+# registered individually. Source and test files are covered by their directory
+# rows on purpose (see document-lifecycle.md §4.4), so adding a normal source
+# file never forces a map edit.
+MAP_PURPOSE_TAGS = ('authoritative', 'reference', 'implementation', 'derived-local',
+                    'outdated', 'mixed')
+MAP_LIFECYCLE_STATES = ('PROPOSED', 'ACTIVE', 'IMPLEMENTED', 'DROPPED', 'SUPERSEDED',
+                        'ARCHIVED')
+MAP_EXCEPTION_HEADING = '例外登记'
+# Derived / private paths that are exempt from registration by construction. The
+# map's exception section must still name them, so the exemption is written down
+# instead of being a silent hole in the scanner.
+MAP_EXEMPT_PREFIXES = ('.local/', '.orchestration/', '.worktrees/', '.workbuddy/',
+                       '__pycache__/', '.pytest_cache/', '.mypy_cache/', 'docs/images/')
+KEY_ROOT_FILES = ('AGENTS.md', 'LICENSE.md', 'README.md', 'VERSION.md')
+KEY_FILE_ROOTS = ('docs', 'editions', 'templates')
+
+DOC_IMPACT_FIELD = 'documentation impact'
+DOC_IMPACT_STATUSES = ('UPDATE', 'NO_CHANGE', 'NOT_APPLICABLE')
+DOC_IMPACT_COLUMNS = ('path', 'status', 'change or reason')
+EMPTY_CELL_MARKERS = ('', '(none)', 'none', 'n/a', '-', '—')
+
+# Task state vocabulary. READY / DISPATCHED / ... are defined once in
+# docs/orchestration.md 4.1; OPEN / CLOSED / PLANNED are planning words a phase
+# plan may use for its rows. An unknown token is a typo or a second vocabulary.
+PLAN_STATUS_VALUES = (
+    'PLANNED', 'READY', 'DISPATCHED', 'IN_PROGRESS', 'PR_OPEN', 'MASTER_REVIEW',
+    'APPROVED', 'MERGED', 'VERIFIED', 'BLOCKED', 'FAILED', 'CANCELED', 'OPEN',
+    'CLOSED', 'NOT_RUN', 'UNKNOWN', 'NEEDS_HUMAN_DECISION',
+)
+PLAN_STATUS_RE = re.compile(r'(?<![A-Za-z0-9_])[A-Z][A-Z_]{2,}(?![A-Za-z0-9_])')
+PLAN_UNPROVEN_NOTE = '待人工核验'
+
+# Directories that hold generated, vendored or private state. A document scan
+# must not treat them as project documentation, and registration coverage must
+# not demand a row for them.
+DOC_SCAN_EXCLUDED_DIRS = frozenset({
+    '.git', 'node_modules', '__pycache__', '.pytest_cache', '.mypy_cache',
+    '.ruff_cache', '.orchestration', '.local', '.worktrees', '.workbuddy',
+})
+# Release-path segments that must never reach a package. `release/` and
+# `scripts/build_release.py` cover the builder itself; `docs/` is a single-file
+# allowlist rather than a blanket ban (the core contract lives there).
+RELEASE_FORBIDDEN_SEGMENTS = frozenset({
+    '.orchestration', 'release', '.worktrees', '.workbuddy', '.git', '.local',
+})
+RELEASE_DOC_TOKENS = ('PACKAGE_DOC_PATHS', 'REQUIRED', 'MANIFEST.json')
+
+
+def _section_body(text, needle):
+    """Body of every heading containing *needle*, joined; up to the next heading.
+
+    A document may carry more than one related section (e.g. a per-directory
+    exception note and a consolidated exception register); the check reads all of
+    them instead of silently stopping at the first heading.
+    """
+    lines = text.splitlines()
+    bodies, index = [], 0
+    while index < len(lines):
+        match = re.match(r'^(#{1,6})\s+(.*)$', lines[index])
+        if not match or needle not in match.group(2):
+            index += 1
+            continue
+        level, index = len(match.group(1)), index + 1
+        body = []
+        while index < len(lines):
+            inner = re.match(r'^(#{1,6})\s+', lines[index])
+            if inner and len(inner.group(1)) <= level:
+                break
+            body.append(lines[index])
+            index += 1
+        bodies.append('\n'.join(body))
+    return '\n'.join(bodies)
+
+
+def _first_token(cell):
+    """First backticked token of a map cell, else its first plain word."""
+    match = re.search(r'`([^`]+)`', cell or '')
+    if match:
+        return match.group(1).strip()
+    plain = re.sub(r'[*\[\]]', '', cell or '').strip()
+    return plain.split()[0] if plain else ''
+
+
+def _map_cell_paths(cell):
+    """[(repo_relative_path, kind)] for every relative link in a map cell."""
+    paths = []
+    for target in re.findall(r'\[[^\]]*\]\(([^)]+)\)', cell or ''):
+        target = target.strip()
+        if not target or target.startswith(EXTERNAL_LINK_PREFIXES):
+            continue
+        target = target.split('#', 1)[0].strip()
+        if not target:
+            continue
+        normalised = posixpath.normpath(
+            posixpath.join(posixpath.dirname(REPO_MAP_DOC), target))
+        if normalised in ('', '.', '..') or normalised.startswith('../'):
+            continue
+        if '*' in normalised:
+            paths.append((normalised, 'glob'))
+        elif target.endswith('/'):
+            paths.append((normalised.rstrip('/') + '/', 'dir'))
+        else:
+            paths.append((normalised, 'file'))
+    return paths
+
+
+def map_registration_rows(text):
+    """Registration rows of the repository map (path / purpose / lifecycle / scope)."""
+    rows = []
+    for header, body in _tables(text):
+        labels = [field_label(cell) for cell in header]
+        if '路径' not in labels or '生命周期' not in labels:
+            continue
+        column = {name: labels.index(name) for name in labels}
+        for cells in body:
+            if len(cells) <= column['生命周期']:
+                continue
+            for path, kind in _map_cell_paths(cells[column['路径']]):
+                rows.append({
+                    'path': path,
+                    'kind': kind,
+                    'purpose': _first_token(cells[column['用途']] if '用途' in column else ''),
+                    'lifecycle': _first_token(cells[column['生命周期']]),
+                    'distribution': cells[column['分发']] if '分发' in column else '',
+                    'responsibility': cells[-1],
+                })
+    return rows
+
+
+def _registered(rel, rows):
+    for row in rows:
+        if row['kind'] == 'file' and row['path'] == rel:
+            return True
+        if row['kind'] == 'dir' and rel.startswith(row['path'].rstrip('/') + '/'):
+            return True
+        if row['kind'] == 'glob' and fnmatch.fnmatch(rel, row['path']):
+            return True
+    return False
+
+
+def _map_exempt(rel):
+    return any(rel == prefix.rstrip('/') or rel.startswith(prefix)
+               for prefix in MAP_EXEMPT_PREFIXES)
+
+
+def repository_map_coverage_errors(root, rows):
+    """Key files that no registration row covers.
+
+    Only the governance surface is covered: root entry / contract files and every
+    file under `docs/`, `editions/` and `templates/`. `scripts/` and `tests/` are
+    registered as directory groups, so a host project never has to list its own
+    source files in this upstream map.
+    """
+    root, errors, scan_errors = Path(root), [], []
+    covering = [row for row in rows if row['purpose'] != 'mixed']
+    for path in _scan_files(root, root, scan_errors, DOC_SCAN_EXCLUDED_DIRS):
+        rel = path.relative_to(root).as_posix()
+        if _map_exempt(rel):
+            continue
+        if rel not in KEY_ROOT_FILES and rel.split('/')[0] not in KEY_FILE_ROOTS:
+            continue
+        if not _registered(rel, covering):
+            errors.append(f'{rel} is not registered in {REPO_MAP_DOC}; add a row with its '
+                          'purpose, lifecycle and distribution scope, or write an explicit '
+                          f'exception under "{MAP_EXCEPTION_HEADING}"')
+    errors.extend(scan_errors)
+    return errors
+
+
+def repository_map_errors(root=ROOT):
+    """Registration, tags, existence and the written exception rules of the map."""
+    root = Path(root)
+    path = root / REPO_MAP_DOC
+    if not path.is_file():
+        return [f'missing repository map: {REPO_MAP_DOC}']
+    text = path.read_text(encoding='utf-8')
+    rows = map_registration_rows(text)
+    if not rows:
+        return [f'{REPO_MAP_DOC}: no registration rows found (expected a table whose header '
+                'carries 路径 / 用途 / 生命周期 columns)']
+    errors = []
+    for row in rows:
+        purpose, lifecycle = row['purpose'], row['lifecycle']
+        if purpose not in MAP_PURPOSE_TAGS:
+            errors.append(f'{REPO_MAP_DOC}: {row["path"]} declares unknown purpose tag: '
+                          f'{purpose or "(empty)"}')
+        if lifecycle not in MAP_LIFECYCLE_STATES:
+            errors.append(f'{REPO_MAP_DOC}: {row["path"]} declares unknown lifecycle state: '
+                          f'{lifecycle or "(empty)"}')
+        target = root / row['path'].rstrip('/')
+        if row['kind'] == 'dir':
+            exists = target.is_dir()
+        elif row['kind'] == 'glob':
+            exists = target.parent.is_dir() and any(target.parent.glob(target.name))
+        else:
+            exists = target.is_file()
+        if (not exists and lifecycle not in ('ARCHIVED', 'SUPERSEDED', 'DROPPED')
+                and purpose != 'outdated'):
+            errors.append(f'{REPO_MAP_DOC}: {row["path"]} is registered but missing on disk')
+        responsibility = row['responsibility']
+        if purpose == 'outdated' and not (markdown_links(responsibility)
+                                          or '无替代' in responsibility):
+            errors.append(f'{REPO_MAP_DOC}: {row["path"]} is outdated without a successor or an '
+                          'explicit 无替代 decision; a stale tag must never stand alone')
+        if lifecycle in ('ARCHIVED', 'SUPERSEDED') and (
+                ('保留' not in responsibility and '归档' not in responsibility)
+                or not (markdown_links(responsibility) or '无替代' in responsibility)):
+            errors.append(f'{REPO_MAP_DOC}: {row["path"]} {lifecycle} must state retention and a '
+                          'successor (link or explicit 无替代)')
+    if not re.search(r'^#{1,4}\s+.*' + MAP_EXCEPTION_HEADING, text, re.M):
+        errors.append(f'{REPO_MAP_DOC}: missing an {MAP_EXCEPTION_HEADING} section: the '
+                      'derived-local / private / archived exceptions must be written down '
+                      '(derived-local, .local/, .orchestration/)')
+    else:
+        body = _section_body(text, MAP_EXCEPTION_HEADING)
+        if 'derived-local' not in body:
+            errors.append(f'{REPO_MAP_DOC}: {MAP_EXCEPTION_HEADING} must name the derived-local '
+                          'exception and the paths that are exempt from registration')
+        if '.local' not in body and '.orchestration' not in body:
+            errors.append(f'{REPO_MAP_DOC}: {MAP_EXCEPTION_HEADING} must name the private paths '
+                          'that are exempt from registration (.local/, .orchestration/)')
+    errors.extend(repository_map_coverage_errors(root, rows))
+    return errors
+
+
+def legacy_path_registry(text):
+    """Rows of the 旧路径登记 table in the lifecycle document."""
+    entries, rows = [], _table_after(text, '旧路径登记')
+    if not rows:
+        return entries
+    for cells in rows:
+        if len(cells) < 3:
+            continue
+        old, new = _backticked(cells[0]), _backticked(cells[1])
+        if not old or not new:
+            continue
+        allowed = [item.strip().strip('/') for item in re.findall(r'`([^`]+)`', cells[2])]
+        entries.append({'old': old.strip('/').strip(), 'new': new.strip(),
+                        'allowed': [item for item in allowed if item]})
+    return entries
+
+
+def legacy_path_errors(root=ROOT):
+    """A migrated path may only appear where the migration registry allows it."""
+    root = Path(root)
+    registry_path = root / LIFECYCLE_DOC
+    if not registry_path.is_file():
+        return [f'missing legacy path registry: {LIFECYCLE_DOC}']
+    entries = legacy_path_registry(registry_path.read_text(encoding='utf-8'))
+    if not entries:
+        return [f'{LIFECYCLE_DOC}: no 旧路径登记 table found (columns: 旧路径 / 替代路径 / '
+                '允许出现的文件 / 说明)']
+    errors, scan_errors = [], []
+    for entry in entries:
+        old, new = entry['old'], entry['new']
+        if not (root / new).exists():
+            errors.append(f'{LIFECYCLE_DOC}: legacy {old} successor {new} does not exist')
+        if (root / old).exists():
+            errors.append(f'{LIFECYCLE_DOC}: legacy path {old} still exists on disk; keep one '
+                          'authority instead of a second copy')
+        if any(rel == old or rel.startswith(old + '/') for rel in REQUIRED):
+            errors.append(f'{LIFECYCLE_DOC}: legacy path {old} must not be a release path')
+        for rel in entry['allowed']:
+            if not (root / rel).exists():
+                errors.append(f'{LIFECYCLE_DOC}: legacy {old} allowed file {rel} does not exist')
+        allowed = set(entry['allowed'])
+        for path in _scan_files(root, root, scan_errors, DOC_SCAN_EXCLUDED_DIRS):
+            if path.suffix.lower() != '.md':
+                continue
+            rel = path.relative_to(root).as_posix()
+            if rel == LIFECYCLE_DOC:
+                continue  # the registry itself has to name the old path
+            content = CODE_BLOCK_RE.sub(
+                '', path.read_text(encoding='utf-8', errors='replace'))
+            if old in content and rel not in allowed:
+                errors.append(f'{rel}: legacy path {old} is not registered for this file in '
+                              f'{LIFECYCLE_DOC} §7.1')
+    errors.extend(scan_errors)
+    return errors
+
+
+def docs_impact_errors(text, label='task packet'):
+    """The documentation impact record: three statuses, each with a reason."""
+    fields = parse_task_packet(text)
+    if field_label(DOC_IMPACT_FIELD) not in fields:
+        return [f'{label}: missing required field: {DOC_IMPACT_FIELD}']
+    header, rows = parse_matrix(fields[field_label(DOC_IMPACT_FIELD)]['lines'])
+    if header is None:
+        return [f'{label}: documentation impact table not found']
+    errors = []
+    if [_clean(cell) for cell in header] != list(DOC_IMPACT_COLUMNS):
+        errors.append(f'{label}: documentation impact columns must be exactly '
+                      f'{list(DOC_IMPACT_COLUMNS)}')
+    if not rows:
+        errors.append(f'{label}: documentation impact lists no documents')
+    seen = set()
+    for index, cells in enumerate(rows, 1):
+        if len(cells) != len(DOC_IMPACT_COLUMNS):
+            errors.append(f'{label}: documentation impact row #{index} has {len(cells)} fields, '
+                          f'expected {len(DOC_IMPACT_COLUMNS)}')
+            continue
+        path, status, detail = (_clean(cell) for cell in cells)
+        if not path:
+            errors.append(f'{label}: documentation impact row #{index} has an empty path')
+        elif path.startswith('/') or '..' in Path(path).parts or ':' in path[:3]:
+            errors.append(f'{label}: documentation impact row #{index} path {path} must be '
+                          'repo-relative')
+        elif path in seen:
+            errors.append(f'{label}: documentation impact lists {path} more than once')
+        else:
+            seen.add(path)
+        if status not in DOC_IMPACT_STATUSES:
+            errors.append(f'{label}: documentation impact row #{index} has unknown status: '
+                          f'{status or "(empty)"} (allowed: {", ".join(DOC_IMPACT_STATUSES)})')
+            continue
+        empty = not detail.strip() or detail.strip().lower() in EMPTY_CELL_MARKERS
+        if status == 'UPDATE' and empty:
+            errors.append(f'{label}: documentation impact row #{index} is UPDATE without a '
+                          'change description')
+        elif status != 'UPDATE' and empty:
+            errors.append(f'{label}: documentation impact row #{index} is {status} without a '
+                          'reason')
+    return errors
+
+
+def docs_impact_template_errors(root=ROOT):
+    """The shipped templates must carry the impact contract, not only mention it."""
+    root, errors = Path(root), []
+    packet = root / TASK_PACKET_DOC
+    if not packet.is_file():
+        errors.append(f'missing required template: {TASK_PACKET_DOC}')
+    else:
+        text = packet.read_text(encoding='utf-8')
+        if DOC_IMPACT_FIELD not in text.lower():
+            errors.append(f'{TASK_PACKET_DOC} does not carry the documentation impact field')
+        if '| ' + ' | '.join(DOC_IMPACT_COLUMNS) + ' |' not in text:
+            errors.append(f'{TASK_PACKET_DOC} does not declare the impact table header '
+                          f'{list(DOC_IMPACT_COLUMNS)}')
+        for status in DOC_IMPACT_STATUSES:
+            if status not in text:
+                errors.append(f'{TASK_PACKET_DOC} does not document the impact status {status}')
+    checklist = root / REVIEW_CHECKLIST_DOC
+    if not checklist.is_file():
+        errors.append(f'missing required template: {REVIEW_CHECKLIST_DOC}')
+    else:
+        text = checklist.read_text(encoding='utf-8')
+        covered = [line for line in text.splitlines()
+                   if line.lstrip().startswith('- [ ]')
+                   and all(status in line for status in DOC_IMPACT_STATUSES)]
+        if not covered:
+            errors.append(f'{REVIEW_CHECKLIST_DOC} has no checklist item covering the '
+                          'documentation impact record (UPDATE / NO_CHANGE / NOT_APPLICABLE)')
+    return errors
+
+
+def plan_status_table(text):
+    """(header, rows, status column) of the task status table, if it exists."""
+    for header, rows in _tables(text):
+        labels = [field_label(cell) for cell in header]
+        if '任务' in labels and '状态' in labels:
+            return header, rows, labels.index('状态')
+    return None, [], None
+
+
+def _claims_verified(status):
+    for match in re.finditer('VERIFIED', status):
+        prefix = status[max(0, match.start() - 4):match.start()]
+        if '未' in prefix or 'not' in prefix.lower():
+            continue
+        return True
+    return False
+
+
+def _evidence_pointer(cells):
+    # The first cell is the task itself (usually its Issue link); evidence must
+    # come from another column, otherwise every row would look "proven".
+    row = ' '.join(cells[1:])
+    if re.search(r'https?://[^\s)]+/(?:pull|issues|releases|commit)/', row):
+        return True
+    if re.search(r'\b[0-9a-f]{40}\b', row):
+        return True
+    return any(target and not target.startswith(EXTERNAL_LINK_PREFIXES)
+               for target in markdown_links(row))
+
+
+def plan_status_errors(root=ROOT):
+    """Only the statically provable part of the phase plan's status table.
+
+    An unknown state token or a completion claim with no pointer is a defect a
+    file can prove. Whether a GitHub Issue is really `VERIFIED` is not, and is
+    deliberately never guessed here.
+    """
+    path = Path(root) / PLAN_DOC
+    if not path.is_file():
+        return [f'missing phase plan: {PLAN_DOC}']
+    header, rows, column = plan_status_table(path.read_text(encoding='utf-8'))
+    if header is None:
+        return [f'{PLAN_DOC}: no task status table found (expected a table with 任务 and 状态 '
+                f'columns; status values are defined in {CORE_DOC} 4.1)']
+    errors = []
+    for cells in rows:
+        if column >= len(cells):
+            errors.append(f'{PLAN_DOC}: a task row is shorter than its status column')
+            continue
+        task = _clean(cells[0]) or '(unnamed task)'
+        status = cells[column]
+        for token in PLAN_STATUS_RE.findall(status):
+            if token not in PLAN_STATUS_VALUES:
+                errors.append(f'{PLAN_DOC}: status {token} is not a known task state '
+                              f'(see {CORE_DOC} 4.1)')
+        if _claims_verified(status) and not _evidence_pointer(cells):
+            errors.append(f'{PLAN_DOC}: {task} claims VERIFIED without an evidence pointer '
+                          '(Issue / PR / commit SHA / repository link)')
+    return errors
+
+
+def plan_status_manual_lines(root=ROOT):
+    """Status rows the repository cannot prove, reported for manual verification."""
+    path = Path(root) / PLAN_DOC
+    if not path.is_file():
+        return []
+    header, rows, column = plan_status_table(path.read_text(encoding='utf-8'))
+    if header is None or not rows:
+        return []
+    tasks = []
+    for cells in rows:
+        if not cells:
+            continue
+        match = re.search(r'/issues/(\d+)', cells[0]) or re.search(r'#(\d+)', cells[0])
+        tasks.append(f'#{match.group(1)}' if match else _clean(cells[0]))
+    if not tasks:
+        return []
+    return [f'{PLAN_DOC}: {PLAN_UNPROVEN_NOTE} — {len(tasks)} task status row(s) '
+            f'({", ".join(tasks)}) depend on live GitHub Issue / PR state; repository '
+            'content cannot prove them, so this check neither guesses nor edits the plan.']
+
+
+def release_rule_errors(required, package_doc_paths, forbidden_paths, forbidden_segments,
+                        build_script='scripts/build_release.py'):
+    """One rule set for REQUIRED, the manifest and the package self-check."""
+    segments = set(forbidden_segments)
+    package_doc_paths = set(package_doc_paths)
+    errors, seen = [], set()
+    for rel in required:
+        if rel in seen:
+            errors.append(f'REQUIRED lists a path more than once: {rel}')
+        seen.add(rel)
+        parts = rel.split('/')
+        if any(part in segments for part in parts):
+            errors.append(f'REQUIRED contains a forbidden path segment: {rel}')
+        if 'docs' in parts and rel not in package_doc_paths:
+            errors.append(f'REQUIRED contains an upstream design / archive document that must '
+                          f'not ship: {rel}')
+    if build_script not in set(forbidden_paths):
+        errors.append(f'{build_script} must be listed as a forbidden release path')
+    for rel in sorted(package_doc_paths):
+        if 'docs' not in rel.split('/'):
+            errors.append(f'the package docs allowlist may only name docs/ files: {rel}')
+        elif rel not in seen:
+            errors.append(f'the package docs allowlist names a file that is not in REQUIRED: {rel}')
+    for segment in ('.orchestration', 'release', '.worktrees', '.workbuddy'):
+        if segment not in segments:
+            errors.append(f'release must forbid the path segment {segment}')
+    return errors
+
+
+def _release_builder(root):
+    """Import ``scripts/build_release.py`` from *root*, or None when absent."""
+    path = Path(root) / 'scripts' / 'build_release.py'
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location('build_release_for_validate_kit', path)
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:  # noqa: BLE001 - an unimportable builder fails the check closed
+        return None
+    return module
+
+
+def release_consistency_errors(root=ROOT):
+    """The release builder's rules and the published standard must agree with REQUIRED."""
+    root = Path(root)
+    builder = _release_builder(root)
+    if builder is None:
+        # The builder is repository-only and never ships, so a package or a
+        # downstream project has nothing to compare here.
+        return []
+    errors = release_rule_errors(
+        REQUIRED, getattr(builder, 'PACKAGE_DOC_PATHS', ()),
+        getattr(builder, 'FORBIDDEN_PATHS', ()),
+        getattr(builder, 'FORBIDDEN_SEGMENTS', ()),
+    )
+    readme = root / RELEASE_DOC
+    if not readme.is_file():
+        errors.append(f'missing release standard: {RELEASE_DOC}')
+    else:
+        text = readme.read_text(encoding='utf-8')
+        for token in RELEASE_DOC_TOKENS:
+            if token not in text:
+                errors.append(f'{RELEASE_DOC} must document the package rule {token}')
+    return errors
+
+
+def documentation_consistency_errors(root=ROOT):
+    """All document consistency gates that apply to the tree being validated."""
+    root = Path(root)
+    errors = []
+    errors.extend(docs_impact_template_errors(root))
+    errors.extend(release_consistency_errors(root))
+    if tree_mode(root) == TREE_UPSTREAM:
+        errors.extend(repository_map_errors(root))
+        errors.extend(legacy_path_errors(root))
+        errors.extend(plan_status_errors(root))
+    return errors
+
+
 def validate_kit(root=ROOT, project_ready=False):
     errors = []
     root = Path(root)
@@ -1016,6 +1554,11 @@ def validate_kit(root=ROOT, project_ready=False):
                       '(`git mv ORCHESTRATION-PROJECT.md docs/PROJECT.md`) — see docs/upgrade.md')
 
     errors.extend(template_structure_errors(root))
+
+    # Document consistency gates: file responsibility / lifecycle registration,
+    # legacy path usage, the documentation impact record and the phase plan.
+    # Report-only — nothing here rewrites a document or guesses an Issue state.
+    errors.extend(documentation_consistency_errors(root))
 
     # Repository-only documents. Which ones are required depends on the tree:
     # a package carries no docs/, a downstream project only fills in
@@ -1127,6 +1670,7 @@ def validate_kit(root=ROOT, project_ready=False):
             sample['text'], evidence_fields, status_values,
             label=f'{TASK_PACKET_DOC} sample "{sample["name"]}"',
             structured_fields=packet_fields,
+            require_docs_impact=True,
         ))
 
     # The edition selector is the routing key for the whole kit. It must be present
@@ -1221,6 +1765,7 @@ def main(argv=None):
         errors = validate_task_packet(
             read_text(args.task_packet), evidence_fields, status_values,
             label=args.task_packet, structured_fields=packet_fields,
+            require_docs_impact=True,
         )
         if errors:
             print('TASK PACKET VALIDATION FAILED')
@@ -1234,6 +1779,11 @@ def main(argv=None):
     if errors:
         print('VALIDATION FAILED')
         print('\n'.join(f'- {e}' for e in errors))
+        # Status rows the repository cannot prove are still reported on failure:
+        # a failed structural check must not hide what needs a human.
+        manual = plan_status_manual_lines(ROOT)
+        if manual:
+            print('\n'.join(manual))
         return 1
     scan_errors = []
     mode = tree_mode(ROOT, scan_errors)
@@ -1251,6 +1801,9 @@ def main(argv=None):
           f'editions local/github share 2 files, github adds 3 templates; '
           f'{documents} repository-only document(s) checked; '
           f'{sample_count} task packet samples validated).')
+    manual = plan_status_manual_lines(ROOT)
+    if manual:
+        print('\n'.join(manual))
     return 0
 
 
