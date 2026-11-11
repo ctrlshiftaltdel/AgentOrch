@@ -707,5 +707,46 @@ class PackagedDocRuleTests(unittest.TestCase):
                 self.builder.collect_sources([rel])
 
 
+@unittest.skipUnless(BUILD.is_file(), 'build_release.py is repository-only')
+class PackageSetRuleTests(unittest.TestCase):
+    """Self-check (a): the packaged set must equal REQUIRED + MANIFEST.json.
+
+    Both directions are negative-tested here without building a whole archive:
+    a file that silently stopped shipping and a file that should never ship are
+    different defects, and an exit code alone cannot tell them apart.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.builder = load('build_release_package_set_under_test', BUILD)
+
+    def errors(self, packaged, required=('AGENTS.md', 'docs/orchestration.md')):
+        return self.builder.package_set_errors(list(packaged), list(required))
+
+    def test_exact_set_passes(self):
+        self.assertEqual(
+            self.errors(['AGENTS.md', 'docs/orchestration.md', drift.MANIFEST_NAME]), [])
+
+    def test_missing_required_file_is_reported(self):
+        errors = self.errors(['AGENTS.md', drift.MANIFEST_NAME])
+        self.assertTrue(any('missing REQUIRED files: docs/orchestration.md' in e for e in errors), errors)
+
+    def test_extra_file_is_reported(self):
+        errors = self.errors(
+            ['AGENTS.md', 'docs/orchestration.md', drift.MANIFEST_NAME,
+             'docs/design/resource-locks.md'])
+        self.assertTrue(any('not in REQUIRED' in e and 'docs/design/resource-locks.md' in e
+                            for e in errors), errors)
+
+    def test_missing_manifest_is_reported(self):
+        errors = self.errors(['AGENTS.md', 'docs/orchestration.md'])
+        self.assertTrue(any(drift.MANIFEST_NAME in e for e in errors), errors)
+
+    def test_duplicate_package_entry_is_reported(self):
+        errors = self.errors(['AGENTS.md', 'AGENTS.md', 'docs/orchestration.md',
+                              drift.MANIFEST_NAME])
+        self.assertTrue(any('lists a file more than once' in e for e in errors), errors)
+
+
 if __name__ == '__main__':
     unittest.main()

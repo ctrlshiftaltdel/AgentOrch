@@ -105,6 +105,17 @@
 
 本任务（#150）**不移动任何文件**；未来的核心契约迁移（GOV-2 / #151）必须按本节单独执行。
 
+### 7.1 旧路径登记（迁移 / 兼容例外）
+
+一个已迁移的路径只允许出现在本节登记过的文件里；未登记的文件出现旧路径时，`scripts/validate_kit.py` 报错并指出文件与该行登记。登记行必须同时给出仍然存在的替代路径，且旧路径本身不得仍存在于磁盘或 `REQUIRED` 中。
+
+| 旧路径 | 替代路径 | 允许出现的文件 | 生效版本 | 说明 |
+|---|---|---|---|---|
+| `kit/orchestration.md` | `docs/orchestration.md` | `docs/architecture/repository-map.md`、`docs/design/next-phase-governance-and-agent-performance.md`、`docs/implementation-plan.md`、`docs/metrics.md`、`docs/orchestration.md`、`docs/upgrade.md`、`release/README.md` | 1.5 | #151 迁移；上列文件只用于迁移说明、历史记录或升级指南，不得把旧路径写成当前指令。新增文件若要引用旧路径，必须同时更新本行并说明理由。 |
+
+- 只加文件不删文件、只改链接不改语义；旧路径一旦重新出现在磁盘上，就是第二个权威，检查失败。
+- 发行标准与 `REQUIRED` 不得包含旧路径；`scripts/build_release.py` 的 `PACKAGE_DOC_PATHS` 只允许当前契约路径。
+
 ## 8. 归档
 
 归档表示“保留可追溯地址，但移出默认阅读路径”：
@@ -136,6 +147,7 @@
   - 手工核对本任务新增或修改的每个相对链接与仓库路径真实存在。
 - 涉及发行包路径、`MANIFEST.json`、构建或更新引擎时，追加 `uv run python scripts/build_release.py` 与相关测试；未执行的项目标 `NOT_RUN` / `BLOCKED`，不得写成通过。
 - 生命周期状态与用途标签以 [repository-map.md](repository-map.md) 的当前盘点为准；发现地图与文件实际状态不一致时，先登记差异并停下对齐，不在两处各写一套。
+- 上述检查中可机器判定的部分由 `scripts/validate_kit.py` 执行（登记覆盖、旧路径、文档影响记录形状、计划状态词表与完成声明证据指针），口径与未覆盖范围见 [docs/testing/document-consistency-gates.md](../testing/document-consistency-gates.md)。检查只报告、不自动改文档、不读取 GitHub 实时状态；无法从仓库内容证明的任务状态输出“待人工核验”。
 
 ## 11. 与任务载体、分发的关系
 

@@ -10,6 +10,7 @@ Use this checklist when reviewing an execution task's delivery, independently of
 - [ ] No self-approval or self-merge happened
 - [ ] Every changed frozen item has a decision record in [CONTRACT-DECISION-LOG.md](contract-decision-log.md) (ID, affected tasks, before/after, evidence, status)
 - [ ] A design contract touched by this task fills the headings of [DESIGN.md](design.md), or says `N/A: <reason>`; no heading was deleted to look finished
+- [ ] Documentation impact record: every affected document is listed with `UPDATE`, `NO_CHANGE` or `NOT_APPLICABLE`; each `UPDATE` has a matching change in the Diff, and each `NO_CHANGE` / `NOT_APPLICABLE` gives a checkable reason (rule: `docs/architecture/document-lifecycle.md` §10)
 
 ### Cross-module state, concurrency and recovery
 

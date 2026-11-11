@@ -18,6 +18,11 @@ drift_spec.loader.exec_module(drift)
 
 ROOT = SCRIPT.parents[1]
 HEAD = 'a' * 40
+# Repository-only documents and the release builder never ship, so the checks
+# that read them are skipped inside a release package (same convention as the
+# existing repository-only tests below).
+UPSTREAM_CHECKOUT = (ROOT / 'docs' / 'upgrade.md').is_file()
+BUILD_SCRIPT = ROOT / 'scripts' / 'build_release.py'
 
 
 def canonical():
@@ -50,7 +55,8 @@ class TaskPacketMatrixTests(unittest.TestCase):
         }
         return '  | ' + ' | '.join(cells[name] for name in self.evidence_fields) + ' |'
 
-    def packet(self, acs=None, rows=None, structured=None, head=HEAD, omit=(), resources=None):
+    def packet(self, acs=None, rows=None, structured=None, head=HEAD, omit=(),
+               resources=None, impact=True):
         acs = acs if acs is not None else [('x', 'AC-1', 'dry run writes nothing'),
                                            ('x', 'AC-2', 'existing behaviour unchanged')]
         rows = rows if rows is not None else [self.row('AC-1'), self.row('AC-2', actual='12 tests passed')]
@@ -79,6 +85,11 @@ class TaskPacketMatrixTests(unittest.TestCase):
             lines.append(f'  - [{mark}] {ac_id}: {text}')
         for name in self.structured:
             add(name, structured.get(name, ''))
+        if impact:
+            add('Documentation impact')
+            lines.append('  | path | status | change or reason |')
+            lines.append('  |---|---|---|')
+            lines.append('  | `docs/README.md` | UPDATE | added the gate section |')
         add('Validation commands', '`python -m unittest`')
         add('Baseline branch / commit', '`main` @ `1111111`')
         add('Expected branch / Worktree', '`task/9001-dry-run` / `.worktrees/9001-dry-run`')
@@ -1190,10 +1201,9 @@ class VendoredTreeScanTests(unittest.TestCase):
 
             errors, _ = validate.validate_kit(root)
 
-            # The validator renders the relative path with the platform
-            # separator, so the expectation has to be built the same way
-            # (`scripts\README.md` on Windows, `scripts/README.md` elsewhere).
-            expected = f'{Path("scripts") / "README.md"}: broken relative link: missing.md'
+            # The validator renders the relative path in POSIX form on every
+            # platform, so the expectation must not use the host separator.
+            expected = 'scripts/README.md: broken relative link: missing.md'
             self.assertTrue(any(expected in error for error in errors), errors)
 
     def test_node_modules_markdown_cannot_supply_governance_concepts(self):
@@ -1210,6 +1220,600 @@ class VendoredTreeScanTests(unittest.TestCase):
                 any('missing expected governance concept: PLANNED' in error for error in errors),
                 errors,
             )
+
+
+MAP_HEADER = ('| 路径 | 用途 | 生命周期 | 分发 | 唯一职责 / 权威位置 |\n'
+              '|---|---|---|---|---|\n')
+
+
+def registration_map(rows, extra=''):
+    """A minimal repository map body with registration rows and an exception section."""
+    return ('# map\n\n'
+            '## 2. 用途标签\n\n'
+            '| 标签 | 含义 | 判断边界 |\n|---|---|---|\n'
+            '| `authoritative` | x | y |\n'
+            '| `reference` | x | y |\n'
+            '| `implementation` | x | y |\n'
+            '| `derived-local` | x | y |\n'
+            '| `outdated` | x | y |\n'
+            '| `mixed` | x | y |\n\n'
+            '## 3. 顶层目录与根文件\n\n'
+            + MAP_HEADER
+            + '| [`docs/architecture/repository-map.md`](repository-map.md) | `authoritative` '
+              '| `ACTIVE` | 仅仓库 | this file |\n'
+            + rows + '\n'
+            '## 9.4 例外登记\n\n'
+            '- `derived-local`：`.local/` 与 `.orchestration/` 不入库、不打包；'
+            '归档例外按 lifecycle §6.1 登记。\n'
+            + extra)
+
+
+class RepositoryMapTests(unittest.TestCase):
+    """Every key file must be registered with a purpose, a lifecycle and a scope.
+
+    Registration is by exact path, by directory prefix or by glob; source and
+    test files are deliberately covered by their directory rows (lifecycle §4.4)
+    so adding a normal source file never forces a map edit.
+    """
+
+    def tree(self, tmp, rows, files=('AGENTS.md',), extra=''):
+        root = Path(tmp)
+        for rel in files:
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('x\n', encoding='utf-8')
+        target = root / validate.REPO_MAP_DOC
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(registration_map(rows, extra), encoding='utf-8')
+        return root
+
+    def test_the_map_of_this_tree_is_consistent(self):
+        if not (ROOT / validate.REPO_MAP_DOC).is_file():
+            # A release package carries no map; the gate must not invent one or
+            # turn its absence into a failure (issue #154 AC-7 / AC-8).
+            self.assertEqual(validate.documentation_consistency_errors(ROOT), [])
+            return
+        self.assertEqual(validate.repository_map_errors(ROOT), [])
+
+    def test_every_key_file_in_this_tree_is_registered(self):
+        path = ROOT / validate.REPO_MAP_DOC
+        if not path.is_file():
+            self.assertFalse((ROOT / 'docs' / 'architecture').is_dir())
+            return
+        rows = validate.map_registration_rows(path.read_text(encoding='utf-8'))
+        self.assertTrue(rows)
+        self.assertEqual(validate.repository_map_coverage_errors(ROOT, rows), [])
+
+    def test_unregistered_new_file_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp,
+                '| [`AGENTS.md`](../../AGENTS.md) | `authoritative` | `ACTIVE` | 发行包 | x |\n',
+                files=('AGENTS.md', 'docs/notes.md'))
+            errors = validate.repository_map_errors(root)
+        self.assertTrue(any('docs/notes.md is not registered' in e for e in errors), errors)
+
+    def test_directory_row_covers_the_files_below_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp,
+                '| [`AGENTS.md`](../../AGENTS.md) | `authoritative` | `ACTIVE` | 发行包 | x |\n'
+                '| [`templates/`](../../templates/) | `reference` | `ACTIVE` | 发行包 | x |\n',
+                files=('AGENTS.md', 'templates/task-packet.md'))
+            self.assertEqual(validate.repository_map_errors(root), [])
+
+    def test_mixed_container_row_does_not_cover_its_documents(self):
+        # `docs/` is an index row (`mixed`), not coverage proof: every document
+        # below it still has to be registered in the per-section tables.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp,
+                '| [`AGENTS.md`](../../AGENTS.md) | `authoritative` | `ACTIVE` | 发行包 | x |\n'
+                '| [`docs/`](../../docs/) | `mixed`（见 §4） | `ACTIVE` | 仅仓库 | x |\n',
+                files=('AGENTS.md', 'docs/orchestration.md'))
+            errors = validate.repository_map_errors(root)
+        self.assertTrue(any('docs/orchestration.md is not registered' in e for e in errors), errors)
+
+    def test_registered_path_missing_on_disk_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp,
+                '| [`AGENTS.md`](../../AGENTS.md) | `authoritative` | `ACTIVE` | 发行包 | x |\n'
+                '| [`docs/gone.md`](../gone.md) | `reference` | `ACTIVE` | 仅仓库 | x |\n')
+            errors = validate.repository_map_errors(root)
+        self.assertTrue(any('docs/gone.md is registered but missing' in e for e in errors), errors)
+
+    def test_unknown_purpose_tag_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp,
+                '| [`AGENTS.md`](../../AGENTS.md) | `vendor` | `ACTIVE` | 发行包 | x |\n')
+            errors = validate.repository_map_errors(root)
+        self.assertTrue(any('unknown purpose tag: vendor' in e for e in errors), errors)
+
+    def test_unknown_lifecycle_state_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp,
+                '| [`AGENTS.md`](../../AGENTS.md) | `authoritative` | `DONE` | 发行包 | x |\n')
+            errors = validate.repository_map_errors(root)
+        self.assertTrue(any('unknown lifecycle state: DONE' in e for e in errors), errors)
+
+    def test_outdated_without_a_successor_or_explicit_decision_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp,
+                '| [`AGENTS.md`](../../AGENTS.md) | `outdated` | `ACTIVE` | 仅仓库 | x |\n')
+            errors = validate.repository_map_errors(root)
+        self.assertTrue(any('outdated without a successor or an explicit 无替代' in e
+                            for e in errors), errors)
+
+    def test_outdated_with_an_explicit_no_successor_decision_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp,
+                '| [`AGENTS.md`](../../AGENTS.md) | `outdated` | `ACTIVE` | 仅仓库 '
+                '| 无替代：Owner 决定不再维护，保留理由与退出条件见 §9.2 |\n')
+            self.assertEqual(validate.repository_map_errors(root), [])
+
+    def test_archived_row_must_state_retention_and_a_successor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp,
+                '| [`AGENTS.md`](../../AGENTS.md) | `reference` | `ARCHIVED` | 仅仓库 | old |\n')
+            errors = validate.repository_map_errors(root)
+        self.assertTrue(any('ARCHIVED must state retention and a successor' in e
+                            for e in errors), errors)
+
+    def test_exception_section_must_name_private_and_derived_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'AGENTS.md').write_text('x\n', encoding='utf-8')
+            target = root / validate.REPO_MAP_DOC
+            target.parent.mkdir(parents=True)
+            target.write_text(
+                '# map\n\n## 3. 顶层目录与根文件\n\n' + MAP_HEADER
+                + '| [`AGENTS.md`](../../AGENTS.md) | `authoritative` | `ACTIVE` | 发行包 | x |\n',
+                encoding='utf-8')
+            errors = validate.repository_map_errors(root)
+        self.assertTrue(any('例外登记' in e for e in errors), errors)
+        self.assertTrue(any('derived-local' in e for e in errors), errors)
+
+    def test_missing_map_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            errors = validate.repository_map_errors(Path(tmp))
+        self.assertTrue(any('missing required document' in e or 'repository map' in e
+                            for e in errors), errors)
+
+
+class LegacyPathTests(unittest.TestCase):
+    """A migrated path may only appear where the migration registry allows it."""
+
+    OLD = 'old/thing.md'
+    NEW = 'docs/thing.md'
+
+    def lifecycle(self, allowed='`docs/history.md`', replacement='`docs/thing.md`'):
+        return ('# lifecycle\n\n'
+                '### 7.1 旧路径登记（迁移 / 兼容例外）\n\n'
+                '| 旧路径 | 替代路径 | 允许出现的文件 | 生效版本 | 说明 |\n'
+                '|---|---|---|---|---|\n'
+                f'| `{self.OLD}` | {replacement} | {allowed} | 1.5 | moved |\n')
+
+    def tree(self, tmp, files, allowed='`docs/history.md`', replacement='`docs/thing.md`'):
+        root = Path(tmp)
+        for rel, text in files.items():
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding='utf-8')
+        target = root / validate.LIFECYCLE_DOC
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.lifecycle(allowed=allowed, replacement=replacement),
+                          encoding='utf-8')
+        return root
+
+    def test_repository_registry_passes_and_is_only_required_upstream(self):
+        if not (ROOT / validate.LIFECYCLE_DOC).is_file():
+            # A package ships neither the lifecycle document nor a migrated
+            # path, so the legacy gate must stay silent there.
+            self.assertEqual(validate.legacy_path_errors(ROOT),
+                             [f'missing legacy path registry: {validate.LIFECYCLE_DOC}'])
+            return
+        self.assertEqual(validate.legacy_path_errors(ROOT), [])
+
+    def test_registered_file_may_name_the_legacy_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {
+                self.NEW: '# thing\n',
+                'docs/history.md': f'# history\n\nbefore: `{self.OLD}`\n',
+            })
+            self.assertEqual(validate.legacy_path_errors(root), [])
+
+    def test_unregistered_file_naming_the_legacy_path_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {
+                self.NEW: '# thing\n',
+                'docs/history.md': f'# history\n\nbefore: `{self.OLD}`\n',
+                'docs/notes.md': f'# notes\n\nread `{self.OLD}` first.\n',
+            })
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('docs/notes.md: legacy path old/thing.md is not registered' in e
+                            for e in errors), errors)
+
+    def test_mention_inside_a_fenced_block_is_not_a_current_instruction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {
+                self.NEW: '# thing\n',
+                'docs/history.md': '# history\n',
+                'docs/example.md': f'# example\n\n```json\n{{"path": "{self.OLD}"}}\n```\n',
+            })
+            self.assertEqual(validate.legacy_path_errors(root), [])
+
+    def test_registry_without_an_existing_replacement_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {'docs/history.md': '# history\n'},
+                             replacement='`docs/missing-successor.md`')
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('successor docs/missing-successor.md does not exist' in e
+                            for e in errors), errors)
+
+    def test_registry_naming_a_missing_allowed_file_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {self.NEW: '# thing\n'},
+                             allowed='`docs/never-written.md`')
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('allowed file docs/never-written.md does not exist' in e
+                            for e in errors), errors)
+
+    def test_legacy_path_still_present_on_disk_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {self.NEW: '# thing\n', self.OLD: '# duplicate authority\n',
+                                   'docs/history.md': '# history\n'})
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('legacy path old/thing.md still exists' in e for e in errors), errors)
+
+
+class DocumentationImpactTests(unittest.TestCase):
+    """Every important change records UPDATE / NO_CHANGE / NOT_APPLICABLE plus a reason."""
+
+    HEADER = ('  | path | status | change or reason |\n'
+              '  |---|---|---|\n')
+
+    def impact(self, rows):
+        return ('- **Task ID:** T-1\n'
+                '- **Title:** t\n'
+                '- **Documentation impact:**\n'
+                + self.HEADER + rows)
+
+    def errors(self, rows, header=None):
+        text = self.impact(rows)
+        if header is not None:
+            text = text.replace(self.HEADER, header)
+        return validate.docs_impact_errors(text, label='packet')
+
+    def test_update_and_no_change_rows_pass(self):
+        rows = ('  | `docs/README.md` | UPDATE | added the gate section |\n'
+                '  | `AGENTS.md` | NO_CHANGE | no rule or wording changed |\n')
+        self.assertEqual(self.errors(rows), [])
+
+    def test_not_applicable_with_a_reason_passes(self):
+        rows = '  | `docs/orchestration.md` | NOT_APPLICABLE | no contract field changed |\n'
+        self.assertEqual(self.errors(rows), [])
+
+    def test_missing_field_is_reported(self):
+        errors = validate.docs_impact_errors('- **Task ID:** T-1\n', label='packet')
+        self.assertTrue(any('missing required field: documentation impact' in e
+                            for e in errors), errors)
+
+    def test_missing_table_is_reported(self):
+        errors = validate.docs_impact_errors(
+            '- **Task ID:** T-1\n- **Documentation impact:** none\n', label='packet')
+        self.assertTrue(any('documentation impact table not found' in e for e in errors), errors)
+
+    def test_unknown_status_is_reported(self):
+        errors = self.errors('  | `docs/README.md` | DONE | x |\n')
+        self.assertTrue(any('unknown status: DONE' in e for e in errors), errors)
+
+    def test_no_change_without_a_reason_is_reported(self):
+        for reason in ('(none)', 'none', 'N/A', ''):
+            with self.subTest(reason=reason):
+                errors = self.errors(f'  | `AGENTS.md` | NO_CHANGE | {reason} |\n')
+                self.assertTrue(any('NO_CHANGE without a reason' in e for e in errors), errors)
+
+    def test_not_applicable_without_a_reason_is_reported(self):
+        errors = self.errors('  | `AGENTS.md` | NOT_APPLICABLE | |\n')
+        self.assertTrue(any('NOT_APPLICABLE without a reason' in e for e in errors), errors)
+
+    def test_update_without_a_change_description_is_reported(self):
+        errors = self.errors('  | `docs/README.md` | UPDATE | |\n')
+        self.assertTrue(any('UPDATE without a change description' in e for e in errors), errors)
+
+    def test_empty_table_is_reported(self):
+        errors = self.errors('')
+        self.assertTrue(any('lists no documents' in e for e in errors), errors)
+
+    def test_duplicate_path_is_reported(self):
+        rows = ('  | `docs/README.md` | UPDATE | a |\n'
+                '  | `docs/README.md` | NO_CHANGE | b |\n')
+        errors = self.errors(rows)
+        self.assertTrue(any('lists docs/README.md more than once' in e for e in errors), errors)
+
+    def test_escaping_path_is_reported(self):
+        errors = self.errors('  | `../outside.md` | UPDATE | a |\n')
+        self.assertTrue(any('must be repo-relative' in e for e in errors), errors)
+
+    def test_template_and_checklist_carry_the_impact_contract(self):
+        self.assertEqual(validate.docs_impact_template_errors(ROOT), [])
+
+    def test_packet_without_an_impact_record_is_rejected_when_required(self):
+        builder = TaskPacketMatrixTests('test_legal_packet_passes')
+        builder.evidence_fields, builder.status_values = canonical()
+        builder.structured = validate.canonical_packet_fields(
+            (ROOT / validate.CORE_DOC).read_text(encoding='utf-8'))
+        text = builder.packet(impact=False)
+        errors = validate.validate_task_packet(
+            text, builder.evidence_fields, builder.status_values,
+            label='packet', structured_fields=builder.structured,
+            require_docs_impact=True)
+        self.assertTrue(any('missing required field: documentation impact' in e
+                            for e in errors), errors)
+
+    def test_packet_with_an_impact_record_passes_when_required(self):
+        builder = TaskPacketMatrixTests('test_legal_packet_passes')
+        builder.evidence_fields, builder.status_values = canonical()
+        builder.structured = validate.canonical_packet_fields(
+            (ROOT / validate.CORE_DOC).read_text(encoding='utf-8'))
+        text = builder.packet()
+        errors = validate.validate_task_packet(
+            text, builder.evidence_fields, builder.status_values,
+            label='packet', structured_fields=builder.structured,
+            require_docs_impact=True)
+        self.assertEqual(errors, [])
+
+
+class PlanStatusTests(unittest.TestCase):
+    """The plan may only assert what the repository can prove; the rest is manual."""
+
+    TABLE = ('## 1. 当前状态（唯一状态表）\n\n'
+             '| 任务 | 交付 | 状态 | 依赖 / 阻塞 / 下一步 |\n|---|---|---|---|\n')
+
+    def plan(self, tmp, rows):
+        root = Path(tmp)
+        target = root / validate.PLAN_DOC
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('# plan\n\n' + self.TABLE + rows, encoding='utf-8')
+        return root
+
+    def test_plan_passes_and_reports_manual_verification(self):
+        if not (ROOT / validate.PLAN_DOC).is_file():
+            self.assertEqual(validate.plan_status_errors(ROOT),
+                             [f'missing phase plan: {validate.PLAN_DOC}'])
+            self.assertEqual(validate.plan_status_manual_lines(ROOT), [])
+            return
+        self.assertEqual(validate.plan_status_errors(ROOT), [])
+        lines = validate.plan_status_manual_lines(ROOT)
+        self.assertTrue(lines)
+        self.assertIn('待人工核验', '\n'.join(lines))
+        self.assertIn('#154', '\n'.join(lines))
+
+    def test_unknown_status_token_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.plan(tmp, '| [#1](https://github.com/o/r/issues/1) | x | `SHIPPED` | y |\n')
+            errors = validate.plan_status_errors(root)
+        self.assertTrue(any('status SHIPPED is not a known task state' in e for e in errors), errors)
+
+    def test_completion_claim_without_evidence_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.plan(tmp, '| [#1](https://github.com/o/r/issues/1) | x | `VERIFIED` | y |\n')
+            errors = validate.plan_status_errors(root)
+        self.assertTrue(any('claims VERIFIED without an evidence pointer' in e
+                            for e in errors), errors)
+
+    def test_completion_claim_with_a_link_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.plan(tmp, '| [#1](https://github.com/o/r/issues/1) | x | `VERIFIED` '
+                                  '| [PR](https://github.com/o/r/pull/2) merged |\n')
+            self.assertEqual(validate.plan_status_errors(root), [])
+
+    def test_negated_completion_is_not_a_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.plan(tmp, '| [#1](https://github.com/o/r/issues/1) | x | `OPEN`；未 `VERIFIED` | y |\n')
+            self.assertEqual(validate.plan_status_errors(root), [])
+
+    def test_missing_status_table_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / validate.PLAN_DOC
+            target.parent.mkdir(parents=True)
+            target.write_text('# plan\n\nno table here\n', encoding='utf-8')
+            errors = validate.plan_status_errors(root)
+        self.assertTrue(any('no task status table found' in e for e in errors), errors)
+
+    def test_reading_the_plan_never_writes_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.plan(tmp, '| [#1](https://github.com/o/r/issues/1) | x | `OPEN` | y |\n')
+            before = (root / validate.PLAN_DOC).read_bytes()
+            validate.plan_status_errors(root)
+            validate.plan_status_manual_lines(root)
+            self.assertEqual((root / validate.PLAN_DOC).read_bytes(), before)
+
+
+class ReleaseConsistencyTests(unittest.TestCase):
+    """REQUIRED, MANIFEST and the package self-check must agree on one rule set."""
+
+    def rules(self, **overrides):
+        arguments = dict(
+            required=list(validate.REQUIRED),
+            package_doc_paths={'docs/orchestration.md'},
+            forbidden_paths={'scripts/build_release.py'},
+            forbidden_segments={'.orchestration', 'release', '.worktrees', '.workbuddy',
+                                '.git', '.local'},
+        )
+        arguments.update(overrides)
+        return validate.release_rule_errors(**arguments)
+
+    def test_repository_rules_agree(self):
+        self.assertEqual(self.rules(), [])
+        self.assertEqual(validate.release_consistency_errors(ROOT), [])
+
+    def test_upstream_design_document_in_required_is_reported(self):
+        errors = self.rules(required=list(validate.REQUIRED) + ['docs/design/resource-locks.md'])
+        self.assertTrue(any('must not ship' in e and 'docs/design/resource-locks.md' in e
+                            for e in errors), errors)
+
+    def test_archived_document_in_required_is_reported(self):
+        errors = self.rules(required=list(validate.REQUIRED) + ['docs/architecture/document-lifecycle.md'])
+        self.assertTrue(any('must not ship' in e for e in errors), errors)
+
+    def test_build_script_must_be_forbidden(self):
+        errors = self.rules(forbidden_paths=set())
+        self.assertTrue(any('must be listed as a forbidden release path' in e for e in errors), errors)
+
+    def test_private_segment_in_required_is_reported(self):
+        errors = self.rules(required=list(validate.REQUIRED) + ['.orchestration/state.sqlite3'])
+        self.assertTrue(any('forbidden path segment' in e for e in errors), errors)
+
+    def test_allowlist_entry_outside_required_is_reported(self):
+        errors = self.rules(package_doc_paths={'docs/orchestration.md', 'docs/README.md'})
+        self.assertTrue(any('names a file that is not in REQUIRED' in e for e in errors), errors)
+
+    def test_allowlist_may_only_name_docs_files(self):
+        errors = self.rules(package_doc_paths={'AGENTS.md'})
+        self.assertTrue(any('may only name docs/ files' in e for e in errors), errors)
+
+    def test_missing_private_segment_rule_is_reported(self):
+        errors = self.rules(forbidden_segments={'release'})
+        self.assertTrue(any('must forbid the path segment .orchestration' in e for e in errors), errors)
+
+    def test_release_standard_must_document_the_allowlist(self):
+        if not BUILD_SCRIPT.is_file():
+            # The builder never ships, so a package has nothing to compare.
+            self.assertEqual(validate.release_consistency_errors(ROOT), [])
+            return
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'scripts').mkdir()
+            for name in ('build_release.py', 'check_drift.py'):
+                (root / 'scripts' / name).write_text(
+                    (ROOT / 'scripts' / name).read_text(encoding='utf-8'), encoding='utf-8')
+            (root / 'release').mkdir()
+            (root / 'release' / 'README.md').write_text('# release\n\nno allowlist here\n',
+                                                        encoding='utf-8')
+            errors = validate.release_consistency_errors(root)
+        self.assertTrue(any('release/README.md must document' in e for e in errors), errors)
+
+
+class IsolatedLayoutEntryTests(unittest.TestCase):
+    """An isolated install has no kit-root AGENTS.md; that is never a missing file."""
+
+    def test_kit_root_entry_is_not_required_in_the_isolated_layout(self):
+        kit_required = (validate.ISOLATED_REQUIRED if hasattr(validate, 'ISOLATED_REQUIRED')
+                        else validate.REQUIRED)
+        self.assertNotIn('AGENTS.md', validate.ISOLATED_REQUIRED)
+        self.assertIn('.gitignore', validate.ISOLATED_MANIFEST_PATHS)
+        self.assertTrue(kit_required)
+
+    def test_isolated_tree_does_not_report_a_missing_kit_root_agents_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = Path(tmp)
+            root = host / 'agentorch'
+            root.mkdir()
+            (root / 'VERSION.md').write_text(
+                (ROOT / 'VERSION.md').read_text(encoding='utf-8'), encoding='utf-8')
+            (root / 'MANIFEST.json').write_text('{}', encoding='utf-8')
+            (host / 'AGENTS.md').write_text('# host rules\n', encoding='utf-8')
+            errors, _ = validate.validate_kit(root)
+        self.assertFalse(any('missing required file: AGENTS.md' in e for e in errors), errors)
+
+    def test_a_plain_checkout_still_requires_the_root_agents_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            errors, _ = validate.validate_kit(Path(tmp))
+        self.assertTrue(any('missing required file: AGENTS.md' in e for e in errors), errors)
+
+    def test_isolated_manifest_paths_are_the_shipped_set_plus_the_host_ignore(self):
+        self.assertEqual(set(validate.ISOLATED_MANIFEST_PATHS),
+                         set(validate.ISOLATED_REQUIRED) | {'.gitignore'})
+
+
+class DocumentGateBoundaryTests(unittest.TestCase):
+    """The gates must stay upstream-only and must not police a host project."""
+
+    def downstream_tree(self, tmp):
+        root = Path(tmp)
+        for rel in validate.REQUIRED:
+            target = root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT / rel, target)
+        (root / 'docs').mkdir(parents=True, exist_ok=True)
+        (root / 'docs' / 'PROJECT.md').write_text('# project\n\n- `edition`：`local`\n',
+                                                  encoding='utf-8')
+        (root / 'docs' / 'PLAN.md').write_text('# plan\n\n## 设计目标\n\nx\n', encoding='utf-8')
+        return root
+
+    def test_host_project_files_do_not_need_a_map_row(self):
+        # A host project keeps its own source tree. Only the governance surface
+        # (root entry files, docs/, editions/, templates/) is registered; source,
+        # test and vendored files never force an edit to the upstream map.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'AGENTS.md').write_text('x\n', encoding='utf-8')
+            (root / 'docs').mkdir()
+            (root / 'docs' / 'orchestration.md').write_text('x\n', encoding='utf-8')
+            target = root / validate.REPO_MAP_DOC
+            target.parent.mkdir(parents=True)
+            target.write_text(
+                registration_map(
+                    '| [`AGENTS.md`](../../AGENTS.md) | `authoritative` | `ACTIVE` | 发行包 | x |\n'
+                    '| [`docs/orchestration.md`](../orchestration.md) | `authoritative` '
+                    '| `ACTIVE` | 发行包 | x |\n'),
+                encoding='utf-8')
+            (root / 'src').mkdir()
+            (root / 'src' / 'app.py').write_text('x = 1\n', encoding='utf-8')
+            (root / 'scripts').mkdir()
+            (root / 'scripts' / 'extra_tool.py').write_text('# tool\n', encoding='utf-8')
+            (root / 'tests').mkdir()
+            (root / 'tests' / 'test_project.py').write_text('# test\n', encoding='utf-8')
+            vendored = root / 'node_modules' / 'plugin'
+            vendored.mkdir(parents=True)
+            (vendored / 'README.md').write_text('[broken](missing.md)\n', encoding='utf-8')
+            errors = validate.repository_map_errors(root)
+        self.assertEqual(errors, [])
+
+    def test_a_downstream_tree_does_not_require_a_map_and_keeps_the_host_ignore(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.downstream_tree(tmp)
+            ignore = root / '.gitignore'
+            host_ignore = '# host rules only\n/build/\n'
+            ignore.write_text(host_ignore, encoding='utf-8')
+            errors, _ = validate.validate_kit(root)
+            self.assertFalse(any('.gitignore' in error for error in errors), errors)
+            self.assertFalse(any('repository map' in error for error in errors), errors)
+            self.assertEqual(ignore.read_text(encoding='utf-8'), host_ignore)
+
+    def test_a_broken_link_in_the_repository_map_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / validate.REPO_MAP_DOC
+            target.parent.mkdir(parents=True)
+            target.write_text(
+                registration_map(
+                    '| [`AGENTS.md`](../../AGENTS.md) | `authoritative` | `ACTIVE` | 发行包 | x |\n')
+                + '\nSee [the missing design](missing-design.md).\n', encoding='utf-8')
+            (root / 'AGENTS.md').write_text('x\n', encoding='utf-8')
+            errors, _ = validate.validate_kit(root)
+        expected = f'{validate.REPO_MAP_DOC}: broken relative link: missing-design.md'
+        self.assertTrue(any(expected in e for e in errors), errors)
+
+    def test_cli_prints_the_manual_verification_line_without_failing(self):
+        result = subprocess.run([sys.executable, '-B', str(SCRIPT)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Kit validation passed', result.stdout)
+        if UPSTREAM_CHECKOUT:
+            self.assertIn(validate.PLAN_UNPROVEN_NOTE, result.stdout)
+            self.assertIn('#154', result.stdout)
+        else:
+            # No phase plan ships, so there is nothing to verify manually.
+            self.assertNotIn(validate.PLAN_UNPROVEN_NOTE, result.stdout)
 
 
 if __name__ == '__main__':

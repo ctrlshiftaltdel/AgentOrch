@@ -289,6 +289,37 @@ def indent(text, prefix='      '):
     return '\n'.join(prefix + line for line in lines)
 
 
+def package_set_errors(packaged, required, manifest_name=None):
+    """Self-check (a): the packaged set must equal REQUIRED + MANIFEST.json.
+
+    Split out of `run_self_check` so the rule can be negative-tested without
+    building an archive: a file that silently stopped shipping and a file that
+    should never ship are different defects and must both be reported.
+    """
+    manifest_name = manifest_name or MANIFEST_NAME
+    failures = []
+    expected_set = set(required) | {manifest_name}
+    packaged_set = set(packaged)
+    missing = sorted(expected_set - packaged_set)
+    extra = sorted(packaged_set - expected_set)
+    if missing:
+        failures.append(f'(a) package is missing REQUIRED files: {", ".join(missing)}')
+    if extra:
+        failures.append(f'(a) package contains files not in REQUIRED + {manifest_name}: '
+                        f'{", ".join(extra)}')
+    seen, duplicated = set(), []
+    for rel in packaged:
+        if rel in seen and rel not in duplicated:
+            duplicated.append(rel)
+        seen.add(rel)
+    if duplicated:
+        failures.append(f'(a) package lists a file more than once: {", ".join(sorted(duplicated))}')
+    if len(packaged) != len(expected_set):
+        failures.append(f'(a) package file count {len(packaged)} != '
+                        f'REQUIRED + {manifest_name} count {len(expected_set)}')
+    return failures
+
+
 def run_self_check(zip_path, required, top_dir, extra_patterns=()):
     """Run checks a-j and return a list of human-readable failure strings."""
     failures = []
@@ -298,18 +329,7 @@ def run_self_check(zip_path, required, top_dir, extra_patterns=()):
     packaged = [n[len(top_dir) + 1:] for n in names if n.startswith(top_dir + '/')]
 
     # (a) packaged file set == REQUIRED + MANIFEST.json
-    expected_set = set(required) | {MANIFEST_NAME}
-    packaged_set = set(packaged)
-    missing = sorted(expected_set - packaged_set)
-    extra = sorted(packaged_set - expected_set)
-    if missing:
-        failures.append(f'(a) package is missing REQUIRED files: {", ".join(missing)}')
-    if extra:
-        failures.append(f'(a) package contains files not in REQUIRED + {MANIFEST_NAME}: '
-                        f'{", ".join(extra)}')
-    if len(packaged) != len(expected_set):
-        failures.append(f'(a) package file count {len(packaged)} != '
-                        f'REQUIRED + {MANIFEST_NAME} count {len(expected_set)}')
+    failures.extend(package_set_errors(packaged, required))
 
     # (f, structural) forbidden path segments / files
     for rel in sorted(packaged):

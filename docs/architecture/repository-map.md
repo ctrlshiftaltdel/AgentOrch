@@ -19,6 +19,7 @@
 | `reference` | 导航、用户说明、设计提案、实现记录、证据映射或可复制模板；**不重复定义规则**。 | 可以解释“怎么用”，不能改写权威语义。 |
 | `implementation` | 源码、测试、验证器、构建 / 迁移逻辑、CI 配置与测试夹具。 | 行为以代码和测试为准；文档只解释边界。 |
 | `derived-local` | 生成文件、机器私有记录或本机配置。 | 必须明确是否入库、同步、打包；默认不入库、不打包。 |
+| `mixed` | 目录内文件用途不同，逐文件用途见对应盘点小节。 | 只表达“这是索引行”，**不构成登记覆盖**：该目录下的每个文档仍须在对应小节单独登记。 |
 | `outdated` | 已过时、被替代或仅供历史追溯的文件。 | 必须给出替代链接、保留理由与退出条件；默认不进入当前阅读路径。缺任一项不得标 `outdated`。 |
 
 生命周期状态（`PROPOSED` / `ACTIVE` / `IMPLEMENTED` / `DROPPED` / `SUPERSEDED` / `ARCHIVED`）及转换规则只在 [document-lifecycle.md](document-lifecycle.md) 定义，本文件不重复。
@@ -30,13 +31,14 @@
 | 路径 | 用途 | 生命周期 | 分发 | 唯一职责 / 权威位置 |
 |---|---|---|---|---|
 | [`AGENTS.md`](../../AGENTS.md) | `authoritative` | `ACTIVE` | 发行包 | 协作契约：角色权限、Git 纪律、证据标准、阅读口径。 |
+| [`README.md`](../../README.md) | `reference` | `ACTIVE` | 仅仓库 | GitHub 首页：产品定位、核心能力与上手指南入口；不定义契约或门禁。 |
 | [`docs/orchestration.md`](../orchestration.md) | `authoritative` | `ACTIVE` | 发行包 | 核心编排：会话入口、任务状态机、锁、合并门 G1–G6、能力契约 C1–C4、验收程序。 |
 | [`editions/local/`](../../editions/local/)（`master.md`、`execution.md`） | `authoritative` | `ACTIVE` | 发行包 | `local` 底座的命令、路径锁与启动 / 执行增量；不得定义另一套核心语义。 |
 | [`editions/github/`](../../editions/github/)（`master.md`、`execution.md`、`issue-template.md`、`pr-template.md`、`active-task-registry.md`） | `authoritative` | `ACTIVE` | 发行包 | `github` 底座的 Issue / PR / 登记块与启动 / 执行增量；不得定义另一套核心语义。 |
 | [`templates/`](../../templates/) | `reference` | `ACTIVE` | 发行包 | 可复制模板与起始结构（项目配置、计划、任务包、设计契约、审计、审查、能力、指标、架构、自我完善）。模板只提供结构，不是规则权威。 |
 | [`scripts/`](../../scripts/) | `implementation` | `ACTIVE` | 发行包（例外见下） | CLI、验证器、构建、更新引擎与随包测试支撑。 |
 | [`tests/`](../../tests/) | `implementation` | `ACTIVE` | 部分发行包 | 可重复验证；仓库专属夹具与读取 `docs/` 的测试不随包发布。 |
-| [`docs/`](../../docs/) | 混合（见 §4） | `ACTIVE` | 仅仓库 | 本仓库的配置、设计目标、阶段状态、设计契约、用户手册与历史材料；`docs` 路径段在发行包中禁止出现。 |
+| [`docs/`](../../docs/) | `mixed`（见 §4；逐文件登记） | `ACTIVE` | 仅仓库 | 本仓库的配置、设计目标、阶段状态、设计契约、用户手册与历史材料；`docs` 路径段在发行包中禁止出现（唯一例外见 §8）。 |
 | [`assets/`](../../assets/)（`agentorch-logo.svg`、`agentorch-mark.svg`） | `reference` | `ACTIVE` | 仅仓库 | GitHub 首页与文档展示用图形资产；不在 `REQUIRED` 中。 |
 | [`release/README.md`](../../release/README.md) | `reference` | `ACTIVE` | 仅仓库 | 发布标准与发布清单；`release/` 目录与 `release/*.zip` 不随包发布。 |
 | [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) | `implementation` | `ACTIVE` | 仅仓库 | 本仓库 CI（登记检查、测试、场景、指标、打包自检）；不随包发布。 |
@@ -92,6 +94,7 @@
 | [`docs/design/deepseek-harness-agent-role-tools.md`](../design/deepseek-harness-agent-role-tools.md) | `authoritative` | `ACTIVE` | DSH 角色工具适配的 `FROZEN` 设计；只冻结适配层，不表示运行时已验证。 |
 | [`docs/design/next-phase-governance-and-agent-performance.md`](../design/next-phase-governance-and-agent-performance.md) | `authoritative` | `ACTIVE`（依据 #147 `VERIFIED`；文件头仍写 `PROPOSED`，见 §9.3） | 下一阶段治理、旧项目接入、ETR 与三角色评价的设计依据；阶段状态仍以 `docs/implementation-plan.md` 为准。 |
 | [`docs/design/adaptive-verification-and-quality-gates.md`](../design/adaptive-verification-and-quality-gates.md) | `reference` | `PROPOSED` | AVE 父级提案；仍是提案，不定义现行门禁。 |
+| [`docs/design/runtime-capability-fast-probe-and-collaboration.md`](../design/runtime-capability-fast-probe-and-collaboration.md) | `reference` | `PROPOSED` | 运行时能力快速探测与受控协作边界提案（#174）；未冻结、未实现，不修改 C1–C4。 |
 | [`docs/design/verification-planner-b-contract.md`](../design/verification-planner-b-contract.md) | `authoritative` | `ACTIVE` | AVE B 阶段只读影子 Gate Planner 的 `FROZEN` 子契约。 |
 | [`docs/design/verification-impact-c-contract.md`](../design/verification-impact-c-contract.md) | `authoritative` | `ACTIVE` | AVE C 阶段只读影响面与证据影子的 `FROZEN` 子契约。 |
 | [`docs/design/semver-proactive-release-policy.md`](../design/semver-proactive-release-policy.md) | `reference` | `PROPOSED` | 主动式 SemVer 发行节奏提案；不替代 `release/README.md` 或现行授权规则。 |
@@ -102,6 +105,7 @@
 | 路径 | 用途 | 生命周期 | 唯一职责 / 权威位置 |
 |---|---|---|---|
 | [`docs/testing/delivery-regression-scenarios.md`](../testing/delivery-regression-scenarios.md) | `authoritative` | `ACTIVE` | 合成回归场景目录、正负组判定、场景矩阵、fixture 规则与未验证范围；场景 ID 与预期拦截门只在这里定义。 |
+| [`docs/testing/document-consistency-gates.md`](../testing/document-consistency-gates.md) | `reference` | `ACTIVE` | 文件责任 / 文档影响 / 计划状态一致性门禁的检查口径、登记约定、例外与未覆盖范围；检查实现在 `scripts/validate_kit.py`。 |
 
 ### 4.5 自我完善与更新
 
@@ -120,7 +124,7 @@
 | [`docs/self-improvement/update-engine-implementation.md`](../self-improvement/update-engine-implementation.md) | `reference` | `IMPLEMENTED` | 安全更新引擎实现记录；真实 Release 获取等未验证项按文件内标注。 |
 | [`docs/self-improvement/cross-module-state-and-recovery.md`](../self-improvement/cross-module-state-and-recovery.md) | `reference` | `ACTIVE` | 共享状态 / 并发 / 恢复的增量验收检查点 R1–R6；不新增契约字段。 |
 | [`docs/self-improvement/agentmgr-lessons.md`](../self-improvement/agentmgr-lessons.md) | `reference` | `ACTIVE` | AgentMgr 原始证据到泛化原则、规则、测试与限制的映射。 |
-| [`docs/self-improvement/live-scan-2026-10-26.md`](../self-improvement/live-scan-2026-10-26.md) | `reference` | `ARCHIVED` | 首轮真实经验扫描的一次性脱敏报告；保留审计价值，不进入默认阅读路径。 |
+| [`docs/self-improvement/live-scan-2026-10-26.md`](../self-improvement/live-scan-2026-10-26.md) | `reference` | `ARCHIVED` | 首轮真实经验扫描的一次性脱敏报告；保留审计价值，不进入默认阅读路径；替代项为 [sources.json](../self-improvement/sources.json) 与 [sources-and-trust.md](../self-improvement/sources-and-trust.md)，退出条件见 §9.1。 |
 | [`docs/self-improvement/sources.json`](../self-improvement/sources.json) | `authoritative` | `ACTIVE` | 当前来源注册表数据；字段与语义由 `source-registry.schema.json` 与 `sources-and-trust.md` 约束。 |
 | [`docs/self-improvement-and-update-plan.md`](../self-improvement-and-update-plan.md) | `reference` | `IMPLEMENTED` | 自我完善与安全更新的原始设计与实施计划；阶段 #47–#53 已完成，文件头状态段落未同步，见 §9.3。 |
 
@@ -208,6 +212,8 @@ docs/README.md ─────┘  面向人的导航与使用说明
 
 ### 9.4 例外登记
 
+- **派生、私有与归档例外（`derived-local`）**：`.local/`（除跟踪的 `README.md`）、`.orchestration/`、`.worktrees/`、`.workbuddy/`、`__pycache__/`、`.pytest_cache/`、`.mypy_cache/` 与 `docs/images/` 不入库或只作本机 / 展示用途，因此不要求逐文件登记；`docs/images/` 只按正文引用按需查看，禁止批量读取。该豁免必须写在本节，未写入的路径一律按未登记处理。
+- **归档例外**：`ARCHIVED` / `SUPERSEDED` 条目必须同时给出保留理由与替代项（或显式“无替代”），否则只能登记为 §9.3 的候选过期；状态与规则见 [document-lifecycle.md](document-lifecycle.md) §6.1。
 - `docs/architecture/repository-map.md` 与 `docs/architecture/document-lifecycle.md` 是本任务新增的文件责任 / 生命周期权威；它们不改变任何现有规则文件，也不把 `docs/` 除核心契约外的内容带入发行包。
 - 核心契约的唯一权威版本是 [`docs/orchestration.md`](../orchestration.md)（#151 路径迁移；旧 `kit/orchestration.md` 不再分发，也不得作为第二个权威）。迁移本身不改变状态机、G1–G6、C1–C4 / C1–C8 的语义。
 
@@ -217,4 +223,5 @@ docs/README.md ─────┘  面向人的导航与使用说明
 2. **一项规则一个权威位置**：发现同一规则出现第二处定义时，先停下登记缺陷，不在本文件“顺手”再写一份。
 3. **过期先登记再处置**：候选过期只登记证据与建议；转为 `outdated` 必须满足 [document-lifecycle.md](document-lifecycle.md) 的替代链接、保留理由、退出条件与决定依据。
 4. **不移动、不删除**：本任务只做盘点与导航；迁移 / 归档 / 删除必须另立任务，并更新 `REQUIRED`、构建、更新引擎与所有引用。
-5. **验证**：改动后运行 `uv run python scripts/validate_kit.py`，并手工核对本文件新增的每个相对链接与仓库路径真实存在。
+5. **登记覆盖由检查保证**：新增、迁移或删除 `docs/`、`editions/`、`templates/` 下任一文件时，必须同步本文件；`scripts/validate_kit.py` 会报出未登记文件、缺失的登记路径、词表外的用途 / 生命周期、缺替代项的 `outdated` 以及未写入 `例外登记` 的豁免。`scripts/` 与 `tests/` 由目录行覆盖，不为单个源文件登记。
+6. **验证**：改动后运行 `uv run python scripts/validate_kit.py`，并手工核对本文件新增的每个相对链接与仓库路径真实存在。
