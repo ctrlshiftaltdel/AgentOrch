@@ -5069,17 +5069,14 @@ class PortableWriteSessionTest(unittest.TestCase):
     def test_append_refuses_metadata_it_cannot_prove(self):
         target = self.root / 'AGENTS.md'
         target.write_bytes(b'host\n')
-        if hasattr(os, 'setxattr'):
-            try:
-                os.setxattr(target, b'user.synthetic', b'1')
-            except OSError as exc:
-                unsupported = {errno.ENOTSUP, getattr(errno, 'EOPNOTSUPP', errno.ENOTSUP)}
-                if exc.errno not in unsupported:
-                    raise
-                # The filesystem proved it stores no extended attributes, so
-                # there is nothing an append could fail to preserve.
-                self.assertEqual(workspace._xattr_names(target), [])
-                return
+        try:
+            set_xattr(target, 'user.review', b'preserve-me')
+        except XattrUnavailable:
+            # No platform API can store an attribute here, so the writer can
+            # only fail closed because it cannot enumerate at all (Windows).
+            pass
+        else:
+            self.assertIn('user.review', workspace._xattr_names(target))
         with self.assertRaises(workspace.TransactionConflict) as raised:
             self.session.append('AGENTS.md', b'host\n', b'host\nmore\n')
         self.assertIn('extended attributes', str(raised.exception))
