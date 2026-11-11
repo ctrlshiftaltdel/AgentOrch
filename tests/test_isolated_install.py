@@ -20,6 +20,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -426,10 +427,118 @@ def raw_snapshot(root: Path, *, skip_names=()) -> dict[str, str]:
     return found
 
 
-def markdown_links(text: str):
+def object_snapshot(root: Path, *, skip_names=()) -> dict[str, tuple]:
+    """Snapshot every object *without* following links or resolving targets.
+
+    ``raw_snapshot`` skips symlinks and never records directories, so it cannot
+    prove that a host keeps the objects it had. This snapshot is structural:
+
+    - regular file -> ``('file', sha256(raw bytes))``;
+    - symlink -> ``('symlink', os.readlink(path))``: the stored target string,
+      never ``read_bytes`` and never ``resolve``, so following the link cannot
+      hide a change and an external target is never opened;
+    - directory -> ``('dir',)``: presence only, which is what makes an empty
+      directory observable at all.
+
+    Anything else is recorded as ``('other', <file type>)`` instead of being
+    silently dropped.
+    """
+    root = Path(root)
+    found: dict[str, tuple] = {}
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(dirpath)
+        if base == root:
+            dirnames[:] = [name for name in dirnames if name not in skip_names]
+        for name in list(dirnames) + list(filenames):
+            path = base / name
+            rel = path.relative_to(root).as_posix()
+            if rel.split('/')[0] in skip_names:
+                continue
+            info = os.lstat(path)
+            if stat.S_ISLNK(info.st_mode):
+                found[rel] = ('symlink', os.readlink(path))
+            elif stat.S_ISDIR(info.st_mode):
+                found[rel] = ('dir',)
+            elif stat.S_ISREG(info.st_mode):
+                with open(path, 'rb') as handle:
+                    found[rel] = ('file', hashlib.sha256(handle.read()).hexdigest())
+            else:
+                found[rel] = ('other', stat.S_IFMT(info.st_mode))
+    return found
+
+
+def _resolved(path) -> Path | None:
+    try:
+        return Path(path).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def read_touches(reads, *targets) -> bool:
+    """True when one recorded read resolves to any of *targets*.
+
+    A read performed *through* a symlink is recorded as the link, not as its
+    target, so both sides are resolved before comparing. Without that, following
+    a link would look indistinguishable from leaving the target untouched.
+    """
+    wanted = {resolved for resolved in (_resolved(target) for target in targets)
+              if resolved is not None}
+    for recorded in reads:
+        candidate = _resolved(recorded)
+        if candidate is not None and candidate in wanted:
+            return True
+    return False
+
+
+def _strip_markdown_code(text: str) -> str:
     text = re.sub(r'```.*?```', '', text, flags=re.S)
-    text = re.sub(r'`[^`\n]*`', '', text)
-    return re.findall(r'\[[^\]]*\]\(([^)]+)\)', text)
+    text = re.sub(r'~~~.*?~~~', '', text, flags=re.S)
+    return re.sub(r'`[^`\n]*`', '', text)
+
+
+def markdown_links(text: str):
+    return re.findall(r'\[[^\]]*\]\(([^)]+)\)', _strip_markdown_code(text))
+
+
+# Reference definitions: ``[id]: path`` and ``[id]: <path with spaces>``.
+REFERENCE_DEFINITION_RE = re.compile(
+    r'^ {0,3}\[([^\]]+)\]:[ \t]*(?:<([^>\n]+)>|(\S+))', re.M)
+
+# Schemes and forms that are not host paths. ``#`` is a pure anchor; ``/`` is an
+# absolute path, which never means a file of the installed tree.
+SKIPPED_LINK_PREFIXES = ('http://', 'https://', 'mailto:', '#', '/', 'tel:')
+
+
+def _normalize_target(target: str) -> str:
+    """Drop surrounding blanks, angle brackets and an inline link title."""
+    target = re.split(r'''\s+(?=["'])''', target.strip(), maxsplit=1)[0]
+    if len(target) > 2 and target.startswith('<') and target.endswith('>'):
+        return target[1:-1]
+    return target
+
+
+def markdown_relative_targets(text: str) -> tuple[list[str], list[str]]:
+    """Local link targets from inline links and reference definitions.
+
+    Returns ``(inline, reference)``. Covered syntax: ``[text](target)`` and
+    ``[text](target "title")``, ``[id]: target``, ``[id]: <target>``.
+
+    Not covered, and therefore never reported as verified: targets inside fenced
+    code blocks or inline code (they are stripped first because they are
+    examples, not links), targets containing ``)``, and HTML ``<a href>`` links.
+    A caller must not describe a pass here as "every link was checked".
+    """
+    body = _strip_markdown_code(text)
+    inline = [_normalize_target(found)
+              for found in re.findall(r'\]\(([^)]+)\)', body)]
+    reference = [angle or plain
+                 for _id, angle, plain in REFERENCE_DEFINITION_RE.findall(body)]
+    return ([target for target in inline if _is_relative(target)],
+            [target for target in reference if _is_relative(target)])
+
+
+def _is_relative(target: str) -> bool:
+    return bool(target) and not target.startswith(SKIPPED_LINK_PREFIXES)
 
 
 # The only substitution is the network transport. Release selection, digest
@@ -2229,6 +2338,42 @@ runpy.run_path(script,run_name='__main__')
         git_at(self.host, 'commit', '-qm', 'synthetic host content')
         return git_at(self.host, 'rev-parse', 'HEAD')
 
+    def _stage_host_objects(self):
+        """Stage the object-snapshot stimuli in the host project.
+
+        Returns ``(canary, links, unexecuted)``: the external canary file, the
+        ``relative path -> symlink target`` map this platform actually staged,
+        and one ``NOT_RUN: ...`` reason per symlink that could not be created.
+
+        A platform without symlink support must not turn this into a pass *or*
+        a whole-case skip: the reason is returned so the caller announces it,
+        and the empty-directory stimulus is staged unconditionally so the
+        snapshot still runs everywhere.
+        """
+        empty = self.host / 'empty-host-dir'
+        empty.mkdir()
+        self.assertEqual(list(empty.iterdir()), [], 'the empty-dir stimulus must stay empty')
+        canary_dir = self.tmp / 'outside-write-set'
+        canary_dir.mkdir()
+        canary = canary_dir / 'canary.txt'
+        canary.write_bytes(b'outside the write set: no install may read this\n')
+        wanted = {
+            'host-note-link.md': 'docs/NOTES.md',
+            'external-canary-link.txt': str(canary),
+        }
+        links: dict[str, str] = {}
+        unexecuted: list[str] = []
+        for rel, target in wanted.items():
+            link = self.host / rel
+            try:
+                os.symlink(target, link)
+            except (AttributeError, NotImplementedError, OSError) as exc:
+                unexecuted.append(
+                    f'NOT_RUN: symlink stimulus {rel} was not exercised: {exc}')
+                continue
+            links[rel] = target
+        return canary, links, unexecuted
+
     def _git_env(self):
         return {**os.environ, 'GIT_AUTHOR_NAME': 'Synthetic Test',
                 'GIT_AUTHOR_EMAIL': 'synthetic@example.invalid',
@@ -3674,6 +3819,85 @@ runpy.run_path(script,run_name='__main__')
         self.assertEqual(text.count(workspace.MANAGED_BEGIN_PREFIX), 1)
         self.assertEqual(text.count(workspace.MANAGED_END), 1)
 
+    def test_ac4_ac10_object_snapshot_keeps_symlinks_and_empty_dirs(self):
+        # raw_snapshot skips symlinks and never records directories, so the AC-4
+        # "nothing outside the allowed area changes" assertion was blind to a
+        # replaced link and to a removed empty directory. This case snapshots the
+        # objects themselves (link target string, directory presence, raw file
+        # bytes) across a real APPLIED install.
+        canary, links, unexecuted = self._stage_host_objects()
+        for reason in unexecuted:
+            # NOT_RUN is announced, never folded into a pass, and never skips the
+            # case: the empty-directory and regular-file stimuli below still run.
+            warnings.warn(reason, RuntimeWarning, stacklevel=2)
+        for rel in ('host-note-link.md', 'external-canary-link.txt'):
+            self.assertTrue(
+                rel in links or any(rel in reason for reason in unexecuted),
+                f'{rel} must be staged or reported NOT_RUN with a reason')
+        canary_bytes = canary.read_bytes()
+        before = object_snapshot(self.host, skip_names=('.git',))
+        self.assertEqual(before['empty-host-dir'], ('dir',))
+        for rel, target in links.items():
+            self.assertEqual(before[rel], ('symlink', target), rel)
+
+        # Positive controls: the recorder really does see a direct read of the
+        # canary and a read *through* the link. Without them a silent install
+        # could pass by leaving the detector blind.
+        with observe_path_reads() as control:
+            canary.read_bytes()
+        self.assertTrue(read_touches(control, canary), 'direct canary read must be recorded')
+        if links:
+            with observe_path_reads() as control:
+                (self.host / 'external-canary-link.txt').read_bytes()
+            self.assertTrue(read_touches(control, canary),
+                            'a read through the link must be attributed to its target')
+
+        with observe_path_reads() as reads:
+            plan, result = self.install()
+        self.assertEqual(result['status'], 'APPLIED', result)
+        self.assertTrue(result['written'])
+        for rel in result['written']:
+            self.assertTrue(rel == 'AGENTS.md' or rel.startswith('agentorch/'), rel)
+        self.assertEqual(canary.read_bytes(), canary_bytes)
+        self.assertFalse(
+            read_touches(reads, canary, self.host / 'external-canary-link.txt'),
+            'the install must not read the external canary nor follow its link')
+        after = object_snapshot(self.host, skip_names=('agentorch', 'AGENTS.md', '.git'))
+        expected = {key: value for key, value in before.items() if key != 'AGENTS.md'}
+        self.assertEqual(after, expected)
+        # Still a link with the same target string, not a followed copy.
+        for rel, target in links.items():
+            self.assertEqual(os.readlink(self.host / rel), target, rel)
+
+    def test_ac4_failure_path_object_snapshot_keeps_symlinks_and_empty_dirs(self):
+        # Same structural snapshot on the fail-closed path: a blocked plan must
+        # leave links, directory presence and the external canary untouched.
+        agents = self.host / 'AGENTS.md'
+        original = agents.read_bytes()
+        duplicate = original + b'\n' + workspace.managed_block(FORMAT_VERSION).encode('utf-8') * 2
+        agents.write_bytes(duplicate)
+        canary, links, unexecuted = self._stage_host_objects()
+        for reason in unexecuted:
+            warnings.warn(reason, RuntimeWarning, stacklevel=2)
+        staged = object_snapshot(self.host)
+        self.assertEqual(staged['empty-host-dir'], ('dir',))
+        canary_bytes = canary.read_bytes()
+        before = object_snapshot(self.host)
+        for rel, target in links.items():
+            self.assertEqual(before[rel], ('symlink', target), rel)
+        with observe_path_reads() as reads:
+            plan = self.plan()
+            self.assertEqual(plan.status, 'STOPPED_CONFLICT', plan.problems)
+            result = workspace.apply_isolated_onboarding(plan)
+        self.assertNotEqual(result['status'], 'APPLIED', result)
+        self.assertEqual(result['written'], [])
+        self.assertEqual(object_snapshot(self.host), before)
+        self.assertEqual(canary.read_bytes(), canary_bytes)
+        self.assertFalse(read_touches(reads, canary),
+                         'a blocked plan must not read the external canary')
+        self.assertEqual(agents.read_bytes(), duplicate)
+        self.assertFalse((self.host / 'agentorch').exists())
+
     def test_ac4_failure_path_writes_nothing(self):
         # A failed plan must be asserted on its own: zero host writes, no
         # agentorch/ tree, and the original AGENTS.md bytes intact.
@@ -3862,6 +4086,101 @@ runpy.run_path(script,run_name='__main__')
         self.assertEqual(raw_snapshot(external), external_before)
 
     # --- AC-7 -------------------------------------------------------------
+    def test_ac7_link_extractor_covers_reference_definitions_and_skips_code(self):
+        # The old extractor only matched [text](url) and would have skipped a
+        # reference definition entirely, so a broken [id]: path link could never
+        # fail. This pins the two definition forms, the inline title form, the
+        # scheme/anchor exclusions and the code forms that are deliberately not
+        # verified (they are examples, not links).
+        text = (
+            'Inline [one](../docs/a.md), [titled](../docs/b.md "Title") and '
+            'angle [spaced](<../docs/d e.md>).\n\n'
+            '[ref-plain]: ../docs/c.md\n'
+            '[ref-angle]: <../docs/d e.md>\n'
+            '[anchor]: #section\n'
+            '[web]: https://example.invalid/x\n'
+            '[mail]: mailto:someone@example.invalid\n\n'
+            '```text\n[fenced]: ../docs/inside-a-fence.md\n```\n\n'
+            'Inline code `[example](missing-inline.md)` is not a link.\n'
+        )
+        inline, definitions = markdown_relative_targets(text)
+        self.assertEqual(inline, ['../docs/a.md', '../docs/b.md', '../docs/d e.md'])
+        self.assertEqual(definitions, ['../docs/c.md', '../docs/d e.md'])
+
+    def test_ac7_full_release_relative_links_resolve_after_embedding(self):
+        # The minimal install above proves the rewrite shape; this case parses
+        # the real release projection (build_release.collect_sources through
+        # _install_full_release) and resolves every relative target against the
+        # filesystem.
+        #
+        # Covered syntax: inline [text](target) and reference definitions
+        # [id]: target / [id]: <target>. NOT covered, and therefore not claimed
+        # as verified: example paths inside fenced code or inline code (the
+        # extractor strips them on purpose), targets containing ')', and HTML
+        # <a href> links. A pass here does not mean "every link was checked".
+        #
+        # At this HEAD the shipped tree has no reference-style definitions, so
+        # that branch runs for every file but finds nothing; its syntax coverage
+        # is pinned by test_ac7_link_extractor_covers_reference_definitions_and_
+        # skips_code.
+        agentorch = self._install_full_release()
+        host_root = self.host.resolve()
+        host_agents = host_root / 'AGENTS.md'
+        self.assertFalse((agentorch / 'AGENTS.md').exists(),
+                         'the isolated layout must not carry agentorch/AGENTS.md')
+        markdown_files = sorted(agentorch.rglob('*.md'))
+        self.assertGreaterEqual(len(markdown_files), 20,
+                                'the full release projection looks too small to be real')
+        checked = 0
+        host_agents_hits = 0
+        references = 0
+        stripped_examples = 0
+        for path in markdown_files:
+            rel = path.relative_to(agentorch).as_posix()
+            text = path.read_text(encoding='utf-8')
+            inline, definitions = markdown_relative_targets(text)
+            references += len(definitions)
+            # Measure the deliberate blind spot instead of assuming it exists:
+            # example paths inside fenced blocks or inline code are stripped
+            # before parsing, so they are not verified and must not be reported
+            # as verified.
+            stripped_examples += (len(re.findall(r'\]\(([^)]+)\)', text))
+                                  - len(re.findall(r'\]\(([^)]+)\)',
+                                                   _strip_markdown_code(text))))
+            for target in inline + definitions:
+                resolved = (path.parent / target.split('#', 1)[0]).resolve()
+                with self.subTest(file=rel, target=target):
+                    self.assertTrue(resolved.exists(),
+                                    f'{target} from {rel} does not resolve')
+                    self.assertTrue(
+                        resolved == host_agents or host_root in resolved.parents,
+                        f'{target} from {rel} escapes the host root')
+                    if resolved == host_agents:
+                        host_agents_hits += 1
+                checked += 1
+        self.assertGreaterEqual(checked, 40,
+                                'too few relative targets were resolved to be meaningful; '
+                                f'reference definitions found: {references}')
+        self.assertGreaterEqual(host_agents_hits, 3,
+                                'relative links to the host root AGENTS.md were not exercised')
+        self.assertGreater(stripped_examples, 0,
+                           'no code-block or inline-code example path was skipped, so the '
+                           'uncovered-syntax boundary is untested on this tree')
+        # Design §6.3: a link to the host root AGENTS.md must land on the Host
+        # Root (two levels up from docs/), never on an agentorch/AGENTS.md.
+        core = (agentorch / 'docs' / 'orchestration.md').read_text(encoding='utf-8')
+        self.assertIn('../../AGENTS.md', core)
+        self.assertEqual((agentorch / 'docs' / '../../AGENTS.md').resolve(), host_agents)
+        self.assertTrue(host_agents.is_file())
+        for rel in ('editions/local/master.md', 'editions/github/master.md',
+                    'templates/runtime-capability.md'):
+            path = agentorch / rel
+            inline, definitions = markdown_relative_targets(path.read_text(encoding='utf-8'))
+            self.assertTrue(
+                any((path.parent / target.split('#', 1)[0]).resolve() == host_agents
+                    for target in inline + definitions),
+                f'{rel} must reference the host root AGENTS.md')
+
     def test_ac7_relative_markdown_links_resolve_after_embedding(self):
         self.install()
         agentorch = self.host / 'agentorch'
