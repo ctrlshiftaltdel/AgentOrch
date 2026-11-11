@@ -829,6 +829,53 @@ class IsolatedLayoutTest(unittest.TestCase):
         self.assertIn('hard-linked', proc.stderr)
         self.assertNotIn('in-scope', proc.stdout)
 
+    def test_symlinked_local_directory_is_refused(self):
+        # ``O_NOFOLLOW`` on the database only guards the last component. A link
+        # at ``agentorch/.local`` would redirect the whole store outside the
+        # work tree, so it must be refused before any read.
+        _, host, kit, scaffold = build_isolated_host(self.base)
+        external = self.base / 'external-local'
+        store = external / 'orchestration' / 'state.sqlite3'
+        create_task_db(store, [('T-EXTERNAL', 'DISPATCHED', ['.'], scaffold)])
+        store_bytes = store.read_bytes()
+        listing = _dir_listing(store.parent)
+        os.symlink(external, kit / '.local')
+        add_host_decoy(host, scaffold)
+        (host / 'docs').mkdir()
+        (host / 'docs' / 'notes.md').write_text('outside src\n', encoding='utf-8')
+
+        proc = run_isolated(kit, ['--json'], _outside(self.base))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn('symlink', proc.stderr.lower())
+        self.assertNotIn('in-scope', proc.stdout)
+        self.assertNotIn('T-EXTERNAL', proc.stdout)
+        self.assertEqual(store.read_bytes(), store_bytes)
+        self.assertEqual(_dir_listing(store.parent), listing)
+        self.assertFalse(Path(str(store) + '-shm').exists())
+
+    def test_symlinked_orchestration_directory_is_refused(self):
+        # Same boundary one level lower: the store directory itself is a link
+        # to an external directory that holds a readable task database.
+        _, host, kit, scaffold = build_isolated_host(self.base)
+        external = self.base / 'external-orchestration'
+        store = external / 'state.sqlite3'
+        create_task_db(store, [('T-EXTERNAL', 'DISPATCHED', ['.'], scaffold)])
+        store_bytes = store.read_bytes()
+        listing = _dir_listing(external)
+        (kit / '.local').mkdir()
+        os.symlink(external, kit / '.local' / 'orchestration')
+        add_host_decoy(host, scaffold)
+        (host / 'docs').mkdir()
+        (host / 'docs' / 'notes.md').write_text('outside src\n', encoding='utf-8')
+
+        proc = run_isolated(kit, ['--json'], _outside(self.base))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn('symlink', proc.stderr.lower())
+        self.assertNotIn('in-scope', proc.stdout)
+        self.assertNotIn('T-EXTERNAL', proc.stdout)
+        self.assertEqual(store.read_bytes(), store_bytes)
+        self.assertEqual(_dir_listing(external), listing)
+
     def test_agentorch_shaped_directory_without_markers_is_refused(self):
         _, host, kit, scaffold = build_isolated_host(self.base)
         init_isolated_store(kit, [('T-KIT', 'DISPATCHED', ['src/'], scaffold)])
@@ -897,6 +944,80 @@ class IsolatedLayoutTest(unittest.TestCase):
         self.assertEqual(_dir_listing(state), listing)
         self.assertEqual(_file_digests(state), digests)
         self.assertFalse((state / 'state.sqlite3-shm').exists())
+
+
+class LinkedParentComponentTest(unittest.TestCase):
+    """A link in a *parent* component is a stop, not a redirect.
+
+    ``O_NOFOLLOW`` refuses a symlinked final component only. Opening
+    ``<repo>/.orchestration/state.sqlite3`` still follows a ``.orchestration``
+    link planted in the repository, so a perfectly regular external database is
+    reachable as "this repository's" task database. Every component from the Git
+    work-tree root to the file is therefore inspected without following it.
+
+    The inspection is a pre-read refusal, not atomic isolation: a same-UID
+    writer can swap a component after it is inspected. Ancestors *above* the
+    work-tree root are outside the boundary and must not be refused (macOS
+    ``/var`` -> ``/private/var``, Windows short names).
+    """
+
+    def setUp(self):
+        self.repo_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.repo_tmp.cleanup)
+        self.fx = GitFixture(self.repo_tmp.name)
+        self.outside = Path(tempfile.mkdtemp(prefix='scope-parent-'))
+        self.addCleanup(shutil.rmtree, self.outside, True)
+
+    def run_tool(self, *args, root=None):
+        out, err = io.StringIO(), io.StringIO()
+        target = self.fx.root if root is None else root
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = check.main(['--root', str(target), *args])
+        return code, out.getvalue(), err.getvalue()
+
+    def external_store(self):
+        path = self.outside / 'state.sqlite3'
+        create_task_db(path, [('T-CANARY', 'DISPATCHED', ['.'], self.fx.base)])
+        return path
+
+    def test_flat_symlinked_state_directory_fails_closed(self):
+        store = self.external_store()
+        store_bytes = store.read_bytes()
+        listing = sorted(item.name for item in self.outside.iterdir())
+        os.symlink(self.outside, self.fx.root / '.orchestration')
+        self.fx.write('docs/notes.md', 'out of scope\n')
+
+        code, out, err = self.run_tool('--json', '--base', self.fx.base)
+        self.assertEqual(code, 1, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload['status'], 'error')
+        self.assertIn('symlink', payload['error'].lower())
+        self.assertNotIn('T-CANARY', out)
+        self.assertNotIn('T-CANARY', err)
+        self.assertNotIn('in-scope', out)
+        # The external store is never opened, copied, or given a sidecar.
+        self.assertEqual(store.read_bytes(), store_bytes)
+        self.assertEqual(sorted(item.name for item in self.outside.iterdir()),
+                         listing)
+        self.assertFalse(Path(str(store) + '-shm').exists())
+        self.assertFalse(Path(str(store) + '-wal').exists())
+
+    def test_a_linked_root_path_is_not_treated_as_a_linked_component(self):
+        # The work-tree root itself may be reached through a link (a user alias,
+        # macOS /var -> /private/var). The root is canonicalised before the walk,
+        # so ordinary access through an alias must still succeed.
+        self.fx.init_db()
+        self.fx.add_task('T-1', ['src/'], head_sha=self.fx.base)
+        self.fx.write('src/app.py', 'x\n')
+        aliases = Path(tempfile.mkdtemp(prefix='scope-alias-'))
+        self.addCleanup(shutil.rmtree, aliases, True)
+        os.symlink(self.fx.root, aliases / 'through-link')
+
+        code, out, err = self.run_tool('--json', '--task', 'T-1',
+                                       '--base', self.fx.base,
+                                       root=aliases / 'through-link')
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(json.loads(out)['task']['id'], 'T-1')
 
 
 class NoFollowFallbackTest(unittest.TestCase):
@@ -1029,6 +1150,27 @@ class NoFollowFallbackTest(unittest.TestCase):
                 check._open_regular_file(source, 'task database')
         self.assertIn('changed while it was being opened', str(caught.exception))
         self.assertEqual(source.read_bytes(), source_bytes)
+
+    def test_without_o_nofollow_a_symlinked_state_directory_fails_closed(self):
+        # The fallback proves the final component's identity; it cannot prove a
+        # parent component was not followed. A parent link is therefore a stop
+        # before any byte of the external database is read.
+        canary = self.canary('state.sqlite3')
+        canary_bytes = canary.read_bytes()
+        canary_listing = sorted(p.name for p in canary.parent.iterdir())
+        os.symlink(canary.parent, self.fx.root / '.orchestration')
+        self.fx.write('docs/notes.md', 'out of scope\n')
+        self.hide_no_follow()
+
+        code, out, err = self.run_tool('--json', '--base', self.fx.base)
+        self.assertEqual(code, 1, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload['status'], 'error')
+        self.assertIn('symlink', payload['error'].lower())
+        self.assertNotIn('T-CANARY', out)
+        self.assertNotIn('T-CANARY', err)
+        self.assertNotIn('in-scope', out)
+        self.assert_canary_untouched(canary, canary_bytes, canary_listing)
 
     def test_with_o_nofollow_a_symlinked_database_is_refused_in_the_flat_layout(self):
         # The existing refusal semantics must not regress where the flag exists,

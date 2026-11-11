@@ -42,7 +42,12 @@ Two layouts are recognised, and neither is guessed:
 
 * **flat** - the script lives at ``<repository>/scripts/check_scope.py``. The
   repository root is the Git work-tree top level (the historical contract); the
-  task database is ``<repository>/.orchestration/state.sqlite3``.
+  task database is ``<repository>/.orchestration/state.sqlite3``. Every path
+  component from the work-tree root to that file is inspected without following
+  it; a symlink anywhere in that walk is exit 1. Ancestors above the work-tree
+  root are not inspected, so a canonicalised root reached through a link (macOS
+  ``/var`` -> ``/private/var``, Windows short names) is not mistaken for an
+  attack.
 * **isolated** - the script lives at
   ``<host>/agentorch/scripts/check_scope.py``. Git commands run on the host
   work-tree top level ``H``, while the task database is
@@ -289,6 +294,52 @@ def _reject_component_link(path, label, *, is_dir):
         raise ScopeError(f'isolated layout refuses a hard-linked {label}')
 
 
+def _reject_linked_path_components(root, target, label):
+    """Refuse a symlink in any component from *root* down to *target*.
+
+    ``O_NOFOLLOW`` only closes the final component: opening
+    ``<repo>/.orchestration/state.sqlite3`` still follows a ``.orchestration``
+    link planted in the repository, so an external, perfectly regular database
+    would be read as this repository's task database. Every component below the
+    Git work-tree root is inspected here without following it, and a link is a
+    stop before any byte is read.
+
+    Ancestors of *root* are deliberately not inspected. On macOS ``/var`` is a
+    link to ``/private/var`` and Windows short names differ from the canonical
+    spelling, so walking above the work tree would refuse ordinary CI temporary
+    directories. The boundary is the work-tree root itself.
+
+    This is a pre-read check, not atomic isolation and not a same-UID guarantee:
+    another process with the same user can still swap a component between this
+    inspection and the open. The claim is only that an existing link is not
+    followed.
+    """
+    root = Path(root)
+    try:
+        relative = Path(target).relative_to(root)
+    except ValueError:
+        raise ScopeError(
+            f'cannot prove the {label} is inside the Git work-tree root; '
+            'refusing to read it')
+    if not relative.parts:
+        raise ScopeError(f'the {label} is the Git work-tree root itself')
+    current = root
+    for part in relative.parts:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            # The caller reports a missing database (or a missing intermediate
+            # directory) as "not found"; it is never a silent pass.
+            return
+        except OSError as exc:
+            raise ScopeError(f'cannot inspect the {label}: {exc.strerror or exc}')
+        if stat.S_ISLNK(info.st_mode):
+            raise ScopeError(
+                f'the {label} is reached through a symlinked path component '
+                f'({current.relative_to(root).as_posix()}); refusing to follow it')
+
+
 def _validate_isolated_store(roots):
     base = roots.state_root
     state = roots.database.parent
@@ -368,6 +419,10 @@ def load_tasks(roots):
     """
     path = roots.database
     display = roots.database_label if roots.layout == LAYOUT_ISOLATED else str(path)
+    # A link in a parent component is not covered by ``O_NOFOLLOW`` on the open.
+    # Refuse one anywhere between the Git work-tree root and the database before
+    # the existence check can follow it.
+    _reject_linked_path_components(roots.git_root, path, 'task database')
     if roots.layout == LAYOUT_ISOLATED:
         _validate_isolated_store(roots)
     if _inspect_regular_file(path, 'task database')[0] is None:
