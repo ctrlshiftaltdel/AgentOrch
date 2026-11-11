@@ -4666,11 +4666,12 @@ runpy.run_path(script,run_name='__main__')
         self.assertTrue((self.host / 'AGENTS.md').read_text(encoding='utf-8').count(
             workspace.MANAGED_BEGIN_PREFIX) == 1)
 
-    def test_cli_rollback_is_blocked_and_preserves_the_installed_tree(self):
+    def test_cli_rollback_restores_the_installed_tree_and_consumes_the_record(self):
         import subprocess
         from unittest.mock import patch
         from scripts.update_agentorch import entry, sources
         head = self._linked_worktree_host()
+        before = raw_snapshot(self.host, skip_names=('.git',))
         release, payload = self._review_release_transport()
         with patch.object(sources.GitHubReleaseSource, 'fetch_release', return_value=release), \
              patch.object(sources.GitHubReleaseSource, 'download_asset', return_value=payload):
@@ -4684,16 +4685,179 @@ runpy.run_path(script,run_name='__main__')
         backup = prepared['result']['backup_location']
         self.assertIsInstance(backup, str)
         self.assertTrue(Path(backup).is_dir())
-        after_apply = raw_snapshot(self.host)
+        self.addCleanup(shutil.rmtree, backup, True)
+        after_apply = raw_snapshot(self.host, skip_names=('.git',))
+        self.assertNotEqual(after_apply, before)
         env = dict(os.environ, PYTHONPATH=str(ROOT))
         rollback_cmd = [sys.executable, '-m', 'scripts.update_agentorch.entry',
                         '--install-isolated', str(self.host),
                         '--rollback-backup', backup]
         rolled = subprocess.run(rollback_cmd, cwd=self.tmp, env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        self.assertNotEqual(rolled.returncode, 0)
-        self.assertEqual(json.loads(rolled.stdout)['status'], 'BLOCKED')
-        self.assertEqual(raw_snapshot(self.host), after_apply)
+        self.assertEqual(rolled.returncode, 0, rolled.stderr)
+        public = json.loads(rolled.stdout)
+        self.assertEqual(public['status'], 'ROLLED_BACK', public)
+        self.assertEqual(public['rollback']['result'], 'SUCCEEDED', public)
+        # The public output never carries the backup directory or any other
+        # project-external absolute path.
+        self.assertNotIn(backup, rolled.stdout + rolled.stderr)
+        self.assertNotIn(str(self.tmp), rolled.stdout + rolled.stderr)
+        self.assertEqual(raw_snapshot(self.host, skip_names=('.git',)), before)
+        # The record is one-shot: a replay after a verified restore stops.
+        replayed = subprocess.run(rollback_cmd, cwd=self.tmp, env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(replayed.returncode, 2)
+        self.assertEqual(json.loads(replayed.stdout)['status'], 'BLOCKED')
+        self.assertEqual(raw_snapshot(self.host, skip_names=('.git',)), before)
+
+    def _apply_isolated_for_rollback(self):
+        """Run a real APPLY and return ``(head, snapshot_before, backup_dir)``."""
+        from unittest.mock import patch
+        from scripts.update_agentorch import entry, sources
+        head = self._install_linked_worktree()
+        before = raw_snapshot(self.host, skip_names=('.git',))
+        release, payload = self._review_release_transport()
+        with patch.object(sources.GitHubReleaseSource, 'fetch_release', return_value=release), \
+             patch.object(sources.GitHubReleaseSource, 'download_asset', return_value=payload):
+            prepared = entry.prepare_isolated_install(
+                self.host, mode='APPLY', declared_exclusive=True,
+                expected_head=head)
+        self.assertEqual(prepared['result']['status'], 'APPLIED', prepared['result'])
+        backup = prepared['result']['backup_location']
+        self.assertIsInstance(backup, str)
+        self.assertTrue(Path(backup).is_dir())
+        self.addCleanup(shutil.rmtree, backup, True)
+        return head, before, backup
+
+    def test_cross_process_rollback_restores_and_consumes_the_binding(self):
+        head, before, backup = self._apply_isolated_for_rollback()
+        self.assertTrue((self.host / 'agentorch' / 'README.md').is_file())
+        result = workspace.rollback_isolated_onboarding({
+            'host_root': str(self.host), 'backup_location': backup})
+        self.assertEqual(result['status'], 'ROLLED_BACK', result)
+        self.assertEqual(result['rollback']['result'], 'SUCCEEDED')
+        self.assertEqual(raw_snapshot(self.host, skip_names=('.git',)), before)
+        # A second call with the same backup must not restore again.
+        replayed = workspace.rollback_isolated_onboarding({
+            'host_root': str(self.host), 'backup_location': backup})
+        self.assertEqual(replayed['status'], 'BLOCKED', replayed)
+        self.assertEqual(raw_snapshot(self.host, skip_names=('.git',)), before)
+
+    def test_cross_process_rollback_preserves_concurrent_changes_outside_backup(self):
+        head, before, backup = self._apply_isolated_for_rollback()
+        unrelated = self.host / 'src' / 'app.py'
+        unrelated.write_text('concurrent host edit\n', encoding='utf-8')
+        new_file = self.host / 'notes' / 'concurrent.md'
+        new_file.parent.mkdir()
+        new_file.write_text('kept\n', encoding='utf-8')
+        result = workspace.rollback_isolated_onboarding({
+            'host_root': str(self.host), 'backup_location': backup})
+        self.assertEqual(result['status'], 'ROLLED_BACK', result)
+        self.assertEqual(unrelated.read_text(encoding='utf-8'), 'concurrent host edit\n')
+        self.assertEqual(new_file.read_text(encoding='utf-8'), 'kept\n')
+        restored = raw_snapshot(self.host, skip_names=('.git',))
+        self.assertNotIn('agentorch/README.md', restored)
+        self.assertEqual(restored['src/app.py'], hashlib.sha256(
+            b'concurrent host edit\n').hexdigest())
+
+    def test_cross_process_rollback_blocks_when_an_applied_file_changed(self):
+        head, before, backup = self._apply_isolated_for_rollback()
+        applied = self.host / 'agentorch' / 'README.md'
+        applied.write_text('foreign edit after apply\n', encoding='utf-8')
+        after_apply = raw_snapshot(self.host, skip_names=('.git',))
+        result = workspace.rollback_isolated_onboarding({
+            'host_root': str(self.host), 'backup_location': backup})
+        self.assertEqual(result['status'], 'BLOCKED', result)
+        self.assertEqual(raw_snapshot(self.host, skip_names=('.git',)), after_apply)
+        self.assertEqual(applied.read_text(encoding='utf-8'),
+                         'foreign edit after apply\n')
+
+    def test_cross_process_rollback_rejects_a_forged_record(self):
+        head, before, backup = self._apply_isolated_for_rollback()
+        victim = self.host / 'src' / 'app.py'
+        victim_bytes = victim.read_bytes()
+        forged = self.tmp / 'forged-backup'
+        (forged / 'files').mkdir(parents=True)
+        (forged / 'backup.json').write_text(json.dumps({
+            'backup_schema_version': 1,
+            'created_at': '2026-01-01T00:00:00Z',
+            'kind': 'isolated_onboarding',
+            'mode': 'INSTALL',
+            'target_version': '1.7',
+            'files': [{'path': 'src/app.py', 'present': False,
+                       'sha256': None, 'size': None}],
+        }), encoding='utf-8')
+        (forged / 'rollback-binding.json').write_text(json.dumps({
+            'schema': 'agentorch-rollback-binding/1',
+            'host_identity': [os.lstat(self.host).st_dev, os.lstat(self.host).st_ino],
+            'head_sha': head,
+            'operation_id': 'a' * 32,
+            'entries': [{
+                'path': 'src/app.py',
+                'original_present': False,
+                'original_sha256': None,
+                'written_sha256': hashlib.sha256(victim_bytes).hexdigest(),
+                'backup_sha256': None,
+            }],
+        }), encoding='utf-8')
+        result = workspace.rollback_isolated_onboarding({
+            'host_root': str(self.host), 'backup_location': str(forged)})
+        self.assertEqual(result['status'], 'BLOCKED', result)
+        self.assertEqual(victim.read_bytes(), victim_bytes)
+
+    def test_cross_process_rollback_rejects_a_tampered_binding(self):
+        head, before, backup = self._apply_isolated_for_rollback()
+        record_path = Path(backup) / 'rollback-binding.json'
+        record = json.loads(record_path.read_text(encoding='utf-8'))
+        entry = next(item for item in record['entries'] if item['original_present'])
+        entry['backup_sha256'] = '0' * 64
+        record_path.write_text(json.dumps(record), encoding='utf-8')
+        after_apply = raw_snapshot(self.host, skip_names=('.git',))
+        result = workspace.rollback_isolated_onboarding({
+            'host_root': str(self.host), 'backup_location': backup})
+        self.assertEqual(result['status'], 'BLOCKED', result)
+        self.assertEqual(raw_snapshot(self.host, skip_names=('.git',)), after_apply)
+
+    def test_cross_process_rollback_rejects_a_different_host(self):
+        head, before, backup = self._apply_isolated_for_rollback()
+        other = self.tmp / 'other-host'
+        shutil.copytree(self.host, other, symlinks=True)
+        other_before = raw_snapshot(other, skip_names=('.git',))
+        result = workspace.rollback_isolated_onboarding({
+            'host_root': str(other), 'backup_location': backup})
+        self.assertEqual(result['status'], 'BLOCKED', result)
+        self.assertEqual(raw_snapshot(other, skip_names=('.git',)), other_before)
+
+    def test_cross_process_rollback_rejects_a_changed_head(self):
+        import subprocess
+        head, before, backup = self._apply_isolated_for_rollback()
+        subprocess.run(['git', '-C', str(self.host), 'add', '-A'], check=True,
+                       env=self._git_env(), capture_output=True, text=True)
+        subprocess.run(['git', '-C', str(self.host), 'commit', '-qm', 'moved head'],
+                       check=True, env=self._git_env(), capture_output=True, text=True)
+        after_commit = raw_snapshot(self.host, skip_names=('.git',))
+        result = workspace.rollback_isolated_onboarding({
+            'host_root': str(self.host), 'backup_location': backup})
+        self.assertEqual(result['status'], 'BLOCKED', result)
+        self.assertEqual(raw_snapshot(self.host, skip_names=('.git',)), after_commit)
+
+    def test_cross_process_rollback_rejects_missing_and_duplicate_records(self):
+        head, before, backup = self._apply_isolated_for_rollback()
+        record_path = Path(backup) / 'rollback-binding.json'
+        saved = record_path.read_bytes()
+        record_path.unlink()
+        after_apply = raw_snapshot(self.host, skip_names=('.git',))
+        missing = workspace.rollback_isolated_onboarding({
+            'host_root': str(self.host), 'backup_location': backup})
+        self.assertEqual(missing['status'], 'BLOCKED', missing)
+        self.assertEqual(raw_snapshot(self.host, skip_names=('.git',)), after_apply)
+        record_path.write_bytes(saved)
+        (Path(backup) / 'rollback-binding-copy.json').write_text(
+            saved.decode('utf-8'), encoding='utf-8')
+        duplicated = workspace.rollback_isolated_onboarding({
+            'host_root': str(self.host), 'backup_location': backup})
+        self.assertEqual(duplicated['status'], 'BLOCKED', duplicated)
+        self.assertEqual(raw_snapshot(self.host, skip_names=('.git',)), after_apply)
 
     def test_cli_plan_mode_does_not_write(self):
         import subprocess

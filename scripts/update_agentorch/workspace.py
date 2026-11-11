@@ -3967,6 +3967,268 @@ def _raw_sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+# --- cross-process rollback binding ----------------------------------------
+#
+# APPLY writes one record into the backup directory. The record is *not*
+# authority on its own: rollback re-opens it, re-reads every field, and verifies
+# the whole claim against the live host and the actual backup copies. A local
+# file can always be forged by a same-UID process, so the binding is only a
+# one-shot descriptor for a write set that is still present on disk; it does not
+# claim strong isolation from other processes running as the same user.
+
+ROLLBACK_BINDING_NAME = 'rollback-binding.json'
+ROLLBACK_CONSUMED_NAME = 'rollback-consumed.json'
+ROLLBACK_BINDING_SCHEMA = 'agentorch-rollback-binding/1'
+ROLLBACK_CONSUMED_SCHEMA = 'agentorch-rollback-consumed/1'
+ROLLBACK_BINDING_RE = re.compile(r'^rollback-binding.*\.json$')
+_ROLLBACK_BINDING_KEYS = frozenset({
+    'schema', 'host_identity', 'head_sha', 'operation_id', 'entries'})
+_ROLLBACK_ENTRY_KEYS = frozenset({
+    'path', 'original_present', 'original_sha256', 'written_sha256',
+    'backup_sha256'})
+_SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
+_OPERATION_ID_RE = re.compile(r'^[0-9a-f]{32}$')
+
+
+class _RollbackRefused(Exception):
+    """A binding claim that cannot be re-verified; the message is public-safe."""
+
+
+def _rollback_blocked(message: str, *, attempted: bool = False) -> dict:
+    return {
+        'status': 'BLOCKED',
+        'problems': [message],
+        'rollback': {'required': True, 'attempted': attempted,
+                     'result': 'FAILED' if attempted else 'NOT_RUN'},
+    }
+
+
+def _read_json_regular(root: Path, name: str):
+    data = _read_regular_file_path(root, name, name)
+    if data is None:
+        return None
+    try:
+        return json.loads(data.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError):
+        raise _RollbackRefused(f'{name} is not valid JSON') from None
+
+
+def _live_head_sha(host: Path) -> str | None:
+    """Read the current commit without trusting the binding record."""
+    try:
+        proc = subprocess.run(
+            ['git', '-C', str(host), 'rev-parse', '--verify', 'HEAD^{commit}'],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            encoding='utf-8', errors='replace', timeout=30,
+            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = proc.stdout.strip() if proc.returncode == 0 else ''
+    return value if re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', value) else None
+
+
+def _backup_copy_present(files_dir: Path, rel: str) -> bool:
+    try:
+        os.lstat(files_dir / rel)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _rollback_binding_payload(backup, writes: dict[str, bytes],
+                              originals: dict[str, bytes | None], *,
+                              host_identity, head_sha: str) -> dict:
+    """Build the fixed-field record from the verified backup and this operation."""
+    if host_identity is None:
+        raise TransactionConflict(
+            'host identity is unavailable; a rollback record cannot be bound')
+    recorded = {entry['path']: entry for entry in backup.entries}
+    entries = []
+    for rel in sorted(writes):
+        backup_entry = recorded.get(rel)
+        if backup_entry is None:
+            raise TransactionConflict('the backup does not cover every written path')
+        original = originals.get(rel)
+        if original is None:
+            if backup_entry.get('present'):
+                raise TransactionConflict('the backup records an original for a created path')
+            original_sha = None
+            copy_sha = None
+        else:
+            if not backup_entry.get('present'):
+                raise TransactionConflict('the backup is missing an original path')
+            copy_bytes = _read_regular_file_path(
+                backup.files_dir, rel, 'rollback backup copy')
+            if copy_bytes is None:
+                raise TransactionConflict('the backup copy is missing')
+            copy_sha = _raw_sha(copy_bytes)
+            original_sha = _raw_sha(original)
+            if copy_sha != original_sha:
+                raise TransactionConflict(
+                    'the backup copy does not match the original bytes')
+            if sha256_bytes(copy_bytes) != backup_entry.get('sha256'):
+                raise TransactionConflict(
+                    'the backup copy does not match its own manifest entry')
+        entries.append({
+            'path': rel,
+            'original_present': original is not None,
+            'original_sha256': original_sha,
+            'written_sha256': _raw_sha(writes[rel]),
+            'backup_sha256': copy_sha,
+        })
+    return {
+        'schema': ROLLBACK_BINDING_SCHEMA,
+        'host_identity': [host_identity[0], host_identity[1]],
+        'head_sha': head_sha,
+        'operation_id': secrets.token_hex(16),
+        'entries': entries,
+    }
+
+
+def _write_rollback_binding(backup, writes: dict[str, bytes],
+                            originals: dict[str, bytes | None], *,
+                            host_identity, head_sha: str) -> None:
+    payload = _rollback_binding_payload(
+        backup, writes, originals, host_identity=host_identity, head_sha=head_sha)
+    atomic_write(
+        backup.location / ROLLBACK_BINDING_NAME,
+        (json.dumps(payload, indent=2, sort_keys=True) + '\n').encode('utf-8'))
+
+
+def _open_rollback_session(host_root, expected_identity):
+    """Open the same guarded writer used by APPLY, without a plan."""
+    dir_fd_problems = _platform_capability_problems()
+    if not dir_fd_problems:
+        try:
+            return _FdWriteSession(
+                _open_host_fd(host_root, expected_identity), owns_root=True), []
+        except (OSError, OnboardingError) as exc:
+            return None, [str(exc)]
+    path_problems = _path_backend_problems()
+    if path_problems:
+        return None, list(dir_fd_problems) + list(path_problems)
+    try:
+        return _PathWriteSession.open(host_root, expected_identity), []
+    except (OSError, OnboardingError) as exc:
+        return None, [str(exc)]
+
+
+def _validate_rollback_binding(record, host_identity, live_head, location: Path):
+    """Re-verify every field against the live host and the backup copies."""
+    if type(record) is not dict or set(record) != set(_ROLLBACK_BINDING_KEYS):
+        raise _RollbackRefused('rollback binding record is malformed')
+    if record.get('schema') != ROLLBACK_BINDING_SCHEMA:
+        raise _RollbackRefused('rollback binding schema is unsupported')
+    identity = record.get('host_identity')
+    if (type(identity) is not list or len(identity) != 2
+            or any(type(value) is not int for value in identity)
+            or identity != [host_identity[0], host_identity[1]]):
+        raise _RollbackRefused('rollback binding does not match this host')
+    head_sha = record.get('head_sha')
+    if type(head_sha) is not str or not (
+            _SHA256_RE.fullmatch(head_sha) or re.fullmatch(r'[0-9a-f]{40}', head_sha)):
+        raise _RollbackRefused('rollback binding record is malformed')
+    if live_head is None:
+        raise _RollbackRefused('rollback host HEAD cannot be verified')
+    if head_sha != live_head:
+        raise _RollbackRefused('rollback binding does not match the current HEAD')
+    operation_id = record.get('operation_id')
+    if type(operation_id) is not str or not _OPERATION_ID_RE.fullmatch(operation_id):
+        raise _RollbackRefused('rollback binding record is malformed')
+    raw_entries = record.get('entries')
+    if type(raw_entries) is not list or not raw_entries:
+        raise _RollbackRefused('rollback binding record has no entries')
+    entries = []
+    seen = set()
+    for item in raw_entries:
+        if type(item) is not dict or set(item) != set(_ROLLBACK_ENTRY_KEYS):
+            raise _RollbackRefused('rollback binding entry is malformed')
+        rel = item.get('path')
+        if type(rel) is not str:
+            raise _RollbackRefused('rollback binding entry is malformed')
+        try:
+            lexical_rel_path(rel)
+        except OnboardingError:
+            raise _RollbackRefused('rollback binding contains an unsafe path') from None
+        if rel in seen:
+            raise _RollbackRefused('rollback binding contains a duplicate path')
+        seen.add(rel)
+        if write_set_problems({rel: b''}):
+            raise _RollbackRefused(
+                'rollback binding contains a path outside the managed write set')
+        present = item.get('original_present')
+        written = item.get('written_sha256')
+        original = item.get('original_sha256')
+        copy = item.get('backup_sha256')
+        if type(present) is not bool:
+            raise _RollbackRefused('rollback binding entry is malformed')
+        if type(written) is not str or not _SHA256_RE.fullmatch(written):
+            raise _RollbackRefused('rollback binding entry is malformed')
+        if present:
+            if (type(original) is not str or not _SHA256_RE.fullmatch(original)
+                    or type(copy) is not str or not _SHA256_RE.fullmatch(copy)):
+                raise _RollbackRefused('rollback binding entry is malformed')
+        elif original is not None or copy is not None:
+            raise _RollbackRefused('rollback binding entry is malformed')
+        entries.append(item)
+
+    backup = _read_json_regular(location, 'backup.json')
+    if type(backup) is not dict:
+        raise _RollbackRefused('rollback backup manifest is malformed')
+    if backup.get('kind') != 'isolated_onboarding':
+        raise _RollbackRefused(
+            'rollback backup was not produced by an isolated onboarding')
+    raw_files = backup.get('files')
+    if type(raw_files) is not list:
+        raise _RollbackRefused('rollback backup manifest is malformed')
+    by_path = {}
+    for item in raw_files:
+        if type(item) is not dict or type(item.get('path')) is not str:
+            raise _RollbackRefused('rollback backup manifest is malformed')
+        rel = item['path']
+        if rel in by_path:
+            raise _RollbackRefused('rollback backup contains a duplicate path')
+        by_path[rel] = item
+    record_paths = {item['path'] for item in entries}
+    if record_paths != set(by_path):
+        raise _RollbackRefused('rollback binding paths do not match the backup')
+
+    files_dir = location / 'files'
+    for item in entries:
+        rel = item['path']
+        backup_entry = by_path[rel]
+        present = backup_entry.get('present')
+        if type(present) is not bool:
+            raise _RollbackRefused('rollback backup manifest is malformed')
+        if present != item['original_present']:
+            raise _RollbackRefused(
+                'rollback backup presence does not match the binding')
+        if present:
+            copy_bytes = _read_regular_file_path(
+                files_dir, rel, 'rollback backup copy')
+            if copy_bytes is None:
+                raise _RollbackRefused('rollback backup copy is missing')
+            if _raw_sha(copy_bytes) != item['backup_sha256']:
+                raise _RollbackRefused(
+                    'rollback backup copy hash does not match the binding')
+            if item['original_sha256'] != item['backup_sha256']:
+                raise _RollbackRefused(
+                    'rollback original hash does not match the backup copy')
+            recorded_sha = backup_entry.get('sha256')
+            if type(recorded_sha) is not str or sha256_bytes(copy_bytes) != recorded_sha:
+                raise _RollbackRefused(
+                    'rollback backup manifest does not match the backup copy')
+            item['_original'] = copy_bytes
+        else:
+            if _backup_copy_present(files_dir, rel):
+                raise _RollbackRefused(
+                    'rollback backup contains bytes for a created path')
+            item['_original'] = None
+    return entries, operation_id
+
+
 def apply_isolated_onboarding(plan: OnboardingPlan, *, now: datetime | None = None,
                               fault_injector=None, precondition=None,
                               declared_exclusive=False, expected_head=None) -> dict:
@@ -4236,6 +4498,13 @@ def apply_isolated_onboarding(plan: OnboardingPlan, *, now: datetime | None = No
                     raise TransactionConflict(
                         'expected files are missing under agentorch/: '
                         + ', '.join(missing[:5]))
+            # The binding record is written only after every post-write check
+            # passed. It is a one-shot *descriptor* for this write set, not
+            # authority: rollback re-verifies it against the live host and the
+            # actual backup copies before touching anything.
+            _write_rollback_binding(
+                backup, writes, plan.originals,
+                host_identity=plan.host_identity, head_sha=head)
         except BaseException as exc:  # noqa: BLE001 - every failure must roll back
             failure = exc
             result['failure'] = {'phase': failure_phase, 'kind': type(exc).__name__,
@@ -4314,15 +4583,153 @@ def _replace_file_at_for_write(root_fd: int, rel: str, data: bytes,
 
 
 def rollback_isolated_onboarding(result: dict) -> dict:
-    """Explicit cross-process rollback is not authorized yet.
+    """Roll back one APPLY from the binding record written into its backup.
 
-    A caller-supplied ``backup.json`` (including self-recorded hashes) is not
-    bound to this host or to the operation that wrote the files. Treating it as
-    authority could delete or overwrite host data, so the operation stays
-    ``BLOCKED`` until an independently verifiable binding exists. In-process
-    failure recovery uses :func:`apply_isolated_onboarding`'s recorded originals
-    instead.
+    The backup directory and its record are not authority. Every claim is
+    re-derived or re-read before anything is written: the live host identity,
+    the live HEAD, the legal write set, the record's own shape (missing,
+    duplicated or already-consumed records stop here), each backup copy's raw
+    hash, and the bytes this operation left in the host. Only when all of them
+    agree does the caller's write set get restored. Paths outside the recorded
+    set are never touched, so concurrent files outside the backup survive.
+
+    The record is consumed by a marker after a verified restore. This does not
+    claim strong isolation from another process running as the same user: a
+    same-UID writer can forge local files, which is why the live state is
+    re-checked instead of trusting the record.
     """
-    return {'status': 'BLOCKED', 'problems': [
-        'cross-process rollback backup ownership and host binding cannot be '
-        'independently verified; the operation is not authorized']}
+    if type(result) is not dict:
+        return _rollback_blocked('rollback request is malformed')
+    host_value = result.get('host_root')
+    backup_value = result.get('backup_location')
+    if type(host_value) is not str or not host_value:
+        return _rollback_blocked('rollback host root is missing')
+    if type(backup_value) is not str or not backup_value:
+        return _rollback_blocked('rollback backup location is missing')
+    host = Path(host_value)
+    location = Path(backup_value)
+
+    try:
+        host_info = os.lstat(host)
+    except OSError:
+        return _rollback_blocked('rollback host root cannot be inspected')
+    if stat.S_ISLNK(host_info.st_mode) or not stat.S_ISDIR(host_info.st_mode):
+        return _rollback_blocked('rollback host root is not a regular directory')
+    host_identity = _file_identity(host_info)
+    if host_identity is None:
+        return _rollback_blocked('rollback host identity cannot be verified')
+
+    try:
+        location_info = os.lstat(location)
+    except OSError:
+        return _rollback_blocked('rollback backup directory cannot be inspected')
+    if stat.S_ISLNK(location_info.st_mode) or not stat.S_ISDIR(location_info.st_mode):
+        return _rollback_blocked('rollback backup directory is not a regular directory')
+
+    try:
+        names = os.listdir(location)
+    except OSError:
+        return _rollback_blocked('rollback backup directory cannot be listed')
+    record_names = sorted(name for name in names if ROLLBACK_BINDING_RE.match(name))
+    if not record_names:
+        return _rollback_blocked('rollback binding record is missing')
+    if len(record_names) != 1:
+        return _rollback_blocked('rollback binding record is duplicated')
+    if ROLLBACK_CONSUMED_NAME in names:
+        return _rollback_blocked('rollback binding record was already consumed')
+
+    try:
+        record = _read_json_regular(location, ROLLBACK_BINDING_NAME)
+        if record is None:
+            return _rollback_blocked('rollback binding record is missing')
+        entries, operation_id = _validate_rollback_binding(
+            record, host_identity, _live_head_sha(host), location)
+    except _RollbackRefused as exc:
+        return _rollback_blocked(str(exc))
+    except (OSError, OnboardingError):
+        return _rollback_blocked('rollback binding record could not be verified')
+
+    session, session_problems = _open_rollback_session(host, host_identity)
+    if session is None:
+        return _rollback_blocked('rollback host cannot be opened safely')
+    removed: list[str] = []
+    restored: list[str] = []
+    try:
+        for item in entries:
+            rel = item['path']
+            try:
+                current, info = session.read_file(rel)
+            except (OSError, TransactionConflict, OnboardingError):
+                return _rollback_blocked(f'rollback target could not be read: {rel}')
+            if current is None or info is None:
+                return _rollback_blocked(f'rollback target is missing: {rel}')
+            if _raw_sha(current) != item['written_sha256']:
+                return _rollback_blocked(
+                    "rollback target no longer contains this operation's bytes: "
+                    + rel)
+            item['_current'] = current
+
+        try:
+            for item in reversed(entries):
+                rel = item['path']
+                if not item['original_present']:
+                    current, _ = session.read_file(rel)
+                    if current is None or _raw_sha(current) != item['written_sha256']:
+                        raise _RollbackRefused(
+                            f'rollback target changed during recovery: {rel}')
+                    session.unlink(rel)
+                    removed.append(rel)
+                    continue
+                original = item['_original']
+                current = item['_current']
+                if rel == ALLOWED_ROOT_ENTRY and current.startswith(original):
+                    session.truncate(rel, current, len(original))
+                elif rel == ALLOWED_ROOT_ENTRY:
+                    session.restore_in_place(rel, current, original)
+                else:
+                    session.restore_replace(rel, current, original)
+                restored.append(rel)
+        except _RollbackRefused as exc:
+            return _rollback_blocked(str(exc), attempted=True)
+        except (OSError, TransactionConflict, OnboardingError):
+            return _rollback_blocked(
+                'rollback restore failed; inspect the host locally', attempted=True)
+
+        failures = []
+        for item in entries:
+            rel = item['path']
+            try:
+                current, _ = session.read_file(rel)
+            except (OSError, TransactionConflict, OnboardingError):
+                failures.append(rel)
+                continue
+            if item['original_present']:
+                if current is None or _raw_sha(current) != item['original_sha256']:
+                    failures.append(rel)
+            elif current is not None:
+                failures.append(rel)
+        if failures:
+            return _rollback_blocked(
+                'rollback verification failed: '
+                + ', '.join(sorted(failures)[:3]), attempted=True)
+    finally:
+        session.close()
+
+    try:
+        atomic_write(
+            location / ROLLBACK_CONSUMED_NAME,
+            (json.dumps({'schema': ROLLBACK_CONSUMED_SCHEMA,
+                         'operation_id': operation_id},
+                        indent=2, sort_keys=True) + '\n').encode('utf-8'))
+    except OSError:
+        return _rollback_blocked(
+            'rollback completed but the one-shot marker could not be written; '
+            'preserve the backup and inspect locally', attempted=True)
+
+    return {
+        'status': 'ROLLED_BACK',
+        'problems': [],
+        'restored': sorted(restored),
+        'removed': sorted(removed),
+        'rollback': {'required': True, 'attempted': True, 'result': 'SUCCEEDED'},
+    }
