@@ -4772,6 +4772,76 @@ runpy.run_path(script,run_name='__main__')
         self.assertEqual(applied.read_text(encoding='utf-8'),
                          'foreign edit after apply\n')
 
+    def test_cross_process_rollback_reverts_its_own_restores_on_late_conflict(self):
+        """A conflict mid-restore must not leave a half-rolled-back host.
+
+        The concurrent edit lands after this attempt already changed some paths
+        and before the root ``AGENTS.md`` entry is reached. That attempt has not
+        completed, so every restore it did perform is put back: the host returns
+        to the applied tree, the concurrent bytes survive untouched, and the
+        report stays ``BLOCKED``.
+        """
+        from unittest.mock import patch
+        head, before, backup = self._apply_isolated_for_rollback()
+        agents = self.host / 'AGENTS.md'
+        after_apply = raw_snapshot(self.host, skip_names=('.git',))
+        concurrent = agents.read_bytes() + b'concurrent edit during rollback\n'
+        mutations = []
+
+        class EditAfterFirstRestore:
+            """Delegate to the real writer, editing one later path once."""
+
+            def __init__(self, session):
+                self._session = session
+
+            def __getattr__(self, name):
+                return getattr(self._session, name)
+
+            def _after_mutation(self):
+                mutations.append(1)
+                if len(mutations) == 1:
+                    agents.write_bytes(concurrent)
+
+            def unlink(self, rel):
+                self._session.unlink(rel)
+                self._after_mutation()
+
+            def truncate(self, rel, expected, length):
+                self._session.truncate(rel, expected, length)
+                self._after_mutation()
+
+            def restore_in_place(self, rel, expected, original):
+                self._session.restore_in_place(rel, expected, original)
+                self._after_mutation()
+
+            def restore_replace(self, rel, expected, original):
+                self._session.restore_replace(rel, expected, original)
+                self._after_mutation()
+
+        real_open = workspace._open_rollback_session
+
+        def open_with_concurrent_edit(host_root, expected_identity):
+            session, problems = real_open(host_root, expected_identity)
+            if session is None:
+                return None, problems
+            return EditAfterFirstRestore(session), problems
+
+        with patch.object(workspace, '_open_rollback_session',
+                          open_with_concurrent_edit):
+            result = workspace.rollback_isolated_onboarding({
+                'host_root': str(self.host), 'backup_location': backup})
+        self.assertEqual(result['status'], 'BLOCKED', result)
+        self.assertTrue(mutations, result)
+        expected = dict(after_apply)
+        expected['AGENTS.md'] = hashlib.sha256(concurrent).hexdigest()
+        self.assertEqual(raw_snapshot(self.host, skip_names=('.git',)), expected)
+        self.assertEqual(agents.read_bytes(), concurrent)
+        undo = result['rollback'].get('undo', {})
+        self.assertEqual(undo.get('preserved'), ['AGENTS.md'], result)
+        self.assertEqual(undo.get('unverified'), [], result)
+        # The binding is not consumed: nothing was proven restored.
+        self.assertFalse((Path(backup) / 'rollback-consumed.json').exists())
+
     def test_cross_process_rollback_rejects_a_forged_record(self):
         head, before, backup = self._apply_isolated_for_rollback()
         victim = self.host / 'src' / 'app.py'
@@ -5343,6 +5413,83 @@ class IsolatedEntryCommandsTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertTrue((flat / '.orchestration' / 'state.sqlite3').is_file())
         self.assertFalse((flat / '.local' / 'orchestration').exists())
+
+
+class RollbackUndoTest(unittest.TestCase):
+    """Taking back the restores one failed rollback attempt already performed.
+
+    The cross-process rollback is all-or-nothing per attempt. These cases drive
+    the compensating writer directly, so each decision (put back, preserve a
+    foreign path, report what cannot be proven) is proven on every platform.
+    """
+
+    def setUp(self):
+        self.tmp_path = Path(tempfile.mkdtemp(prefix='agentorch-undo-'))
+        self.addCleanup(shutil.rmtree, self.tmp_path, True)
+        self.root = self.tmp_path / 'host'
+        self.root.mkdir()
+        (self.root / 'agentorch').mkdir()
+        self.session = workspace._PathWriteSession(
+            self.root, workspace._file_identity(os.lstat(self.root)))
+
+    def test_removed_created_file_is_recreated_with_the_applied_bytes(self):
+        journal = [{'rel': 'agentorch/README.md', 'action': 'remove',
+                    'written': b'applied bytes\n', 'restored': None,
+                    'in_place': False, 'applied': True}]
+        report = workspace._undo_rollback_restores(self.session, journal)
+        self.assertEqual(report, {'undone': ['agentorch/README.md'],
+                                  'preserved': [], 'unverified': []})
+        self.assertEqual((self.root / 'agentorch' / 'README.md').read_bytes(),
+                         b'applied bytes\n')
+
+    def test_in_place_restore_is_reverted_within_the_same_inode(self):
+        target = self.root / 'AGENTS.md'
+        written = b'host line\n\n<!-- AGENTORCH:BEGIN -->\nblock\n'
+        original = b'host line\n'
+        target.write_bytes(original)
+        before = os.lstat(target)
+        journal = [{'rel': 'AGENTS.md', 'action': 'restore', 'written': written,
+                    'restored': original, 'in_place': True, 'applied': True}]
+        report = workspace._undo_rollback_restores(self.session, journal)
+        self.assertEqual(report['undone'], ['AGENTS.md'])
+        self.assertEqual(target.read_bytes(), written)
+        after = os.lstat(target)
+        self.assertEqual((after.st_dev, after.st_ino), (before.st_dev, before.st_ino))
+
+    def test_foreign_bytes_are_preserved_and_are_never_overwritten(self):
+        applied = b'applied bytes\n'
+        original = b'original bytes\n'
+        (self.root / 'agentorch' / 'README.md').write_bytes(original)
+        (self.root / 'agentorch' / 'VERSION.md').write_bytes(b'foreign bytes\n')
+        journal = [
+            # A restore this attempt performed, then reverted by its undo.
+            {'rel': 'agentorch/README.md', 'action': 'restore',
+             'written': applied, 'restored': original, 'in_place': False,
+             'applied': True},
+            # A guarded restore that raised because another writer owned the
+            # path; its bytes must never be replaced by this attempt.
+            {'rel': 'agentorch/VERSION.md', 'action': 'restore',
+             'written': applied, 'restored': original, 'in_place': False,
+             'applied': False},
+        ]
+        report = workspace._undo_rollback_restores(self.session, journal)
+        self.assertEqual(report, {'undone': ['agentorch/README.md'],
+                                  'preserved': ['agentorch/VERSION.md'],
+                                  'unverified': []})
+        self.assertEqual((self.root / 'agentorch' / 'README.md').read_bytes(), applied)
+        self.assertEqual((self.root / 'agentorch' / 'VERSION.md').read_bytes(),
+                         b'foreign bytes\n')
+
+    def test_a_removal_that_cannot_be_proven_is_reported_not_recreated(self):
+        # The unlink raised before returning and the path is gone: recreating it
+        # could undo a concurrent writer's removal, so it is only reported.
+        journal = [{'rel': 'agentorch/README.md', 'action': 'remove',
+                    'written': b'applied bytes\n', 'restored': None,
+                    'in_place': False, 'applied': False}]
+        report = workspace._undo_rollback_restores(self.session, journal)
+        self.assertEqual(report, {'undone': [], 'preserved': [],
+                                  'unverified': ['agentorch/README.md']})
+        self.assertFalse((self.root / 'agentorch' / 'README.md').exists())
 
 
 class PortableWriteSessionTest(unittest.TestCase):

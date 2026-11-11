@@ -3994,13 +3994,17 @@ class _RollbackRefused(Exception):
     """A binding claim that cannot be re-verified; the message is public-safe."""
 
 
-def _rollback_blocked(message: str, *, attempted: bool = False) -> dict:
-    return {
+def _rollback_blocked(message: str, *, attempted: bool = False,
+                      undo: dict | None = None) -> dict:
+    result = {
         'status': 'BLOCKED',
         'problems': [message],
         'rollback': {'required': True, 'attempted': attempted,
                      'result': 'FAILED' if attempted else 'NOT_RUN'},
     }
+    if undo is not None:
+        result['rollback']['undo'] = undo
+    return result
 
 
 def _read_json_regular(root: Path, name: str):
@@ -4582,6 +4586,103 @@ def _replace_file_at_for_write(root_fd: int, rel: str, data: bytes,
         os.close(parent)
 
 
+def _undo_rollback_restores(session, journal: list[dict]) -> dict:
+    """Put back every path this rollback attempt already changed.
+
+    The goal state of one attempt is the tree the APPLY left behind. A restore
+    is undone only while the live file still holds exactly the bytes this
+    attempt wrote; a path another writer changed is reported as preserved and
+    never overwritten. A mutation that raised before it reported success can no
+    longer be attributed to this attempt, so it is reported instead of guessed
+    at. The caller turns any non-empty report into ``BLOCKED``.
+    """
+    undone, preserved, unverified = [], [], []
+    written_by_path = {item['rel']: item['written'] for item in journal}
+    for item in reversed(journal):
+        rel = item['rel']
+        written = item['written']
+        try:
+            current, _info = session.read_file(rel)
+        except (OSError, TransactionConflict, OnboardingError):
+            unverified.append(rel)
+            continue
+        if current == written:
+            # Already back in the applied state: nothing to take back.
+            undone.append(rel)
+            continue
+        if not item['applied']:
+            # The mutation raised before returning, so its effect cannot be
+            # attributed to this attempt. A path still holding the bytes that
+            # mutation would have replaced it with may or may not be ours; a
+            # path holding anything else was never changed by it.
+            if item['action'] == 'remove':
+                if current is None:
+                    unverified.append(rel)
+                else:
+                    preserved.append(rel)
+            elif current == item['restored']:
+                unverified.append(rel)
+            else:
+                preserved.append(rel)
+            continue
+        if item['action'] == 'remove':
+            if current is not None:
+                preserved.append(rel)
+                continue
+            try:
+                session.write_new_file(rel, written)
+            except (OSError, TransactionConflict, OnboardingError):
+                unverified.append(rel)
+                continue
+            undone.append(rel)
+            continue
+        if current != item['restored']:
+            # Foreign bytes: the concurrent writer keeps this path.
+            preserved.append(rel)
+            continue
+        try:
+            if item['in_place']:
+                session.restore_in_place(rel, item['restored'], written)
+            else:
+                session.restore_replace(rel, item['restored'], written)
+        except (OSError, TransactionConflict, OnboardingError):
+            unverified.append(rel)
+            continue
+        undone.append(rel)
+    # Re-read what this attempt claims it put back: an undo that did not land
+    # is a partially recovered host, not a reported success.
+    verified = []
+    for rel in undone:
+        try:
+            current, _info = session.read_file(rel)
+        except (OSError, TransactionConflict, OnboardingError):
+            unverified.append(rel)
+            continue
+        if current != written_by_path[rel]:
+            unverified.append(rel)
+            continue
+        verified.append(rel)
+    return {'undone': sorted(set(verified)), 'preserved': sorted(set(preserved)),
+            'unverified': sorted(set(unverified))}
+
+
+def _rollback_blocked_after_undo(message: str, session, journal: list[dict]) -> dict:
+    """Report a failed attempt after taking back whatever it already restored."""
+    undo = _undo_rollback_restores(session, journal)
+    result = _rollback_blocked(message, attempted=True, undo=undo)
+    problems = [message]
+    if undo['preserved']:
+        problems.append(
+            'rollback left a concurrently changed path untouched: '
+            + ', '.join(undo['preserved'][:5]))
+    if undo['unverified']:
+        problems.append(
+            'rollback could not confirm these paths were put back: '
+            + ', '.join(undo['unverified'][:5]))
+    result['problems'] = problems
+    return result
+
+
 def rollback_isolated_onboarding(result: dict) -> dict:
     """Roll back one APPLY from the binding record written into its backup.
 
@@ -4593,10 +4694,14 @@ def rollback_isolated_onboarding(result: dict) -> dict:
     agree does the caller's write set get restored. Paths outside the recorded
     set are never touched, so concurrent files outside the backup survive.
 
-    The record is consumed by a marker after a verified restore. This does not
-    claim strong isolation from another process running as the same user: a
-    same-UID writer can forge local files, which is why the live state is
-    re-checked instead of trusting the record.
+    A restore that cannot reach every recorded path is one failed attempt, not a
+    partial success: the paths this attempt already changed are put back to the
+    bytes the APPLY left behind, and a path another writer changed meanwhile is
+    preserved and reported instead of overwritten. The record is consumed by a
+    marker only after a verified restore. This does not claim strong isolation
+    from another process running as the same user: a same-UID writer can forge
+    local files, which is why the live state is re-checked instead of trusting
+    the record.
     """
     if type(result) is not dict:
         return _rollback_blocked('rollback request is malformed')
@@ -4654,6 +4759,7 @@ def rollback_isolated_onboarding(result: dict) -> dict:
         return _rollback_blocked('rollback host cannot be opened safely')
     removed: list[str] = []
     restored: list[str] = []
+    journal: list[dict] = []
     try:
         for item in entries:
             rel = item['path']
@@ -4672,28 +4778,47 @@ def rollback_isolated_onboarding(result: dict) -> dict:
         try:
             for item in reversed(entries):
                 rel = item['path']
+                current = item['_current']
                 if not item['original_present']:
-                    current, _ = session.read_file(rel)
-                    if current is None or _raw_sha(current) != item['written_sha256']:
+                    fresh, _ = session.read_file(rel)
+                    if fresh is None or _raw_sha(fresh) != item['written_sha256']:
                         raise _RollbackRefused(
                             f'rollback target changed during recovery: {rel}')
+                    # Record intent first: a mutation that raises after it
+                    # changed the path is reported as unverified, never assumed.
+                    record = {'rel': rel, 'action': 'remove', 'written': current,
+                              'restored': None, 'in_place': False, 'applied': False}
+                    journal.append(record)
                     session.unlink(rel)
+                    record['applied'] = True
                     removed.append(rel)
                     continue
                 original = item['_original']
-                current = item['_current']
                 if rel == ALLOWED_ROOT_ENTRY and current.startswith(original):
+                    record = {'rel': rel, 'action': 'restore', 'written': current,
+                              'restored': original, 'in_place': True,
+                              'applied': False}
+                    journal.append(record)
                     session.truncate(rel, current, len(original))
                 elif rel == ALLOWED_ROOT_ENTRY:
+                    record = {'rel': rel, 'action': 'restore', 'written': current,
+                              'restored': original, 'in_place': True,
+                              'applied': False}
+                    journal.append(record)
                     session.restore_in_place(rel, current, original)
                 else:
+                    record = {'rel': rel, 'action': 'restore', 'written': current,
+                              'restored': original, 'in_place': False,
+                              'applied': False}
+                    journal.append(record)
                     session.restore_replace(rel, current, original)
+                record['applied'] = True
                 restored.append(rel)
         except _RollbackRefused as exc:
-            return _rollback_blocked(str(exc), attempted=True)
+            return _rollback_blocked_after_undo(str(exc), session, journal)
         except (OSError, TransactionConflict, OnboardingError):
-            return _rollback_blocked(
-                'rollback restore failed; inspect the host locally', attempted=True)
+            return _rollback_blocked_after_undo(
+                'rollback restore failed; inspect the host locally', session, journal)
 
         failures = []
         for item in entries:
@@ -4709,9 +4834,9 @@ def rollback_isolated_onboarding(result: dict) -> dict:
             elif current is not None:
                 failures.append(rel)
         if failures:
-            return _rollback_blocked(
+            return _rollback_blocked_after_undo(
                 'rollback verification failed: '
-                + ', '.join(sorted(failures)[:3]), attempted=True)
+                + ', '.join(sorted(failures)[:3]), session, journal)
     finally:
         session.close()
 
