@@ -284,29 +284,25 @@ def _run_variant(root_handle, name, variant, create_options, attributes):
 def _mount_point_buffer(target):
     """Build the FSCTL_SET_REPARSE_POINT input for an NTFS junction.
 
-    Layout: REPARSE_DATA_BUFFER header (tag + data length + reserved = 8 bytes)
-    then MOUNT_POINT_REPARSE_BUFFER (four USHORT fields = 8 bytes, no Flags)
-    then the substitute and print names.  Both names are stored NULL-terminated
-    and the recorded lengths exclude the terminator, which is how the kernel
-    validates mount-point buffers.
+    This mirrors the layout PowerShell uses for ``New-Item -ItemType Junction``:
+    an 8-byte REPARSE_DATA_BUFFER header, the 8-byte MOUNT_POINT fields (four
+    USHORTs, no Flags field), then the NULL-terminated substitute name and an
+    empty print name.  ``ReparseDataLength`` covers the fields plus both
+    terminators; the recorded name lengths exclude the terminators.
     """
     substitute = ('\\??\\' + str(target)).encode('utf-16-le')
-    printable_name = str(target).encode('utf-16-le')
     terminator = b'\x00\x00'
-    path_buffer_offset = 16  # 8-byte header + 8-byte mount-point fields
-    data_length = (8 + len(substitute) + len(terminator) +
-                   len(printable_name) + len(terminator))
-    buffer = ctypes.create_string_buffer(path_buffer_offset + data_length)
+    fields_size = 8
+    data_length = fields_size + len(substitute) + len(terminator) + len(terminator)
+    buffer = ctypes.create_string_buffer(8 + data_length)
     struct.pack_into('<IHH', buffer, 0, IO_REPARSE_TAG_MOUNT_POINT, data_length, 0)
     struct.pack_into('<HHHH', buffer, 8, 0, len(substitute),
-                     len(substitute) + len(terminator), len(printable_name))
-    start = path_buffer_offset
+                     len(substitute) + len(terminator), 0)
+    start = 8 + fields_size
     buffer[start:start + len(substitute)] = substitute
     start += len(substitute)
     buffer[start:start + len(terminator)] = terminator
     start += len(terminator)
-    buffer[start:start + len(printable_name)] = printable_name
-    start += len(printable_name)
     buffer[start:start + len(terminator)] = terminator
     return buffer
 
@@ -670,16 +666,15 @@ class ProbeSelfCheck(unittest.TestCase):
         sub_offset, sub_length, print_offset, print_length = struct.unpack_from(
             '<HHHH', raw, 8)
         self.assertEqual(sub_offset, 0)
+        self.assertEqual(sub_length, len(('\\??\\' + target).encode('utf-16-le')))
         self.assertEqual(print_offset, sub_length + 2)
-        self.assertEqual(data_length, 8 + sub_length + 2 + print_length + 2)
-        self.assertEqual(len(raw), 16 + data_length)
+        self.assertEqual(print_length, 0)
+        self.assertEqual(data_length, 8 + sub_length + 4)
+        self.assertEqual(len(raw), 8 + data_length)
         self.assertEqual(raw[16:16 + sub_length].decode('utf-16-le'),
                          '\\??\\' + target)
-        self.assertEqual(raw[16 + sub_length:16 + sub_length + 2], b'\x00\x00')
-        print_start = 16 + sub_length + 2
-        self.assertEqual(raw[print_start:print_start + print_length].decode('utf-16-le'),
-                         target)
-        self.assertEqual(raw[-2:], b'\x00\x00')
+        self.assertEqual(raw[16 + sub_length:16 + sub_length + 4],
+                         b'\x00\x00\x00\x00')
 
     def test_missing_handle_never_reports_a_close(self):
         module = sys.modules[__name__]
