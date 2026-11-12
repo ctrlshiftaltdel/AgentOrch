@@ -1,7 +1,8 @@
 """Structural tests for scripts/validate_kit.py (evidence matrix contract).
 
-The field names / status enum are read back from docs/orchestration.md, so these
-tests fail if the authoritative definition and the validator drift apart.
+The field names / status enum are read back from the core contract
+(`kit/orchestration.md` in the 1.7.1 bridge layout), so these tests fail if the
+authoritative definition and the validator drift apart.
 """
 import importlib.util, json, re, shutil, subprocess, sys, tempfile, unittest
 from pathlib import Path
@@ -831,7 +832,8 @@ class TreeModeTests(unittest.TestCase):
     """validate_kit has to work in all three trees it can be pointed at.
 
     - `package`: a pristine release package. Its `docs/` holds nothing but the
-      shipped files of REQUIRED (today only docs/orchestration.md).
+      shipped files of REQUIRED (currently none: the bridge package ships no
+      `docs/` file and keeps the contract at `kit/orchestration.md`).
     - `downstream`: a project that unzipped the kit and filled in its own
       `docs/PROJECT.md` + `docs/PLAN.md`; the project config is the marker.
     - `upstream`: this repository, where `docs/upgrade.md` exists.

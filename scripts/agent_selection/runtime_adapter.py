@@ -64,7 +64,8 @@ __all__ = [
 ]
 
 # The capability ids are the existing contract ids: C1-C4 from
-# docs/orchestration.md §5 and C5-C8 from templates/runtime-capability.md.
+# kit/orchestration.md §5 (the 1.7.1 bridge layout) and C5-C8 from
+# templates/runtime-capability.md.
 CAPABILITY_IDS = ('C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8')
 # Only these gate the real automatic dispatch path (kit §5).
 GATING_CAPABILITIES = ('C1', 'C2', 'C3', 'C4')
