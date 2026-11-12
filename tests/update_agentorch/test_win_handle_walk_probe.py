@@ -34,6 +34,8 @@ import unittest
 if os.name == 'nt':  # pragma: no branch - the whole probe is Windows-only
     kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
     ntdll = ctypes.WinDLL('ntdll')
+    print(f'WINPROBE-IMPORT os.name={os.name!r} platform={platform.platform()!r}',
+          file=sys.stderr, flush=True)
 else:  # Linux/macOS: the test is skipped before these are used
     kernel32 = None
     ntdll = None
@@ -372,10 +374,14 @@ def _run_probe():
 class WindowsNtCreateFileProbe(unittest.TestCase):
     def test_ntcreatefile_root_relative_probe(self):
         if os.name != 'nt':
+            print(f'WINPROBE-SKIP NOT_RUN: Windows-only NtCreateFile diagnostic '
+                  f'os.name={os.name!r} platform={platform.platform()!r}',
+                  file=sys.stderr, flush=True)
             self.skipTest('NOT_RUN: Windows-only NtCreateFile diagnostic; '
                           'this is not pass evidence')
         report = _run_probe()
-        print('WINPROBE ' + json.dumps(report, sort_keys=True, ensure_ascii=False))
+        print('WINPROBE ' + json.dumps(report, sort_keys=True, ensure_ascii=False),
+              file=sys.stderr, flush=True)
         self.assertEqual(report.get('probe'), 'completed')
         self.assertTrue(report.get('root_open'), 'WINPROBE root handle did not open')
         self.assertTrue(report.get('handles_closed'), 'WINPROBE handle leak')
