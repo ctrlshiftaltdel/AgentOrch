@@ -4,7 +4,7 @@ The field names / status enum are read back from the core contract
 (`kit/orchestration.md` in the 1.7.1 bridge layout), so these tests fail if the
 authoritative definition and the validator drift apart.
 """
-import importlib.util, json, os, re, shutil, subprocess, sys, tempfile, unittest
+import contextlib, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -25,6 +25,30 @@ HEAD = 'a' * 40
 # existing repository-only tests below).
 UPSTREAM_CHECKOUT = (ROOT / 'docs' / 'upgrade.md').is_file()
 BUILD_SCRIPT = ROOT / 'scripts' / 'build_release.py'
+
+
+@contextlib.contextmanager
+def recording_fs():
+    """Record every os.stat / os.lstat / os.open path argument made in the block."""
+    calls = []
+    real_stat, real_lstat, real_open = os.stat, os.lstat, os.open
+
+    def stat(path, *args, **kwargs):
+        calls.append(('stat', os.fspath(path)))
+        return real_stat(path, *args, **kwargs)
+
+    def lstat(path, *args, **kwargs):
+        calls.append(('lstat', os.fspath(path)))
+        return real_lstat(path, *args, **kwargs)
+
+    def opened(path, *args, **kwargs):
+        calls.append(('open', os.fspath(path)))
+        return real_open(path, *args, **kwargs)
+
+    with mock.patch.object(os, 'stat', stat), \
+            mock.patch.object(os, 'lstat', lstat), \
+            mock.patch.object(os, 'open', opened):
+        yield calls
 
 
 def canonical():
@@ -1658,25 +1682,17 @@ class LegacyPathTests(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp:
             root = self.tree(
-                tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n',
-                      'old/legacy.md': '# still here\n'},
+                tmp, {self.AUTH_OLD: '# authority\n', self.AUTH_NEW: '# successor\n',
+                      'docs/history.md': '# history\n', 'old/legacy.md': '# still here\n'},
+                note=self.DEFERRED, old=self.AUTH_OLD, new=self.AUTH_NEW,
                 extra_rows='| `old/legacy.md` | no-backticked-new | `docs/history.md` | '
                            '1.5 | moved |\n')
             calls = []
-            real_exists = Path.exists
-
-            def recording_exists(path_self):
-                calls.append(str(path_self))
-                return real_exists(path_self)
-
-            with mock.patch.object(Path, 'exists', recording_exists):
+            with recording_fs() as calls:
                 errors = validate.legacy_path_errors(root)
         self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
-        self.assertFalse(any('old/legacy.md' in call for call in calls), calls)
-        self.assertTrue(calls, 'the valid row should still be checked')
-        root_prefix = str(root) + os.sep
-        self.assertTrue(all(call == str(root) or call.startswith(root_prefix)
-                            for call in calls), calls)
+        self.assertFalse(any('old/legacy.md' in arg for _, arg in calls), calls)
+        self.assertTrue(calls, 'the deferred row should still be checked')
 
     def test_malformed_rows_never_probe_relative_absolute_or_symlink_escapes(self):
         with tempfile.TemporaryDirectory() as tmp, \
@@ -1684,7 +1700,9 @@ class LegacyPathTests(unittest.TestCase):
             outside = Path(outside_tmp) / 'outside.md'
             outside.write_text('# outside\n', encoding='utf-8')
             root = self.tree(
-                tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n'},
+                tmp, {self.AUTH_OLD: '# authority\n', self.AUTH_NEW: '# successor\n',
+                      'docs/history.md': '# history\n'},
+                note=self.DEFERRED, old=self.AUTH_OLD, new=self.AUTH_NEW,
                 extra_rows=(
                     '| `../outside.md` | no-backticked-new | `docs/history.md` | 1.5 | '
                     'moved |\n'
@@ -1693,23 +1711,13 @@ class LegacyPathTests(unittest.TestCase):
                     '| `escape-link` | no-backticked-new | `docs/history.md` | 1.5 | '
                     'moved |\n'))
             os.symlink(outside, root / 'escape-link')
-            calls = []
-            real_exists = Path.exists
-
-            def recording_exists(path_self):
-                calls.append(str(path_self))
-                return real_exists(path_self)
-
-            with mock.patch.object(Path, 'exists', recording_exists):
+            with recording_fs() as calls:
                 errors = validate.legacy_path_errors(root)
         malformed = [e for e in errors if 'malformed 旧路径登记 row' in e]
         self.assertEqual(len(malformed), 3, errors)
         for needle in ('../outside.md', '/etc/hostname', 'escape-link'):
-            self.assertFalse(any(needle in call for call in calls), (needle, calls))
-        self.assertTrue(calls, 'the valid row should still be checked')
-        root_prefix = str(root) + os.sep
-        self.assertTrue(all(call == str(root) or call.startswith(root_prefix)
-                            for call in calls), calls)
+            self.assertFalse(any(needle in arg for _, arg in calls), (needle, calls))
+        self.assertTrue(calls, 'the deferred row should still be checked')
 
     def test_malformed_row_with_multiple_old_paths_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1784,6 +1792,136 @@ class LegacyPathTests(unittest.TestCase):
             errors = validate.legacy_path_errors(root)
         self.assertFalse(any('kit/orchestration.md still exists' in e for e in errors), errors)
         self.assertTrue(any('legacy path old/other.md still exists' in e for e in errors), errors)
+
+
+class LegacyPathSafetyTests(unittest.TestCase):
+    """Paths from the registry must never become filesystem input outside root."""
+
+    AUTH_OLD = 'kit/orchestration.md'
+    AUTH_NEW = 'docs/orchestration.md'
+    DEFERRED = '`DEFERRED`: #238 BRIDGE-1.7.1'
+    HEADER = ('# lifecycle\n\n'
+              '### 7.1 旧路径登记（迁移 / 兼容例外）\n\n'
+              '| 旧路径 | 替代路径 | 允许出现的文件 | 生效版本 | 说明 |\n'
+              '|---|---|---|---|---|\n')
+
+    def table(self, *rows):
+        return self.HEADER + ''.join(rows)
+
+    def tree(self, tmp, files, *rows):
+        root = Path(tmp)
+        for rel, text in files.items():
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding='utf-8')
+        target = root / validate.LIFECYCLE_DOC
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.table(*rows), encoding='utf-8')
+        return root
+
+    def control_row(self):
+        return (f'| `{self.AUTH_OLD}` | `{self.AUTH_NEW}` | `docs/history.md` | 1.5 | '
+                f'{self.DEFERRED} |\n')
+
+    def base_files(self):
+        return {self.AUTH_OLD: '# authority\n', self.AUTH_NEW: '# successor\n',
+                'docs/history.md': '# history\n'}
+
+    def assert_not_probed(self, calls, needles):
+        rendered = [arg for _, arg in calls]
+        for needle in needles:
+            self.assertFalse(any(needle in item for item in rendered), (needle, rendered))
+
+    def test_absolute_paths_in_old_new_and_allowed_are_not_probed(self):
+        rows = (
+            self.control_row(),
+            '| `  /etc/hostname  ` | `docs/history.md` | `docs/history.md` | 1.5 | moved |\n',
+            '| `old/a.md` | `  /etc/hostname  ` | `docs/history.md` | 1.5 | moved |\n',
+            '| `old/b.md` | `docs/history.md` | `  /etc/hostname  ` | 1.5 | moved |\n',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, self.base_files(), *rows)
+            with recording_fs() as calls:
+                errors = validate.legacy_path_errors(root)
+        self.assertEqual(sum('absolute' in error for error in errors), 3, errors)
+        self.assert_not_probed(calls, ['/etc/hostname'])
+
+    def test_parent_traversal_in_old_new_and_allowed_is_not_probed(self):
+        rows = (
+            self.control_row(),
+            '| `../outside.md` | `docs/history.md` | `docs/history.md` | 1.5 | moved |\n',
+            '| `old/a.md` | `../outside.md` | `docs/history.md` | 1.5 | moved |\n',
+            '| `old/b.md` | `docs/history.md` | `../outside.md` | 1.5 | moved |\n',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, self.base_files(), *rows)
+            with recording_fs() as calls:
+                errors = validate.legacy_path_errors(root)
+        self.assertEqual(sum('parent traversal' in error for error in errors), 3, errors)
+        self.assert_not_probed(calls, ['..'])
+
+    def test_symlinks_to_outside_are_refused_without_following(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                tempfile.TemporaryDirectory() as outside_tmp:
+            outside_dir = Path(outside_tmp)
+            outside_file = outside_dir / 'outside.md'
+            outside_file.write_text('# outside\n', encoding='utf-8')
+            root = self.tree(
+                tmp, self.base_files(),
+                self.control_row(),
+                '| `old-link` | `docs/history.md` | `docs/history.md` | 1.5 | moved |\n',
+                '| `old/a.md` | `new-link` | `docs/history.md` | 1.5 | moved |\n',
+                '| `old/b.md` | `docs/history.md` | `allowed-link` | 1.5 | moved |\n',
+                '| `old/c.md` | `linkdir/outside.md` | `docs/history.md` | 1.5 | moved |\n')
+            os.symlink(outside_file, root / 'old-link')
+            os.symlink(outside_file, root / 'new-link')
+            os.symlink(outside_file, root / 'allowed-link')
+            os.symlink(outside_dir, root / 'linkdir')
+            with recording_fs() as calls:
+                errors = validate.legacy_path_errors(root)
+        self.assertEqual(sum('symlink' in error for error in errors), 4, errors)
+        self.assert_not_probed(calls, [str(outside_file), str(outside_dir), 'outside.md'])
+        for error in errors:
+            self.assertNotIn(str(outside_file), error)
+            self.assertNotIn(str(outside_dir), error)
+
+    def test_unsafe_paths_fail_closed_on_a_platform_without_dir_fd(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                tempfile.TemporaryDirectory() as outside_tmp:
+            outside_dir = Path(outside_tmp)
+            outside_file = outside_dir / 'outside.md'
+            outside_file.write_text('# outside\n', encoding='utf-8')
+            root = self.tree(
+                tmp, self.base_files(),
+                self.control_row(),
+                '| `  /etc/hostname  ` | `docs/history.md` | `docs/history.md` | 1.5 | moved |\n',
+                '| `old/a.md` | `../outside.md` | `docs/history.md` | 1.5 | moved |\n',
+                '| `old/b.md` | `docs/history.md` | `allowed-link` | 1.5 | moved |\n',
+                '| `old/c.md` | `linkdir/outside.md` | `docs/history.md` | 1.5 | moved |\n')
+            os.symlink(outside_file, root / 'allowed-link')
+            os.symlink(outside_dir, root / 'linkdir')
+            with mock.patch.object(validate, '_DIR_FD_SAFE', False):
+                with recording_fs() as calls:
+                    errors = validate.legacy_path_errors(root)
+        self.assertEqual(len([e for e in errors if 'unsafe' in e]), 4, errors)
+        self.assert_not_probed(calls, ['/etc/hostname', '..', str(outside_file),
+                                       str(outside_dir), 'outside.md'])
+
+    def test_valid_rows_still_pass_without_dir_fd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {'docs/second.md': '# second\n', 'docs/history.md': '# history\n'},
+                '| `old/second.md` | `docs/second.md` | `docs/history.md` | 1.5 | moved |\n')
+            with mock.patch.object(validate, '_DIR_FD_SAFE', False):
+                errors = validate.legacy_path_errors(root)
+        self.assertEqual(errors, [])
+
+    def test_exact_deferral_still_passes_without_dir_fd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, self.base_files(), self.control_row())
+            with mock.patch.object(validate, '_DIR_FD_SAFE', False):
+                errors = validate.legacy_path_errors(root)
+        self.assertEqual(errors, [])
 
 
 class DocumentationImpactTests(unittest.TestCase):

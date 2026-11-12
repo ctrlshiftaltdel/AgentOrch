@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Static validation for the Agent-Orchestration kit (core + local/github editions)."""
 from pathlib import Path
-import argparse, fnmatch, hashlib, importlib.util, json, os, posixpath, re, runpy, sys
+import argparse, fnmatch, hashlib, importlib.util, json, os, posixpath, re, runpy, stat, sys
 
 ROOT = Path(__file__).resolve().parents[1]
 # Release package manifest. It exists only in a built package (the repository
@@ -700,6 +700,10 @@ def _scan_files(root, start, errors, excluded=()):
         dirnames[:] = [name for name in dirnames if name not in excluded]
         for name in filenames:
             path = Path(directory) / name
+            if path.is_symlink():
+                # Never read a file through a symlink: the target may be outside
+                # the tree this scan is meant to inspect.
+                continue
             if path.is_file():
                 yield path
 
@@ -1282,13 +1286,13 @@ def legacy_path_registry(text):
                 cells, 'the 旧路径 and 替代路径 cells must each contain exactly one '
                        f'backticked path (found {len(old_paths)} and {len(new_paths)})'))
             continue
-        old, new = old_paths[0].strip('/').strip(), new_paths[0].strip()
+        old, new = old_paths[0].strip(), new_paths[0].strip()
         if not old or not new:
             entries.append(_malformed_registry_row(
                 cells, 'the 旧路径 and 替代路径 cells must each contain a non-empty '
                        'backticked path'))
             continue
-        allowed = [item.strip().strip('/') for item in re.findall(r'`([^`]+)`', cells[2])]
+        allowed = [item.strip() for item in re.findall(r'`([^`]+)`', cells[2])]
         note = cells[4]
         elsewhere = any(DEFERRAL_MENTION_RE.search(cell)
                         for index, cell in enumerate(cells) if index != 4)
@@ -1319,6 +1323,124 @@ DEFERRAL_AUTHORISATIONS = {
     },
 }
 DEFERRAL_MENTION_RE = re.compile(r'DEFERRED', re.IGNORECASE)
+
+
+# --- Registry path safety ----------------------------------------------------
+# Every path in a registry row is untrusted input. Before any filesystem call it
+# must pass a lexical gate, and the existence/symlink probe must never follow a
+# symlink or step outside the project root. On POSIX the probe walks the path one
+# component at a time with O_NOFOLLOW + dir_fd, so a component that is a symlink
+# is refused and a concurrent rename cannot redirect the walk through an opened
+# directory descriptor. Platforms without those primitives use a component-wise
+# lstat fallback; it refuses observed symlinks but, like any path-based check,
+# is not race-free against a concurrent mutation of the tree. That limitation is
+# documented rather than described as strong isolation.
+_REGISTRY_DRIVE_RE = re.compile(r'^[A-Za-z]:')
+_DIR_FD_SAFE = bool(
+    hasattr(os, 'supports_dir_fd')
+    and hasattr(os, 'O_NOFOLLOW') and hasattr(os, 'O_DIRECTORY')
+    and os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+)
+
+
+def _registry_path_problem(path):
+    """Return why *path* is not a plain project-relative path, or ``None``."""
+    if not isinstance(path, str) or not path:
+        return 'is empty'
+    if path.startswith(('/', '\\')):
+        return 'is absolute'
+    if _REGISTRY_DRIVE_RE.match(path):
+        return 'is an absolute drive path'
+    if '\\' in path:
+        return 'contains a backslash path separator'
+    if '\x00' in path:
+        return 'contains a NUL byte'
+    for part in path.split('/'):
+        if part in ('', '.', '..'):
+            return "contains an empty, '.' or '..' (parent traversal) component"
+        if ':' in part:
+            return 'contains a colon that is ambiguous across platforms'
+    return None
+
+
+def _kind(mode):
+    if stat.S_ISREG(mode):
+        return 'file'
+    if stat.S_ISDIR(mode):
+        return 'dir'
+    return 'other'
+
+
+def _is_link_or_reparse(info):
+    """True for a symlink, and on Windows for any reparse point (junction/mount)."""
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    return bool(getattr(info, 'st_reparse_tag', 0))
+
+
+def _safe_registry_stat(root, rel):
+    """Return ``(status, detail)`` for one registry path without leaving root.
+
+    status is one of ``file`` / ``dir`` / ``other`` / ``missing`` / ``unsafe``.
+    ``unsafe`` means the path is absolute, traverses upward, is (or crosses) a
+    symlink, or cannot be inspected without following links. No filesystem call
+    is made with an absolute, parent-traversing or otherwise unprovable path.
+    """
+    problem = _registry_path_problem(rel)
+    if problem is not None:
+        return 'unsafe', problem
+    parts = rel.split('/')
+    if _DIR_FD_SAFE:
+        try:
+            fd = os.open(os.fspath(root), os.O_RDONLY | os.O_DIRECTORY)
+        except OSError:
+            return 'unsafe', 'the project root cannot be opened safely'
+        try:
+            for name in parts[:-1]:
+                try:
+                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                    dir_fd=fd)
+                except FileNotFoundError:
+                    return 'missing', ''
+                except OSError:
+                    return ('unsafe',
+                            f'component {name!r} is a symlink or not a real directory')
+                os.close(fd)
+                fd = child
+            try:
+                info = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return 'missing', ''
+            except OSError:
+                return 'unsafe', 'the final component cannot be inspected without following links'
+            if _is_link_or_reparse(info):
+                return 'unsafe', 'is a symlink or reparse point'
+            return _kind(info.st_mode), ''
+        finally:
+            os.close(fd)
+    current = Path(root)
+    for name in parts[:-1]:
+        current = current / name
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            return 'missing', ''
+        except OSError:
+            return 'unsafe', f'component {name!r} cannot be inspected safely'
+        if _is_link_or_reparse(info):
+            return 'unsafe', f'component {name!r} is a symlink or reparse point'
+        if not stat.S_ISDIR(info.st_mode):
+            return 'unsafe', f'component {name!r} is not a directory'
+    try:
+        info = os.lstat(current / parts[-1])
+    except FileNotFoundError:
+        return 'missing', ''
+    except OSError:
+        return 'unsafe', 'the final component cannot be inspected safely'
+    if _is_link_or_reparse(info):
+        return 'unsafe', 'is a symlink or reparse point'
+    return _kind(info.st_mode), ''
 
 
 def _deferral_state(note, old, new, *, marker_outside_note=False):
@@ -1368,29 +1490,54 @@ def legacy_path_errors(root=ROOT):
                           + '; '.join(details))
             continue
         old, new = entry['old'], entry['new']
-        state = entry.get('deferral', 'none')
-        if state == 'malformed':
+        deferral_state = entry.get('deferral', 'none')
+        if deferral_state == 'malformed':
             errors.append(f'{LIFECYCLE_DOC}: legacy {old} has a malformed deferral marker: '
                           f'{entry.get("deferral_error") or "invalid marker"}')
             continue
-        if not (root / new).exists():
+        row_unsafe = False
+        new_state, new_detail = _safe_registry_stat(root, new)
+        if new_state == 'unsafe':
+            errors.append(f'{LIFECYCLE_DOC}: legacy {old} successor {new} is unsafe: '
+                          f'{new_detail}; refusing to inspect it')
+            row_unsafe = True
+        elif new_state == 'missing':
             errors.append(f'{LIFECYCLE_DOC}: legacy {old} successor {new} does not exist')
+        elif new_state != 'file':
+            errors.append(f'{LIFECYCLE_DOC}: legacy {old} successor {new} is not a regular file')
         for rel in entry['allowed']:
-            if not (root / rel).exists():
+            allowed_state, allowed_detail = _safe_registry_stat(root, rel)
+            if allowed_state == 'unsafe':
+                errors.append(f'{LIFECYCLE_DOC}: legacy {old} allowed file {rel} is unsafe: '
+                              f'{allowed_detail}; refusing to inspect it')
+                row_unsafe = True
+            elif allowed_state == 'missing':
                 errors.append(f'{LIFECYCLE_DOC}: legacy {old} allowed file {rel} does not exist')
-        if state == 'valid':
+            elif allowed_state != 'file':
+                errors.append(f'{LIFECYCLE_DOC}: legacy {old} allowed file {rel} is not a '
+                              'regular file')
+        old_state, old_detail = _safe_registry_stat(root, old)
+        if old_state == 'unsafe':
+            errors.append(f'{LIFECYCLE_DOC}: legacy path {old} is unsafe: '
+                          f'{old_detail}; refusing to inspect it')
+            row_unsafe = True
+        if deferral_state == 'valid':
             # Exactly three migrated-state checks are deferred, and only for this
             # row: the old path may still exist, may still be a release path, and
             # may still be referenced anywhere until the migration is executed.
             # A deferral whose old path is already gone is stale and must be
             # cleaned up instead of staying as an open-ended exception.
-            if not (root / old).exists():
+            if old_state == 'missing':
                 errors.append(f'{LIFECYCLE_DOC}: legacy {old} is marked deferred but no longer '
                               'exists on disk; remove the deferral and close the migration row')
             continue
-        if (root / old).exists():
+        if old_state != 'unsafe' and old_state != 'missing':
             errors.append(f'{LIFECYCLE_DOC}: legacy path {old} still exists on disk; keep one '
                           'authority instead of a second copy')
+        if row_unsafe:
+            # A path from this row could not be proven safe; do not run the
+            # reference scan (it would touch the tree with an untrusted path).
+            continue
         if any(rel == old or rel.startswith(old + '/') for rel in REQUIRED):
             errors.append(f'{LIFECYCLE_DOC}: legacy path {old} must not be a release path')
         allowed = set(entry['allowed'])
