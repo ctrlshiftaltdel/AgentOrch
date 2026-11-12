@@ -4,7 +4,7 @@ The field names / status enum are read back from the core contract
 (`kit/orchestration.md` in the 1.7.1 bridge layout), so these tests fail if the
 authoritative definition and the validator drift apart.
 """
-import importlib.util, json, re, shutil, subprocess, sys, tempfile, unittest
+import importlib.util, json, os, re, shutil, subprocess, sys, tempfile, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -1647,17 +1647,102 @@ class LegacyPathTests(unittest.TestCase):
         self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
         self.assertTrue(any('outside the 说明 column' in e for e in errors), errors)
 
-    def test_malformed_row_naming_an_existing_old_file_fails_closed(self):
+    def test_malformed_row_naming_an_existing_old_file_is_reported_without_probing(self):
+        """A malformed row is reported; its paths are never used as filesystem input.
+
+        The previous version of this test expected a "still exists" detail. That
+        detail required stat-ing an untrusted path from the malformed row, which
+        is a privacy/exfiltration risk, so the assertion is changed (by the
+        owner's explicit authorisation) to prove fail-closed reporting *and*
+        that the named path is not probed.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             root = self.tree(
                 tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n',
                       'old/legacy.md': '# still here\n'},
                 extra_rows='| `old/legacy.md` | no-backticked-new | `docs/history.md` | '
                            '1.5 | moved |\n')
+            calls = []
+            real_exists = Path.exists
+
+            def recording_exists(path_self):
+                calls.append(str(path_self))
+                return real_exists(path_self)
+
+            with mock.patch.object(Path, 'exists', recording_exists):
+                errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
+        self.assertFalse(any('old/legacy.md' in call for call in calls), calls)
+        self.assertTrue(calls, 'the valid row should still be checked')
+        root_prefix = str(root) + os.sep
+        self.assertTrue(all(call == str(root) or call.startswith(root_prefix)
+                            for call in calls), calls)
+
+    def test_malformed_rows_never_probe_relative_absolute_or_symlink_escapes(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                tempfile.TemporaryDirectory() as outside_tmp:
+            outside = Path(outside_tmp) / 'outside.md'
+            outside.write_text('# outside\n', encoding='utf-8')
+            root = self.tree(
+                tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n'},
+                extra_rows=(
+                    '| `../outside.md` | no-backticked-new | `docs/history.md` | 1.5 | '
+                    'moved |\n'
+                    '| `/etc/hostname` | no-backticked-new | `docs/history.md` | 1.5 | '
+                    'moved |\n'
+                    '| `escape-link` | no-backticked-new | `docs/history.md` | 1.5 | '
+                    'moved |\n'))
+            os.symlink(outside, root / 'escape-link')
+            calls = []
+            real_exists = Path.exists
+
+            def recording_exists(path_self):
+                calls.append(str(path_self))
+                return real_exists(path_self)
+
+            with mock.patch.object(Path, 'exists', recording_exists):
+                errors = validate.legacy_path_errors(root)
+        malformed = [e for e in errors if 'malformed 旧路径登记 row' in e]
+        self.assertEqual(len(malformed), 3, errors)
+        for needle in ('../outside.md', '/etc/hostname', 'escape-link'):
+            self.assertFalse(any(needle in call for call in calls), (needle, calls))
+        self.assertTrue(calls, 'the valid row should still be checked')
+        root_prefix = str(root) + os.sep
+        self.assertTrue(all(call == str(root) or call.startswith(root_prefix)
+                            for call in calls), calls)
+
+    def test_malformed_row_with_multiple_old_paths_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n'},
+                extra_rows='| `old/a.md` `old/b.md` | `docs/new.md` | `docs/history.md` | '
+                           '1.5 | moved |\n')
             errors = validate.legacy_path_errors(root)
         self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
-        self.assertTrue(any('still exist' in e and 'old/legacy.md' in e for e in errors),
-                        errors)
+        self.assertTrue(any('exactly one backticked path' in e for e in errors), errors)
+
+    def test_malformed_row_with_multiple_new_paths_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n'},
+                extra_rows='| `old/a.md` | `docs/new.md` `docs/new2.md` | `docs/history.md` '
+                           '| 1.5 | moved |\n')
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
+        self.assertTrue(any('exactly one backticked path' in e for e in errors), errors)
+
+    def test_rows_with_three_or_four_columns_fail_closed(self):
+        for row in (
+            '| `old/a.md` | `docs/new.md` | `docs/history.md` |\n',
+            '| `old/a.md` | `docs/new.md` | `docs/history.md` | 1.5 |\n',
+        ):
+            with self.subTest(row=row), tempfile.TemporaryDirectory() as tmp:
+                root = self.tree(
+                    tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n'},
+                    extra_rows=row)
+                errors = validate.legacy_path_errors(root)
+            self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
+            self.assertTrue(any('exactly 5 columns' in e for e in errors), errors)
 
     def test_row_with_too_few_columns_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
