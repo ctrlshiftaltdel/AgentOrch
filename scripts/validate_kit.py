@@ -1242,16 +1242,42 @@ def repository_map_errors(root=ROOT):
     return errors
 
 
+def _malformed_registry_row(cells, reason):
+    """A registry row that cannot be parsed; it must still fail closed."""
+    elsewhere = any(DEFERRAL_MENTION_RE.search(cell)
+                    for index, cell in enumerate(cells) if index != 4)
+    candidate_cells = cells[:2] if len(cells) >= 2 else cells
+    named = [item.strip().strip('/')
+             for cell in candidate_cells
+             for item in re.findall(r'`([^`]+)`', cell or '')]
+    return {'old': None, 'new': None, 'allowed': [], 'deferral': 'none',
+            'deferral_error': '', 'malformed_row': reason,
+            'malformed_row_marker_outside_note': elsewhere,
+            'malformed_row_paths': [item for item in named if item]}
+
+
 def legacy_path_registry(text):
-    """Rows of the 旧路径登记 table in the lifecycle document."""
+    """Rows of the 旧路径登记 table in the lifecycle document.
+
+    ``_table_after`` already drops the header and separator rows. Every
+    remaining row is a data row: one that cannot be parsed is returned as a
+    malformed entry instead of being skipped, so a valid row next to it cannot
+    mask the defect.
+    """
     entries, rows = [], _table_after(text, '旧路径登记')
     if not rows:
         return entries
     for cells in rows:
         if len(cells) < 3:
+            entries.append(_malformed_registry_row(
+                cells, 'the row must carry at least the 旧路径, 替代路径 and 允许出现的文件 '
+                       'columns'))
             continue
         old, new = _backticked(cells[0]), _backticked(cells[1])
         if not old or not new:
+            entries.append(_malformed_registry_row(
+                cells, 'the 旧路径 and 替代路径 cells must each contain exactly one '
+                       'backticked path'))
             continue
         allowed = [item.strip().strip('/') for item in re.findall(r'`([^`]+)`', cells[2])]
         note = cells[4] if len(cells) > 4 else ''
@@ -1326,6 +1352,17 @@ def legacy_path_errors(root=ROOT):
                 '允许出现的文件 / 说明)']
     errors, scan_errors = [], []
     for entry in entries:
+        if entry.get('malformed_row'):
+            details = [entry['malformed_row']]
+            if entry.get('malformed_row_marker_outside_note'):
+                details.append('a DEFERRED marker appears outside the 说明 column')
+            existing = sorted({path for path in entry.get('malformed_row_paths') or []
+                               if path and (root / path).exists()})
+            if existing:
+                details.append('path(s) named in the row still exist: ' + ', '.join(existing))
+            errors.append(f'{LIFECYCLE_DOC}: malformed 旧路径登记 row: '
+                          + '; '.join(details))
+            continue
         old, new = entry['old'], entry['new']
         state = entry.get('deferral', 'none')
         if state == 'malformed':

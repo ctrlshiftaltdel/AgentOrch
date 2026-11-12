@@ -1405,7 +1405,7 @@ class LegacyPathTests(unittest.TestCase):
     DEFERRED = '`DEFERRED`: #238 BRIDGE-1.7.1'
 
     def lifecycle(self, allowed='`docs/history.md`', replacement=None, note='moved',
-                  old=None, new=None):
+                  old=None, new=None, extra_rows=''):
         old = self.OLD if old is None else old
         new = self.NEW if new is None else new
         if replacement is None:
@@ -1414,10 +1414,11 @@ class LegacyPathTests(unittest.TestCase):
                 '### 7.1 旧路径登记（迁移 / 兼容例外）\n\n'
                 '| 旧路径 | 替代路径 | 允许出现的文件 | 生效版本 | 说明 |\n'
                 '|---|---|---|---|---|\n'
-                f'| `{old}` | {replacement} | {allowed} | 1.5 | {note} |\n')
+                f'| `{old}` | {replacement} | {allowed} | 1.5 | {note} |\n'
+                + extra_rows)
 
     def tree(self, tmp, files, allowed='`docs/history.md`', replacement=None, note='moved',
-             old=None, new=None):
+             old=None, new=None, extra_rows=''):
         root = Path(tmp)
         for rel, text in files.items():
             path = root / rel
@@ -1426,7 +1427,7 @@ class LegacyPathTests(unittest.TestCase):
         target = root / validate.LIFECYCLE_DOC
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(self.lifecycle(allowed=allowed, replacement=replacement, note=note,
-                                         old=old, new=new),
+                                         old=old, new=new, extra_rows=extra_rows),
                           encoding='utf-8')
         return root
 
@@ -1625,6 +1626,55 @@ class LegacyPathTests(unittest.TestCase):
             errors = validate.legacy_path_errors(root)
         self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
         self.assertTrue(any('说明 column' in e for e in errors), errors)
+
+    def test_a_malformed_row_next_to_a_valid_row_fails_closed(self):
+        """A valid row must not mask a row whose old/new paths cannot be parsed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n'},
+                extra_rows='| `old/broken.md` | no-backticked-new | `docs/history.md` | '
+                           '1.5 | moved |\n')
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
+
+    def test_malformed_row_with_deferred_outside_the_note_column_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n'},
+                extra_rows='| `old/broken.md` | no-backticked-new | `DEFERRED` | 1.5 | '
+                           'moved |\n')
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
+        self.assertTrue(any('outside the 说明 column' in e for e in errors), errors)
+
+    def test_malformed_row_naming_an_existing_old_file_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n',
+                      'old/legacy.md': '# still here\n'},
+                extra_rows='| `old/legacy.md` | no-backticked-new | `docs/history.md` | '
+                           '1.5 | moved |\n')
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
+        self.assertTrue(any('still exist' in e and 'old/legacy.md' in e for e in errors),
+                        errors)
+
+    def test_row_with_too_few_columns_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n'},
+                extra_rows='| `old/thing.md` | `docs/thing.md` |\n')
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
+
+    def test_a_second_valid_row_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {self.NEW: '# thing\n', 'docs/second.md': '# second\n',
+                      'docs/history.md': '# history\n'},
+                extra_rows='| `old/second.md` | `docs/second.md` | `docs/history.md` | '
+                           '1.5 | moved |\n')
+            self.assertEqual(validate.legacy_path_errors(root), [])
 
     def test_other_rows_stay_strict_while_one_row_is_deferred(self):
         other_old, other_new = 'old/other.md', 'docs/other.md'

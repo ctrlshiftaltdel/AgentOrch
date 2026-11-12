@@ -113,6 +113,8 @@
 
 这里的机器规则只是**本地冻结标记的精确匹配**：它不访问 GitHub，也不证明 `#238` 是否存在、已批准或仍然授权。授权事实以任务载体为准，离线校验不替代它，也不声称能验证人工作出的授权。
 
+表内每一行都是数据行（表头与分隔行由解析器先行移除）；列数不足、或 `旧路径` / `替代路径` 单元格无法各解析出一个反引号路径的行，一律按**畸形行**报错。畸形行不会因为同一张表里还有合法行而被跳过；检查还会报告该行说明列以外的 `DEFERRED`，以及其旧路径 / 替代路径单元格中点名且仍存在于磁盘的路径。
+
 | 旧路径 | 替代路径 | 允许出现的文件 | 生效版本 | 说明 |
 |---|---|---|---|---|
 | `kit/orchestration.md` | `docs/orchestration.md` | `docs/architecture/repository-map.md`、`docs/design/next-phase-governance-and-agent-performance.md`、`docs/implementation-plan.md`、`docs/metrics.md`、`docs/orchestration.md`、`docs/upgrade.md`、`release/README.md` | 1.5 | `DEFERRED`: #238 BRIDGE-1.7.1 |
