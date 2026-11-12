@@ -281,6 +281,28 @@ def _run_variant(root_handle, name, variant, create_options, attributes):
     return result
 
 
+def _mount_point_buffer(target):
+    """Build the FSCTL_SET_REPARSE_POINT input for an NTFS junction.
+
+    Layout: REPARSE_DATA_BUFFER header (tag + data length + reserved = 8 bytes)
+    then MOUNT_POINT_REPARSE_BUFFER (four USHORT fields = 8 bytes, no Flags)
+    then the substitute and print names, both counted in bytes.
+    """
+    substitute = ('\\??\\' + str(target)).encode('utf-16-le')
+    printable_name = str(target).encode('utf-16-le')
+    path_buffer_offset = 16  # 8-byte header + 8-byte mount-point fields
+    data_length = 8 + len(substitute) + len(printable_name)
+    size = path_buffer_offset + len(substitute) + len(printable_name)
+    buffer = ctypes.create_string_buffer(size)
+    struct.pack_into('<IHH', buffer, 0, IO_REPARSE_TAG_MOUNT_POINT, data_length, 0)
+    struct.pack_into('<HHHH', buffer, 8, 0, len(substitute),
+                     len(substitute), len(printable_name))
+    buffer[path_buffer_offset:path_buffer_offset + len(substitute)] = substitute
+    start = path_buffer_offset + len(substitute)
+    buffer[start:start + len(printable_name)] = printable_name
+    return buffer
+
+
 def _create_junction(link, target):
     """Create an NTFS mount-point junction without any shell in the path.
 
@@ -305,22 +327,11 @@ def _create_junction(link, target):
     if handle in (None, INVALID_HANDLE_VALUE):
         return False, f'CreateFileW:0x{ctypes.get_last_error():08x}'
     try:
-        substitute = ('\\??\\' + str(target)).encode('utf-16-le')
-        printable_name = str(target).encode('utf-16-le')
-        path_buffer_offset = 20  # REPARSE_DATA_BUFFER header + mount-point fields
-        data_length = 12 + len(substitute) + len(printable_name)
-        size = path_buffer_offset + len(substitute) + len(printable_name)
-        buffer = ctypes.create_string_buffer(size)
-        struct.pack_into('<IHH', buffer, 0, IO_REPARSE_TAG_MOUNT_POINT, data_length, 0)
-        struct.pack_into('<HHHHI', buffer, 8, 0, len(substitute),
-                         len(substitute), len(printable_name), 0)
-        buffer[path_buffer_offset:path_buffer_offset + len(substitute)] = substitute
-        start = path_buffer_offset + len(substitute)
-        buffer[start:start + len(printable_name)] = printable_name
+        buffer = _mount_point_buffer(target)
         returned = ctypes.c_uint32(0)
         ok = kernel32.DeviceIoControl(
-            handle, FSCTL_SET_REPARSE_POINT, buffer, size, None, 0,
-            ctypes.byref(returned), None)
+            handle, FSCTL_SET_REPARSE_POINT, buffer, ctypes.sizeof(buffer),
+            None, 0, ctypes.byref(returned), None)
         if not ok:
             return False, f'FSCTL_SET_REPARSE_POINT:0x{ctypes.get_last_error():08x}'
         tag = getattr(os.lstat(link), 'st_reparse_tag', None)
@@ -641,6 +652,22 @@ class ProbeSelfCheck(unittest.TestCase):
             _remove_entry(outside, 'test', [])
             _remove_entry(root, 'test', [])
             _remove_entry(temp, 'test', [])
+
+    def test_junction_buffer_matches_mount_point_layout(self):
+        target = 'C:\\probe target\\outside'
+        raw = bytes(_mount_point_buffer(target))
+        tag, data_length, reserved = struct.unpack_from('<IHH', raw, 0)
+        self.assertEqual(tag, IO_REPARSE_TAG_MOUNT_POINT)
+        self.assertEqual(reserved, 0)
+        sub_offset, sub_length, print_offset, print_length = struct.unpack_from(
+            '<HHHH', raw, 8)
+        self.assertEqual(sub_offset, 0)
+        self.assertEqual(print_offset, sub_length)
+        self.assertEqual(data_length, 8 + sub_length + print_length)
+        self.assertEqual(len(raw), 16 + sub_length + print_length)
+        self.assertEqual(raw[16:16 + sub_length].decode('utf-16-le'),
+                         '\\??\\' + target)
+        self.assertEqual(raw[16 + sub_length:].decode('utf-16-le'), target)
 
     def test_missing_handle_never_reports_a_close(self):
         module = sys.modules[__name__]
