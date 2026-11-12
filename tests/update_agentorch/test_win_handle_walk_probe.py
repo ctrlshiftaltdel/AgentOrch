@@ -3,19 +3,25 @@
 This test records what the Windows runner actually does with directory-relative
 ``NtCreateFile`` calls.  It deliberately does **not** assert that any variant is
 safe and it does not implement a production scanner.  The output line beginning
-with ``WINPROBE`` is the evidence; a skipped run on Linux/macOS is ``NOT_RUN``,
-not a pass.
+with ``WINPROBE`` is the evidence.  On Linux/macOS the test takes a verifiable
+platform-unavailable branch that reports ``NOT_RUN``; that run is not pass
+evidence for the Windows probe and must not be described as one.
 
-Safety of the probe itself:
+Safety and evidence boundaries of the probe itself:
 
 * It creates an isolated temporary ``root`` and an isolated ``outside`` canary
-  directory.  It never reads a file's data (no ``ReadFile``/``NtReadFile``); it
-  only asks the kernel for status codes, handle attributes/tag and the handle's
-  final path label.  The canary file is created only to make an outside target
-  visible to path-label checks; its bytes are never read.
-* Every opened handle is closed; failures are reported and fail the test.
+  directory.  Content reading is a design boundary only: the probe never issues
+  ``ReadFile``/``NtReadFile`` and reports ``content_read: NOT_ATTEMPTED``.  That
+  is not an observation that a canary stayed unread and must not be cited as
+  one.  Only NTSTATUS, handle attributes/tag and handle-close results are
+  measured.
+* Every opened handle is closed; a close failure is reported and fails the test.
 * A junction/symlink that cannot be created is reported as ``UNKNOWN`` /
   ``NOT_RUN`` for that target; it is never counted as a successful variant.
+* The handle's final path label is **not** reported.  The earlier
+  ``final_under_root``/``final_under_outside`` labels were unreliable (they read
+  ``no`` even for handles opened under the probe root), so both fields are
+  ``UNKNOWN`` here and no conclusion may be drawn from them.
 * No network, no third-party dependency, no production code and no workflow
   change.
 """
@@ -36,9 +42,12 @@ if os.name == 'nt':  # pragma: no branch - the whole probe is Windows-only
     ntdll = ctypes.WinDLL('ntdll')
     print(f'WINPROBE-IMPORT os.name={os.name!r} platform={platform.platform()!r}',
           file=sys.stderr, flush=True)
-else:  # Linux/macOS: the test is skipped before these are used
+else:  # Linux/macOS: the test runs a NOT_RUN platform branch, no Windows API call
     kernel32 = None
     ntdll = None
+
+# Counts Windows API configuration/use. A non-Windows run must leave this at 0.
+WINDOWS_API_CALLS = 0
 
 GENERIC_READ = 0x80000000
 FILE_READ_ATTRIBUTES = 0x00000080
@@ -102,6 +111,8 @@ class FILE_ATTRIBUTE_TAG_INFO(ctypes.Structure):
 
 
 def _configure_api():
+    global WINDOWS_API_CALLS
+    WINDOWS_API_CALLS += 1
     kernel32.CreateFileW.argtypes = [
         ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
         ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
@@ -113,10 +124,6 @@ def _configure_api():
         ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32,
     ]
     kernel32.GetFileInformationByHandleEx.restype = ctypes.c_int
-    kernel32.GetFinalPathNameByHandleW.argtypes = [
-        ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
-    ]
-    kernel32.GetFinalPathNameByHandleW.restype = ctypes.c_uint32
     kernel32.GetVolumeInformationW.argtypes = [
         ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32,
         ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
@@ -158,29 +165,6 @@ def _attribute_tag(handle):
     return info.FileAttributes, info.ReparseTag
 
 
-def _final_path(handle):
-    size = 32768
-    buffer = ctypes.create_unicode_buffer(size)
-    length = kernel32.GetFinalPathNameByHandleW(handle, buffer, size, 0)
-    if length == 0 or length >= size:
-        return None
-    value = buffer.value
-    if value.startswith('\\\\?\\'):
-        value = value[4:]
-    return value
-
-
-def _under(path, base):
-    if not path:
-        return 'unknown'
-    try:
-        path = os.path.normcase(os.path.abspath(path))
-        base = os.path.normcase(os.path.abspath(base))
-        return 'yes' if os.path.commonpath([path, base]) == base else 'no'
-    except (OSError, ValueError):
-        return 'unknown'
-
-
 def _ntcreate(handle_out, root_handle, name, create_options, attributes):
     name_buffer = ctypes.create_unicode_buffer(name)
     us = UNICODE_STRING()
@@ -209,8 +193,7 @@ def _ntcreate(handle_out, root_handle, name, create_options, attributes):
     return status
 
 
-def _run_variant(root_handle, root_dir, outside_dir, name, variant, create_options,
-                 attributes):
+def _run_variant(root_handle, name, variant, create_options, attributes):
     handle = ctypes.c_void_p()
     result = {
         'target': name,
@@ -224,8 +207,10 @@ def _run_variant(root_handle, root_dir, outside_dir, name, variant, create_optio
         'is_directory': None,
         'is_reparse': None,
         'reparse_tag': None,
-        'final_under_root': None,
-        'final_under_outside': None,
+        # Final-path containment is deliberately not reported; the previous
+        # labels were unreliable, so these stay UNKNOWN (see module docstring).
+        'final_under_root': 'UNKNOWN',
+        'final_under_outside': 'UNKNOWN',
         'closed': None,
     }
     try:
@@ -241,9 +226,6 @@ def _run_variant(root_handle, root_dir, outside_dir, name, variant, create_optio
                 result['is_directory'] = bool(file_attributes & FILE_ATTRIBUTE_DIRECTORY)
                 result['is_reparse'] = bool(file_attributes & FILE_ATTRIBUTE_REPARSE_POINT)
                 result['reparse_tag'] = hex(reparse_tag)
-            final = _final_path(handle)
-            result['final_under_root'] = _under(final, root_dir)
-            result['final_under_outside'] = _under(final, outside_dir)
         elif status >= 0:
             result['closed'] = True
     except Exception as exc:  # noqa: BLE001 - diagnostic must record, not crash
@@ -279,8 +261,8 @@ def _run_probe():
         'root_open': False,
         'junction_created': 'UNKNOWN',
         'symlink_created': 'UNKNOWN',
-        'canary_read': False,
-        'read_calls': 0,
+        'content_read': 'NOT_ATTEMPTED',
+        'windows_api_calls': WINDOWS_API_CALLS,
         'handles_closed': False,
         'variants': [],
         'unknown': [],
@@ -290,6 +272,9 @@ def _run_probe():
     outside = os.path.join(temp, 'outside')
     os.makedirs(root)
     os.makedirs(os.path.join(outside, 'child'))
+    # Isolated canary target inside the probe's own temp dir.  It is written
+    # here and never read; `content_read: NOT_ATTEMPTED` is a design boundary,
+    # not an observation.
     with open(os.path.join(outside, 'canary.txt'), 'w', encoding='utf-8') as handle:
         handle.write('WINPROBE_CANARY_NEVER_READ')
     try:
@@ -351,8 +336,7 @@ def _run_probe():
             for target in targets:
                 for variant, options, attributes in variants:
                     report['variants'].append(
-                        _run_variant(root_handle, root, outside, target, variant,
-                                     options, attributes))
+                        _run_variant(root_handle, target, variant, options, attributes))
         finally:
             closed = kernel32.CloseHandle(root_handle)
             report['handles_closed'] = bool(closed)
@@ -376,19 +360,41 @@ def _run_probe():
 class WindowsNtCreateFileProbe(unittest.TestCase):
     def test_ntcreatefile_root_relative_probe(self):
         if os.name != 'nt':
-            print(f'WINPROBE-SKIP NOT_RUN: Windows-only NtCreateFile diagnostic '
+            # Verified platform-unavailable branch.  It must run (not skip) and
+            # prove that no Windows API was loaded or configured, so the run is
+            # NOT_RUN and never pass evidence for the Windows probe.
+            self.assertIsNone(kernel32, 'Windows API must not load off Windows')
+            self.assertIsNone(ntdll, 'Windows API must not load off Windows')
+            self.assertEqual(WINDOWS_API_CALLS, 0,
+                             'no Windows API may be configured off Windows')
+            print(f'WINPROBE NOT_RUN content_read=NOT_ATTEMPTED '
                   f'os.name={os.name!r} platform={platform.platform()!r}',
                   file=sys.stderr, flush=True)
-            self.skipTest('NOT_RUN: Windows-only NtCreateFile diagnostic; '
-                          'this is not pass evidence')
+            return
         report = _run_probe()
         print('WINPROBE ' + json.dumps(report, sort_keys=True, ensure_ascii=False),
               file=sys.stderr, flush=True)
         self.assertEqual(report.get('probe'), 'completed')
         self.assertTrue(report.get('root_open'), 'WINPROBE root handle did not open')
         self.assertTrue(report.get('handles_closed'), 'WINPROBE handle leak')
-        self.assertFalse(report.get('canary_read'), 'WINPROBE canary was read')
-        self.assertEqual(report.get('read_calls'), 0, 'WINPROBE read a file')
+        self.assertEqual(report.get('content_read'), 'NOT_ATTEMPTED',
+                         'WINPROBE content-reading boundary changed')
+        self.assertGreaterEqual(report.get('windows_api_calls'), 1,
+                                'WINPROBE never configured the Windows API')
+        variants = report.get('variants') or []
+        self.assertTrue(variants, 'WINPROBE recorded no variants')
+        for item in variants:
+            self.assertRegex(item.get('status_hex') or '', r'^0x[0-9a-f]{8}$')
+            self.assertEqual(item.get('final_under_root'), 'UNKNOWN')
+            self.assertEqual(item.get('final_under_outside'), 'UNKNOWN')
+            self.assertIsNot(item.get('closed'), False,
+                             f'WINPROBE handle leak: {item}')
+            if item.get('success'):
+                # An opened handle must yield real attribute/tag data.
+                self.assertIsNotNone(item.get('is_directory'))
+                self.assertIsNotNone(item.get('is_reparse'))
+                self.assertIsNotNone(item.get('reparse_tag'))
+                self.assertIs(item.get('closed'), True)
 
 
 if __name__ == '__main__':
