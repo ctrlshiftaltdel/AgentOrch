@@ -677,6 +677,129 @@ class ValidateKitManifestTests(unittest.TestCase):
         self.assertIn('tests/test_release_drift.py', validate.REQUIRED)
 
 
+# Frozen REQUIRED list from published tag v1.7.0. Shallow CI cannot
+# `git show` that tag, and a release package has no .git.
+PUBLISHED_V170_REQUIRED = (
+    'AGENTS.md',
+    'LICENSE.md',
+    'VERSION.md',
+    'kit/orchestration.md',
+    'editions/github/active-task-registry.md',
+    'editions/github/issue-template.md',
+    'editions/github/execution.md',
+    'editions/github/master.md',
+    'editions/github/pr-template.md',
+    'editions/local/master.md',
+    'editions/local/execution.md',
+    'templates/architecture/README.md',
+    'templates/architecture/contract.example.json',
+    'templates/contract-decision-log.md',
+    'templates/design.md',
+    'templates/implementation-plan.md',
+    'templates/metrics.md',
+    'templates/milestone-audit.md',
+    'templates/plan.md',
+    'templates/project.md',
+    'templates/project-charter.md',
+    'templates/review-checklist.md',
+    'templates/runtime-capability.md',
+    'templates/task-packet.md',
+    'templates/gitignore.snippet',
+    'templates/self-improvement/README.md',
+    'templates/self-improvement/closure-report.md',
+    'templates/self-improvement/proposal.md',
+    'templates/self-improvement/sources.example.json',
+    'templates/self-improvement/task-packet.md',
+    'scripts/architecture/__init__.py',
+    'scripts/architecture/check.py',
+    'scripts/architecture/contract.py',
+    'scripts/architecture/report.py',
+    'scripts/architecture/rules.py',
+    'scripts/architecture/adapters/__init__.py',
+    'scripts/architecture/adapters/python_ast.py',
+    'scripts/architecture/adapters/rust.py',
+    'scripts/agent_selection/__init__.py',
+    'scripts/agent_selection/scope.py',
+    'scripts/agent_selection/local_store.py',
+    'scripts/agent_selection/runtime_adapter.py',
+    'scripts/agent_selection/discovery.py',
+    'scripts/agent_selection/roles.py',
+    'scripts/agent_selection/model_selection.py',
+    'scripts/agent_selection/feedback.py',
+    'scripts/agent_selection/model_sources/__init__.py',
+    'scripts/agent_selection/model_sources/snapshot.py',
+    'scripts/agent_selection/model_sources/artificial_analysis.py',
+    'scripts/check_drift.py',
+    'scripts/check_scope.py',
+    'scripts/orchestrator.py',
+    'scripts/report_metrics.py',
+    'scripts/run_delivery_scenarios.py',
+    'scripts/validate_kit.py',
+    'scripts/self_improvement/__init__.py',
+    'scripts/self_improvement/cli.py',
+    'scripts/self_improvement/collect.py',
+    'scripts/self_improvement/lessons.py',
+    'scripts/self_improvement/orchestration.py',
+    'scripts/self_improvement/pipeline.py',
+    'scripts/self_improvement/planning.py',
+    'scripts/self_improvement/sources.py',
+    'scripts/self_improvement/untrusted.py',
+    'scripts/update_agentorch/__init__.py',
+    'scripts/update_agentorch/__main__.py',
+    'scripts/update_agentorch/classify.py',
+    'scripts/update_agentorch/cli.py',
+    'scripts/update_agentorch/engine.py',
+    'scripts/update_agentorch/entry.py',
+    'scripts/update_agentorch/package.py',
+    'scripts/update_agentorch/report.py',
+    'scripts/update_agentorch/sources.py',
+    'scripts/update_agentorch/versions.py',
+    'scripts/update_agentorch/workspace.py',
+    'tests/architecture/__init__.py',
+    'tests/architecture/test_architecture_checker.py',
+    'tests/agent_selection/__init__.py',
+    'tests/agent_selection/test_scope.py',
+    'tests/agent_selection/test_local_store.py',
+    'tests/agent_selection/support.py',
+    'tests/agent_selection/test_runtime_adapter.py',
+    'tests/agent_selection/test_discovery.py',
+    'tests/agent_selection/test_roles.py',
+    'tests/agent_selection/test_model_selection.py',
+    'tests/agent_selection/test_feedback.py',
+    'tests/agent_selection/test_e2e.py',
+    'tests/agent_selection/model_sources/__init__.py',
+    'tests/agent_selection/model_sources/fixtures.py',
+    'tests/agent_selection/model_sources/test_snapshot.py',
+    'tests/agent_selection/model_sources/test_artificial_analysis.py',
+    'tests/self_improvement/__init__.py',
+    'tests/self_improvement/loop_support.py',
+    'tests/self_improvement/support.py',
+    'tests/self_improvement/test_acceptance_report.py',
+    'tests/self_improvement/test_collection.py',
+    'tests/self_improvement/test_lesson_lifecycle.py',
+    'tests/self_improvement/test_orchestration.py',
+    'tests/self_improvement/test_pipeline.py',
+    'tests/self_improvement/test_planning.py',
+    'tests/self_improvement/test_registry.py',
+    'tests/self_improvement/test_routing.py',
+    'tests/test_check_scope.py',
+    'tests/test_orchestrator.py',
+    'tests/test_release_drift.py',
+    'tests/test_report_metrics.py',
+    'tests/test_run_delivery_scenarios.py',
+    'tests/test_update_entry.py',
+    'tests/test_validate_kit.py',
+    'tests/update_agentorch/__init__.py',
+    'tests/update_agentorch/support.py',
+    'tests/update_agentorch/test_classification.py',
+    'tests/update_agentorch/test_dependencies.py',
+    'tests/update_agentorch/test_engine.py',
+    'tests/update_agentorch/test_entry_release.py',
+    'tests/update_agentorch/test_package.py',
+    'tests/update_agentorch/test_versions_and_sources.py',
+)
+
+
 @unittest.skipUnless(BUILD.is_file(), 'build_release.py is repository-only')
 class PackagedDocRuleTests(unittest.TestCase):
     """Only the core contract may reach the package from docs/.
@@ -700,6 +823,9 @@ class PackagedDocRuleTests(unittest.TestCase):
     def test_published_v1_7_0_classifier_would_not_block_this_required_set(self):
         """The published updater treats docs/ as project-owned and a missing
         baseline file as a blocking removal. This release must not create either.
+
+        The published REQUIRED list is frozen here. CI checkouts are shallow and
+        do not have the v1.7.0 tag, so this test must not call git.
         """
         required = set(validate.REQUIRED)
         self.assertIn('kit/orchestration.md', required)
@@ -709,21 +835,7 @@ class PackagedDocRuleTests(unittest.TestCase):
         )
         shipped_owned = [rel for rel in required if rel.startswith(owned_prefixes)]
         self.assertEqual(shipped_owned, [])
-        if not (ROOT / '.git').exists():
-            return
-        old = set()
-        import ast
-        import subprocess
-        text = subprocess.check_output(
-            ['git', 'show', 'v1.7.0:scripts/validate_kit.py'], text=True)
-        for node in ast.parse(text).body:
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id == 'REQUIRED':
-                        old = set(ast.literal_eval(node.value))
-        self.assertTrue(old, 'could not read the published REQUIRED list')
-        removed = sorted(old - required)
-        self.assertEqual(removed, [])
+        self.assertEqual(sorted(set(PUBLISHED_V170_REQUIRED) - required), [])
 
     def test_the_real_package_ships_only_the_contract_from_docs(self):
         files = self.builder.collect_sources(validate.REQUIRED)
