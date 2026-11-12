@@ -76,24 +76,30 @@ def audit_frozen_manifest(payload):
     if not isinstance(entries, list) or not entries:
         return errors + ['fixture carries no file entries']
     paths = []
+    complete = True
     for entry in entries:
         if not isinstance(entry, dict):
             errors.append('fixture entry is not an object')
+            complete = False
             continue
         path = entry.get('path')
         digest = entry.get('sha256')
         size = entry.get('size')
         if not isinstance(path, str) or not path:
             errors.append('fixture entry has no path')
+            complete = False
             continue
         paths.append(path)
         if not isinstance(digest, str) or not SHA256_RE.match(digest):
             errors.append(f'{path}: fixture sha256 is not 64 lowercase hex digits')
+            complete = False
         if type(size) is not int or size < 1:
             errors.append(f'{path}: fixture size is not a positive integer')
+            complete = False
     if len(paths) != len(set(paths)):
         errors.append('fixture lists a path more than once')
-    if semantic_manifest_digest(entries) != AUDITED_MANIFEST_DIGEST:
+        complete = False
+    if complete and semantic_manifest_digest(entries) != AUDITED_MANIFEST_DIGEST:
         errors.append('fixture content does not match the audited v1.7.0 manifest digest')
     return errors
 
@@ -172,6 +178,13 @@ class PublishedV170ClassifierCompatibilityTests(unittest.TestCase):
         tampered['source_manifest_sha256'] = semantic_manifest_digest(tampered['files'])
         errors = audit_frozen_manifest(tampered)
         self.assertTrue(any('audited v1.7.0 manifest digest' in error for error in errors),
+                        errors)
+
+    def test_malformed_fixture_entry_is_reported_without_crashing(self):
+        tampered = copy.deepcopy(self.provenance)
+        del tampered['files'][0]['size']
+        errors = audit_frozen_manifest(tampered)
+        self.assertTrue(any('size is not a positive integer' in error for error in errors),
                         errors)
 
     # -- positive: today's release classifies cleanly ---------------------- #
