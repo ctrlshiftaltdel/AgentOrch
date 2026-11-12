@@ -14,12 +14,13 @@ MANIFEST_DOC = 'MANIFEST.json'
 # no second manifest to maintain. Keep it in sync whenever a versioned artifact is
 # added or removed. Files that must not ship (the rest of docs/, release/, the
 # release builder itself, .orchestration/, .worktrees/, .workbuddy/) are simply not
-# listed here. `docs/orchestration.md` is the one deliberate exception: the core
-# contract lives in docs/ but still ships, because a package without the contract
-# would be unusable.
+# listed here. This bridge release ships the contract at `kit/orchestration.md`
+# again: the published v1.7.0 updater will not write anything under `docs/` and
+# stops if `kit/orchestration.md` disappears. `docs/orchestration.md` in this
+# repository is a non-shipped pointer, not a second contract.
 REQUIRED = [
     'AGENTS.md', 'LICENSE.md', 'VERSION.md',
-    'docs/orchestration.md',
+    'kit/orchestration.md',
     'editions/github/active-task-registry.md', 'editions/github/issue-template.md',
     'editions/github/execution.md', 'editions/github/master.md',
     'editions/github/pr-template.md',
@@ -263,7 +264,7 @@ EXTERNAL_LINK_PREFIXES = ('http://', 'https://', 'mailto:', '#')
 # restate it) and enforces it on the local/github task templates. If the doc drifts
 # away from the contract floor below, validation fails instead of silently
 # accepting a second definition.
-CORE_DOC = 'docs/orchestration.md'
+CORE_DOC = 'kit/orchestration.md'
 TASK_PACKET_DOC = 'templates/task-packet.md'
 ISSUE_TEMPLATE_DOC = 'editions/github/issue-template.md'
 EVIDENCE_FIELD_ANCHOR = '证据条目（evidence item）字段'
@@ -704,18 +705,18 @@ def _scan_files(root, start, errors, excluded=()):
 def tree_mode(root=ROOT, errors=None):
     """Which of the three supported trees *root* is.
 
-    `package`    - a pristine release package: its `docs/` holds nothing but the
-                   shipped files of REQUIRED (today only docs/orchestration.md).
+    `package`    - a pristine release package. This bridge release ships no
+                   `docs/` file; a `docs/` tree is a package only while every
+                   file under it is in REQUIRED.
     `downstream` - a project tree: `docs/PROJECT.md` exists, `docs/upgrade.md`
                    does not.
     `upstream`   - this repository: `docs/upgrade.md` marks an upstream checkout.
 
-    The contract now lives at docs/orchestration.md, so "has a docs/ directory"
-    no longer distinguishes a package from a project. The project config
-    (docs/PROJECT.md) does; a docs/ tree without it is only a package while every
-    file under it is shipped. Anything else is treated as a downstream project,
-    which fails closed on a missing docs/PROJECT.md instead of silently skipping
-    the document checks.
+    The published v1.7.0 updater will not write `docs/`, so this release ships
+    the contract at `kit/orchestration.md` and ships no `docs/` file. A package
+    with no `docs/` directory is still a package. A `docs/` tree without
+    `docs/PROJECT.md` is a package only while every file under it is shipped;
+    anything else fails closed on a missing `docs/PROJECT.md`.
     """
     root = Path(root)
     if (root / UPSTREAM_MARKER_DOC).is_file():
@@ -1250,8 +1251,10 @@ def legacy_path_registry(text):
         if not old or not new:
             continue
         allowed = [item.strip().strip('/') for item in re.findall(r'`([^`]+)`', cells[2])]
+        note = cells[4] if len(cells) > 4 else ''
         entries.append({'old': old.strip('/').strip(), 'new': new.strip(),
-                        'allowed': [item for item in allowed if item]})
+                        'allowed': [item for item in allowed if item],
+                        'deferred': 'DEFERRED' in note})
     return entries
 
 
@@ -1268,6 +1271,8 @@ def legacy_path_errors(root=ROOT):
     errors, scan_errors = [], []
     for entry in entries:
         old, new = entry['old'], entry['new']
+        if entry.get('deferred'):
+            continue
         if not (root / new).exists():
             errors.append(f'{LIFECYCLE_DOC}: legacy {old} successor {new} does not exist')
         if (root / old).exists():

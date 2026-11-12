@@ -319,7 +319,7 @@ class VersionConsistencyTests(unittest.TestCase):
     def test_release_tag_matches_the_format_version(self):
         release = self.release_version()
         _, format_version = drift.read_version(ROOT)
-        self.assertEqual(release, '1.7.0')
+        self.assertEqual(release, '1.7.1')
         self.assertEqual(format_version, '1.7')
         self.assertTrue(self.versions.tag_matches_format(f'v{release}', format_version))
         # The rule compares major.minor: a different major.minor (v1.5) must NOT
@@ -691,13 +691,44 @@ class PackagedDocRuleTests(unittest.TestCase):
         cls.builder = load('build_release_doc_rule_under_test', BUILD)
 
     def test_allowlist_is_exactly_the_core_contract(self):
-        self.assertEqual(self.builder.PACKAGE_DOC_PATHS, {validate.CORE_DOC})
+        self.assertEqual(self.builder.PACKAGE_DOC_PATHS, set())
+        self.assertEqual(validate.CORE_DOC, 'kit/orchestration.md')
+        self.assertNotIn('docs/orchestration.md', validate.REQUIRED)
+        self.assertFalse(any(rel.startswith('docs/') for rel in validate.REQUIRED))
         self.assertNotIn('docs', self.builder.FORBIDDEN_SEGMENTS)
+
+    def test_published_v1_7_0_classifier_would_not_block_this_required_set(self):
+        """The published updater treats docs/ as project-owned and a missing
+        baseline file as a blocking removal. This release must not create either.
+        """
+        required = set(validate.REQUIRED)
+        self.assertIn('kit/orchestration.md', required)
+        owned_prefixes = (
+            'docs/', 'src/', '.github/', '.local/', '.orchestration/',
+            '.worktrees/', '.workbuddy/', 'release/',
+        )
+        shipped_owned = [rel for rel in required if rel.startswith(owned_prefixes)]
+        self.assertEqual(shipped_owned, [])
+        if not (ROOT / '.git').exists():
+            return
+        old = set()
+        import ast
+        import subprocess
+        text = subprocess.check_output(
+            ['git', 'show', 'v1.7.0:scripts/validate_kit.py'], text=True)
+        for node in ast.parse(text).body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == 'REQUIRED':
+                        old = set(ast.literal_eval(node.value))
+        self.assertTrue(old, 'could not read the published REQUIRED list')
+        removed = sorted(old - required)
+        self.assertEqual(removed, [])
 
     def test_the_real_package_ships_only_the_contract_from_docs(self):
         files = self.builder.collect_sources(validate.REQUIRED)
         shipped_docs = sorted(path for path in files if 'docs' in path.split('/'))
-        self.assertEqual(shipped_docs, [validate.CORE_DOC])
+        self.assertEqual(shipped_docs, [])
         self.assertIn(validate.CORE_DOC, files)
 
     def test_any_other_docs_source_is_a_build_error(self):

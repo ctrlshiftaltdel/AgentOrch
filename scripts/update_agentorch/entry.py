@@ -436,7 +436,7 @@ _PUBLIC_STATUSES = frozenset({'PLANNED', 'APPLIED', 'NEW_PROJECT_MODE', 'BLOCKED
                               'STOPPED_CONFLICT', 'STOPPED_UNSAFE_SOURCE',
                               'STOPPED_SCENARIO', 'ROLLED_BACK'})
 _PUBLIC_FILE_NAMES = frozenset({'LICENSE.md', 'VERSION.md', 'README.md', 'MANIFEST.json',
-                                '.gitignore', 'docs/orchestration.md'})
+                                '.gitignore', 'docs/orchestration.md', 'kit/orchestration.md'})
 
 
 def _public_enum(value, choices, fallback='UNKNOWN'):

@@ -591,13 +591,13 @@ class ContractTemplateTests(unittest.TestCase):
         text = (ROOT / 'templates' / 'design.md').read_text(encoding='utf-8')
         self.assertIn('not permanence', text)
         self.assertIn('contract-decision-log.md', text)
-        for needle in ('N/A: <reason>', 'docs/orchestration.md'):
+        for needle in ('N/A: <reason>', 'kit/orchestration.md'):
             self.assertIn(needle, text)
 
     def test_templates_reference_instead_of_restating_the_core_contract(self):
         for rel in ('templates/design.md', 'templates/milestone-audit.md'):
             text = (ROOT / rel).read_text(encoding='utf-8')
-            self.assertIn('docs/orchestration.md', text)
+            self.assertIn('kit/orchestration.md', text)
             for state in ('DISPATCHED', 'MASTER_REVIEW', 'APPROVED', 'VERIFIED'):
                 self.assertNotIn(state, text, f'{rel} must not copy the task lifecycle')
 
@@ -622,7 +622,7 @@ class ContractTemplateTests(unittest.TestCase):
         for rel in ('templates/design.md', 'templates/contract-decision-log.md',
                     'templates/milestone-audit.md'):
             self.assertIn(rel, readme)
-        acceptance = (ROOT / 'docs/orchestration.md').read_text(encoding='utf-8')
+        acceptance = (ROOT / 'kit/orchestration.md').read_text(encoding='utf-8')
         for rel in ('templates/milestone-audit.md', 'templates/contract-decision-log.md'):
             self.assertIn(rel, acceptance)
 
@@ -658,7 +658,7 @@ class CapabilityAndMetricsTemplateTests(unittest.TestCase):
             self.assertIn(needle, text)
         # A record must not become a permission grant or a second definition of C1-C4.
         self.assertIn('not a permission grant', text)
-        self.assertIn('docs/orchestration.md', text)
+        self.assertIn('kit/orchestration.md', text)
 
     def test_capability_template_refuses_a_stale_pass(self):
         text = (ROOT / self.CAPABILITY).read_text(encoding='utf-8')
@@ -711,7 +711,7 @@ class CapabilityAndMetricsTemplateTests(unittest.TestCase):
         readme = (ROOT / 'docs' / 'README.md').read_text(encoding='utf-8')
         for rel in (self.CAPABILITY, self.METRICS, 'scripts/report_metrics.py'):
             self.assertIn(rel, readme)
-        acceptance = (ROOT / 'docs/orchestration.md').read_text(encoding='utf-8')
+        acceptance = (ROOT / 'kit/orchestration.md').read_text(encoding='utf-8')
         for rel in (self.CAPABILITY, self.METRICS):
             self.assertIn(rel, acceptance)
 
@@ -820,7 +820,7 @@ class DeliveryScenarioIntegrationTests(unittest.TestCase):
                          'docs/README.md is repository-only and absent inside a release package')
     def test_readme_and_acceptance_point_at_the_scenario_runner(self):
         readme = (ROOT / 'docs' / 'README.md').read_text(encoding='utf-8')
-        acceptance = (ROOT / 'docs/orchestration.md').read_text(encoding='utf-8')
+        acceptance = (ROOT / 'kit/orchestration.md').read_text(encoding='utf-8')
         self.assertIn(self.RUNNER, readme)
         self.assertIn(self.RUNNER, acceptance)
         self.assertIn(self.SCENARIO_DOC, readme)
@@ -901,13 +901,13 @@ class TreeModeTests(unittest.TestCase):
             self.assertEqual(validate.required_doc_errors(root), [])
 
     def test_package_may_carry_the_core_contract(self):
-        # The contract lives under docs/ now, so a shipped docs/ directory no
-        # longer means "project tree". Only the shipped REQUIRED docs may be
-        # there, and the repository document checks stay skipped.
+        # This bridge release ships the contract at kit/ and ships no docs/
+        # file. A tree with only that contract is still a package.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / 'docs').mkdir()
-            (root / validate.CORE_DOC).write_text('# contract\n', encoding='utf-8')
+            target = root / validate.CORE_DOC
+            target.parent.mkdir(parents=True)
+            target.write_text('# contract\n', encoding='utf-8')
             self.assertEqual(validate.tree_mode(root), validate.TREE_PACKAGE)
             self.assertEqual(validate.required_doc_errors(root), [])
 
@@ -917,7 +917,6 @@ class TreeModeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'docs').mkdir()
-            (root / validate.CORE_DOC).write_text('# contract\n', encoding='utf-8')
             (root / 'docs' / 'notes.md').write_text('# project notes\n', encoding='utf-8')
             self.assertEqual(validate.tree_mode(root), validate.TREE_DOWNSTREAM)
             errors = validate.required_doc_errors(root)
@@ -925,7 +924,9 @@ class TreeModeTests(unittest.TestCase):
 
     def test_only_the_contract_ships_from_docs(self):
         shipped = [rel for rel in validate.REQUIRED if 'docs' in Path(rel).parts]
-        self.assertEqual(shipped, [validate.CORE_DOC])
+        self.assertEqual(shipped, [])
+        self.assertEqual(validate.CORE_DOC, 'kit/orchestration.md')
+        self.assertIn(validate.CORE_DOC, validate.REQUIRED)
 
     def test_downstream_tree_only_requires_project_and_plan(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -976,6 +977,11 @@ class TreeModeTests(unittest.TestCase):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
             root = self.kit_tree(Path(tmp), docs='package')
+            # The bridge package ships no docs/ file. tree_mode still walks a
+            # docs/ directory when one is present; one entry makes the iterate
+            # phase raise, which is what this assertion covers.
+            (root / 'docs').mkdir()
+            (root / 'docs' / 'marker').write_text('x\n', encoding='utf-8')
             self.emit_manifest(root)
             (root / 'AGENTS.md').write_text('# tampered\n', encoding='utf-8')
             real_scandir = os.scandir
@@ -1643,7 +1649,7 @@ class ReleaseConsistencyTests(unittest.TestCase):
     def rules(self, **overrides):
         arguments = dict(
             required=list(validate.REQUIRED),
-            package_doc_paths={'docs/orchestration.md'},
+            package_doc_paths=set(),
             forbidden_paths={'scripts/build_release.py'},
             forbidden_segments={'.orchestration', 'release', '.worktrees', '.workbuddy',
                                 '.git', '.local'},

@@ -207,6 +207,7 @@ DECISION_CONTRACT = 'HD-13'
 HIGH_RISK_PATH_PREFIXES = (
     'AGENTS.md',
     'docs/orchestration.md',
+    'kit/orchestration.md',
     'editions/',
     'docs/contracts/',
     'docs/design/',

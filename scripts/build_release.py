@@ -163,10 +163,11 @@ FORBIDDEN_REGEXES = [
 # of check a, which already pins the file set to REQUIRED).
 FORBIDDEN_SEGMENTS = frozenset({'.orchestration', 'release', '.worktrees', '.workbuddy',
                                 '.git', '.local'})
-# `docs/` is special: the core contract now lives there and must ship, while every
-# other repository document (design drafts, plans, upgrade notes, contracts) must
-# not. This allowlist is what keeps "all of docs/" from ever being packaged.
-PACKAGE_DOC_PATHS = frozenset({'docs/orchestration.md'})
+# `docs/` must not ship in this bridge release. The published v1.7.0 updater
+# treats that prefix as project-owned and will not write a new file there.
+# The contract ships at kit/orchestration.md instead. Keep the allowlist empty
+# so a later docs/ path cannot enter the package by accident.
+PACKAGE_DOC_PATHS = frozenset()
 FORBIDDEN_PATHS = frozenset({'scripts/build_release.py'})
 
 # Optional per-machine / per-repository additions. Git-ignored (.gitignore keeps

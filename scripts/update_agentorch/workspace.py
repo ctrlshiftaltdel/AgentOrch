@@ -1123,7 +1123,7 @@ def managed_block(version: str) -> str:
         'AgentOrch 不覆盖；两者冲突时以宿主所有者的明文规则为准。',
         '',
         '- 职责：AgentOrch 作为本项目的任务 / 审查 / 证据推进引擎，不替代宿主规则。',
-        '- AgentOrch Root：`agentorch/`；核心契约：`agentorch/docs/orchestration.md`。',
+        '- AgentOrch Root：`agentorch/`；核心契约：`agentorch/kit/orchestration.md`。',
         '- 内部操作手册：`agentorch/editions/<edition>/master.md`。',
         '- 本机命令：在宿主根运行 `python agentorch/scripts/orchestrator.py --layout isolated '
         '<command>`；',

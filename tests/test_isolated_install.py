@@ -1352,11 +1352,11 @@ else:
         from unittest.mock import patch
         from scripts import validate_kit
         agentorch, _ = self._validator_complete_tree()
-        public = agentorch / 'docs'
+        public = agentorch / 'kit'
         outside = self.tmp / 'synthetic-outside'
         outside.mkdir()
         (public / '.local').symlink_to(outside, target_is_directory=True)
-        self.assertTrue(any('symlink' in e and 'docs/.local' in e
+        self.assertTrue(any('symlink' in e and 'kit/.local' in e
                             for e in validate_kit.isolated_layout_errors(agentorch)))
         real_scandir = os.scandir
         for number in (errno.EACCES, errno.EIO):
@@ -1368,7 +1368,7 @@ else:
                 with patch.object(os, 'scandir', side_effect=failing_scandir):
                     errors = validate_kit.isolated_layout_errors(agentorch)
                 message = '\n'.join(errors)
-                self.assertIn('docs', message)
+                self.assertIn('kit', message)
                 self.assertIn(str(number), message)
                 self.assertIn('enumerat', message)
                 self.assertNotIn(str(self.tmp), message)
@@ -1378,7 +1378,7 @@ else:
         import subprocess
         from scripts import validate_kit
         agentorch, _ = self._validator_complete_tree()
-        public = agentorch / 'docs'
+        public = agentorch / 'kit'
         outside = self.tmp / 'synthetic-outside'
         outside.mkdir()
         (public / '.local').symlink_to(outside, target_is_directory=True)
@@ -1390,7 +1390,7 @@ else:
             except PermissionError:
                 errors = validate_kit.isolated_layout_errors(agentorch)
                 message = '\n'.join(errors)
-                self.assertIn('docs', message)
+                self.assertIn('kit', message)
                 self.assertIn('enumerat', message)
                 self.assertNotIn(str(self.tmp), message)
                 proc = subprocess.run([sys.executable, '-I', '-B',
@@ -1479,6 +1479,7 @@ runpy.run_path(script, run_name='__main__')
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
         docs = root / 'docs'
+        docs.mkdir()
         (docs / 'synthetic-project.txt').write_text('synthetic', encoding='utf-8')
         cli = [sys.executable, '-I', '-B', str(root / 'scripts' / 'validate_kit.py')]
         readable = subprocess.run(cli, cwd=self.tmp, capture_output=True, text=True)
@@ -4768,9 +4769,9 @@ runpy.run_path(script,run_name='__main__')
                            'uncovered-syntax boundary is untested on this tree')
         # Design §6.3: a link to the host root AGENTS.md must land on the Host
         # Root (two levels up from docs/), never on an agentorch/AGENTS.md.
-        core = (agentorch / 'docs' / 'orchestration.md').read_text(encoding='utf-8')
+        core = (agentorch / 'kit' / 'orchestration.md').read_text(encoding='utf-8')
         self.assertIn('../../AGENTS.md', core)
-        self.assertEqual((agentorch / 'docs' / '../../AGENTS.md').resolve(), host_agents)
+        self.assertEqual((agentorch / 'kit' / '../../AGENTS.md').resolve(), host_agents)
         self.assertTrue(host_agents.is_file())
         for rel in ('editions/local/master.md', 'editions/github/master.md',
                     'templates/runtime-capability.md'):
@@ -4846,7 +4847,7 @@ runpy.run_path(script,run_name='__main__')
         from scripts import build_release, check_drift
         files = build_release.collect_sources(build_release.read_required())
         manifest = check_drift.build_manifest(files, SUITE, FORMAT_VERSION)
-        self.assertIn('docs/orchestration.md', files)
+        self.assertIn('kit/orchestration.md', files)
         self.assertFalse(any('.orchestration' in p.split('/') for p in files))
         self.assertFalse(any('.orchestration' in e['path'].split('/')
                              for e in manifest['files']))
@@ -6284,6 +6285,7 @@ class IsolatedEntryCommandsTest(unittest.TestCase):
         # isolated as the command. The generated sequence starts with the
         # idempotent `init`, then registers, readies and dispatches the task.
         agentorch = self._complete_tree()
+        (agentorch / 'docs').mkdir()
         (agentorch / 'docs' / 'PROJECT.md').write_text(
             '# Project\n\n- `edition`: `local`\n', encoding='utf-8')
         isolated_commands = self._run_generated_next_steps(

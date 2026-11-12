@@ -815,10 +815,17 @@ APPLY 后的可核对事实：
 
 **范围与未验证项**：目标包是合成的，运行方式是 `PLAN` + 内存 Release 源，不是旧客户端到真实 `v1.8.0` Release 的完整 CLI / 网络升级；它也**不是**“旧客户端安装桥接包后成功升级”的证据。桥接发行需要自身仍满足旧规则（同 Format），本任务只实现与测试桥接、**不发布桥接包**，因此“旧客户端安装桥接 → 新更新器升级不升 Format MINOR”的端到端为 `NOT_RUN`。真实旧客户端对不升 Format MINOR 的拒绝已由第 1 行实测。
 
-## 15. 迁移八（本次新增）：核心编排契约从 `kit/` 迁到 `docs/`
+## 15. 迁移八（推迟到下一发）：核心编排契约从 `kit/` 迁到 `docs/`
+
+- **这一发不执行该迁移。** Release 1.7.1 仍把契约放在 `kit/orchestration.md`。已发布的 v1.7.0 更新器把 `docs/` 当作项目自有路径，不会写入 `docs/orchestration.md`；目标包如果去掉 `kit/orchestration.md`，它会记为 `UPSTREAM_REMOVAL` 并以 `STOPPED_CONFLICT` / `HD-09` 零写入停止。因此桥接发行必须仍带 `kit/orchestration.md`。仓库里的 `docs/orchestration.md` 只是不随包发布的路径指针。
+- **不要在这一发删除 `kit/orchestration.md`，也不要指望更新器创建 `docs/orchestration.md`。** 下面保留的是下一发才会用的迁移说明，不是 1.7.1 的安装步骤。
+
+### 15.1 下一发才会发生的迁移
+
+- **变了什么（尚未在发行包中发生）**：计划把 `kit/orchestration.md` 移到 `docs/orchestration.md`，仍是唯一可编辑权威。1.7.1 不删除 `kit/`，发行包也不包含 `docs/orchestration.md`。
 
 - **变了什么**：`kit/orchestration.md` 移到 `docs/orchestration.md`，仍是**唯一可编辑权威**；`kit/` 目录随之消失，发行包里不再有 `kit/`。契约正文的语义（会话入口、状态机、合并门 G1–G6、C1–C4 / C1–C8、证据矩阵）不变，只改位置与指向它的引用。发行包从此只包含 `docs/` 下的这一个文件；其余 `docs/` 内容（设计稿、阶段计划、本文件）仍不打包。
-- **怎么改**（下游项目；本套件自身的同一迁移已在本任务执行，全部为 `git mv` + `rmdir kit`）：
+- **下一发才改**（不是 1.7.1 的安装步骤；本套件这一发没有执行 `git mv` / `rmdir kit`）：
 
   ```bash
   # 1. 先确认旧契约没有本地修改；有修改就先合并 / 备份，不要直接删

@@ -107,11 +107,11 @@
 
 ### 7.1 旧路径登记（迁移 / 兼容例外）
 
-一个已迁移的路径只允许出现在本节登记过的文件里；未登记的文件出现旧路径时，`scripts/validate_kit.py` 报错并指出文件与该行登记。登记行必须同时给出仍然存在的替代路径，且旧路径本身不得仍存在于磁盘或 `REQUIRED` 中。
+一个已迁移的路径只允许出现在本节登记过的文件里；未登记的文件出现旧路径时，`scripts/validate_kit.py` 报错并指出文件与该行登记。登记行必须同时给出仍然存在的替代路径，且旧路径本身不得仍存在于磁盘或 `REQUIRED` 中。说明列含 `DEFERRED` 的行只记录尚未执行的迁移，不执行上述存在性检查。
 
 | 旧路径 | 替代路径 | 允许出现的文件 | 生效版本 | 说明 |
 |---|---|---|---|---|
-| `kit/orchestration.md` | `docs/orchestration.md` | `docs/architecture/repository-map.md`、`docs/design/next-phase-governance-and-agent-performance.md`、`docs/implementation-plan.md`、`docs/metrics.md`、`docs/orchestration.md`、`docs/upgrade.md`、`release/README.md` | 1.5 | #151 迁移；上列文件只用于迁移说明、历史记录或升级指南，不得把旧路径写成当前指令。新增文件若要引用旧路径，必须同时更新本行并说明理由。 |
+| `kit/orchestration.md` | `docs/orchestration.md` | `docs/architecture/repository-map.md`、`docs/design/next-phase-governance-and-agent-performance.md`、`docs/implementation-plan.md`、`docs/metrics.md`、`docs/orchestration.md`、`docs/upgrade.md`、`release/README.md` | 1.5 | `DEFERRED`：#238 桥接发行仍分发 `kit/orchestration.md`，因为已发布的 v1.7.0 更新器不会写入 `docs/`，删除该文件会 `STOPPED_CONFLICT`。本行不执行“不得存在 / 不得入包”检查。迁移留到下一发。 |
 
 - 只加文件不删文件、只改链接不改语义；旧路径一旦重新出现在磁盘上，就是第二个权威，检查失败。
 - 发行标准与 `REQUIRED` 不得包含旧路径；`scripts/build_release.py` 的 `PACKAGE_DOC_PATHS` 只允许当前契约路径。
