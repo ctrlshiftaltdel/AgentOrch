@@ -10,15 +10,19 @@ The frozen inputs live in ``fixtures/``:
 
 * ``v1_7_0_classify.py`` — exact published file, pinned by SHA-256 below;
 * ``v1_7_0_manifest.json`` — the published 1.7.0 ``MANIFEST.json`` path/hash
-  set with its asset and manifest digests recorded for provenance.
+  set. Its content is audited against a digest pinned **in this test module**,
+  not against the file's own ``source_manifest_sha256`` declaration.
 
 Negative controls prove the same frozen code still blocks the two failure modes
 the bridge release must avoid: deleting ``kit/orchestration.md`` and moving the
-contract into ``docs/``.
+contract into ``docs/``. A separate tampering test proves that changing one
+fixture entry breaks the audited digest.
 """
+import copy
 import hashlib
 import importlib.util
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -32,9 +36,66 @@ FROZEN_MANIFEST = FIXTURE_DIR / 'v1_7_0_manifest.json'
 # the official AgentOrch-1.7.0.zip asset (asset SHA-256 cbc35fcf...4c10).
 PUBLISHED_CLASSIFIER_SHA256 = (
     '95313520e12edc102075cc1dba848cd5f8b513a285125cf7bd38ea54c0ec9ff0')
+# The published 1.7.0 asset and the MANIFEST.json bytes it contains.
+PUBLISHED_ASSET_SHA256 = (
+    'cbc35fcf5ddf2aa8c7c799e52c7f5fa83ec8943a7691e1053155cc85988a4c10')
+PUBLISHED_MANIFEST_SHA256 = (
+    'd07addc8b8a0eb153454af9ac0792d6785de7b1d6915cd3bf82b0a11f2aba4b1')
+# Independent audit of the frozen fixture content. Recomputed from the entries as
+# sha256("path\0sha256\0size\n" for each path in sorted order); it is pinned here
+# so a changed fixture fails even if its own ``source_manifest_sha256`` field is
+# rewritten to match. Reproduce with:
+#   python3 -c "import hashlib,json; p=json.load(open('<fixture>')); print(hashlib.sha256(''.join(f\"{e['path']}\\0{e['sha256']}\\0{e['size']}\\n\" for e in sorted(p['files'], key=lambda e: e['path'])).encode()).hexdigest())"
+AUDITED_MANIFEST_DIGEST = (
+    '11e3609c4f799912a51a3f8c76afd86cbbce08c617ee3d5c88eb2cbb474063a1')
+
+SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
 
 CORE = 'kit/orchestration.md'
 PROJECT_OWNED_CONTRACT = 'docs/orchestration.md'
+
+
+def semantic_manifest_digest(entries):
+    """Independent digest of a path/sha256/size list (not of the file bytes)."""
+    lines = []
+    for entry in sorted(entries, key=lambda item: item['path']):
+        lines.append(f"{entry['path']}\0{entry['sha256']}\0{entry['size']}\n")
+    return hashlib.sha256(''.join(lines).encode('utf-8')).hexdigest()
+
+
+def audit_frozen_manifest(payload):
+    """Return every reason the frozen fixture is not the audited v1.7.0 content."""
+    errors = []
+    if not isinstance(payload, dict):
+        return ['fixture is not a JSON object']
+    if payload.get('source_asset_sha256') != PUBLISHED_ASSET_SHA256:
+        errors.append('fixture does not declare the published 1.7.0 asset digest')
+    if payload.get('source_manifest_sha256') != PUBLISHED_MANIFEST_SHA256:
+        errors.append('fixture does not declare the published 1.7.0 manifest digest')
+    entries = payload.get('files')
+    if not isinstance(entries, list) or not entries:
+        return errors + ['fixture carries no file entries']
+    paths = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            errors.append('fixture entry is not an object')
+            continue
+        path = entry.get('path')
+        digest = entry.get('sha256')
+        size = entry.get('size')
+        if not isinstance(path, str) or not path:
+            errors.append('fixture entry has no path')
+            continue
+        paths.append(path)
+        if not isinstance(digest, str) or not SHA256_RE.match(digest):
+            errors.append(f'{path}: fixture sha256 is not 64 lowercase hex digits')
+        if type(size) is not int or size < 1:
+            errors.append(f'{path}: fixture size is not a positive integer')
+    if len(paths) != len(set(paths)):
+        errors.append('fixture lists a path more than once')
+    if semantic_manifest_digest(entries) != AUDITED_MANIFEST_DIGEST:
+        errors.append('fixture content does not match the audited v1.7.0 manifest digest')
+    return errors
 
 
 def load(name, path, *, register=False):
@@ -84,6 +145,34 @@ class PublishedV170ClassifierCompatibilityTests(unittest.TestCase):
         self.assertNotIn(PROJECT_OWNED_CONTRACT, self.baseline)
         self.assertFalse(any(path.startswith('docs/') for path in self.target))
         self.assertIn(CORE, self.target)
+
+    def test_frozen_manifest_matches_the_audited_digest(self):
+        """The fixture content is checked against a digest pinned in this module."""
+        self.assertEqual(audit_frozen_manifest(self.provenance), [])
+        self.assertEqual(semantic_manifest_digest(self.provenance['files']),
+                         AUDITED_MANIFEST_DIGEST)
+        # The audit must not merely echo the fixture's own declaration.
+        self.assertNotEqual(AUDITED_MANIFEST_DIGEST,
+                            self.provenance['source_manifest_sha256'])
+
+    def test_tampering_one_manifest_entry_fails_the_audit(self):
+        tampered = copy.deepcopy(self.provenance)
+        tampered['files'][0]['sha256'] = '0' * 64
+        # Rewriting the file's own declaration must not rescue the tampered entry.
+        tampered['source_manifest_sha256'] = semantic_manifest_digest(tampered['files'])
+        errors = audit_frozen_manifest(tampered)
+        self.assertTrue(any('audited v1.7.0 manifest digest' in error for error in errors),
+                        errors)
+        self.assertNotEqual(semantic_manifest_digest(tampered['files']),
+                            AUDITED_MANIFEST_DIGEST)
+
+    def test_tampering_one_manifest_size_fails_the_audit(self):
+        tampered = copy.deepcopy(self.provenance)
+        tampered['files'][0]['size'] = tampered['files'][0]['size'] + 1
+        tampered['source_manifest_sha256'] = semantic_manifest_digest(tampered['files'])
+        errors = audit_frozen_manifest(tampered)
+        self.assertTrue(any('audited v1.7.0 manifest digest' in error for error in errors),
+                        errors)
 
     # -- positive: today's release classifies cleanly ---------------------- #
 

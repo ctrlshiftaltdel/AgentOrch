@@ -1400,18 +1400,24 @@ class LegacyPathTests(unittest.TestCase):
 
     OLD = 'old/thing.md'
     NEW = 'docs/thing.md'
-    DEFERRED = '`DEFERRED`: #238 keeps the old path until the bridge release ships'
+    AUTH_OLD = 'kit/orchestration.md'
+    AUTH_NEW = 'docs/orchestration.md'
+    DEFERRED = f'`DEFERRED`: #238 keeps `{AUTH_OLD}` until the bridge release ships'
 
-    def lifecycle(self, allowed='`docs/history.md`', replacement='`docs/thing.md`',
-                  note='moved'):
+    def lifecycle(self, allowed='`docs/history.md`', replacement=None, note='moved',
+                  old=None, new=None):
+        old = self.OLD if old is None else old
+        new = self.NEW if new is None else new
+        if replacement is None:
+            replacement = f'`{new}`'
         return ('# lifecycle\n\n'
                 '### 7.1 旧路径登记（迁移 / 兼容例外）\n\n'
                 '| 旧路径 | 替代路径 | 允许出现的文件 | 生效版本 | 说明 |\n'
                 '|---|---|---|---|---|\n'
-                f'| `{self.OLD}` | {replacement} | {allowed} | 1.5 | {note} |\n')
+                f'| `{old}` | {replacement} | {allowed} | 1.5 | {note} |\n')
 
-    def tree(self, tmp, files, allowed='`docs/history.md`', replacement='`docs/thing.md`',
-             note='moved'):
+    def tree(self, tmp, files, allowed='`docs/history.md`', replacement=None, note='moved',
+             old=None, new=None):
         root = Path(tmp)
         for rel, text in files.items():
             path = root / rel
@@ -1419,7 +1425,8 @@ class LegacyPathTests(unittest.TestCase):
             path.write_text(text, encoding='utf-8')
         target = root / validate.LIFECYCLE_DOC
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(self.lifecycle(allowed=allowed, replacement=replacement, note=note),
+        target.write_text(self.lifecycle(allowed=allowed, replacement=replacement, note=note,
+                                         old=old, new=new),
                           encoding='utf-8')
         return root
 
@@ -1483,54 +1490,114 @@ class LegacyPathTests(unittest.TestCase):
             errors = validate.legacy_path_errors(root)
         self.assertTrue(any('legacy path old/thing.md still exists' in e for e in errors), errors)
 
+    def test_deferral_authorisation_table_is_exactly_one_pair(self):
+        """No other path pair or task number may be silently authorised."""
+        self.assertEqual(
+            dict(validate.DEFERRAL_AUTHORISATIONS),
+            {('kit/orchestration.md', 'docs/orchestration.md'): '238'})
+        self.assertEqual(
+            validate._deferral_state(self.DEFERRED, 'kit/orchestration.md',
+                                     'docs/orchestration.md'), ('valid', ''))
+
     def test_deferred_row_is_limited_to_the_deferred_migration_state(self):
         """A valid deferral suspends exactly the migrated-state checks.
 
         The old path may still exist, may still be a release path, and may be
         referenced outside the allowed-file list until the migration executes.
+        Deferral is bound to this exact path pair and to #238.
         """
         with tempfile.TemporaryDirectory() as tmp:
             root = self.tree(tmp, {
-                self.NEW: '# thing\n',
-                self.OLD: '# still the current authority\n',
+                self.AUTH_NEW: '# thing\n',
+                self.AUTH_OLD: '# still the current authority\n',
                 'docs/history.md': '# history\n',
-                'docs/elsewhere.md': f'# elsewhere\n\nread `{self.OLD}` first.\n',
-            }, note=self.DEFERRED)
+                'docs/elsewhere.md': f'# elsewhere\n\nread `{self.AUTH_OLD}` first.\n',
+            }, note=self.DEFERRED, old=self.AUTH_OLD, new=self.AUTH_NEW)
             with mock.patch.object(validate, 'REQUIRED',
-                                   list(validate.REQUIRED) + [self.OLD]):
+                                   list(validate.REQUIRED) + [self.AUTH_OLD]):
                 errors = validate.legacy_path_errors(root)
         self.assertEqual(errors, [])
 
     def test_deferred_row_still_requires_an_existing_successor(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self.tree(tmp, {'docs/history.md': '# history\n'},
-                             replacement='`docs/missing-successor.md`', note=self.DEFERRED)
+                             note=self.DEFERRED,
+                             old=self.AUTH_OLD, new=self.AUTH_NEW)
             errors = validate.legacy_path_errors(root)
-        self.assertTrue(any('successor docs/missing-successor.md does not exist' in e
+        self.assertTrue(any('successor docs/orchestration.md does not exist' in e
                             for e in errors), errors)
 
     def test_deferred_row_still_requires_its_declared_allowed_files(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = self.tree(tmp, {self.OLD: '# current authority\n'},
-                             allowed='`docs/never-written.md`', note=self.DEFERRED)
+            root = self.tree(tmp, {self.AUTH_OLD: '# current authority\n'},
+                             allowed='`docs/never-written.md`', note=self.DEFERRED,
+                             old=self.AUTH_OLD, new=self.AUTH_NEW)
             errors = validate.legacy_path_errors(root)
         self.assertTrue(any('allowed file docs/never-written.md does not exist' in e
                             for e in errors), errors)
 
     def test_deferred_row_whose_old_path_is_gone_is_reported_as_stale(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = self.tree(tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n'},
-                             note=self.DEFERRED)
+            root = self.tree(tmp, {self.AUTH_NEW: '# thing\n', 'docs/history.md': '# history\n'},
+                             note=self.DEFERRED, old=self.AUTH_OLD, new=self.AUTH_NEW)
             errors = validate.legacy_path_errors(root)
         self.assertTrue(any('marked deferred but no longer exists' in e for e in errors), errors)
 
     def test_deferred_row_must_cite_the_authorising_task(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = self.tree(tmp, {self.NEW: '# thing\n', self.OLD: '# current authority\n'},
-                             note='`DEFERRED`: keep it for now')
+            root = self.tree(tmp, {self.AUTH_NEW: '# thing\n',
+                                   self.AUTH_OLD: '# current authority\n'},
+                             note='`DEFERRED`: keep it for now',
+                             old=self.AUTH_OLD, new=self.AUTH_NEW)
             errors = validate.legacy_path_errors(root)
         self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
-        self.assertTrue(any('authorising task' in e for e in errors), errors)
+        self.assertTrue(any('cite exactly #238' in e for e in errors), errors)
+
+    def test_deferral_is_rejected_for_another_path_pair(self):
+        """The exception cannot be borrowed by a different migration row."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {self.NEW: '# thing\n', self.OLD: '# second authority\n',
+                                   'docs/history.md': '# history\n'},
+                             note=self.DEFERRED)
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
+        self.assertTrue(any('only authorised for' in e for e in errors), errors)
+
+    def test_deferral_rejects_a_different_task_number(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {self.AUTH_NEW: '# thing\n',
+                                   self.AUTH_OLD: '# current authority\n'},
+                             note='`DEFERRED`: #999 keeps the old path',
+                             old=self.AUTH_OLD, new=self.AUTH_NEW)
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('cite exactly #238' in e for e in errors), errors)
+
+    def test_deferral_rejects_a_second_task_number(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {self.AUTH_NEW: '# thing\n',
+                                   self.AUTH_OLD: '# current authority\n'},
+                             note='`DEFERRED`: #238 and #999 keep the old path',
+                             old=self.AUTH_OLD, new=self.AUTH_NEW)
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('cite exactly #238' in e for e in errors), errors)
+
+    def test_deferral_rejects_an_empty_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {self.AUTH_NEW: '# thing\n',
+                                   self.AUTH_OLD: '# current authority\n'},
+                             note='`DEFERRED`:    ',
+                             old=self.AUTH_OLD, new=self.AUTH_NEW)
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('must not be empty' in e for e in errors), errors)
+
+    def test_deferral_rejects_a_contradictory_negation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {self.AUTH_NEW: '# thing\n',
+                                   self.AUTH_OLD: '# current authority\n'},
+                             note='`DEFERRED`: #238 not deferred; the migration is complete',
+                             old=self.AUTH_OLD, new=self.AUTH_NEW)
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('negates the deferral' in e for e in errors), errors)
 
     def test_negated_deferral_marker_is_not_a_deferral(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1562,11 +1629,12 @@ class LegacyPathTests(unittest.TestCase):
                 '### 7.1 旧路径登记（迁移 / 兼容例外）\n\n'
                 '| 旧路径 | 替代路径 | 允许出现的文件 | 生效版本 | 说明 |\n'
                 '|---|---|---|---|---|\n'
-                f'| `{self.OLD}` | `{self.NEW}` | `docs/history.md` | 1.5 | {self.DEFERRED} |\n'
+                f'| `{self.AUTH_OLD}` | `{self.AUTH_NEW}` | `docs/history.md` | 1.5 | '
+                f'{self.DEFERRED} |\n'
                 f'| `{other_old}` | `{other_new}` | `docs/history.md` | 1.5 | moved |\n')
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for rel, content in {self.NEW: '# thing\n', self.OLD: '# authority\n',
+            for rel, content in {self.AUTH_NEW: '# thing\n', self.AUTH_OLD: '# authority\n',
                                  other_new: '# other\n', other_old: '# duplicate\n',
                                  'docs/history.md': '# history\n'}.items():
                 path = root / rel
@@ -1576,7 +1644,7 @@ class LegacyPathTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(text, encoding='utf-8')
             errors = validate.legacy_path_errors(root)
-        self.assertFalse(any('old/thing.md still exists' in e for e in errors), errors)
+        self.assertFalse(any('kit/orchestration.md still exists' in e for e in errors), errors)
         self.assertTrue(any('legacy path old/other.md still exists' in e for e in errors), errors)
 
 
