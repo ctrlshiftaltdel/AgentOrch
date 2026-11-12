@@ -343,7 +343,9 @@ def _run_probe():
             ]
             targets = ['sub']
             if report['junction_created'] == 'yes':
-                targets.extend(['linkdir', 'linkdir/child'])
+                # Relative NtCreateFile object names use the Windows separator;
+                # 'linkdir/child' returns STATUS_OBJECT_NAME_INVALID.
+                targets.extend(['linkdir', 'linkdir\\child'])
             if report['symlink_created'] == 'yes':
                 targets.append('symlinkdir')
             for target in targets:
