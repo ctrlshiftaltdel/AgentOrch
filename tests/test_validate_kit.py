@@ -1402,7 +1402,7 @@ class LegacyPathTests(unittest.TestCase):
     NEW = 'docs/thing.md'
     AUTH_OLD = 'kit/orchestration.md'
     AUTH_NEW = 'docs/orchestration.md'
-    DEFERRED = f'`DEFERRED`: #238 keeps `{AUTH_OLD}` until the bridge release ships'
+    DEFERRED = '`DEFERRED`: #238 BRIDGE-1.7.1'
 
     def lifecycle(self, allowed='`docs/history.md`', replacement=None, note='moved',
                   old=None, new=None):
@@ -1494,7 +1494,8 @@ class LegacyPathTests(unittest.TestCase):
         """No other path pair or task number may be silently authorised."""
         self.assertEqual(
             dict(validate.DEFERRAL_AUTHORISATIONS),
-            {('kit/orchestration.md', 'docs/orchestration.md'): '238'})
+            {('kit/orchestration.md', 'docs/orchestration.md'):
+                {'task': '238', 'marker': '`DEFERRED`: #238 BRIDGE-1.7.1'}})
         self.assertEqual(
             validate._deferral_state(self.DEFERRED, 'kit/orchestration.md',
                                      'docs/orchestration.md'), ('valid', ''))
@@ -1543,15 +1544,19 @@ class LegacyPathTests(unittest.TestCase):
             errors = validate.legacy_path_errors(root)
         self.assertTrue(any('marked deferred but no longer exists' in e for e in errors), errors)
 
-    def test_deferred_row_must_cite_the_authorising_task(self):
+    def _deferral_error(self, note, *, allowed='`docs/history.md`'):
         with tempfile.TemporaryDirectory() as tmp:
             root = self.tree(tmp, {self.AUTH_NEW: '# thing\n',
-                                   self.AUTH_OLD: '# current authority\n'},
-                             note='`DEFERRED`: keep it for now',
+                                   self.AUTH_OLD: '# current authority\n',
+                                   'docs/history.md': '# history\n'},
+                             allowed=allowed, note=note,
                              old=self.AUTH_OLD, new=self.AUTH_NEW)
-            errors = validate.legacy_path_errors(root)
+            return validate.legacy_path_errors(root)
+
+    def test_deferred_row_requires_the_exact_authorised_marker(self):
+        errors = self._deferral_error('`DEFERRED`: keep it for now')
         self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
-        self.assertTrue(any('cite exactly #238' in e for e in errors), errors)
+        self.assertTrue(any('must be exactly' in e for e in errors), errors)
 
     def test_deferral_is_rejected_for_another_path_pair(self):
         """The exception cannot be borrowed by a different migration row."""
@@ -1564,40 +1569,37 @@ class LegacyPathTests(unittest.TestCase):
         self.assertTrue(any('only authorised for' in e for e in errors), errors)
 
     def test_deferral_rejects_a_different_task_number(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = self.tree(tmp, {self.AUTH_NEW: '# thing\n',
-                                   self.AUTH_OLD: '# current authority\n'},
-                             note='`DEFERRED`: #999 keeps the old path',
-                             old=self.AUTH_OLD, new=self.AUTH_NEW)
-            errors = validate.legacy_path_errors(root)
-        self.assertTrue(any('cite exactly #238' in e for e in errors), errors)
+        errors = self._deferral_error('`DEFERRED`: #999 BRIDGE-1.7.1')
+        self.assertTrue(any('must be exactly' in e for e in errors), errors)
 
     def test_deferral_rejects_a_second_task_number(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = self.tree(tmp, {self.AUTH_NEW: '# thing\n',
-                                   self.AUTH_OLD: '# current authority\n'},
-                             note='`DEFERRED`: #238 and #999 keep the old path',
-                             old=self.AUTH_OLD, new=self.AUTH_NEW)
-            errors = validate.legacy_path_errors(root)
-        self.assertTrue(any('cite exactly #238' in e for e in errors), errors)
+        errors = self._deferral_error('`DEFERRED`: #238 and #999 BRIDGE-1.7.1')
+        self.assertTrue(any('must be exactly' in e for e in errors), errors)
 
     def test_deferral_rejects_an_empty_reason(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = self.tree(tmp, {self.AUTH_NEW: '# thing\n',
-                                   self.AUTH_OLD: '# current authority\n'},
-                             note='`DEFERRED`:    ',
-                             old=self.AUTH_OLD, new=self.AUTH_NEW)
-            errors = validate.legacy_path_errors(root)
-        self.assertTrue(any('must not be empty' in e for e in errors), errors)
+        errors = self._deferral_error('`DEFERRED`:    ')
+        self.assertTrue(any('must be exactly' in e for e in errors), errors)
 
     def test_deferral_rejects_a_contradictory_negation(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = self.tree(tmp, {self.AUTH_NEW: '# thing\n',
-                                   self.AUTH_OLD: '# current authority\n'},
-                             note='`DEFERRED`: #238 not deferred; the migration is complete',
-                             old=self.AUTH_OLD, new=self.AUTH_NEW)
-            errors = validate.legacy_path_errors(root)
-        self.assertTrue(any('negates the deferral' in e for e in errors), errors)
+        errors = self._deferral_error('`DEFERRED`: #238 not deferred; the migration is complete')
+        self.assertTrue(any('must be exactly' in e for e in errors), errors)
+
+    def test_deferral_rejects_a_completion_claim_in_chinese(self):
+        """Regression from review: a polite "no need to defer, done" is not a marker."""
+        errors = self._deferral_error('`DEFERRED`: #238 无需延期，已完成')
+        self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
+
+    def test_deferral_rejects_not_currently_deferred_wording(self):
+        errors = self._deferral_error('`DEFERRED`: #238 not currently deferred')
+        self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
+
+    def test_deferral_rejects_a_bare_task_number(self):
+        errors = self._deferral_error('`DEFERRED`: #238')
+        self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
+
+    def test_deferral_rejects_extra_text_after_the_canonical_marker(self):
+        errors = self._deferral_error(self.DEFERRED + ' (temporary)')
+        self.assertTrue(any('must be exactly' in e for e in errors), errors)
 
     def test_negated_deferral_marker_is_not_a_deferral(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1615,13 +1617,14 @@ class LegacyPathTests(unittest.TestCase):
             errors = validate.legacy_path_errors(root)
         self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
 
-    def test_deferral_marker_outside_the_note_column_is_not_a_deferral(self):
+    def test_deferral_marker_outside_the_note_column_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self.tree(tmp, {self.NEW: '# thing\n', self.OLD: '# second authority\n',
                                    'docs/history.md': '# history\n'},
                              allowed='`docs/history.md` `DEFERRED`', note='moved')
             errors = validate.legacy_path_errors(root)
-        self.assertTrue(any('legacy path old/thing.md still exists' in e for e in errors), errors)
+        self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
+        self.assertTrue(any('说明 column' in e for e in errors), errors)
 
     def test_other_rows_stay_strict_while_one_row_is_deferred(self):
         other_old, other_new = 'old/other.md', 'docs/other.md'

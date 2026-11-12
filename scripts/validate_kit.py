@@ -1256,16 +1256,22 @@ def legacy_path_registry(text):
         allowed = [item.strip().strip('/') for item in re.findall(r'`([^`]+)`', cells[2])]
         note = cells[4] if len(cells) > 4 else ''
         old, new = old.strip('/').strip(), new.strip()
-        deferral, deferral_error = _deferral_state(note, old, new)
+        elsewhere = any(DEFERRAL_MENTION_RE.search(cell)
+                        for index, cell in enumerate(cells) if index != 4)
+        deferral, deferral_error = _deferral_state(note, old, new,
+                                                   marker_outside_note=elsewhere)
         entries.append({'old': old, 'new': new,
                         'allowed': [item for item in allowed if item],
                         'deferral': deferral, 'deferral_error': deferral_error})
     return entries
 
 
-# A deferral is a temporary, auditable exception, not a keyword that switches
-# the checks off. Only the exact marker `` `DEFERRED`: <reason> `` at the start of
-# the 说明 cell defers anything, and only for the one path pair recorded here.
+# Deferral is a single, machine-checkable exception, not a natural-language
+# promise. For the one authorised path pair the 说明 cell must be exactly the
+# canonical marker string below; there is no reason parser, no negation word list
+# and no partial credit. Any other text in that cell (including a negation,
+# a completion claim, or just the task number) is malformed, so an ambiguous
+# sentence can never be read as an authorisation.
 #
 # This table is a *local* authorisation record copied from the approved task
 # (#238). The check binds a row to that record; it does not contact GitHub and
@@ -1273,44 +1279,38 @@ def legacy_path_registry(text):
 # exception. That fact must be established by the task carrier, not by this
 # offline validator.
 DEFERRAL_AUTHORISATIONS = {
-    ('kit/orchestration.md', 'docs/orchestration.md'): '238',
+    ('kit/orchestration.md', 'docs/orchestration.md'): {
+        'task': '238',
+        'marker': '`DEFERRED`: #238 BRIDGE-1.7.1',
+    },
 }
-DEFERRAL_MARKER_RE = re.compile(r'^\s*`DEFERRED`\s*[:：]\s*(?P<reason>.*?)\s*$')
 DEFERRAL_MENTION_RE = re.compile(r'DEFERRED', re.IGNORECASE)
-DEFERRAL_TASK_RE = re.compile(r'#(\d+)')
-# A reason that negates the marker is contradictory, not an authorisation.
-DEFERRAL_NEGATION_RE = re.compile(
-    r'\bnot\s+deferred\b|\bno\s+longer\s+deferred\b|\bundeferred\b|'
-    r'不延期|未延期|不再延期|不推迟|不再推迟|取消延期|并未延期', re.IGNORECASE)
 
 
-def _deferral_state(note, old, new):
-    """Return ``(state, detail)`` for one 说明 cell: none / valid / malformed."""
+def _deferral_state(note, old, new, *, marker_outside_note=False):
+    """Return ``(state, detail)`` for one row: none / valid / malformed.
+
+    Only the exact canonical marker of the one authorised pair is ``valid``.
+    A DEFERRED marker anywhere outside the 说明 column is malformed instead of
+    being silently ignored, so the documented fail-closed rule is enforced.
+    """
+    if marker_outside_note:
+        return ('malformed',
+                'the deferral marker must appear only in the 说明 column; a marker in '
+                'any other column is not an authorisation')
     if not note or not DEFERRAL_MENTION_RE.search(note):
         return 'none', ''
     authorised = DEFERRAL_AUTHORISATIONS.get((old, new))
     if authorised is None:
-        pairs = ', '.join(f'{pair_old} -> {pair_new} (#{task})'
-                          for (pair_old, pair_new), task in DEFERRAL_AUTHORISATIONS.items())
+        pairs = ', '.join(f'{pair_old} -> {pair_new} (#{spec["task"]})'
+                          for (pair_old, pair_new), spec in DEFERRAL_AUTHORISATIONS.items())
         return ('malformed',
                 f'a deferral is only authorised for {pairs}; this row is not that pair')
-    match = DEFERRAL_MARKER_RE.match(note)
-    if not match:
+    if note.strip() != authorised['marker']:
         return ('malformed',
-                'the deferral marker must be exactly `DEFERRED` at the start of the 说明 '
-                'cell, followed by ":" or "：" and a reason')
-    reason = match.group('reason').strip()
-    if not reason:
-        return ('malformed', 'the deferral reason must not be empty')
-    references = set(DEFERRAL_TASK_RE.findall(reason))
-    if references != {authorised}:
-        return ('malformed',
-                f'the deferral reason must cite exactly #{authorised} (the locally recorded '
-                'authorising task) and no other task number')
-    if DEFERRAL_NEGATION_RE.search(reason):
-        return ('malformed',
-                'the deferral reason negates the deferral marker; a contradictory row '
-                'cannot reserve the exception')
+                f'the 说明 cell of the authorised deferral must be exactly '
+                f'"{authorised["marker"]}"; no additional text, negation, completion claim '
+                'or alternative wording is accepted')
     return 'valid', ''
 
 
