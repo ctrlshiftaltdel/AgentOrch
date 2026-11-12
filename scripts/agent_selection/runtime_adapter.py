@@ -3,7 +3,7 @@
 
 Design contract: ``docs/design/agent-role-discovery-and-model-selection.md``
 §4–§7. This module defines **only** what a runtime fact is; it does not define
-or redefine C1–C8. C1–C4 stay authoritative in ``docs/orchestration.md`` §5 and
+or redefine C1–C8. C1–C4 stay authoritative in ``kit/orchestration.md`` §5 and
 C5–C8 in ``templates/runtime-capability.md``; here they are consumed as
 evidence and gated, never re-specified.
 

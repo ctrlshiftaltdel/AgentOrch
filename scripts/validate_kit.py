@@ -135,10 +135,10 @@ MANAGED_BODY_HEADING = '# AgentOrch 推进引擎（受管区块）'
 
 # --- Repository-only required documents --------------------------------------
 # These files are required in a checkout but must NOT be added to REQUIRED:
-# scripts/build_release.py refuses every `docs` path except the shipped core
-# contract (docs/orchestration.md), so listing any of them above would turn every
-# release self-check red. They are still required artifacts — a missing file or a
-# deleted section fails validate_kit on a checkout.
+# scripts/build_release.py refuses every `docs` path (the shipped core contract
+# currently lives at `kit/orchestration.md`), so listing any of them above would
+# turn every release self-check red. They are still required artifacts — a missing
+# file or a deleted section fails validate_kit on a checkout.
 #
 # `tests/update_agentorch/test_report.py` is repository-only for the same
 # reason: it reads the frozen fixtures under `docs/contracts/fixtures/`, which
@@ -158,9 +158,9 @@ MANAGED_BODY_HEADING = '# AgentOrch 推进引擎（受管区块）'
 # presence means "this is an upstream checkout" and the full set is enforced.
 # A docs/ directory holding a project config (`docs/PROJECT.md`) is a downstream
 # project tree; a docs/ directory holding nothing but the shipped contents of
-# REQUIRED (today just docs/orchestration.md) is a pristine release package. See
-# `tree_mode` for the exact rule. A downstream project must not create its own
-# `docs/upgrade.md` — that would switch the tree to upstream mode.
+# REQUIRED (currently nothing, because the contract ships at `kit/`) is a pristine
+# release package. See `tree_mode` for the exact rule. A downstream project must
+# not create its own `docs/upgrade.md` — that would switch the tree to upstream mode.
 PROJECT_DOCS = {
     'docs/PROJECT.md': (),
     'docs/PLAN.md': ('设计目标',),
@@ -260,10 +260,11 @@ EXTERNAL_LINK_PREFIXES = ('http://', 'https://', 'mailto:', '#')
 
 # --- Evidence matrix contract -------------------------------------------------
 # The field names, the status enum and the G1 rules are defined once, in
-# docs/orchestration.md 4.1. This module reads that definition back (it does not
-# restate it) and enforces it on the local/github task templates. If the doc drifts
-# away from the contract floor below, validation fails instead of silently
-# accepting a second definition.
+# the core contract (`kit/orchestration.md` for the 1.7.1 bridge release;
+# `CORE_DOC` below is the machine-readable copy of that path). This module reads
+# that definition back (it does not restate it) and enforces it on the
+# local/github task templates. If the doc drifts away from the contract floor
+# below, validation fails instead of silently accepting a second definition.
 CORE_DOC = 'kit/orchestration.md'
 TASK_PACKET_DOC = 'templates/task-packet.md'
 ISSUE_TEMPLATE_DOC = 'editions/github/issue-template.md'
@@ -278,7 +279,8 @@ NOT_RUN_MARKERS = re.compile(
     r'\bnot[ _-]?run\b|\bnot executed\b|\bnot verified\b|未执行|未运行|未验证|blocked by|被阻塞', re.I)
 SHA_RE = re.compile(r'^[0-9a-f]{40}$')
 # Fields every task packet must carry, on top of the structured scenario fields
-# read from docs/orchestration.md. Names are the template labels, lower-cased.
+# read from the core contract (`kit/orchestration.md`). Names are the template
+# labels, lower-cased.
 PACKET_REQUIRED_FIELDS = (
     'task id', 'title', 'goal / user-visible result', 'context', 'allowed paths',
     'forbidden paths', 'dependencies (must be verified)', 'acceptance criteria',
@@ -1035,9 +1037,10 @@ DOC_IMPACT_STATUSES = ('UPDATE', 'NO_CHANGE', 'NOT_APPLICABLE')
 DOC_IMPACT_COLUMNS = ('path', 'status', 'change or reason')
 EMPTY_CELL_MARKERS = ('', '(none)', 'none', 'n/a', '-', '—')
 
-# Task state vocabulary. READY / DISPATCHED / ... are defined once in
-# docs/orchestration.md 4.1; OPEN / CLOSED / PLANNED are planning words a phase
-# plan may use for its rows. An unknown token is a typo or a second vocabulary.
+# Task state vocabulary. READY / DISPATCHED / ... are defined once in the core
+# contract (`kit/orchestration.md` 4.1); OPEN / CLOSED / PLANNED are planning
+# words a phase plan may use for its rows. An unknown token is a typo or a second
+# vocabulary.
 PLAN_STATUS_VALUES = (
     'PLANNED', 'READY', 'DISPATCHED', 'IN_PROGRESS', 'PR_OPEN', 'MASTER_REVIEW',
     'APPROVED', 'MERGED', 'VERIFIED', 'BLOCKED', 'FAILED', 'CANCELED', 'OPEN',
@@ -1252,10 +1255,36 @@ def legacy_path_registry(text):
             continue
         allowed = [item.strip().strip('/') for item in re.findall(r'`([^`]+)`', cells[2])]
         note = cells[4] if len(cells) > 4 else ''
+        deferral, deferral_error = _deferral_state(note)
         entries.append({'old': old.strip('/').strip(), 'new': new.strip(),
                         'allowed': [item for item in allowed if item],
-                        'deferred': 'DEFERRED' in note})
+                        'deferral': deferral, 'deferral_error': deferral_error})
     return entries
+
+
+# A deferral is a temporary, auditable exception, not a keyword that switches
+# the checks off. Only the exact marker `` `DEFERRED`: <reason> `` at the start of
+# the 说明 cell defers anything, and the reason must name the authorising task
+# (``#238``). Anything else that mentions the word DEFERRED is malformed and is
+# reported instead of silently disabling (or silently running) the strict checks.
+DEFERRAL_MARKER_RE = re.compile(r'^\s*`DEFERRED`\s*[:：]\s*(?P<reason>.+?)\s*$')
+DEFERRAL_MENTION_RE = re.compile(r'DEFERRED', re.IGNORECASE)
+DEFERRAL_AUTH_RE = re.compile(r'#\d+')
+
+
+def _deferral_state(note):
+    """Return ``(state, detail)`` for one 说明 cell: none / valid / malformed."""
+    if not note or not DEFERRAL_MENTION_RE.search(note):
+        return 'none', ''
+    match = DEFERRAL_MARKER_RE.match(note)
+    if not match:
+        return ('malformed',
+                'the deferral marker must be exactly `DEFERRED` at the start of the 说明 '
+                'cell, followed by ":" or "：" and a reason')
+    if not DEFERRAL_AUTH_RE.search(match.group('reason')):
+        return ('malformed',
+                'the deferral reason must cite the authorising task (for example #238)')
+    return 'valid', ''
 
 
 def legacy_path_errors(root=ROOT):
@@ -1271,18 +1300,31 @@ def legacy_path_errors(root=ROOT):
     errors, scan_errors = [], []
     for entry in entries:
         old, new = entry['old'], entry['new']
-        if entry.get('deferred'):
+        state = entry.get('deferral', 'none')
+        if state == 'malformed':
+            errors.append(f'{LIFECYCLE_DOC}: legacy {old} has a malformed deferral marker: '
+                          f'{entry.get("deferral_error") or "invalid marker"}')
             continue
         if not (root / new).exists():
             errors.append(f'{LIFECYCLE_DOC}: legacy {old} successor {new} does not exist')
+        for rel in entry['allowed']:
+            if not (root / rel).exists():
+                errors.append(f'{LIFECYCLE_DOC}: legacy {old} allowed file {rel} does not exist')
+        if state == 'valid':
+            # Exactly three migrated-state checks are deferred, and only for this
+            # row: the old path may still exist, may still be a release path, and
+            # may still be referenced anywhere until the migration is executed.
+            # A deferral whose old path is already gone is stale and must be
+            # cleaned up instead of staying as an open-ended exception.
+            if not (root / old).exists():
+                errors.append(f'{LIFECYCLE_DOC}: legacy {old} is marked deferred but no longer '
+                              'exists on disk; remove the deferral and close the migration row')
+            continue
         if (root / old).exists():
             errors.append(f'{LIFECYCLE_DOC}: legacy path {old} still exists on disk; keep one '
                           'authority instead of a second copy')
         if any(rel == old or rel.startswith(old + '/') for rel in REQUIRED):
             errors.append(f'{LIFECYCLE_DOC}: legacy path {old} must not be a release path')
-        for rel in entry['allowed']:
-            if not (root / rel).exists():
-                errors.append(f'{LIFECYCLE_DOC}: legacy {old} allowed file {rel} does not exist')
         allowed = set(entry['allowed'])
         for path in _scan_files(root, root, scan_errors, DOC_SCAN_EXCLUDED_DIRS):
             if path.suffix.lower() != '.md':

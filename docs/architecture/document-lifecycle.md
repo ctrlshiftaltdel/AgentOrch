@@ -107,13 +107,15 @@
 
 ### 7.1 旧路径登记（迁移 / 兼容例外）
 
-一个已迁移的路径只允许出现在本节登记过的文件里；未登记的文件出现旧路径时，`scripts/validate_kit.py` 报错并指出文件与该行登记。登记行必须同时给出仍然存在的替代路径，且旧路径本身不得仍存在于磁盘或 `REQUIRED` 中。说明列含 `DEFERRED` 的行只记录尚未执行的迁移，不执行上述存在性检查。
+一个已迁移的路径只允许出现在本节登记过的文件里；未登记的文件出现旧路径时，`scripts/validate_kit.py` 报错并指出文件与该行登记。登记行必须同时给出仍然存在的替代路径，且旧路径本身不得仍存在于磁盘或 `REQUIRED` 中。
+
+**尚未执行的迁移**用延期登记记录，写法只有一种：说明列必须以 `` `DEFERRED` `` 开头，紧跟 `:` 或 `：`，后接非空理由，且理由必须写明授权任务（形如 `#238`）。只有这种写法会暂停三项“迁移已完成”检查——旧路径不得存在于磁盘、旧路径不得进入 `REQUIRED`、旧路径引用只能出现在允许文件（引用扫描）。延期登记仍然强制：替代路径必须存在、列出的允许文件必须存在、旧路径本身必须仍存在于磁盘（否则延期已过期，必须删掉标记并收口该行）。任何其他形式的 `DEFERRED`（小写、`NOT DEFERRED`、不在说明列、缺少授权引用）都按畸形标记报错，既不会当成延期，也不会被静默忽略。延期只登记“这次不迁移”的事实，不是跳过检查的通用开关，也不会让说明里的文字变成第二套规则。
 
 | 旧路径 | 替代路径 | 允许出现的文件 | 生效版本 | 说明 |
 |---|---|---|---|---|
-| `kit/orchestration.md` | `docs/orchestration.md` | `docs/architecture/repository-map.md`、`docs/design/next-phase-governance-and-agent-performance.md`、`docs/implementation-plan.md`、`docs/metrics.md`、`docs/orchestration.md`、`docs/upgrade.md`、`release/README.md` | 1.5 | `DEFERRED`：#238 桥接发行仍分发 `kit/orchestration.md`，因为已发布的 v1.7.0 更新器不会写入 `docs/`，删除该文件会 `STOPPED_CONFLICT`。本行不执行“不得存在 / 不得入包”检查。迁移留到下一发。 |
+| `kit/orchestration.md` | `docs/orchestration.md` | `docs/architecture/repository-map.md`、`docs/design/next-phase-governance-and-agent-performance.md`、`docs/implementation-plan.md`、`docs/metrics.md`、`docs/orchestration.md`、`docs/upgrade.md`、`release/README.md` | 1.5 | `DEFERRED`：#238 桥接发行仍分发 `kit/orchestration.md`，因为已发布的 v1.7.0 更新器不会写入 `docs/`，删除该文件会 `STOPPED_CONFLICT`。本行只暂停旧路径存在性、`REQUIRED` 成员与引用扫描三项检查；替代路径、允许文件、旧路径仍存在与授权引用仍校验。迁移留到下一发。 |
 
-- 只加文件不删文件、只改链接不改语义；旧路径一旦重新出现在磁盘上，就是第二个权威，检查失败。
+- 只加文件不删文件、只改链接不改语义；非延期行里旧路径一旦重新出现在磁盘上，就是第二个权威，检查失败。
 - 发行标准与 `REQUIRED` 不得包含旧路径；`scripts/build_release.py` 的 `PACKAGE_DOC_PATHS` 只允许当前契约路径。
 
 ## 8. 归档

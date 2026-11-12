@@ -162,6 +162,10 @@ class CompletePacketTests(unittest.TestCase):
             self.assertIn('migration_cases', text)
             self.assertIn('validation_commands', text)
             self.assertIn('4.1', text)
+            # The rendered field reference must point at the contract the
+            # package actually ships, not at a project-owned path.
+            self.assertIn('`kit/orchestration.md` 4.1', text)
+            self.assertNotIn('`docs/orchestration.md` 4.1', text)
         self.assertIn('## 可改路径', github_body)
         self.assertIn('- **Allowed paths:**', local_packet)
 

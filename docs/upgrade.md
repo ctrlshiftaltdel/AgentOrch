@@ -822,30 +822,12 @@ APPLY 后的可核对事实：
 
 ### 15.1 下一发才会发生的迁移
 
-- **变了什么（尚未在发行包中发生）**：计划把 `kit/orchestration.md` 移到 `docs/orchestration.md`，仍是唯一可编辑权威。1.7.1 不删除 `kit/`，发行包也不包含 `docs/orchestration.md`。
-
-- **变了什么**：`kit/orchestration.md` 移到 `docs/orchestration.md`，仍是**唯一可编辑权威**；`kit/` 目录随之消失，发行包里不再有 `kit/`。契约正文的语义（会话入口、状态机、合并门 G1–G6、C1–C4 / C1–C8、证据矩阵）不变，只改位置与指向它的引用。发行包从此只包含 `docs/` 下的这一个文件；其余 `docs/` 内容（设计稿、阶段计划、本文件）仍不打包。
-- **下一发才改**（不是 1.7.1 的安装步骤；本套件这一发没有执行 `git mv` / `rmdir kit`）：
-
-  ```bash
-  # 1. 先确认旧契约没有本地修改；有修改就先合并 / 备份，不要直接删
-  git diff -- kit/orchestration.md
-  git rm kit/orchestration.md
-  # 2. 重新运行更新入口；引擎随后写入 docs/orchestration.md
-  uv run python -m scripts.update_agentorch.entry --project . \
-    --request "更新 AgentOrch" --mode APPLY
-  ```
-
-- **更新引擎会怎么做**：旧副本还在时，入口以 `STOPPED_CONFLICT` + `HD-09` 停止并零写入，不会把新旧两份并排写出来；`docs/orchestration.md` 已存在且与包内不一致时以 `HD-10` 停止，不覆盖本地文件。旧副本即使未被本地修改也不会被静默删除——删除是明确的人工动作。
-- **怎么自检**：
-
-  ```bash
-  uv run python scripts/validate_kit.py    # 0：核心契约在 docs/orchestration.md
-  test ! -e kit/orchestration.md           # 0：旧路径已不存在
-  uv run python scripts/build_release.py   # 0：包内只有 docs/orchestration.md 一个 docs/ 文件
-  ```
-
-- **不要这样做**：同时保留 `kit/orchestration.md` 与 `docs/orchestration.md`（两个权威）；把整棵 `docs/` 当成随包内容；只复制旧文件到新路径而不改引用（`validate_kit.py` 的链接扫描会逐个指出断链）。
+- **变了什么（尚未在发行包中发生）**：计划把 `kit/orchestration.md` 移到 `docs/orchestration.md`，它仍是**唯一可编辑权威**；`kit/` 目录随之消失，发行包里不再有 `kit/`。契约正文的语义（会话入口、状态机、合并门 G1–G6、C1–C4 / C1–C8、证据矩阵）不变，只改位置与指向它的引用。发行包从此只包含 `docs/` 下的这一个文件；其余 `docs/` 内容（设计稿、阶段计划、本文件）仍不打包。
+- **状态：尚待设计与验证（`NOT_RUN`）。** 这一发只实现桥接，没有执行迁移，也没有验证任何迁移操作序列；本文件不把未执行的步骤写成可复制命令。
+- **已知的设计缺口（下一发必须先解决，不能照抄任何“先删再更新”的想法）**：删除 `kit/orchestration.md` 会在工作树留下一个未提交的删除，而本套件的 `APPLY` 路径在脏工作树上要么要求隔离 worktree、要么以 `STOPPED_DIRTY_WORKTREE` / `HD-12` 停止（§14.6 的实测路径是在干净树上运行的）。因此“先 `git rm` 旧文件、再运行更新入口”的序列与引擎的前置条件冲突，必须先在迁移任务里确定：旧副本由谁删除、删除与写入的相对顺序、如何在干净树上取证、以及失败时如何回退。
+- **`scripts/update_agentorch/migrate.py` 的既定行为（已实现、未在真实迁移上验证）**：目标包同时包含新旧路径或旧副本仍在磁盘时，入口按 `HD-09` / `HD-10` 停止并零写入，不会把两份权威并排写出来，也不会静默删除旧副本。它只描述单一路径移动，不提供迁移命令序列。
+- **下一发的验收条件（待设计确认后执行，不是本轮结果）**：迁移任务必须给出真实执行的命令、退出码、head 与零写入 / 成功写入的证据；在此之前，任何“已迁移”“已验证可迁移”的表述都不成立。
+- **不要这样做**：同时保留 `kit/orchestration.md` 与 `docs/orchestration.md`（两个权威）；把整棵 `docs/` 当成随包内容；只复制旧文件到新路径而不改引用。
 
 ## 16. 迁移九（#153）：旧项目改为 `agentorch/` 隔离布局
 

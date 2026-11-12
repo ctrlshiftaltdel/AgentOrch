@@ -9,13 +9,13 @@
   - **正式 Release 资产**：`uv run python scripts/build_release.py --release-version 1.6` 产出 `release/AgentOrch-1.6.zip`，zip 顶层目录与资产 stem 一致，即 `AgentOrch-1.6/`。对应 Git tag 为 `v1.6`、资产名为 `AgentOrch-1.6.zip`。参数写 `1.6`，**不要写 `v1.6`**：`v1.6` 是 tag 名而不是资产名，带 `v` 前缀或预发布后缀会被构建直接拒绝。补丁发行把版本号写全：`--release-version 1.6.1` 产出 `AgentOrch-1.6.1.zip` / 顶层目录 `AgentOrch-1.6.1/`，tag 为 `v1.6.1`；补丁号只改变资产名与顶层目录，不改变 Format。
   - **日期构建（默认，保持不变）**：`uv run python scripts/build_release.py`（今天）或 `--date YYYYMMDD` 产出 `release/agentorch-{YYYYMMDD}.zip`，顶层目录 `agentorch-{YYYYMMDD}/`。CI 与 `docs/upgrade.md` 的基线重建继续用这个模式。
   - `--date` 与 `--release-version` **互斥**：同时给出即报错退出（`argparse` 退出码 2），不存在"谁覆盖谁"的隐含优先级；不带任何命名参数时仍按今天日期命名。
-- **发布名只决定资产名与顶层目录**：包内文件集合、`MANIFEST.json` schema 与 `format_version` 在两种模式下完全相同。**Release 版本号不是 Format 版本**：`Release 1.6` 发布时与 `Format version` 1.6 数值相同；当前 `Release 1.7.1` 与 `Format 1.7` 的 major.minor 相同、编号仍各自独立。两者仍是两条序列（发行号 vs 格式契约），`MANIFEST.json` 的 `format_version` 由 `VERSION.md` 的 `Format version:` 一行生成；两者的区别与当前发行记录见第 5 节。
+- **发布名只决定资产名与顶层目录**：包内文件集合、`MANIFEST.json` schema 与 `format_version` 在两种模式下完全相同。**Release 版本号不是 Format 版本**：`Release 1.6` 发布时与 `Format version` 1.6 数值相同；候选 `Release 1.7.1`（准备中，**未发布**）与 `Format 1.7` 的 major.minor 相同、编号仍各自独立。两者仍是两条序列（发行号 vs 格式契约），`MANIFEST.json` 的 `format_version` 由 `VERSION.md` 的 `Format version:` 一行生成；两者的区别与当前发行记录见第 5 节。
 - 产物不纳入 git：`.gitignore` 忽略 `release/*.zip`；仓库只保留流程文档、构建脚本与本标准；历史版本记录由 GitHub Releases 承担。`release/README.md` 不入忽略范围。**已发布的历史资产（如 `agentorch-20261023.zip`）不删除、不覆盖、不改写**；新 Release 用新的资产名。
 - 产物可随时重建：运行 `uv run python scripts/build_release.py`（默认输出到 `release/`），或按上面的正式 Release 命令指定 `--release-version`。构建是**可复现**的：同一仓库状态下（同一命名模式与同一 top dir），包内文件集合、各文件内容与 zip 的校验和均一致（归档时间戳使用固定值），因此 zip 的校验和可被任何人重建复核。可复现性不依赖检出行尾：构建时文本文件按 LF 归一后打包、二进制文件原样打包（仓库以 `.gitattributes` 统一 LF），故任何检出（含 Windows 上 `core.autocrlf=true`）重建都得到同一校验和。
 
 ## 2. 包内容规范
 
-- 只含通用可复用产出；不得包含本仓库特有的演进决策、任务记录或个人环境信息。`docs/` 下**只有**核心契约 `docs/orchestration.md` 随包分发，其余 `docs/` 路径一律拒绝（`build_release.py` 的 `PACKAGE_DOC_PATHS` 白名单）。
+- 只含通用可复用产出；不得包含本仓库特有的演进决策、任务记录或个人环境信息。**1.7.1 桥接发行不打包任何 `docs/` 文件**：核心契约 `kit/orchestration.md` 随包分发，`build_release.py` 的 `PACKAGE_DOC_PATHS` 是空集合，其余 `docs/` 路径一律拒绝。暂不改到 `docs/orchestration.md` 是兼容约束，不是遗漏：已发布的 v1.7.0 更新器把 `docs/` 当项目自有路径，拒绝写入，且目标包缺少 `kit/orchestration.md` 会被判为 `UPSTREAM_REMOVAL` 并停止（见 §5.1.5）。
 - 包内文件集合 == `scripts/validate_kit.py` 中的 `REQUIRED` 列表 **+ 构建时生成的 `MANIFEST.json`**（数量与名称都一致，即 `len(REQUIRED) + 1` 个文件）。`REQUIRED` 是分发内容的唯一来源，构建脚本直接解析它，不再维护第二份清单；`MANIFEST.json` 是唯一不来自 `REQUIRED` 的成员。
 - **规则一致性由检查保证**：`REQUIRED` 中的 `docs/` 路径必须全部在白名单 `PACKAGE_DOC_PATHS` 内，白名单只能列 `docs/` 文件，`scripts/build_release.py` 与 `.orchestration` / `release` / `.worktrees` / `.workbuddy` 必须列为禁止项；`scripts/validate_kit.py` 的文档一致性门禁逐条核对，本文件也必须记录这三条规则（`REQUIRED`、`PACKAGE_DOC_PATHS`、`MANIFEST.json`），口径见 `docs/testing/document-consistency-gates.md` §6（仓库文档，不随包发布）。上游设计、架构与归档文档因此不会被自动塞进发行包。
 - **`MANIFEST.json`（机器可读清单）**：由 `scripts/check_drift.py` 生成，构建脚本导入该模块而不另写一份规则，因此分类只有一处实现。字段固定为：
@@ -76,13 +76,13 @@
 
 ### 3.2 包内自检在三种树下的行为
 
-自检 b / d 在**解压后的纯净包**里执行：包内 `docs/` 只有随包分发的 `docs/orchestration.md`，没有 `docs/PROJECT.md` / `docs/upgrade.md`，因此 `validate_kit.py` 判定为纯净包并跳过仓库专属文档，`MANIFEST.json` 的 SHA-256 与大小严格比较。这是发布物本身的证据，不受下游用法影响。
+自检 b / d 在**解压后的纯净包**里执行：1.7.1 桥接包**没有任何 `docs/` 文件**（契约在 `kit/orchestration.md`），也没有 `docs/PROJECT.md` / `docs/upgrade.md`，因此 `validate_kit.py` 判定为纯净包并跳过仓库专属文档，`MANIFEST.json` 的 SHA-256 与大小严格比较。这是发布物本身的证据，不受下游用法影响。
 
 同一个 `validate_kit.py` 会按树切换模式（汇总行打印 `tree mode`）：
 
 | 树 | 判定依据 | 仓库文档 | `MANIFEST.json` |
 | --- | --- | --- | --- |
-| 纯净包 | `docs/` 不存在，或只含随包分发的 `REQUIRED` 文件（当前只有 `docs/orchestration.md`） | 跳过 | 结构 + 分类 + 路径 + `REQUIRED` 集合 + SHA-256 / 大小 |
+| 纯净包 | `docs/` 不存在（1.7.1 桥接包即如此：契约在 `kit/orchestration.md`），或只含随包分发的 `REQUIRED` 文件 | 跳过 | 结构 + 分类 + 路径 + `REQUIRED` 集合 + SHA-256 / 大小 |
 | 下游项目 | 有 `docs/PROJECT.md`，没有 `docs/upgrade.md` | 只要求 `docs/PROJECT.md` 与 `docs/PLAN.md` | 结构 + 分类 + 路径 + `REQUIRED` 集合 + 列出文件存在；不比较哈希 |
 | 上游 checkout | 有 `docs/upgrade.md` | 全部仓库文档 | 结构 + 分类 + 路径 + `REQUIRED` 集合 + SHA-256 / 大小 |
 
@@ -193,9 +193,26 @@
   - macOS / Windows 之外的操作系统与用户桌面环境为 `UNKNOWN`；CI 只覆盖 GitHub-hosted 的三个 runner。
 - 历史 `v1.6.3`、`v1.6.2`、`v1.6.1`、`v1.6` 与 `v1.5` Release 及其资产保留原样，不删除、不覆盖、不改写。
 
+### 5.1.5 发行记录：Release 1.7.1（桥接发行，准备中，未发布）
+
+- **状态：候选，准备中，未发布。** 没有 tag、没有 GitHub Release、没有上传任何资产；本节记录的是构建与兼容性验证，不是发布事实。最终发布由 Master 按第 4 节执行并重新取证。
+- 目标：`Release version` `1.7.1`，`Format version` 仍为 `1.7`；`tag_matches_format('v1.7.1', '1.7')` 为真，因此已发布的 v1.7.0 客户端可以通过 `VERSION_MATCH` 并安装它。
+- **包内文件集合 131 个（130 `REQUIRED` + `MANIFEST.json`）**：相对 v1.7.0 的 118 个（117 + 1）**新增 13 个 `REQUIRED` 文件、无删除、无改名**（`scripts/agent_selection/peer_review.py`、`scripts/delivery_scenarios/`、`scripts/update_agentorch/migrate.py`、`scripts/verification_profile.py` 与 3 个随包测试等）。**包内没有任何 `docs/` 文件**，契约仍为 `kit/orchestration.md`；`MANIFEST.json` schema 1、`format_version` 1.7 不变。
+- 构建：`python3 scripts/build_release.py --release-version 1.7.1`，自检 a–l 全过，无跳过项；本任务在最终 head 上用仓库工作树与 `git archive` 导出树各构建一次，产物逐字节相同：`AgentOrch-1.7.1.zip` 785,806 bytes，SHA256 `00c3bf699168b8b9cc6bfc6db6ca76620b2828370c5d3b5d796258517a50c71b`。该数值只由随包文件决定，任何随包文件变化都会使它失效并必须重算。
+- **与已发布 v1.7.0 客户端的兼容性（真实旧分类器）**：仓库内新增的持续回归 `tests/update_agentorch/test_v170_classifier_compat.py` 使用从官方 `AgentOrch-1.7.0.zip` 冻结的 `classify.py`（SHA256 `95313520…9ff0`）与冻结的 v1.7.0 清单，对当前 `REQUIRED` 跑正负例：PLAN/APPLY 均不阻断，`UPSTREAM_REMOVAL` / `UPSTREAM_RENAME` / `THREE_WAY_CONFLICT` 全为 0；删除 `kit/orchestration.md`、或把契约移入 `docs/` 的负向控制仍然阻断。该回归不联网、不读 git tag，也不依赖浅克隆。
+- **隔离升级验证（引擎层，不是发布证据）**：用真实已发布 v1.7.0 资产中的引擎代码（`engine.__file__` 指向解压的 `AgentOrch-1.7.0/`，与 zip 成员哈希一致）在仓库外 fixture 上执行。传输层替换为本地候选字节与按未来 `v1.7.1` 形状构造的 Release 记录；其余校验 / 分类 / 备份 / 写入均为 v1.7.0 原代码。`PLAN` = `PLANNED`、零写入；`APPLY` = `APPLIED`，写入 62 个路径（49 修改 + 13 新增，0 删除），`130/130` 包内文件与候选包逐字节一致，`MANIFEST.json` 与候选包相同，项目自有 `docs/PROJECT.md` / `docs/PLAN.md` / `docs/orchestration.md` / `src/` / `.github/` / `LOCAL-NOTES.md` 字节不变，备份 `required=true` / `verified=true`，`rollback.result=NOT_NEEDED`，head 前后不变；升级后项目 `validate_kit` 退出码 0（downstream）、`check_drift` clean。
+- **仍未验证 / 精确限制（不得写成已验证）**：
+  - 没有已发布的 `v1.7.1` 资产，因此“从 GitHub 下载真实 `v1.7.1` 并升级”为 `NOT_RUN`；隔离升级的传输是本地字节，不是官方 HTTPS 客户端；`--request "更新 AgentOrch"` 的入口路由 / 交付包层为 `NOT_RUN`；隔离 `agentorch/` 布局的安装 / 升级路径为 `NOT_RUN`。
+  - 仅在 Linux x86_64 + CPython 3.13.5 上执行；Windows / macOS / 大小写不敏感文件系统为 `UNKNOWN`。
+  - 本地修改、冲突、回滚故障注入只由合成测试覆盖，本轮没有在真实迁移上重跑。
+  - 这段记录绑定本任务最终 head；head 变化后必须在新 head 上重新构建、重新取证。
+- 历史 `v1.7.0` 及其资产保留原样，不删除、不覆盖、不改写。
+
 ### 5.2 Format version 变更
 
 - **1.6.1 / 1.6.2 / 1.6.3 是补丁发行，不属于 Format 变更**：Format 仍为 `1.6`，见 5.1.1 / 5.1.2 / 5.1.3；本节只记录真正的格式版本升级。其中 1.6.3 在 Format 1.6 内新增了 `REQUIRED` 文件（见 5.1.3），但包格式、`MANIFEST.json` schema 与 `format_version` 未变，仍不是 Format 变更。
+
+- **1.7.1 是 Format 1.7 内的桥接 / 补丁发行，不属于 Format 变更**：`Format version` 保持 `1.7`，只升 `Release version`；包内文件集合从 118 个（117 `REQUIRED` + `MANIFEST.json`）变为 131 个（130 + 1），新增文件与桥接修复见 5.1.5。包格式、`MANIFEST.json` schema 与 `format_version` 不变。
 
 - **1.7（当前）** 相对 1.6：
   - **包内新增 Phase D 角色选择资产族**：`scripts/agent_selection/`（每终端 scope、Markdown 私有记录、runtime adapter、发现与角色匹配、可选模型数据源与快照、本机反馈）及随包测试 `tests/agent_selection/`（含 E1–E13 端到端）进入 `REQUIRED`。包内文件从 v1.6.3 资产的 93 个（92 `REQUIRED` + `MANIFEST.json`）增至 118 个（117 + 1）。
