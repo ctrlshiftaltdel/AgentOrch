@@ -2274,10 +2274,13 @@ class BridgeRegistryReadBoundaryTests(unittest.TestCase):
     `legacy_path_errors`, `_safe_registry_stat` and
     `repository_map_coverage_errors` read the whole tree or stat registered
     paths, and the published v1.7.0 validator has none of them. This release
-    does not claim those reads are complete, race-free or a security proof, so
-    they are restricted to a real upstream checkout (`docs/upgrade.md`). A
-    release package and a host project must never reach them, not even when the
-    host tree carries ordinary files such as `docs/notes.md` or `src/app.py`.
+    does not claim those reads are complete, race-free or a security proof.
+    `validate_kit` / `documentation_consistency_errors` therefore never call
+    them: no copyable file (`docs/upgrade.md` included) or symlink in the tree
+    can switch them on. The functions remain for the repository's own tests to
+    call directly. A release package and a host project must never reach them,
+    not even when the host tree carries ordinary files such as `docs/notes.md`
+    or `src/app.py`.
     """
 
     REGISTRY_FUNCTIONS = ('repository_map_errors', 'legacy_path_errors',
@@ -2323,20 +2326,71 @@ class BridgeRegistryReadBoundaryTests(unittest.TestCase):
     def zero_calls(self):
         return {name: 0 for name in self.REGISTRY_FUNCTIONS}
 
-    def assert_no_registry_reads(self, root):
+    def run_both(self, root):
+        """Run both entry points under registry spies and read recording."""
+        reads = []
+        real_read_text, real_read_bytes = Path.read_text, Path.read_bytes
+
+        def read_text(path, *args, **kwargs):
+            reads.append(os.path.realpath(path))
+            return real_read_text(path, *args, **kwargs)
+
+        def read_bytes(path, *args, **kwargs):
+            reads.append(os.path.realpath(path))
+            return real_read_bytes(path, *args, **kwargs)
+
         calls = self.zero_calls()
         patches = self.registry_spies(calls)
         try:
             for patch in patches:
                 patch.start()
-            errors, _ = validate.validate_kit(root)
-            consistency = validate.documentation_consistency_errors(root)
+            with mock.patch.object(Path, 'read_text', read_text), \
+                    mock.patch.object(Path, 'read_bytes', read_bytes):
+                errors, _ = validate.validate_kit(root)
+                consistency = validate.documentation_consistency_errors(root)
         finally:
             for patch in reversed(patches):
                 patch.stop()
+        return errors, consistency, calls, reads
+
+    def assert_no_registry_reads(self, root):
+        errors, consistency, calls, _ = self.run_both(root)
         self.assertEqual(errors, [])
         self.assertEqual(consistency, [])
         self.assertEqual(calls, self.zero_calls())
+
+    def add_canary_symlink(self, root, canary):
+        """Bait a tree scan: an in-tree link to an out-of-tree canary file."""
+        try:
+            (root / 'docs' / 'linked.md').symlink_to(canary)
+        except OSError as exc:
+            self.fail('cannot create the docs/linked.md symlink fixture: '
+                      f'{exc} (this test must not be skipped)')
+
+    def marker_tree(self, base, kind, canary):
+        """A downstream tree that also carries `docs/upgrade.md`.
+
+        `kind='file'` writes an ordinary file; `kind='symlink'` makes the marker
+        a link to the out-of-tree canary, so any read of the marker through the
+        link is observable. A failed symlink creation fails the test; it is not
+        skipped.
+        """
+        root = self.downstream_tree(base / 'project')
+        marker = root / validate.UPSTREAM_MARKER_DOC
+        if kind == 'file':
+            marker.write_text('# upgrade\n', encoding='utf-8')
+        else:
+            try:
+                marker.symlink_to(canary)
+            except OSError as exc:
+                self.fail(f'cannot create the {validate.UPSTREAM_MARKER_DOC} '
+                          f'symlink fixture: {exc} (this test must not be skipped)')
+        self.add_canary_symlink(root, canary)
+        return root
+
+    def assert_canary_unread(self, reads, canary):
+        self.assertNotIn(os.path.realpath(canary), reads)
+        self.assertNotIn(str(canary), reads)
 
     def test_package_validation_skips_the_registry_reads(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2353,58 +2407,51 @@ class BridgeRegistryReadBoundaryTests(unittest.TestCase):
     def test_validation_never_reads_an_out_of_tree_canary(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
-            root = self.downstream_tree(base / 'project')
             canary = base / 'canary.md'
             canary.write_text('# canary\n\nOUT-OF-TREE-CANARY\n', encoding='utf-8')
+            root = self.downstream_tree(base / 'project')
             # A link inside the tree points at the canary. A scan that followed
             # it would read a file outside the validated root.
-            (root / 'docs' / 'linked.md').symlink_to(canary)
-            reads = []
-            real_read_text, real_read_bytes = Path.read_text, Path.read_bytes
-
-            def read_text(path, *args, **kwargs):
-                reads.append(os.path.realpath(path))
-                return real_read_text(path, *args, **kwargs)
-
-            def read_bytes(path, *args, **kwargs):
-                reads.append(os.path.realpath(path))
-                return real_read_bytes(path, *args, **kwargs)
-
-            calls = self.zero_calls()
-            patches = self.registry_spies(calls)
-            try:
-                for patch in patches:
-                    patch.start()
-                with mock.patch.object(Path, 'read_text', read_text), \
-                        mock.patch.object(Path, 'read_bytes', read_bytes):
-                    errors, _ = validate.validate_kit(root)
-            finally:
-                for patch in reversed(patches):
-                    patch.stop()
+            self.add_canary_symlink(root, canary)
+            errors, consistency, calls, reads = self.run_both(root)
         self.assertEqual(errors, [])
+        self.assertEqual(consistency, [])
         self.assertEqual(calls, self.zero_calls())
-        self.assertNotIn(os.path.realpath(canary), reads)
-        self.assertNotIn(str(canary), reads)
+        self.assert_canary_unread(reads, canary)
 
-    def test_only_the_upstream_marker_document_enables_the_registry_gates(self):
-        # Positive control: the gate is not dead code. A tree that carries the
-        # marker reaches both repository-only readers even without a real map or
-        # lifecycle document; the spies prove the trigger, not their results.
+    def test_marker_file_in_a_downstream_tree_skips_the_registry_reads(self):
+        # A downstream tree (docs/PROJECT.md) that also carries an ordinary
+        # docs/upgrade.md used to call repository_map_errors / legacy_path_errors
+        # and could reach the whole-tree scan and _safe_registry_stat. Neither
+        # entry point may call those functions for such a tree.
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / 'docs').mkdir()
-            (root / validate.UPSTREAM_MARKER_DOC).write_text('# upgrade\n', encoding='utf-8')
-            calls = self.zero_calls()
-            patches = self.registry_spies(calls)
-            try:
-                for patch in patches:
-                    patch.start()
-                validate.documentation_consistency_errors(root)
-            finally:
-                for patch in reversed(patches):
-                    patch.stop()
-        self.assertEqual(calls['repository_map_errors'], 1)
-        self.assertEqual(calls['legacy_path_errors'], 1)
+            base = Path(tmp)
+            canary = base / 'canary.md'
+            canary.write_text('# canary\n\nOUT-OF-TREE-CANARY\n', encoding='utf-8')
+            root = self.marker_tree(base, 'file', canary)
+            self.assertEqual(validate.tree_mode(root), validate.TREE_UPSTREAM)
+            errors, consistency, calls, reads = self.run_both(root)
+        self.assertEqual(calls, self.zero_calls())
+        self.assert_canary_unread(reads, canary)
+        # A plain marker still selects the upstream document set, which is the
+        # documented "a downstream project must not create docs/upgrade.md"
+        # behaviour: a plain, in-tree requirement read, not a registry read.
+        self.assertTrue(errors, errors)
+
+    def test_marker_symlink_in_a_downstream_tree_skips_the_registry_reads(self):
+        # The marker is a symlink to an ordinary file outside the tree. It must
+        # neither switch the tree mode nor let a document read follow the link.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            canary = base / 'canary.md'
+            canary.write_text('# canary\n\nOUT-OF-TREE-CANARY\n', encoding='utf-8')
+            root = self.marker_tree(base, 'symlink', canary)
+            self.assertEqual(validate.tree_mode(root), validate.TREE_DOWNSTREAM)
+            errors, consistency, calls, reads = self.run_both(root)
+        self.assertEqual(errors, [])
+        self.assertEqual(consistency, [])
+        self.assertEqual(calls, self.zero_calls())
+        self.assert_canary_unread(reads, canary)
 
 
 if __name__ == '__main__':

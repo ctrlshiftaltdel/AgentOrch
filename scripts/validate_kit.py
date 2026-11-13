@@ -154,13 +154,15 @@ MANAGED_BODY_HEADING = '# AgentOrch 推进引擎（受管区块）'
 #   * `UPSTREAM_DOCS` — this repository's own documents. They never ship, so a
 #     downstream project must not be forced to copy them.
 #
-# `docs/upgrade.md` is the upstream marker: it is repository-only, so its
-# presence means "this is an upstream checkout" and the full set is enforced.
-# A docs/ directory holding a project config (`docs/PROJECT.md`) is a downstream
-# project tree; a docs/ directory holding nothing but the shipped contents of
-# REQUIRED (currently nothing, because the contract ships at `kit/`) is a pristine
-# release package. See `tree_mode` for the exact rule. A downstream project must
-# not create its own `docs/upgrade.md` — that would switch the tree to upstream mode.
+# `docs/upgrade.md` is usable only to select the document set: a tree that
+# carries it is asked for the full upstream set. It is an ordinary, copyable
+# repository file, so it neither proves the caller is an upstream checkout nor
+# gates any filesystem read. A docs/ directory holding a project config
+# (`docs/PROJECT.md`) is a downstream project tree; a docs/ directory holding
+# nothing but the shipped contents of REQUIRED (currently nothing, because the
+# contract ships at `kit/`) is a pristine release package. See `tree_mode` for
+# the exact rule. A downstream project must not create its own `docs/upgrade.md`
+# — that would ask it for the full upstream document set.
 PROJECT_DOCS = {
     'docs/PROJECT.md': (),
     'docs/PLAN.md': ('设计目标',),
@@ -725,7 +727,7 @@ def tree_mode(root=ROOT, errors=None):
     anything else fails closed on a missing `docs/PROJECT.md`.
     """
     root = Path(root)
-    if (root / UPSTREAM_MARKER_DOC).is_file():
+    if _upstream_marker_is_regular_file(root):
         return TREE_UPSTREAM
     if (root / 'docs' / 'PROJECT.md').is_file():
         return TREE_DOWNSTREAM
@@ -742,15 +744,19 @@ def tree_mode(root=ROOT, errors=None):
     return TREE_PACKAGE if shipped <= set(REQUIRED) else TREE_DOWNSTREAM
 
 
-def is_upstream_tree(root=ROOT):
-    """True only for a checkout that carries the upstream marker document.
+def _upstream_marker_is_regular_file(root):
+    """True when `docs/upgrade.md` is a real file, not a symlink to one.
 
-    This is deliberately narrower than `tree_mode`: it never scans the tree, so a
-    release package or a host project cannot switch the repository-only document
-    gates on by carrying an ordinary file. The marker (`docs/upgrade.md`) is the
-    single, stat-only trigger; only a real upstream checkout has it.
+    The marker only selects the document set. It never proves the caller is the
+    upstream repository, so no filesystem read is keyed on it. ``lstat`` keeps a
+    symlink from turning the classification (and the document reads that follow
+    it) into a read of a target outside the validated tree.
     """
-    return (Path(root) / UPSTREAM_MARKER_DOC).is_file()
+    try:
+        info = os.lstat(os.fspath(Path(root) / UPSTREAM_MARKER_DOC))
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode)
 
 
 def required_doc_errors(root=ROOT):
@@ -1796,13 +1802,15 @@ def documentation_consistency_errors(root=ROOT):
     errors = []
     errors.extend(docs_impact_template_errors(root))
     errors.extend(release_consistency_errors(root))
-    # Repository-only gates. The trigger is the upstream marker document alone,
-    # not the general tree mode: a release package or a host project must never
-    # run the registration / legacy-path reads, which do not exist in the
-    # published v1.7.0 validator. See `is_upstream_tree`.
-    if is_upstream_tree(root):
-        errors.extend(repository_map_errors(root))
-        errors.extend(legacy_path_errors(root))
+    # Repository-only document gates. The phase plan is a plain in-tree document
+    # read, so it may follow the tree mode. The registration and legacy-path
+    # readers (`repository_map_errors`, `legacy_path_errors`, and the whole-tree
+    # scan / `_safe_registry_stat` helpers they use) are deliberately NOT called
+    # here: the published v1.7.0 validator has none of them, and a copyable file
+    # such as `docs/upgrade.md` cannot prove the caller is the upstream
+    # repository. The functions stay available for the repository's own tests to
+    # call directly. See docs/architecture/document-lifecycle.md §7.1.
+    if tree_mode(root) == TREE_UPSTREAM:
         errors.extend(plan_status_errors(root))
     return errors
 
