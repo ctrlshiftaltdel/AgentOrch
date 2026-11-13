@@ -65,7 +65,7 @@
 | 路径 | 用途 | 生命周期 | 唯一职责 / 权威位置 |
 |---|---|---|---|
 | [`docs/README.md`](../README.md) | `reference` | `ACTIVE` | 完整用户手册、安装 / 升级 / 排错与文档导航。规则以 `AGENTS.md`、`docs/orchestration.md` 为准，本文件不弱化。 |
-| [`docs/autonomous-delivery.md`](../autonomous-delivery.md) | `reference` | `ACTIVE` | 仅仓库；实验性交付执行切片的入口、安全假设与未完成项，不随发行包发布。 |
+| [`docs/autonomous-delivery.md`](../autonomous-delivery.md) | `reference` | `ACTIVE` | 仅仓库；实验性自主交付执行器（`scripts/autonomous_delivery.py`）的计划格式、合并门、恢复语义、安全假设与未完成项，不随发行包发布。 |
 | [`docs/PROJECT.md`](../PROJECT.md) | `authoritative` | `ACTIVE` | 本项目适配配置：`edition` 唯一权威、允许 / 禁改路径、验证命令、并发与本地工作流。 |
 | [`docs/PLAN.md`](../PLAN.md) | `authoritative` | `ACTIVE` | 设计目标权威：为什么做、做到什么程度、原则与边界。 |
 | [`docs/implementation-plan.md`](../implementation-plan.md) | `authoritative` | `ACTIVE` | 阶段目标、任务顺序、依赖与当前状态的唯一落点。 |
