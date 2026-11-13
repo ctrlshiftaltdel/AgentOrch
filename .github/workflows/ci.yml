@@ -12,9 +12,10 @@ permissions:
 
 # Keep full validation for the latest PR head while avoiding redundant runs
 # for superseded heads of the same PR. Separate PRs never share a group.
-# Only pull_request runs may cancel; main pushes and manual runs are retained.
+# Non-PR runs get unique run IDs, so pushes and manual runs never even
+# replace pending checks. Only pull_request runs may cancel prior PR runs.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # One encoding for every platform. The Windows runner otherwise starts Python
