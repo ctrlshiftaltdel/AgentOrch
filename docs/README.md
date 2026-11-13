@@ -35,7 +35,7 @@
 
 前提：Git 与 [uv](https://docs.astral.sh/uv/)（本项目统一用 `uv run python` 执行脚本）；脚本只用标准库，**无第三方依赖**；`local` 底座完全离线可用。
 
-**用法一句话：把下面的话术原样复制给你的 Agent（WorkBuddy、Claude Code、Cursor… 都行），它会自己识别要做什么、执行对应命令，并把输出与退出码带回来给你。** 命令不需要你手打；想知道 Agent 到底会跑什么，见第 3 节的「话术 → 命令」对照表。Agent 第一次接入本项目时，先让它读 [docs/orchestration.md](orchestration.md) 与 [AGENTS.md](../AGENTS.md)——那是它的行为契约，话术只负责"点菜"。
+**用法一句话：把下面的话术原样复制给你的 Agent（WorkBuddy、Claude Code、Cursor… 都行），它会自己识别要做什么、执行对应命令，并把输出与退出码带回来给你。** 命令不需要你手打；想知道 Agent 到底会跑什么，见第 3 节的「话术 → 命令」对照表。Agent 第一次接入本项目时，先让它读 [kit/orchestration.md](../kit/orchestration.md) 与 [AGENTS.md](../AGENTS.md)——那是它的行为契约，话术只负责"点菜"。
 
 **先判断你处在哪种情况**：
 
