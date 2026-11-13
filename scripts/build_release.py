@@ -163,10 +163,11 @@ FORBIDDEN_REGEXES = [
 # of check a, which already pins the file set to REQUIRED).
 FORBIDDEN_SEGMENTS = frozenset({'.orchestration', 'release', '.worktrees', '.workbuddy',
                                 '.git', '.local'})
-# `docs/` is special: the core contract now lives there and must ship, while every
-# other repository document (design drafts, plans, upgrade notes, contracts) must
-# not. This allowlist is what keeps "all of docs/" from ever being packaged.
-PACKAGE_DOC_PATHS = frozenset({'docs/orchestration.md'})
+# `docs/` must not ship in this bridge release. The published v1.7.0 updater
+# treats that prefix as project-owned and will not write a new file there.
+# The contract ships at kit/orchestration.md instead. Keep the allowlist empty
+# so a later docs/ path cannot enter the package by accident.
+PACKAGE_DOC_PATHS = frozenset()
 FORBIDDEN_PATHS = frozenset({'scripts/build_release.py'})
 
 # Optional per-machine / per-repository additions. Git-ignored (.gitignore keeps
@@ -196,10 +197,10 @@ def collect_sources(required):
 
     The per-project config is intentionally NOT shipped: downstream copies
     templates/project.md to docs/PROJECT.md and fills it in (self-check c proves
-    --project-ready fails until they do). Of the `docs/` tree only the core
-    contract (docs/orchestration.md) is allowed into the package; any other docs
-    path in REQUIRED is a build error rather than a silent widening of the
-    release contents.
+    --project-ready fails until they do). The core contract ships at
+    `kit/orchestration.md` for the 1.7.1 bridge release, so no `docs/` path is
+    allowed into the package; any docs path in REQUIRED is a build error rather
+    than a silent widening of the release contents.
     """
     files = {}
     for rel in required:
@@ -402,7 +403,7 @@ def run_self_check(zip_path, required, top_dir, extra_patterns=()):
 
         # (h) the optional architecture checker must import and degrade to
         # diagnostic mode inside a package that carries no architecture contract
-        # (only docs/orchestration.md ships, no docs/contracts/). A non-zero exit,
+        # (the bridge package ships no docs/ at all). A non-zero exit,
         # a guessed ENFORCE mode or a report
         # without a bound head_sha would mean the shipped checker lies about
         # what it checked.

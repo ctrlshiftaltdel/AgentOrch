@@ -6,15 +6,17 @@
 
 | 树 | 执行的检查 |
 |---|---|
-| 上游 checkout（`docs/upgrade.md` 存在） | 全部检查：登记覆盖、旧路径、文档影响、计划状态，以及两种发行规则核对 |
-| 下游项目（有 `docs/PROJECT.md`，无 `docs/upgrade.md`） | 文档影响模板；发行规则（仅当仓库自带构建脚本时） |
+| 上游 checkout（`docs/upgrade.md` 是普通文件） | `validate_kit`：文档影响模板、计划状态、发行规则核对；登记覆盖与旧路径检查不在随包校验里执行，由仓库测试直接调用 `repository_map_errors` / `legacy_path_errors` |
+| 下游项目（有 `docs/PROJECT.md`，无 `docs/upgrade.md`） | 文档影响模板；发行规则（仅当仓库自带构建脚本时）；不调用登记覆盖 / 旧路径读取 |
 | 纯净发行包 | 文档影响模板；构建脚本不随包发布，因此没有可比对的发行规则 |
+
+`docs/upgrade.md` 只是可选择文档集合的普通文件，**不能证明调用方是上游仓库**：随包校验不以任何可复制文件或符号链接决定是否执行登记覆盖 / 旧路径读取。相关函数保留给仓库测试直接调用；这些读取也不是严格路径或扫描完整性的证明。
 
 所有检查都只读：不改写文档、不修改 Issue / PR、不写任务库、不访问网络。唯一产物是 stdout 的失败项与“待人工核验”行。
 
 ## 2. 关键文件责任 / 路径 / 生命周期登记
 
-- 登记位置：[repository-map.md](../architecture/repository-map.md) §3（顶层目录与根文件）与 §4（`docs/` 逐文件）。检查依据 `路径` / `用途` / `生命周期` 三列。
+- 登记位置：[repository-map.md](../architecture/repository-map.md) §3（顶层目录与根文件）与 §4（`docs/` 逐文件）。检查依据 `路径` / `用途` / `生命周期` 三列。本发随包校验不调用该读取；检查由仓库测试直接调用 `repository_map_errors` / `repository_map_coverage_errors`。
 - **必须登记**：根入口与契约文件（`AGENTS.md`、`LICENSE.md`、`README.md`、`VERSION.md`），以及 `docs/`、`editions/`、`templates/` 下的每个文件。`scripts/` 与 `tests/` 按目录行整体覆盖（[document-lifecycle.md](../architecture/document-lifecycle.md) §4.4：普通源文件按目录归组）。
 - **登记方式**：精确路径、目录前缀（以 `/` 结尾）或 glob（如 `docs/contracts/schemas/*.schema.json`）。`mixed` 是索引行，**不构成覆盖**：`docs/` 行只说明“逐文件见 §4”。
 - **允许的例外**（必须写在 repository-map.md 的 `例外登记` 一节）：
@@ -27,7 +29,7 @@
 ## 3. Markdown 相对链接与核心路径引用
 
 - 相对链接必须解析到真实文件或目录；外部 URL、`mailto:` 与锚点跳过。代码块与行内代码里的链接语法是示例文本，不当作活动链接。已由既有的链接扫描覆盖，本次不重复实现。
-- **旧路径只允许出现在显式迁移 / 兼容登记中**：[document-lifecycle.md](../architecture/document-lifecycle.md) §7.1 的 `旧路径登记` 表给出“旧路径 / 替代路径 / 允许出现的文件”。检查逐文件扫描 Markdown 正文（忽略 fenced code block），出现在未登记文件即失败。
+- **旧路径只允许出现在显式迁移 / 兼容登记中**：[document-lifecycle.md](../architecture/document-lifecycle.md) §7.1 的 `旧路径登记` 表给出“旧路径 / 替代路径 / 允许出现的文件”。检查逐文件扫描 Markdown 正文（忽略 fenced code block），出现在未登记文件即失败。本发随包校验不执行该扫描；由仓库测试直接调用 `legacy_path_errors`。
 - 登记行本身也要成立：替代路径必须存在，列出的允许文件必须存在，旧路径不得仍存在于磁盘或 `REQUIRED` 中。
 
 ## 4. 文档影响记录

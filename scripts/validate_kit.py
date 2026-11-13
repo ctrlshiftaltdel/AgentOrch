@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Static validation for the Agent-Orchestration kit (core + local/github editions)."""
 from pathlib import Path
-import argparse, fnmatch, hashlib, importlib.util, json, os, posixpath, re, runpy, sys
+import argparse, fnmatch, hashlib, importlib.util, json, os, posixpath, re, runpy, stat, sys
 
 ROOT = Path(__file__).resolve().parents[1]
 # Release package manifest. It exists only in a built package (the repository
@@ -14,12 +14,13 @@ MANIFEST_DOC = 'MANIFEST.json'
 # no second manifest to maintain. Keep it in sync whenever a versioned artifact is
 # added or removed. Files that must not ship (the rest of docs/, release/, the
 # release builder itself, .orchestration/, .worktrees/, .workbuddy/) are simply not
-# listed here. `docs/orchestration.md` is the one deliberate exception: the core
-# contract lives in docs/ but still ships, because a package without the contract
-# would be unusable.
+# listed here. This bridge release ships the contract at `kit/orchestration.md`
+# again: the published v1.7.0 updater will not write anything under `docs/` and
+# stops if `kit/orchestration.md` disappears. `docs/orchestration.md` in this
+# repository is a non-shipped pointer, not a second contract.
 REQUIRED = [
     'AGENTS.md', 'LICENSE.md', 'VERSION.md',
-    'docs/orchestration.md',
+    'kit/orchestration.md',
     'editions/github/active-task-registry.md', 'editions/github/issue-template.md',
     'editions/github/execution.md', 'editions/github/master.md',
     'editions/github/pr-template.md',
@@ -134,10 +135,10 @@ MANAGED_BODY_HEADING = '# AgentOrch 推进引擎（受管区块）'
 
 # --- Repository-only required documents --------------------------------------
 # These files are required in a checkout but must NOT be added to REQUIRED:
-# scripts/build_release.py refuses every `docs` path except the shipped core
-# contract (docs/orchestration.md), so listing any of them above would turn every
-# release self-check red. They are still required artifacts — a missing file or a
-# deleted section fails validate_kit on a checkout.
+# scripts/build_release.py refuses every `docs` path (the shipped core contract
+# currently lives at `kit/orchestration.md`), so listing any of them above would
+# turn every release self-check red. They are still required artifacts — a missing
+# file or a deleted section fails validate_kit on a checkout.
 #
 # `tests/update_agentorch/test_report.py` is repository-only for the same
 # reason: it reads the frozen fixtures under `docs/contracts/fixtures/`, which
@@ -153,13 +154,15 @@ MANAGED_BODY_HEADING = '# AgentOrch 推进引擎（受管区块）'
 #   * `UPSTREAM_DOCS` — this repository's own documents. They never ship, so a
 #     downstream project must not be forced to copy them.
 #
-# `docs/upgrade.md` is the upstream marker: it is repository-only, so its
-# presence means "this is an upstream checkout" and the full set is enforced.
-# A docs/ directory holding a project config (`docs/PROJECT.md`) is a downstream
-# project tree; a docs/ directory holding nothing but the shipped contents of
-# REQUIRED (today just docs/orchestration.md) is a pristine release package. See
-# `tree_mode` for the exact rule. A downstream project must not create its own
-# `docs/upgrade.md` — that would switch the tree to upstream mode.
+# `docs/upgrade.md` is usable only to select the document set: a tree that
+# carries it is asked for the full upstream set. It is an ordinary, copyable
+# repository file, so it neither proves the caller is an upstream checkout nor
+# gates any filesystem read. A docs/ directory holding a project config
+# (`docs/PROJECT.md`) is a downstream project tree; a docs/ directory holding
+# nothing but the shipped contents of REQUIRED (currently nothing, because the
+# contract ships at `kit/`) is a pristine release package. See `tree_mode` for
+# the exact rule. A downstream project must not create its own `docs/upgrade.md`
+# — that would ask it for the full upstream document set.
 PROJECT_DOCS = {
     'docs/PROJECT.md': (),
     'docs/PLAN.md': ('设计目标',),
@@ -259,11 +262,12 @@ EXTERNAL_LINK_PREFIXES = ('http://', 'https://', 'mailto:', '#')
 
 # --- Evidence matrix contract -------------------------------------------------
 # The field names, the status enum and the G1 rules are defined once, in
-# docs/orchestration.md 4.1. This module reads that definition back (it does not
-# restate it) and enforces it on the local/github task templates. If the doc drifts
-# away from the contract floor below, validation fails instead of silently
-# accepting a second definition.
-CORE_DOC = 'docs/orchestration.md'
+# the core contract (`kit/orchestration.md` for the 1.7.1 bridge release;
+# `CORE_DOC` below is the machine-readable copy of that path). This module reads
+# that definition back (it does not restate it) and enforces it on the
+# local/github task templates. If the doc drifts away from the contract floor
+# below, validation fails instead of silently accepting a second definition.
+CORE_DOC = 'kit/orchestration.md'
 TASK_PACKET_DOC = 'templates/task-packet.md'
 ISSUE_TEMPLATE_DOC = 'editions/github/issue-template.md'
 EVIDENCE_FIELD_ANCHOR = '证据条目（evidence item）字段'
@@ -277,7 +281,8 @@ NOT_RUN_MARKERS = re.compile(
     r'\bnot[ _-]?run\b|\bnot executed\b|\bnot verified\b|未执行|未运行|未验证|blocked by|被阻塞', re.I)
 SHA_RE = re.compile(r'^[0-9a-f]{40}$')
 # Fields every task packet must carry, on top of the structured scenario fields
-# read from docs/orchestration.md. Names are the template labels, lower-cased.
+# read from the core contract (`kit/orchestration.md`). Names are the template
+# labels, lower-cased.
 PACKET_REQUIRED_FIELDS = (
     'task id', 'title', 'goal / user-visible result', 'context', 'allowed paths',
     'forbidden paths', 'dependencies (must be verified)', 'acceptance criteria',
@@ -697,6 +702,10 @@ def _scan_files(root, start, errors, excluded=()):
         dirnames[:] = [name for name in dirnames if name not in excluded]
         for name in filenames:
             path = Path(directory) / name
+            if path.is_symlink():
+                # Never read a file through a symlink: the target may be outside
+                # the tree this scan is meant to inspect.
+                continue
             if path.is_file():
                 yield path
 
@@ -704,21 +713,21 @@ def _scan_files(root, start, errors, excluded=()):
 def tree_mode(root=ROOT, errors=None):
     """Which of the three supported trees *root* is.
 
-    `package`    - a pristine release package: its `docs/` holds nothing but the
-                   shipped files of REQUIRED (today only docs/orchestration.md).
+    `package`    - a pristine release package. This bridge release ships no
+                   `docs/` file; a `docs/` tree is a package only while every
+                   file under it is in REQUIRED.
     `downstream` - a project tree: `docs/PROJECT.md` exists, `docs/upgrade.md`
                    does not.
     `upstream`   - this repository: `docs/upgrade.md` marks an upstream checkout.
 
-    The contract now lives at docs/orchestration.md, so "has a docs/ directory"
-    no longer distinguishes a package from a project. The project config
-    (docs/PROJECT.md) does; a docs/ tree without it is only a package while every
-    file under it is shipped. Anything else is treated as a downstream project,
-    which fails closed on a missing docs/PROJECT.md instead of silently skipping
-    the document checks.
+    The published v1.7.0 updater will not write `docs/`, so this release ships
+    the contract at `kit/orchestration.md` and ships no `docs/` file. A package
+    with no `docs/` directory is still a package. A `docs/` tree without
+    `docs/PROJECT.md` is a package only while every file under it is shipped;
+    anything else fails closed on a missing `docs/PROJECT.md`.
     """
     root = Path(root)
-    if (root / UPSTREAM_MARKER_DOC).is_file():
+    if _upstream_marker_is_regular_file(root):
         return TREE_UPSTREAM
     if (root / 'docs' / 'PROJECT.md').is_file():
         return TREE_DOWNSTREAM
@@ -733,6 +742,21 @@ def tree_mode(root=ROOT, errors=None):
             errors.extend(scan_errors)
         return TREE_DOWNSTREAM
     return TREE_PACKAGE if shipped <= set(REQUIRED) else TREE_DOWNSTREAM
+
+
+def _upstream_marker_is_regular_file(root):
+    """True when `docs/upgrade.md` is a real file, not a symlink to one.
+
+    The marker only selects the document set. It never proves the caller is the
+    upstream repository, so no filesystem read is keyed on it. ``lstat`` keeps a
+    symlink from turning the classification (and the document reads that follow
+    it) into a read of a target outside the validated tree.
+    """
+    try:
+        info = os.lstat(os.fspath(Path(root) / UPSTREAM_MARKER_DOC))
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode)
 
 
 def required_doc_errors(root=ROOT):
@@ -1034,9 +1058,10 @@ DOC_IMPACT_STATUSES = ('UPDATE', 'NO_CHANGE', 'NOT_APPLICABLE')
 DOC_IMPACT_COLUMNS = ('path', 'status', 'change or reason')
 EMPTY_CELL_MARKERS = ('', '(none)', 'none', 'n/a', '-', '—')
 
-# Task state vocabulary. READY / DISPATCHED / ... are defined once in
-# docs/orchestration.md 4.1; OPEN / CLOSED / PLANNED are planning words a phase
-# plan may use for its rows. An unknown token is a typo or a second vocabulary.
+# Task state vocabulary. READY / DISPATCHED / ... are defined once in the core
+# contract (`kit/orchestration.md` 4.1); OPEN / CLOSED / PLANNED are planning
+# words a phase plan may use for its rows. An unknown token is a typo or a second
+# vocabulary.
 PLAN_STATUS_VALUES = (
     'PLANNED', 'READY', 'DISPATCHED', 'IN_PROGRESS', 'PR_OPEN', 'MASTER_REVIEW',
     'APPROVED', 'MERGED', 'VERIFIED', 'BLOCKED', 'FAILED', 'CANCELED', 'OPEN',
@@ -1238,21 +1263,228 @@ def repository_map_errors(root=ROOT):
     return errors
 
 
+def _malformed_registry_row(cells, reason):
+    """A registry row that cannot be parsed; it must still fail closed.
+
+    The row's cells are *untrusted input*: nothing here extracts or stats a path
+    from them. Reporting the structural defect (and a marker in the wrong
+    column) is enough, and avoids touching the filesystem with attacker-chosen
+    relative, absolute or symlinked paths.
+    """
+    elsewhere = any(DEFERRAL_MENTION_RE.search(cell)
+                    for index, cell in enumerate(cells) if index != 4)
+    return {'old': None, 'new': None, 'allowed': [], 'deferral': 'none',
+            'deferral_error': '', 'malformed_row': reason,
+            'malformed_row_marker_outside_note': elsewhere}
+
+
 def legacy_path_registry(text):
-    """Rows of the 旧路径登记 table in the lifecycle document."""
+    """Rows of the 旧路径登记 table in the lifecycle document.
+
+    ``_table_after`` already drops the header and separator rows. Every
+    remaining row is a data row and must have exactly the five documented
+    columns and exactly one backticked path in 旧路径 / 替代路径. A row that does
+    not is returned as a malformed entry instead of being skipped, so a valid
+    row next to it cannot mask the defect.
+    """
     entries, rows = [], _table_after(text, '旧路径登记')
     if not rows:
         return entries
     for cells in rows:
-        if len(cells) < 3:
+        if len(cells) != 5:
+            entries.append(_malformed_registry_row(
+                cells, 'the row must have exactly 5 columns (旧路径 / 替代路径 / '
+                       '允许出现的文件 / 生效版本 / 说明)'))
             continue
-        old, new = _backticked(cells[0]), _backticked(cells[1])
+        old_paths = re.findall(r'`([^`]+)`', cells[0] or '')
+        new_paths = re.findall(r'`([^`]+)`', cells[1] or '')
+        if len(old_paths) != 1 or len(new_paths) != 1:
+            entries.append(_malformed_registry_row(
+                cells, 'the 旧路径 and 替代路径 cells must each contain exactly one '
+                       f'backticked path (found {len(old_paths)} and {len(new_paths)})'))
+            continue
+        old, new = old_paths[0].strip(), new_paths[0].strip()
         if not old or not new:
+            entries.append(_malformed_registry_row(
+                cells, 'the 旧路径 and 替代路径 cells must each contain a non-empty '
+                       'backticked path'))
             continue
-        allowed = [item.strip().strip('/') for item in re.findall(r'`([^`]+)`', cells[2])]
-        entries.append({'old': old.strip('/').strip(), 'new': new.strip(),
-                        'allowed': [item for item in allowed if item]})
+        allowed = [item.strip() for item in re.findall(r'`([^`]+)`', cells[2])]
+        note = cells[4]
+        elsewhere = any(DEFERRAL_MENTION_RE.search(cell)
+                        for index, cell in enumerate(cells) if index != 4)
+        deferral, deferral_error = _deferral_state(note, old, new,
+                                                   marker_outside_note=elsewhere)
+        entries.append({'old': old, 'new': new,
+                        'allowed': [item for item in allowed if item],
+                        'deferral': deferral, 'deferral_error': deferral_error})
     return entries
+
+
+# Deferral is a single, machine-checkable exception, not a natural-language
+# promise. For the one authorised path pair the 说明 cell must be exactly the
+# canonical marker string below; there is no reason parser, no negation word list
+# and no partial credit. Any other text in that cell (including a negation,
+# a completion claim, or just the task number) is malformed, so an ambiguous
+# sentence can never be read as an authorisation.
+#
+# This table is a *local* authorisation record copied from the approved task
+# (#238). The check binds a row to that record; it does not contact GitHub and
+# does not prove that the task exists, is approved, or still authorises the
+# exception. That fact must be established by the task carrier, not by this
+# offline validator.
+DEFERRAL_AUTHORISATIONS = {
+    ('kit/orchestration.md', 'docs/orchestration.md'): {
+        'task': '238',
+        'marker': '`DEFERRED`: #238 BRIDGE-1.7.1',
+    },
+}
+DEFERRAL_MENTION_RE = re.compile(r'DEFERRED', re.IGNORECASE)
+
+
+# --- Registry path safety ----------------------------------------------------
+# Every path in a registry row is untrusted input. Before any filesystem call it
+# must pass a lexical gate, and the existence/symlink probe must never follow a
+# symlink or step outside the project root. On POSIX the probe walks the path one
+# component at a time with O_NOFOLLOW + dir_fd, so a component that is a symlink
+# is refused and a concurrent rename cannot redirect the walk through an opened
+# directory descriptor. Platforms without those primitives use a component-wise
+# lstat fallback; it refuses observed symlinks but, like any path-based check,
+# is not race-free against a concurrent mutation of the tree. That limitation is
+# documented rather than described as strong isolation.
+_REGISTRY_DRIVE_RE = re.compile(r'^[A-Za-z]:')
+_DIR_FD_SAFE = bool(
+    hasattr(os, 'supports_dir_fd')
+    and hasattr(os, 'O_NOFOLLOW') and hasattr(os, 'O_DIRECTORY')
+    and os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+)
+
+
+def _registry_path_problem(path):
+    """Return why *path* is not a plain project-relative path, or ``None``."""
+    if not isinstance(path, str) or not path:
+        return 'is empty'
+    if path.startswith(('/', '\\')):
+        return 'is absolute'
+    if _REGISTRY_DRIVE_RE.match(path):
+        return 'is an absolute drive path'
+    if '\\' in path:
+        return 'contains a backslash path separator'
+    if '\x00' in path:
+        return 'contains a NUL byte'
+    for part in path.split('/'):
+        if part in ('', '.', '..'):
+            return "contains an empty, '.' or '..' (parent traversal) component"
+        if ':' in part:
+            return 'contains a colon that is ambiguous across platforms'
+    return None
+
+
+def _kind(mode):
+    if stat.S_ISREG(mode):
+        return 'file'
+    if stat.S_ISDIR(mode):
+        return 'dir'
+    return 'other'
+
+
+def _is_link_or_reparse(info):
+    """True for a symlink, and on Windows for any reparse point (junction/mount)."""
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    return bool(getattr(info, 'st_reparse_tag', 0))
+
+
+def _safe_registry_stat(root, rel):
+    """Return ``(status, detail)`` for one registry path without leaving root.
+
+    status is one of ``file`` / ``dir`` / ``other`` / ``missing`` / ``unsafe``.
+    ``unsafe`` means the path is absolute, traverses upward, is (or crosses) a
+    symlink, or cannot be inspected without following links. No filesystem call
+    is made with an absolute, parent-traversing or otherwise unprovable path.
+    """
+    problem = _registry_path_problem(rel)
+    if problem is not None:
+        return 'unsafe', problem
+    parts = rel.split('/')
+    if _DIR_FD_SAFE:
+        try:
+            fd = os.open(os.fspath(root), os.O_RDONLY | os.O_DIRECTORY)
+        except OSError:
+            return 'unsafe', 'the project root cannot be opened safely'
+        try:
+            for name in parts[:-1]:
+                try:
+                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                    dir_fd=fd)
+                except FileNotFoundError:
+                    return 'missing', ''
+                except OSError:
+                    return ('unsafe',
+                            f'component {name!r} is a symlink or not a real directory')
+                os.close(fd)
+                fd = child
+            try:
+                info = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return 'missing', ''
+            except OSError:
+                return 'unsafe', 'the final component cannot be inspected without following links'
+            if _is_link_or_reparse(info):
+                return 'unsafe', 'is a symlink or reparse point'
+            return _kind(info.st_mode), ''
+        finally:
+            os.close(fd)
+    current = Path(root)
+    for name in parts[:-1]:
+        current = current / name
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            return 'missing', ''
+        except OSError:
+            return 'unsafe', f'component {name!r} cannot be inspected safely'
+        if _is_link_or_reparse(info):
+            return 'unsafe', f'component {name!r} is a symlink or reparse point'
+        if not stat.S_ISDIR(info.st_mode):
+            return 'unsafe', f'component {name!r} is not a directory'
+    try:
+        info = os.lstat(current / parts[-1])
+    except FileNotFoundError:
+        return 'missing', ''
+    except OSError:
+        return 'unsafe', 'the final component cannot be inspected safely'
+    if _is_link_or_reparse(info):
+        return 'unsafe', 'is a symlink or reparse point'
+    return _kind(info.st_mode), ''
+
+
+def _deferral_state(note, old, new, *, marker_outside_note=False):
+    """Return ``(state, detail)`` for one row: none / valid / malformed.
+
+    Only the exact canonical marker of the one authorised pair is ``valid``.
+    A DEFERRED marker anywhere outside the 说明 column is malformed instead of
+    being silently ignored, so the documented fail-closed rule is enforced.
+    """
+    if marker_outside_note:
+        return ('malformed',
+                'the deferral marker must appear only in the 说明 column; a marker in '
+                'any other column is not an authorisation')
+    if not note or not DEFERRAL_MENTION_RE.search(note):
+        return 'none', ''
+    authorised = DEFERRAL_AUTHORISATIONS.get((old, new))
+    if authorised is None:
+        pairs = ', '.join(f'{pair_old} -> {pair_new} (#{spec["task"]})'
+                          for (pair_old, pair_new), spec in DEFERRAL_AUTHORISATIONS.items())
+        return ('malformed',
+                f'a deferral is only authorised for {pairs}; this row is not that pair')
+    if note.strip() != authorised['marker']:
+        return ('malformed',
+                f'the 说明 cell of the authorised deferral must be exactly '
+                f'"{authorised["marker"]}"; no additional text, negation, completion claim '
+                'or alternative wording is accepted')
+    return 'valid', ''
 
 
 def legacy_path_errors(root=ROOT):
@@ -1267,17 +1499,64 @@ def legacy_path_errors(root=ROOT):
                 '允许出现的文件 / 说明)']
     errors, scan_errors = [], []
     for entry in entries:
+        if entry.get('malformed_row'):
+            details = [entry['malformed_row']]
+            if entry.get('malformed_row_marker_outside_note'):
+                details.append('a DEFERRED marker appears outside the 说明 column')
+            errors.append(f'{LIFECYCLE_DOC}: malformed 旧路径登记 row: '
+                          + '; '.join(details))
+            continue
         old, new = entry['old'], entry['new']
-        if not (root / new).exists():
+        deferral_state = entry.get('deferral', 'none')
+        if deferral_state == 'malformed':
+            errors.append(f'{LIFECYCLE_DOC}: legacy {old} has a malformed deferral marker: '
+                          f'{entry.get("deferral_error") or "invalid marker"}')
+            continue
+        row_unsafe = False
+        new_state, new_detail = _safe_registry_stat(root, new)
+        if new_state == 'unsafe':
+            errors.append(f'{LIFECYCLE_DOC}: legacy {old} successor {new} is unsafe: '
+                          f'{new_detail}; refusing to inspect it')
+            row_unsafe = True
+        elif new_state == 'missing':
             errors.append(f'{LIFECYCLE_DOC}: legacy {old} successor {new} does not exist')
-        if (root / old).exists():
+        elif new_state != 'file':
+            errors.append(f'{LIFECYCLE_DOC}: legacy {old} successor {new} is not a regular file')
+        for rel in entry['allowed']:
+            allowed_state, allowed_detail = _safe_registry_stat(root, rel)
+            if allowed_state == 'unsafe':
+                errors.append(f'{LIFECYCLE_DOC}: legacy {old} allowed file {rel} is unsafe: '
+                              f'{allowed_detail}; refusing to inspect it')
+                row_unsafe = True
+            elif allowed_state == 'missing':
+                errors.append(f'{LIFECYCLE_DOC}: legacy {old} allowed file {rel} does not exist')
+            elif allowed_state != 'file':
+                errors.append(f'{LIFECYCLE_DOC}: legacy {old} allowed file {rel} is not a '
+                              'regular file')
+        old_state, old_detail = _safe_registry_stat(root, old)
+        if old_state == 'unsafe':
+            errors.append(f'{LIFECYCLE_DOC}: legacy path {old} is unsafe: '
+                          f'{old_detail}; refusing to inspect it')
+            row_unsafe = True
+        if deferral_state == 'valid':
+            # Exactly three migrated-state checks are deferred, and only for this
+            # row: the old path may still exist, may still be a release path, and
+            # may still be referenced anywhere until the migration is executed.
+            # A deferral whose old path is already gone is stale and must be
+            # cleaned up instead of staying as an open-ended exception.
+            if old_state == 'missing':
+                errors.append(f'{LIFECYCLE_DOC}: legacy {old} is marked deferred but no longer '
+                              'exists on disk; remove the deferral and close the migration row')
+            continue
+        if old_state != 'unsafe' and old_state != 'missing':
             errors.append(f'{LIFECYCLE_DOC}: legacy path {old} still exists on disk; keep one '
                           'authority instead of a second copy')
+        if row_unsafe:
+            # A path from this row could not be proven safe; do not run the
+            # reference scan (it would touch the tree with an untrusted path).
+            continue
         if any(rel == old or rel.startswith(old + '/') for rel in REQUIRED):
             errors.append(f'{LIFECYCLE_DOC}: legacy path {old} must not be a release path')
-        for rel in entry['allowed']:
-            if not (root / rel).exists():
-                errors.append(f'{LIFECYCLE_DOC}: legacy {old} allowed file {rel} does not exist')
         allowed = set(entry['allowed'])
         for path in _scan_files(root, root, scan_errors, DOC_SCAN_EXCLUDED_DIRS):
             if path.suffix.lower() != '.md':
@@ -1523,9 +1802,15 @@ def documentation_consistency_errors(root=ROOT):
     errors = []
     errors.extend(docs_impact_template_errors(root))
     errors.extend(release_consistency_errors(root))
+    # Repository-only document gates. The phase plan is a plain in-tree document
+    # read, so it may follow the tree mode. The registration and legacy-path
+    # readers (`repository_map_errors`, `legacy_path_errors`, and the whole-tree
+    # scan / `_safe_registry_stat` helpers they use) are deliberately NOT called
+    # here: the published v1.7.0 validator has none of them, and a copyable file
+    # such as `docs/upgrade.md` cannot prove the caller is the upstream
+    # repository. The functions stay available for the repository's own tests to
+    # call directly. See docs/architecture/document-lifecycle.md §7.1.
     if tree_mode(root) == TREE_UPSTREAM:
-        errors.extend(repository_map_errors(root))
-        errors.extend(legacy_path_errors(root))
         errors.extend(plan_status_errors(root))
     return errors
 

@@ -107,8 +107,10 @@ def classify_upstream(path: str) -> str:
         return 'template'
     if path in PROFILE_PATHS:
         return 'project-profile'
-    # Everything else is core, including docs/orchestration.md: the contract is
-    # kit-owned even though it lives under docs/ (see migrate.py).
+    # Everything else is core, including a contract shipped under docs/: the
+    # contract is kit-owned wherever it lives. The 1.7.1 bridge release ships it
+    # at kit/orchestration.md; migrate.py defines the one prepared move and treats
+    # the docs/ side as core instead of project-owned after that move.
     return 'core'
 
 

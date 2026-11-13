@@ -1,10 +1,12 @@
 """Structural tests for scripts/validate_kit.py (evidence matrix contract).
 
-The field names / status enum are read back from docs/orchestration.md, so these
-tests fail if the authoritative definition and the validator drift apart.
+The field names / status enum are read back from the core contract
+(`kit/orchestration.md` in the 1.7.1 bridge layout), so these tests fail if the
+authoritative definition and the validator drift apart.
 """
-import importlib.util, json, re, shutil, subprocess, sys, tempfile, unittest
+import contextlib, importlib.util, json, os, re, shutil, subprocess, sys, tempfile, unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'scripts' / 'validate_kit.py'
 spec = importlib.util.spec_from_file_location('validate_kit', SCRIPT)
@@ -23,6 +25,30 @@ HEAD = 'a' * 40
 # existing repository-only tests below).
 UPSTREAM_CHECKOUT = (ROOT / 'docs' / 'upgrade.md').is_file()
 BUILD_SCRIPT = ROOT / 'scripts' / 'build_release.py'
+
+
+@contextlib.contextmanager
+def recording_fs():
+    """Record every os.stat / os.lstat / os.open path argument made in the block."""
+    calls = []
+    real_stat, real_lstat, real_open = os.stat, os.lstat, os.open
+
+    def stat(path, *args, **kwargs):
+        calls.append(('stat', os.fspath(path)))
+        return real_stat(path, *args, **kwargs)
+
+    def lstat(path, *args, **kwargs):
+        calls.append(('lstat', os.fspath(path)))
+        return real_lstat(path, *args, **kwargs)
+
+    def opened(path, *args, **kwargs):
+        calls.append(('open', os.fspath(path)))
+        return real_open(path, *args, **kwargs)
+
+    with mock.patch.object(os, 'stat', stat), \
+            mock.patch.object(os, 'lstat', lstat), \
+            mock.patch.object(os, 'open', opened):
+        yield calls
 
 
 def canonical():
@@ -591,13 +617,13 @@ class ContractTemplateTests(unittest.TestCase):
         text = (ROOT / 'templates' / 'design.md').read_text(encoding='utf-8')
         self.assertIn('not permanence', text)
         self.assertIn('contract-decision-log.md', text)
-        for needle in ('N/A: <reason>', 'docs/orchestration.md'):
+        for needle in ('N/A: <reason>', 'kit/orchestration.md'):
             self.assertIn(needle, text)
 
     def test_templates_reference_instead_of_restating_the_core_contract(self):
         for rel in ('templates/design.md', 'templates/milestone-audit.md'):
             text = (ROOT / rel).read_text(encoding='utf-8')
-            self.assertIn('docs/orchestration.md', text)
+            self.assertIn('kit/orchestration.md', text)
             for state in ('DISPATCHED', 'MASTER_REVIEW', 'APPROVED', 'VERIFIED'):
                 self.assertNotIn(state, text, f'{rel} must not copy the task lifecycle')
 
@@ -622,7 +648,7 @@ class ContractTemplateTests(unittest.TestCase):
         for rel in ('templates/design.md', 'templates/contract-decision-log.md',
                     'templates/milestone-audit.md'):
             self.assertIn(rel, readme)
-        acceptance = (ROOT / 'docs/orchestration.md').read_text(encoding='utf-8')
+        acceptance = (ROOT / 'kit/orchestration.md').read_text(encoding='utf-8')
         for rel in ('templates/milestone-audit.md', 'templates/contract-decision-log.md'):
             self.assertIn(rel, acceptance)
 
@@ -658,7 +684,7 @@ class CapabilityAndMetricsTemplateTests(unittest.TestCase):
             self.assertIn(needle, text)
         # A record must not become a permission grant or a second definition of C1-C4.
         self.assertIn('not a permission grant', text)
-        self.assertIn('docs/orchestration.md', text)
+        self.assertIn('kit/orchestration.md', text)
 
     def test_capability_template_refuses_a_stale_pass(self):
         text = (ROOT / self.CAPABILITY).read_text(encoding='utf-8')
@@ -711,7 +737,7 @@ class CapabilityAndMetricsTemplateTests(unittest.TestCase):
         readme = (ROOT / 'docs' / 'README.md').read_text(encoding='utf-8')
         for rel in (self.CAPABILITY, self.METRICS, 'scripts/report_metrics.py'):
             self.assertIn(rel, readme)
-        acceptance = (ROOT / 'docs/orchestration.md').read_text(encoding='utf-8')
+        acceptance = (ROOT / 'kit/orchestration.md').read_text(encoding='utf-8')
         for rel in (self.CAPABILITY, self.METRICS):
             self.assertIn(rel, acceptance)
 
@@ -820,7 +846,7 @@ class DeliveryScenarioIntegrationTests(unittest.TestCase):
                          'docs/README.md is repository-only and absent inside a release package')
     def test_readme_and_acceptance_point_at_the_scenario_runner(self):
         readme = (ROOT / 'docs' / 'README.md').read_text(encoding='utf-8')
-        acceptance = (ROOT / 'docs/orchestration.md').read_text(encoding='utf-8')
+        acceptance = (ROOT / 'kit/orchestration.md').read_text(encoding='utf-8')
         self.assertIn(self.RUNNER, readme)
         self.assertIn(self.RUNNER, acceptance)
         self.assertIn(self.SCENARIO_DOC, readme)
@@ -830,7 +856,8 @@ class TreeModeTests(unittest.TestCase):
     """validate_kit has to work in all three trees it can be pointed at.
 
     - `package`: a pristine release package. Its `docs/` holds nothing but the
-      shipped files of REQUIRED (today only docs/orchestration.md).
+      shipped files of REQUIRED (currently none: the bridge package ships no
+      `docs/` file and keeps the contract at `kit/orchestration.md`).
     - `downstream`: a project that unzipped the kit and filled in its own
       `docs/PROJECT.md` + `docs/PLAN.md`; the project config is the marker.
     - `upstream`: this repository, where `docs/upgrade.md` exists.
@@ -901,13 +928,13 @@ class TreeModeTests(unittest.TestCase):
             self.assertEqual(validate.required_doc_errors(root), [])
 
     def test_package_may_carry_the_core_contract(self):
-        # The contract lives under docs/ now, so a shipped docs/ directory no
-        # longer means "project tree". Only the shipped REQUIRED docs may be
-        # there, and the repository document checks stay skipped.
+        # This bridge release ships the contract at kit/ and ships no docs/
+        # file. A tree with only that contract is still a package.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / 'docs').mkdir()
-            (root / validate.CORE_DOC).write_text('# contract\n', encoding='utf-8')
+            target = root / validate.CORE_DOC
+            target.parent.mkdir(parents=True)
+            target.write_text('# contract\n', encoding='utf-8')
             self.assertEqual(validate.tree_mode(root), validate.TREE_PACKAGE)
             self.assertEqual(validate.required_doc_errors(root), [])
 
@@ -917,7 +944,6 @@ class TreeModeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'docs').mkdir()
-            (root / validate.CORE_DOC).write_text('# contract\n', encoding='utf-8')
             (root / 'docs' / 'notes.md').write_text('# project notes\n', encoding='utf-8')
             self.assertEqual(validate.tree_mode(root), validate.TREE_DOWNSTREAM)
             errors = validate.required_doc_errors(root)
@@ -925,7 +951,9 @@ class TreeModeTests(unittest.TestCase):
 
     def test_only_the_contract_ships_from_docs(self):
         shipped = [rel for rel in validate.REQUIRED if 'docs' in Path(rel).parts]
-        self.assertEqual(shipped, [validate.CORE_DOC])
+        self.assertEqual(shipped, [])
+        self.assertEqual(validate.CORE_DOC, 'kit/orchestration.md')
+        self.assertIn(validate.CORE_DOC, validate.REQUIRED)
 
     def test_downstream_tree_only_requires_project_and_plan(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -976,6 +1004,11 @@ class TreeModeTests(unittest.TestCase):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
             root = self.kit_tree(Path(tmp), docs='package')
+            # The bridge package ships no docs/ file. tree_mode still walks a
+            # docs/ directory when one is present; one entry makes the iterate
+            # phase raise, which is what this assertion covers.
+            (root / 'docs').mkdir()
+            (root / 'docs' / 'marker').write_text('x\n', encoding='utf-8')
             self.emit_manifest(root)
             (root / 'AGENTS.md').write_text('# tampered\n', encoding='utf-8')
             real_scandir = os.scandir
@@ -1391,15 +1424,25 @@ class LegacyPathTests(unittest.TestCase):
 
     OLD = 'old/thing.md'
     NEW = 'docs/thing.md'
+    AUTH_OLD = 'kit/orchestration.md'
+    AUTH_NEW = 'docs/orchestration.md'
+    DEFERRED = '`DEFERRED`: #238 BRIDGE-1.7.1'
 
-    def lifecycle(self, allowed='`docs/history.md`', replacement='`docs/thing.md`'):
+    def lifecycle(self, allowed='`docs/history.md`', replacement=None, note='moved',
+                  old=None, new=None, extra_rows=''):
+        old = self.OLD if old is None else old
+        new = self.NEW if new is None else new
+        if replacement is None:
+            replacement = f'`{new}`'
         return ('# lifecycle\n\n'
                 '### 7.1 旧路径登记（迁移 / 兼容例外）\n\n'
                 '| 旧路径 | 替代路径 | 允许出现的文件 | 生效版本 | 说明 |\n'
                 '|---|---|---|---|---|\n'
-                f'| `{self.OLD}` | {replacement} | {allowed} | 1.5 | moved |\n')
+                f'| `{old}` | {replacement} | {allowed} | 1.5 | {note} |\n'
+                + extra_rows)
 
-    def tree(self, tmp, files, allowed='`docs/history.md`', replacement='`docs/thing.md`'):
+    def tree(self, tmp, files, allowed='`docs/history.md`', replacement=None, note='moved',
+             old=None, new=None, extra_rows=''):
         root = Path(tmp)
         for rel, text in files.items():
             path = root / rel
@@ -1407,7 +1450,8 @@ class LegacyPathTests(unittest.TestCase):
             path.write_text(text, encoding='utf-8')
         target = root / validate.LIFECYCLE_DOC
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(self.lifecycle(allowed=allowed, replacement=replacement),
+        target.write_text(self.lifecycle(allowed=allowed, replacement=replacement, note=note,
+                                         old=old, new=new, extra_rows=extra_rows),
                           encoding='utf-8')
         return root
 
@@ -1470,6 +1514,414 @@ class LegacyPathTests(unittest.TestCase):
                                    'docs/history.md': '# history\n'})
             errors = validate.legacy_path_errors(root)
         self.assertTrue(any('legacy path old/thing.md still exists' in e for e in errors), errors)
+
+    def test_deferral_authorisation_table_is_exactly_one_pair(self):
+        """No other path pair or task number may be silently authorised."""
+        self.assertEqual(
+            dict(validate.DEFERRAL_AUTHORISATIONS),
+            {('kit/orchestration.md', 'docs/orchestration.md'):
+                {'task': '238', 'marker': '`DEFERRED`: #238 BRIDGE-1.7.1'}})
+        self.assertEqual(
+            validate._deferral_state(self.DEFERRED, 'kit/orchestration.md',
+                                     'docs/orchestration.md'), ('valid', ''))
+
+    def test_deferred_row_is_limited_to_the_deferred_migration_state(self):
+        """A valid deferral suspends exactly the migrated-state checks.
+
+        The old path may still exist, may still be a release path, and may be
+        referenced outside the allowed-file list until the migration executes.
+        Deferral is bound to this exact path pair and to #238.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {
+                self.AUTH_NEW: '# thing\n',
+                self.AUTH_OLD: '# still the current authority\n',
+                'docs/history.md': '# history\n',
+                'docs/elsewhere.md': f'# elsewhere\n\nread `{self.AUTH_OLD}` first.\n',
+            }, note=self.DEFERRED, old=self.AUTH_OLD, new=self.AUTH_NEW)
+            with mock.patch.object(validate, 'REQUIRED',
+                                   list(validate.REQUIRED) + [self.AUTH_OLD]):
+                errors = validate.legacy_path_errors(root)
+        self.assertEqual(errors, [])
+
+    def test_deferred_row_still_requires_an_existing_successor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {'docs/history.md': '# history\n'},
+                             note=self.DEFERRED,
+                             old=self.AUTH_OLD, new=self.AUTH_NEW)
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('successor docs/orchestration.md does not exist' in e
+                            for e in errors), errors)
+
+    def test_deferred_row_still_requires_its_declared_allowed_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {self.AUTH_OLD: '# current authority\n'},
+                             allowed='`docs/never-written.md`', note=self.DEFERRED,
+                             old=self.AUTH_OLD, new=self.AUTH_NEW)
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('allowed file docs/never-written.md does not exist' in e
+                            for e in errors), errors)
+
+    def test_deferred_row_whose_old_path_is_gone_is_reported_as_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {self.AUTH_NEW: '# thing\n', 'docs/history.md': '# history\n'},
+                             note=self.DEFERRED, old=self.AUTH_OLD, new=self.AUTH_NEW)
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('marked deferred but no longer exists' in e for e in errors), errors)
+
+    def _deferral_error(self, note, *, allowed='`docs/history.md`'):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {self.AUTH_NEW: '# thing\n',
+                                   self.AUTH_OLD: '# current authority\n',
+                                   'docs/history.md': '# history\n'},
+                             allowed=allowed, note=note,
+                             old=self.AUTH_OLD, new=self.AUTH_NEW)
+            return validate.legacy_path_errors(root)
+
+    def test_deferred_row_requires_the_exact_authorised_marker(self):
+        errors = self._deferral_error('`DEFERRED`: keep it for now')
+        self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
+        self.assertTrue(any('must be exactly' in e for e in errors), errors)
+
+    def test_deferral_is_rejected_for_another_path_pair(self):
+        """The exception cannot be borrowed by a different migration row."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {self.NEW: '# thing\n', self.OLD: '# second authority\n',
+                                   'docs/history.md': '# history\n'},
+                             note=self.DEFERRED)
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
+        self.assertTrue(any('only authorised for' in e for e in errors), errors)
+
+    def test_deferral_rejects_a_different_task_number(self):
+        errors = self._deferral_error('`DEFERRED`: #999 BRIDGE-1.7.1')
+        self.assertTrue(any('must be exactly' in e for e in errors), errors)
+
+    def test_deferral_rejects_a_second_task_number(self):
+        errors = self._deferral_error('`DEFERRED`: #238 and #999 BRIDGE-1.7.1')
+        self.assertTrue(any('must be exactly' in e for e in errors), errors)
+
+    def test_deferral_rejects_an_empty_reason(self):
+        errors = self._deferral_error('`DEFERRED`:    ')
+        self.assertTrue(any('must be exactly' in e for e in errors), errors)
+
+    def test_deferral_rejects_a_contradictory_negation(self):
+        errors = self._deferral_error('`DEFERRED`: #238 not deferred; the migration is complete')
+        self.assertTrue(any('must be exactly' in e for e in errors), errors)
+
+    def test_deferral_rejects_a_completion_claim_in_chinese(self):
+        """Regression from review: a polite "no need to defer, done" is not a marker."""
+        errors = self._deferral_error('`DEFERRED`: #238 无需延期，已完成')
+        self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
+
+    def test_deferral_rejects_not_currently_deferred_wording(self):
+        errors = self._deferral_error('`DEFERRED`: #238 not currently deferred')
+        self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
+
+    def test_deferral_rejects_a_bare_task_number(self):
+        errors = self._deferral_error('`DEFERRED`: #238')
+        self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
+
+    def test_deferral_rejects_extra_text_after_the_canonical_marker(self):
+        errors = self._deferral_error(self.DEFERRED + ' (temporary)')
+        self.assertTrue(any('must be exactly' in e for e in errors), errors)
+
+    def test_negated_deferral_marker_is_not_a_deferral(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {self.NEW: '# thing\n', self.OLD: '# second authority\n',
+                                   'docs/history.md': '# history\n'},
+                             note='NOT DEFERRED: the migration is complete')
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
+
+    def test_lowercase_deferral_word_does_not_disable_the_strict_checks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {self.NEW: '# thing\n', self.OLD: '# second authority\n',
+                                   'docs/history.md': '# history\n'},
+                             note='deferred to the next release')
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
+
+    def test_deferral_marker_outside_the_note_column_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, {self.NEW: '# thing\n', self.OLD: '# second authority\n',
+                                   'docs/history.md': '# history\n'},
+                             allowed='`docs/history.md` `DEFERRED`', note='moved')
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed deferral marker' in e for e in errors), errors)
+        self.assertTrue(any('说明 column' in e for e in errors), errors)
+
+    def test_a_malformed_row_next_to_a_valid_row_fails_closed(self):
+        """A valid row must not mask a row whose old/new paths cannot be parsed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n'},
+                extra_rows='| `old/broken.md` | no-backticked-new | `docs/history.md` | '
+                           '1.5 | moved |\n')
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
+
+    def test_malformed_row_with_deferred_outside_the_note_column_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n'},
+                extra_rows='| `old/broken.md` | no-backticked-new | `DEFERRED` | 1.5 | '
+                           'moved |\n')
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
+        self.assertTrue(any('outside the 说明 column' in e for e in errors), errors)
+
+    def test_malformed_row_naming_an_existing_old_file_is_reported_without_probing(self):
+        """A malformed row is reported; its paths are never used as filesystem input.
+
+        The previous version of this test expected a "still exists" detail. That
+        detail required stat-ing an untrusted path from the malformed row, which
+        is a privacy/exfiltration risk, so the assertion is changed (by the
+        owner's explicit authorisation) to prove fail-closed reporting *and*
+        that the named path is not probed.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {self.AUTH_OLD: '# authority\n', self.AUTH_NEW: '# successor\n',
+                      'docs/history.md': '# history\n', 'old/legacy.md': '# still here\n'},
+                note=self.DEFERRED, old=self.AUTH_OLD, new=self.AUTH_NEW,
+                extra_rows='| `old/legacy.md` | no-backticked-new | `docs/history.md` | '
+                           '1.5 | moved |\n')
+            calls = []
+            with recording_fs() as calls:
+                errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
+        self.assertFalse(any('old/legacy.md' in arg for _, arg in calls), calls)
+        self.assertTrue(calls, 'the deferred row should still be checked')
+
+    def test_malformed_rows_never_probe_relative_absolute_or_symlink_escapes(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                tempfile.TemporaryDirectory() as outside_tmp:
+            outside = Path(outside_tmp) / 'outside.md'
+            outside.write_text('# outside\n', encoding='utf-8')
+            root = self.tree(
+                tmp, {self.AUTH_OLD: '# authority\n', self.AUTH_NEW: '# successor\n',
+                      'docs/history.md': '# history\n'},
+                note=self.DEFERRED, old=self.AUTH_OLD, new=self.AUTH_NEW,
+                extra_rows=(
+                    '| `../outside.md` | no-backticked-new | `docs/history.md` | 1.5 | '
+                    'moved |\n'
+                    '| `/etc/hostname` | no-backticked-new | `docs/history.md` | 1.5 | '
+                    'moved |\n'
+                    '| `escape-link` | no-backticked-new | `docs/history.md` | 1.5 | '
+                    'moved |\n'))
+            os.symlink(outside, root / 'escape-link')
+            with recording_fs() as calls:
+                errors = validate.legacy_path_errors(root)
+        malformed = [e for e in errors if 'malformed 旧路径登记 row' in e]
+        self.assertEqual(len(malformed), 3, errors)
+        for needle in ('../outside.md', '/etc/hostname', 'escape-link'):
+            self.assertFalse(any(needle in arg for _, arg in calls), (needle, calls))
+        self.assertTrue(calls, 'the deferred row should still be checked')
+
+    def test_malformed_row_with_multiple_old_paths_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n'},
+                extra_rows='| `old/a.md` `old/b.md` | `docs/new.md` | `docs/history.md` | '
+                           '1.5 | moved |\n')
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
+        self.assertTrue(any('exactly one backticked path' in e for e in errors), errors)
+
+    def test_malformed_row_with_multiple_new_paths_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n'},
+                extra_rows='| `old/a.md` | `docs/new.md` `docs/new2.md` | `docs/history.md` '
+                           '| 1.5 | moved |\n')
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
+        self.assertTrue(any('exactly one backticked path' in e for e in errors), errors)
+
+    def test_rows_with_three_or_four_columns_fail_closed(self):
+        for row in (
+            '| `old/a.md` | `docs/new.md` | `docs/history.md` |\n',
+            '| `old/a.md` | `docs/new.md` | `docs/history.md` | 1.5 |\n',
+        ):
+            with self.subTest(row=row), tempfile.TemporaryDirectory() as tmp:
+                root = self.tree(
+                    tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n'},
+                    extra_rows=row)
+                errors = validate.legacy_path_errors(root)
+            self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
+            self.assertTrue(any('exactly 5 columns' in e for e in errors), errors)
+
+    def test_row_with_too_few_columns_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {self.NEW: '# thing\n', 'docs/history.md': '# history\n'},
+                extra_rows='| `old/thing.md` | `docs/thing.md` |\n')
+            errors = validate.legacy_path_errors(root)
+        self.assertTrue(any('malformed 旧路径登记 row' in e for e in errors), errors)
+
+    def test_a_second_valid_row_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {self.NEW: '# thing\n', 'docs/second.md': '# second\n',
+                      'docs/history.md': '# history\n'},
+                extra_rows='| `old/second.md` | `docs/second.md` | `docs/history.md` | '
+                           '1.5 | moved |\n')
+            self.assertEqual(validate.legacy_path_errors(root), [])
+
+    def test_other_rows_stay_strict_while_one_row_is_deferred(self):
+        other_old, other_new = 'old/other.md', 'docs/other.md'
+        text = ('# lifecycle\n\n'
+                '### 7.1 旧路径登记（迁移 / 兼容例外）\n\n'
+                '| 旧路径 | 替代路径 | 允许出现的文件 | 生效版本 | 说明 |\n'
+                '|---|---|---|---|---|\n'
+                f'| `{self.AUTH_OLD}` | `{self.AUTH_NEW}` | `docs/history.md` | 1.5 | '
+                f'{self.DEFERRED} |\n'
+                f'| `{other_old}` | `{other_new}` | `docs/history.md` | 1.5 | moved |\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel, content in {self.AUTH_NEW: '# thing\n', self.AUTH_OLD: '# authority\n',
+                                 other_new: '# other\n', other_old: '# duplicate\n',
+                                 'docs/history.md': '# history\n'}.items():
+                path = root / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding='utf-8')
+            target = root / validate.LIFECYCLE_DOC
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding='utf-8')
+            errors = validate.legacy_path_errors(root)
+        self.assertFalse(any('kit/orchestration.md still exists' in e for e in errors), errors)
+        self.assertTrue(any('legacy path old/other.md still exists' in e for e in errors), errors)
+
+
+class LegacyPathSafetyTests(unittest.TestCase):
+    """Paths from the registry must never become filesystem input outside root."""
+
+    AUTH_OLD = 'kit/orchestration.md'
+    AUTH_NEW = 'docs/orchestration.md'
+    DEFERRED = '`DEFERRED`: #238 BRIDGE-1.7.1'
+    HEADER = ('# lifecycle\n\n'
+              '### 7.1 旧路径登记（迁移 / 兼容例外）\n\n'
+              '| 旧路径 | 替代路径 | 允许出现的文件 | 生效版本 | 说明 |\n'
+              '|---|---|---|---|---|\n')
+
+    def table(self, *rows):
+        return self.HEADER + ''.join(rows)
+
+    def tree(self, tmp, files, *rows):
+        root = Path(tmp)
+        for rel, text in files.items():
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding='utf-8')
+        target = root / validate.LIFECYCLE_DOC
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.table(*rows), encoding='utf-8')
+        return root
+
+    def control_row(self):
+        return (f'| `{self.AUTH_OLD}` | `{self.AUTH_NEW}` | `docs/history.md` | 1.5 | '
+                f'{self.DEFERRED} |\n')
+
+    def base_files(self):
+        return {self.AUTH_OLD: '# authority\n', self.AUTH_NEW: '# successor\n',
+                'docs/history.md': '# history\n'}
+
+    def assert_not_probed(self, calls, needles):
+        rendered = [arg for _, arg in calls]
+        for needle in needles:
+            self.assertFalse(any(needle in item for item in rendered), (needle, rendered))
+
+    def test_absolute_paths_in_old_new_and_allowed_are_not_probed(self):
+        rows = (
+            self.control_row(),
+            '| `  /etc/hostname  ` | `docs/history.md` | `docs/history.md` | 1.5 | moved |\n',
+            '| `old/a.md` | `  /etc/hostname  ` | `docs/history.md` | 1.5 | moved |\n',
+            '| `old/b.md` | `docs/history.md` | `  /etc/hostname  ` | 1.5 | moved |\n',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, self.base_files(), *rows)
+            with recording_fs() as calls:
+                errors = validate.legacy_path_errors(root)
+        self.assertEqual(sum('absolute' in error for error in errors), 3, errors)
+        self.assert_not_probed(calls, ['/etc/hostname'])
+
+    def test_parent_traversal_in_old_new_and_allowed_is_not_probed(self):
+        rows = (
+            self.control_row(),
+            '| `../outside.md` | `docs/history.md` | `docs/history.md` | 1.5 | moved |\n',
+            '| `old/a.md` | `../outside.md` | `docs/history.md` | 1.5 | moved |\n',
+            '| `old/b.md` | `docs/history.md` | `../outside.md` | 1.5 | moved |\n',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, self.base_files(), *rows)
+            with recording_fs() as calls:
+                errors = validate.legacy_path_errors(root)
+        self.assertEqual(sum('parent traversal' in error for error in errors), 3, errors)
+        self.assert_not_probed(calls, ['..'])
+
+    def test_symlinks_to_outside_are_refused_without_following(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                tempfile.TemporaryDirectory() as outside_tmp:
+            outside_dir = Path(outside_tmp)
+            outside_file = outside_dir / 'outside.md'
+            outside_file.write_text('# outside\n', encoding='utf-8')
+            root = self.tree(
+                tmp, self.base_files(),
+                self.control_row(),
+                '| `old-link` | `docs/history.md` | `docs/history.md` | 1.5 | moved |\n',
+                '| `old/a.md` | `new-link` | `docs/history.md` | 1.5 | moved |\n',
+                '| `old/b.md` | `docs/history.md` | `allowed-link` | 1.5 | moved |\n',
+                '| `old/c.md` | `linkdir/outside.md` | `docs/history.md` | 1.5 | moved |\n')
+            os.symlink(outside_file, root / 'old-link')
+            os.symlink(outside_file, root / 'new-link')
+            os.symlink(outside_file, root / 'allowed-link')
+            os.symlink(outside_dir, root / 'linkdir')
+            with recording_fs() as calls:
+                errors = validate.legacy_path_errors(root)
+        self.assertEqual(sum('symlink' in error for error in errors), 4, errors)
+        self.assert_not_probed(calls, [str(outside_file), str(outside_dir), 'outside.md'])
+        for error in errors:
+            self.assertNotIn(str(outside_file), error)
+            self.assertNotIn(str(outside_dir), error)
+
+    def test_unsafe_paths_fail_closed_on_a_platform_without_dir_fd(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                tempfile.TemporaryDirectory() as outside_tmp:
+            outside_dir = Path(outside_tmp)
+            outside_file = outside_dir / 'outside.md'
+            outside_file.write_text('# outside\n', encoding='utf-8')
+            root = self.tree(
+                tmp, self.base_files(),
+                self.control_row(),
+                '| `  /etc/hostname  ` | `docs/history.md` | `docs/history.md` | 1.5 | moved |\n',
+                '| `old/a.md` | `../outside.md` | `docs/history.md` | 1.5 | moved |\n',
+                '| `old/b.md` | `docs/history.md` | `allowed-link` | 1.5 | moved |\n',
+                '| `old/c.md` | `linkdir/outside.md` | `docs/history.md` | 1.5 | moved |\n')
+            os.symlink(outside_file, root / 'allowed-link')
+            os.symlink(outside_dir, root / 'linkdir')
+            with mock.patch.object(validate, '_DIR_FD_SAFE', False):
+                with recording_fs() as calls:
+                    errors = validate.legacy_path_errors(root)
+        self.assertEqual(len([e for e in errors if 'unsafe' in e]), 4, errors)
+        self.assert_not_probed(calls, ['/etc/hostname', '..', str(outside_file),
+                                       str(outside_dir), 'outside.md'])
+
+    def test_valid_rows_still_pass_without_dir_fd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(
+                tmp, {'docs/second.md': '# second\n', 'docs/history.md': '# history\n'},
+                '| `old/second.md` | `docs/second.md` | `docs/history.md` | 1.5 | moved |\n')
+            with mock.patch.object(validate, '_DIR_FD_SAFE', False):
+                errors = validate.legacy_path_errors(root)
+        self.assertEqual(errors, [])
+
+    def test_exact_deferral_still_passes_without_dir_fd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.tree(tmp, self.base_files(), self.control_row())
+            with mock.patch.object(validate, '_DIR_FD_SAFE', False):
+                errors = validate.legacy_path_errors(root)
+        self.assertEqual(errors, [])
 
 
 class DocumentationImpactTests(unittest.TestCase):
@@ -1643,7 +2095,7 @@ class ReleaseConsistencyTests(unittest.TestCase):
     def rules(self, **overrides):
         arguments = dict(
             required=list(validate.REQUIRED),
-            package_doc_paths={'docs/orchestration.md'},
+            package_doc_paths=set(),
             forbidden_paths={'scripts/build_release.py'},
             forbidden_segments={'.orchestration', 'release', '.worktrees', '.workbuddy',
                                 '.git', '.local'},
@@ -1814,6 +2266,192 @@ class DocumentGateBoundaryTests(unittest.TestCase):
         else:
             # No phase plan ships, so there is nothing to verify manually.
             self.assertNotIn(validate.PLAN_UNPROVEN_NOTE, result.stdout)
+
+
+class BridgeRegistryReadBoundaryTests(unittest.TestCase):
+    """The 1.7.1 bridge must not run reads the published v1.7.0 lacks.
+
+    `legacy_path_errors`, `_safe_registry_stat` and
+    `repository_map_coverage_errors` read the whole tree or stat registered
+    paths, and the published v1.7.0 validator has none of them. This release
+    does not claim those reads are complete, race-free or a security proof.
+    `validate_kit` / `documentation_consistency_errors` therefore never call
+    them: no copyable file (`docs/upgrade.md` included) or symlink in the tree
+    can switch them on. The functions remain for the repository's own tests to
+    call directly. A release package and a host project must never reach them,
+    not even when the host tree carries ordinary files such as `docs/notes.md`
+    or `src/app.py`.
+    """
+
+    REGISTRY_FUNCTIONS = ('repository_map_errors', 'legacy_path_errors',
+                          '_safe_registry_stat', 'repository_map_coverage_errors')
+
+    def shipped_tree(self, root):
+        for rel in validate.REQUIRED:
+            target = root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT / rel, target)
+        return root
+
+    def package_tree(self, root):
+        return self.shipped_tree(root)
+
+    def downstream_tree(self, root):
+        self.shipped_tree(root)
+        (root / 'docs').mkdir(parents=True, exist_ok=True)
+        (root / 'docs' / 'PROJECT.md').write_text(
+            '# project\n\n- `edition`：`local`\n', encoding='utf-8')
+        (root / 'docs' / 'PLAN.md').write_text('# plan\n\n## 设计目标\n\nx\n',
+                                               encoding='utf-8')
+        # Ordinary project files. None of them is `docs/upgrade.md`, so none may
+        # switch the repository-only registry gates on.
+        (root / 'docs' / 'notes.md').write_text('# notes\n\nsee `kit/orchestration.md`\n',
+                                                encoding='utf-8')
+        (root / 'src').mkdir(exist_ok=True)
+        (root / 'src' / 'app.py').write_text('x = 1\n', encoding='utf-8')
+        (root / '.github' / 'workflows').mkdir(parents=True, exist_ok=True)
+        (root / '.github' / 'workflows' / 'ci.yml').write_text('name: ci\n', encoding='utf-8')
+        (root / 'README.md').write_text('# host project\n', encoding='utf-8')
+        return root
+
+    def registry_spies(self, calls):
+        def counting(name):
+            def spy(*args, **kwargs):
+                calls[name] += 1
+                return []
+            return spy
+        return [mock.patch.object(validate, name, counting(name))
+                for name in self.REGISTRY_FUNCTIONS]
+
+    def zero_calls(self):
+        return {name: 0 for name in self.REGISTRY_FUNCTIONS}
+
+    def run_both(self, root):
+        """Run both entry points under registry spies and read recording."""
+        reads = []
+        real_read_text, real_read_bytes = Path.read_text, Path.read_bytes
+
+        def read_text(path, *args, **kwargs):
+            reads.append(os.path.realpath(path))
+            return real_read_text(path, *args, **kwargs)
+
+        def read_bytes(path, *args, **kwargs):
+            reads.append(os.path.realpath(path))
+            return real_read_bytes(path, *args, **kwargs)
+
+        calls = self.zero_calls()
+        patches = self.registry_spies(calls)
+        try:
+            for patch in patches:
+                patch.start()
+            with mock.patch.object(Path, 'read_text', read_text), \
+                    mock.patch.object(Path, 'read_bytes', read_bytes):
+                errors, _ = validate.validate_kit(root)
+                consistency = validate.documentation_consistency_errors(root)
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+        return errors, consistency, calls, reads
+
+    def assert_no_registry_reads(self, root):
+        errors, consistency, calls, _ = self.run_both(root)
+        self.assertEqual(errors, [])
+        self.assertEqual(consistency, [])
+        self.assertEqual(calls, self.zero_calls())
+
+    def add_canary_symlink(self, root, canary):
+        """Bait a tree scan: an in-tree link to an out-of-tree canary file."""
+        try:
+            (root / 'docs' / 'linked.md').symlink_to(canary)
+        except OSError as exc:
+            self.fail('cannot create the docs/linked.md symlink fixture: '
+                      f'{exc} (this test must not be skipped)')
+
+    def marker_tree(self, base, kind, canary):
+        """A downstream tree that also carries `docs/upgrade.md`.
+
+        `kind='file'` writes an ordinary file; `kind='symlink'` makes the marker
+        a link to the out-of-tree canary, so any read of the marker through the
+        link is observable. A failed symlink creation fails the test; it is not
+        skipped.
+        """
+        root = self.downstream_tree(base / 'project')
+        marker = root / validate.UPSTREAM_MARKER_DOC
+        if kind == 'file':
+            marker.write_text('# upgrade\n', encoding='utf-8')
+        else:
+            try:
+                marker.symlink_to(canary)
+            except OSError as exc:
+                self.fail(f'cannot create the {validate.UPSTREAM_MARKER_DOC} '
+                          f'symlink fixture: {exc} (this test must not be skipped)')
+        self.add_canary_symlink(root, canary)
+        return root
+
+    def assert_canary_unread(self, reads, canary):
+        self.assertNotIn(os.path.realpath(canary), reads)
+        self.assertNotIn(str(canary), reads)
+
+    def test_package_validation_skips_the_registry_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.package_tree(Path(tmp))
+            self.assertEqual(validate.tree_mode(root), validate.TREE_PACKAGE)
+            self.assert_no_registry_reads(root)
+
+    def test_downstream_validation_skips_the_registry_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.downstream_tree(Path(tmp))
+            self.assertEqual(validate.tree_mode(root), validate.TREE_DOWNSTREAM)
+            self.assert_no_registry_reads(root)
+
+    def test_validation_never_reads_an_out_of_tree_canary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            canary = base / 'canary.md'
+            canary.write_text('# canary\n\nOUT-OF-TREE-CANARY\n', encoding='utf-8')
+            root = self.downstream_tree(base / 'project')
+            # A link inside the tree points at the canary. A scan that followed
+            # it would read a file outside the validated root.
+            self.add_canary_symlink(root, canary)
+            errors, consistency, calls, reads = self.run_both(root)
+        self.assertEqual(errors, [])
+        self.assertEqual(consistency, [])
+        self.assertEqual(calls, self.zero_calls())
+        self.assert_canary_unread(reads, canary)
+
+    def test_marker_file_in_a_downstream_tree_skips_the_registry_reads(self):
+        # A downstream tree (docs/PROJECT.md) that also carries an ordinary
+        # docs/upgrade.md used to call repository_map_errors / legacy_path_errors
+        # and could reach the whole-tree scan and _safe_registry_stat. Neither
+        # entry point may call those functions for such a tree.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            canary = base / 'canary.md'
+            canary.write_text('# canary\n\nOUT-OF-TREE-CANARY\n', encoding='utf-8')
+            root = self.marker_tree(base, 'file', canary)
+            self.assertEqual(validate.tree_mode(root), validate.TREE_UPSTREAM)
+            errors, consistency, calls, reads = self.run_both(root)
+        self.assertEqual(calls, self.zero_calls())
+        self.assert_canary_unread(reads, canary)
+        # A plain marker still selects the upstream document set, which is the
+        # documented "a downstream project must not create docs/upgrade.md"
+        # behaviour: a plain, in-tree requirement read, not a registry read.
+        self.assertTrue(errors, errors)
+
+    def test_marker_symlink_in_a_downstream_tree_skips_the_registry_reads(self):
+        # The marker is a symlink to an ordinary file outside the tree. It must
+        # neither switch the tree mode nor let a document read follow the link.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            canary = base / 'canary.md'
+            canary.write_text('# canary\n\nOUT-OF-TREE-CANARY\n', encoding='utf-8')
+            root = self.marker_tree(base, 'symlink', canary)
+            self.assertEqual(validate.tree_mode(root), validate.TREE_DOWNSTREAM)
+            errors, consistency, calls, reads = self.run_both(root)
+        self.assertEqual(errors, [])
+        self.assertEqual(consistency, [])
+        self.assertEqual(calls, self.zero_calls())
+        self.assert_canary_unread(reads, canary)
 
 
 if __name__ == '__main__':

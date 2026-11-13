@@ -32,7 +32,8 @@
 |---|---|---|---|---|
 | [`AGENTS.md`](../../AGENTS.md) | `authoritative` | `ACTIVE` | 发行包 | 协作契约：角色权限、Git 纪律、证据标准、阅读口径。 |
 | [`README.md`](../../README.md) | `reference` | `ACTIVE` | 仅仓库 | GitHub 首页：产品定位、核心能力与上手指南入口；不定义契约或门禁。 |
-| [`docs/orchestration.md`](../orchestration.md) | `authoritative` | `ACTIVE` | 发行包 | 核心编排：会话入口、任务状态机、锁、合并门 G1–G6、能力契约 C1–C4、验收程序。 |
+| [`kit/orchestration.md`](../../kit/orchestration.md) | `authoritative` | `ACTIVE` | 发行包 | 核心编排的这一发随包权威：会话入口、任务状态机、锁、合并门 G1–G6、能力契约 C1–C4、验收程序。桥接发行仍放在 `kit/`，已发布更新器才能原地更新。 |
+| [`docs/orchestration.md`](../orchestration.md) | `reference` | `ACTIVE` | 仅仓库 | 不随包发布的路径指针，指向 `kit/orchestration.md`。不是第二份契约。 |
 | [`editions/local/`](../../editions/local/)（`master.md`、`execution.md`） | `authoritative` | `ACTIVE` | 发行包 | `local` 底座的命令、路径锁与启动 / 执行增量；不得定义另一套核心语义。 |
 | [`editions/github/`](../../editions/github/)（`master.md`、`execution.md`、`issue-template.md`、`pr-template.md`、`active-task-registry.md`） | `authoritative` | `ACTIVE` | 发行包 | `github` 底座的 Issue / PR / 登记块与启动 / 执行增量；不得定义另一套核心语义。 |
 | [`templates/`](../../templates/) | `reference` | `ACTIVE` | 发行包 | 可复制模板与起始结构（项目配置、计划、任务包、设计契约、审计、审查、能力、指标、架构、自我完善）。模板只提供结构，不是规则权威。 |
@@ -182,8 +183,8 @@ docs/README.md ─────┘  面向人的导航与使用说明
 
 | 范围 | 判定 | 包含 | 不包含 / 规则 |
 |---|---|---|---|
-| `发行包` | 路径在 `REQUIRED` 中 | `AGENTS.md`、`VERSION.md`、`LICENSE.md`、`docs/orchestration.md`、`editions/`、`templates/`、大部分 `scripts/` 与随包 `tests/`；构建时另加 `MANIFEST.json`。 | 包内文件集合 == `REQUIRED` + `MANIFEST.json`；不维护第二份清单。 |
-| `仅仓库` | 不在 `REQUIRED` 中，或位于禁止路径段 | `README.md`、`docs/`（核心契约除外）、`assets/`、`release/`、`.github/`、`.local/README.md`、`.gitignore`、`.gitattributes`、`scripts/build_release.py`、AVE 影子工具及其仓库测试、仓库夹具。 | `release`、`.orchestration`、`.worktrees`、`.workbuddy` 等路径段禁止进入发行包；`docs/` 只允许 `docs/orchestration.md`（`build_release.py` 的 `PACKAGE_DOC_PATHS`）。 |
+| `发行包` | 路径在 `REQUIRED` 中 | `AGENTS.md`、`VERSION.md`、`LICENSE.md`、`kit/orchestration.md`、`editions/`、`templates/`、大部分 `scripts/` 与随包 `tests/`；构建时另加 `MANIFEST.json`。 | 包内文件集合 == `REQUIRED` + `MANIFEST.json`；不维护第二份清单。 |
+| `仅仓库` | 不在 `REQUIRED` 中，或位于禁止路径段 | `README.md`、`docs/`（含路径指针 `docs/orchestration.md`）、`assets/`、`release/`、`.github/`、`.local/README.md`、`.gitignore`、`.gitattributes`、`scripts/build_release.py`、AVE 影子工具及其仓库测试、仓库夹具。 | `release`、`.orchestration`、`.worktrees`、`.workbuddy` 等路径段禁止进入发行包；这一发的 `PACKAGE_DOC_PATHS` 为空，`docs/` 不入包。 |
 | `仅本机` | `.local/` 下除 `README.md` 外的内容，以及运行时状态 | 凭据、机器信息、发布扫描规则、scope 记录、任务库、缓存与 Worktree。 | 永不入库、永不上传、永不打包；读取与写入边界服从 `AGENTS.md` 与 `docs/PROJECT.md`。 |
 
 下游项目拿到的是 `templates/project.md` 作为待填配置起点，不是本仓库的 `docs/PROJECT.md`；发行包的 `docs/` 只有核心契约 `docs/orchestration.md`。发布前自检与包内文件集合以 [`release/README.md`](../../release/README.md) 与 [`scripts/build_release.py`](../../scripts/build_release.py) 为准。
@@ -215,7 +216,7 @@ docs/README.md ─────┘  面向人的导航与使用说明
 - **派生、私有与归档例外（`derived-local`）**：`.local/`（除跟踪的 `README.md`）、`.orchestration/`、`.worktrees/`、`.workbuddy/`、`__pycache__/`、`.pytest_cache/`、`.mypy_cache/` 与 `docs/images/` 不入库或只作本机 / 展示用途，因此不要求逐文件登记；`docs/images/` 只按正文引用按需查看，禁止批量读取。该豁免必须写在本节，未写入的路径一律按未登记处理。
 - **归档例外**：`ARCHIVED` / `SUPERSEDED` 条目必须同时给出保留理由与替代项（或显式“无替代”），否则只能登记为 §9.3 的候选过期；状态与规则见 [document-lifecycle.md](document-lifecycle.md) §6.1。
 - `docs/architecture/repository-map.md` 与 `docs/architecture/document-lifecycle.md` 是本任务新增的文件责任 / 生命周期权威；它们不改变任何现有规则文件，也不把 `docs/` 除核心契约外的内容带入发行包。
-- 核心契约的唯一权威版本是 [`docs/orchestration.md`](../orchestration.md)（#151 路径迁移；旧 `kit/orchestration.md` 不再分发，也不得作为第二个权威）。迁移本身不改变状态机、G1–G6、C1–C4 / C1–C8 的语义。
+- 这一发的唯一随包权威是 [`kit/orchestration.md`](../../kit/orchestration.md)。[`docs/orchestration.md`](../orchestration.md) 只是仓库内路径指针。迁到 `docs/` 留到下一发：已发布的 v1.7.0 更新器不会写入 `docs/`，删除 `kit/orchestration.md` 会让它失败关闭。迁移本身不改变状态机、G1–G6、C1–C4 / C1–C8 的语义。
 
 ## 10. 维护规则
 

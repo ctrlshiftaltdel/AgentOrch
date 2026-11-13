@@ -305,7 +305,7 @@ def _issue_body(environment, report, applied, kept):
         '', '## 边界', '',
         '- 本 Issue 由入口生成，不代表已批准、已合并或已验证。',
         '- 不覆盖项目自有配置 / 业务代码；冲突逐文件保留。',
-        '- 证据矩阵与 G1–G6 判定仍由 `docs/orchestration.md` 与其 4.1 节定义。',
+        '- 证据矩阵与 G1–G6 判定仍由 `kit/orchestration.md` 与其 4.1 节定义。',
     ])
     return '\n'.join(lines) + '\n'
 
@@ -436,7 +436,7 @@ _PUBLIC_STATUSES = frozenset({'PLANNED', 'APPLIED', 'NEW_PROJECT_MODE', 'BLOCKED
                               'STOPPED_CONFLICT', 'STOPPED_UNSAFE_SOURCE',
                               'STOPPED_SCENARIO', 'ROLLED_BACK'})
 _PUBLIC_FILE_NAMES = frozenset({'LICENSE.md', 'VERSION.md', 'README.md', 'MANIFEST.json',
-                                '.gitignore', 'docs/orchestration.md'})
+                                '.gitignore', 'docs/orchestration.md', 'kit/orchestration.md'})
 
 
 def _public_enum(value, choices, fallback='UNKNOWN'):

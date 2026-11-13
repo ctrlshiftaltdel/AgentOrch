@@ -1,8 +1,11 @@
-"""The one legacy path move the kit has shipped, and how an update treats it.
+"""The one legacy path move, and how an update treats it.
 
-Formats up to 1.7 shipped the core orchestration contract at
-``kit/orchestration.md``. It now lives at ``docs/orchestration.md`` and is the
-only ``docs/`` path that ships. Two consequences are handled here, in one place:
+Release 1.7.1 still ships the contract at ``kit/orchestration.md``. The move to
+``docs/orchestration.md`` is prepared here for the next release and does not
+trigger while the target package still contains the old path. The published
+v1.7.0 updater cannot write ``docs/`` and stops if ``kit/orchestration.md`` is
+removed, so this release must not perform the move. Two consequences are
+handled here, in one place, for the release that does move it:
 
 1. **Ownership.** ``docs/`` is otherwise a project-owned prefix (the project
    fills in ``docs/PROJECT.md`` / ``docs/PLAN.md`` and keeps its own documents

@@ -1100,10 +1100,11 @@ def detect_install_scenario(host_root) -> str:
 def looks_like_agentorch_root(path) -> bool:
     """True when *path* carries the kit markers (no scheduler import involved).
 
-    The contract may be at ``docs/orchestration.md`` (current layout) or at the
-    historical ``kit/orchestration.md`` (Format 1.6 / v1.7.0 projections). A
-    tree installed from those releases must stay recognizable on the next run,
-    otherwise a repeat would be misreported as a foreign directory.
+    The contract may be at ``kit/orchestration.md`` (the 1.7.1 bridge layout, and
+    the Format 1.6 / v1.7.0 projection) or at ``docs/orchestration.md`` (the layout
+    prepared for the next release). A tree installed from those releases must stay
+    recognizable on the next run, otherwise a repeat would be misreported as a
+    foreign directory.
 
     Symlinked or non-regular markers do not qualify: the caller would otherwise
     treat an attacker-controlled link as an installed kit tree.
@@ -1123,7 +1124,7 @@ def managed_block(version: str) -> str:
         'AgentOrch 不覆盖；两者冲突时以宿主所有者的明文规则为准。',
         '',
         '- 职责：AgentOrch 作为本项目的任务 / 审查 / 证据推进引擎，不替代宿主规则。',
-        '- AgentOrch Root：`agentorch/`；核心契约：`agentorch/docs/orchestration.md`。',
+        '- AgentOrch Root：`agentorch/`；核心契约：`agentorch/kit/orchestration.md`。',
         '- 内部操作手册：`agentorch/editions/<edition>/master.md`。',
         '- 本机命令：在宿主根运行 `python agentorch/scripts/orchestrator.py --layout isolated '
         '<command>`；',
