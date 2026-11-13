@@ -111,3 +111,27 @@ journal 里的状态**不被直接信任**：`APPROVED` / `MERGED` / `VERIFIED` 
 - **审查 Agent 仍可通过 shell 写文件**：只读性来自 `edit` 权限拒绝与事后 head/指纹核验，不是操作系统隔离；审查期间「写入后恢复」理论上可规避事后检查。
 - **同一 journal 之外的并发写者不被阻止**：锁只覆盖同一 journal；不同 journal 同时合并同一目标分支时依靠 Git 自身锁与合并前基线检查，未做全局互斥。
 - **Windows 上的进程存活检查**：为避免 `os.kill` 在 Windows 上终止进程，恢复时不做存活探测，直接 fail closed（要求人工确认）。锁使用 `msvcrt`，未在 Windows 真机实测。
+
+## 8. 实测记录（2026-11-13，本机 OpenCode v2.2.7）
+
+以下都是真实调用后的结果，不是模拟。journal 与运行日志都在本机临时目录，不入库。
+
+**A. 本仓库真实任务（`merge: false`，不碰 `main`）**
+
+- 任务：按 Owner 2026-11-13 方向修正 `docs/charter.md` 中与交付执行器冲突的「非目标」表述；允许路径只有 `docs/charter.md`；验证命令 `python3 scripts/validate_kit.py`；计划附带 Issue #230 的 body 摘要，运行前重新读取并核对。
+- 基线与结果：任务 worktree 分支 `task/230-charter-scope`，基线 `b5451fa593fa2d660d652e065c14046fe0e725e4`，最终 head `47d7ba556c891e519f6c5d3675b66abe4dc400bf`；执行会话 `ses_e2ac111e1ffetOc5f1rkZy32ud`（agent `build`），审查会话 `ses_e2abdf481ffeM0tYDsqnttTScs`（agent `plan`，`edit` 被拒绝）；两次 `session export` 均为 `outcome: succeeded`，目录都是该任务 worktree；验证退出码 0；审查结论 `APPROVE` 绑定上述 head 与 diff 指纹 `7656c697…`。最终状态 `APPROVED`，CLI 退出码 1（未合并、未 `VERIFIED`，符合预期）。
+- 前三次尝试失败并如实保留：① 分类器把工具步骤的 `step_finish: tool-calls` 当成异常，判为失败（worktree 实际已被修改，证据保存为 stash `30295baf…`）；② `session export --sanitize` 会把工作目录脱敏，身份核对失败（证据保存为 stash `33f4fa73…`）；③ 第二次失败留下的改动使 worktree 不干净，被预检拒绝。修正后重跑成功。这三条正是「未知不得当成功」的行为。
+
+**B. 真实内容克隆上的完整合并闭环（`merge: true`）**
+
+- 环境：对本仓库的本地克隆（`git clone --local`），基线 `d99429b6daa68d3f541201934003d2f404c744e1`，目标分支 `delivery/base`（不是 `main`，也不在 AgentOrch 仓库内）。
+- 两个任务有依赖：`smoke-doc` 新建 `docs/testing/delivery-executor-smoke.md` 并在 `docs/architecture/repository-map.md` 注册；`cross-ref` 依赖前者，向 `docs/autonomous-delivery.md` 添加交叉引用。各自验证 `python3 scripts/validate_kit.py`。
+- 结果：两个任务都 `VERIFIED`；合并提交 `bfd98410481544613fd3a5fb3507ac47773681b4` 与 `61ae525cf07f4287e42908d50bbf0c2b2a505f3d`；合并后验证退出码均为 0；`delivery/base` 上 `validate_kit` 通过。执行/审查会话分别为 `ses_e2ab56f72ffeSTOzgk2gm6wIKP`、`ses_e2ab0db85ffel3g0gWyezCoD2K`、`ses_e2aaef6c3ffeALGsmuXJdkWIsn`、`ses_e2aad1794ffeyH7DHJhnrilhyJ`；两两目录分别等于各自任务 worktree，执行 agent 为 `build`、审查 agent 为 `plan`。
+- 幂等重跑：同一计划与 journal 再运行一次，退出码 0，journal 字节不变，没有新增合并提交。
+
+**没有验证、也不宣称的事项**
+
+- 没有对 GitHub 执行任何合并或状态写入：不建 PR、不写 Issue 评论/label、不调用 `gh pr merge`；`github` 底座的最终合并仍由 Master 按 PR + 当前 head CI 完成。
+- 没有实现「从 `docs/implementation-plan.md` 自动挑任务」：该文件是 Markdown 状态表，本工具只读显式计划或真实 Issue。
+- 审查与执行使用同一底层模型（本机默认 `gemini-4-hydrogen`）；「独立」只按会话、Agent 身份、编辑权限与证据绑定判定。
+- Windows、非 Git Bash shell、真实 GitHub CI 触发均未在本轮实测。
