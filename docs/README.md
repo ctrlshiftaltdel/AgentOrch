@@ -50,7 +50,7 @@
 
 > 这是把 Agent-Orchestration 套件引入我的旧项目，分四步做，全程不许覆盖我项目的现有文件：
 > 1. 先读方法：读 docs/orchestration.md 的会话入口、AGENTS.md、editions/local/master.md 的「已有项目接入」章节，给我用三句话概括这套流程的角色分工与合并门。
-> 2. 解压到项目外的临时目录，然后对照发行包文件清单（AGENTS.md、LICENSE.md、VERSION.md、docs/orchestration.md、editions/、templates/、scripts/、tests/）逐个检查我的项目里哪些位置会重名或被覆盖，输出冲突清单给我。
+> 2. 解压到项目外的临时目录，然后对照发行包文件清单（AGENTS.md、LICENSE.md、VERSION.md、kit/orchestration.md、editions/、templates/、scripts/、tests/）逐个检查我的项目里哪些位置会重名或被覆盖，输出冲突清单给我。
 > 3. 经我确认后引入：无冲突的文件直接复制到位；与我已有文件重名的（尤其 AGENTS.md、LICENSE.md 和 docs/、scripts/、tests/ 里的同名文件），先给我看两边内容，按我决定的合并方式写入；套件的 scripts/ 与 tests/ 不得混进我项目自有的同名目录下已有的文件。
 > 4. 引入完成后列出项目根的最新状态给我复核。
 
@@ -178,8 +178,8 @@ uv run python -m unittest discover -s tests
 │   └── github/                        # 同上 + issue/pr/active-task-registry 三个载体模板
 ├── templates/                         # 全部小写、可复制模板（任务包、设计契约、审计、清单…）
 │   └── self-improvement/              # 提案 / 任务包 / 闭环报告 / 注册表示例 / 包内操作说明
-├── docs/                              # 除核心契约外不随包发布；人打开的用大写
-│   ├── orchestration.md               # Agent 唯一权威（随包分发）：会话入口 + 状态机/合并门 + 验收程序
+├── docs/                              # 仓库文档（1.7.1 桥接包不打包任何 docs/ 文件）
+│   ├── orchestration.md               # 不随包的路径指针；唯一可编辑契约在 kit/orchestration.md
 │   ├── README.md                      # 本文件（GitHub 仓库首页仍会渲染它）
 │   ├── PROJECT.md                     # 项目配置：edition、允许/禁改路径、验证命令
 │   ├── PLAN.md                        # 设计目标权威（init 从 templates/plan.md 生成）
@@ -249,11 +249,13 @@ uv run python -m unittest discover -s tests
 ├── VERSION.md                        # 套件名、Format version 与 Release 版本
 ├── LICENSE.md
 ├── docs/
-│   ├── orchestration.md               # 核心编排契约（随包分发）：会话入口、状态机、G1–G6、C1–C4、底座切换、通用验收程序
+│   ├── orchestration.md               # 不随包的路径指针；唯一可编辑契约在 kit/orchestration.md
 │   ├── PROJECT.md                     # 每个项目自己的配置（edition 在这里）
 │   ├── PLAN.md                        # 设计目标权威：为什么做、做到什么程度、边界（init 从模板生成后由所有者填写；1.4 起位于 docs/）
 │   ├── images/                        # 设计配图（正文中相对引用；Agent 按文中指引按需查看，不批量读取）
 │   └── …                              # 阶段计划、UPGRADE、设计稿等项目自有文档（不随包发布）
+├── kit/
+│   └── orchestration.md               # 核心编排契约（随包分发）：会话入口、状态机、G1–G6、C1–C4、底座切换、通用验收程序
 ├── editions/
 │   ├── local/                         # local 增量：SQLite 命令、路径锁、启动提示词
 │   └── github/                        # github 增量：Issue / PR 模板、登记块、启动提示词
@@ -270,9 +272,9 @@ uv run python -m unittest discover -s tests
 └── .local/                            # 本机私有文件（除说明文件外不入库）
 ```
 
-发行包只包含 `scripts/validate_kit.py` 的 `REQUIRED` 清单所列文件：`docs/` 下**只有** `docs/orchestration.md` 随包分发，其余 `docs/` 内容（设计稿、阶段计划、升级说明等）都不打包。
+发行包只包含 `scripts/validate_kit.py` 的 `REQUIRED` 清单所列文件：1.7.1 桥接包**不打包任何 `docs/` 文件**，核心契约随包放在 `kit/orchestration.md`；其余 `docs/` 内容（设计稿、阶段计划、升级说明等）都不打包。
 
-**核心只有一份，底座只做增量。** `AGENTS.md` 与 `docs/orchestration.md` 定义与底座无关的契约；`editions/local/` 与 `editions/github/` 只能细化命令、模板和载体操作，不得复制或改写出另一套核心条款。底座手册与核心契约冲突时，以核心契约为准。
+**核心只有一份，底座只做增量。** `AGENTS.md` 与核心契约 `kit/orchestration.md`（1.7.1 桥接包；仓库里的 `docs/orchestration.md` 只是路径指针）定义与底座无关的契约；`editions/local/` 与 `editions/github/` 只能细化命令、模板和载体操作，不得复制或改写出另一套核心条款。底座手册与核心契约冲突时，以核心契约为准。
 
 ## 6. 配置
 
@@ -411,11 +413,13 @@ uv run python scripts/report_metrics.py --gold-sample --since 2026-01-01 --until
 
 | 树 | 判定依据 | 仓库文档检查 | `MANIFEST.json` 检查 |
 | --- | --- | --- | --- |
-| 纯净包（`package`） | `docs/` 不存在，或只含随包分发的 `REQUIRED` 文件（当前只有 `docs/orchestration.md`） | 跳过（包内不带仓库文档） | 结构 + 分类 + 路径 + `REQUIRED` 集合 + **SHA-256 / 大小** |
-| 下游项目（`downstream`） | 有 `docs/PROJECT.md`，没有 `docs/upgrade.md` | 只要求 `docs/PROJECT.md` 与 `docs/PLAN.md`（后者仍需“设计目标”章节） | 结构 + 分类 + 路径 + `REQUIRED` 集合 + 每个列出文件存在；**不比较哈希** |
-| 上游 checkout（`upstream`） | 有 `docs/upgrade.md` | 全部 `REQUIRED_DOCS` | 结构 + 分类 + 路径 + `REQUIRED` 集合 + **SHA-256 / 大小** |
+| 纯净包（`package`） | `docs/` 不存在（1.7.1 桥接包即如此：契约在 `kit/orchestration.md`），或只含随包分发的 `REQUIRED` 文件（当前桥接包不含任何 `docs/` 文件） | 跳过（包内不带仓库文档） | 结构 + 分类 + 路径 + `REQUIRED` 集合 + **SHA-256 / 大小** |
+| 下游项目（`downstream`） | 有 `docs/PROJECT.md`，没有普通文件 `docs/upgrade.md` | 只要求 `docs/PROJECT.md` 与 `docs/PLAN.md`（后者仍需“设计目标”章节） | 结构 + 分类 + 路径 + `REQUIRED` 集合 + 每个列出文件存在；**不比较哈希** |
+| 上游 checkout（`upstream`） | `docs/upgrade.md` 是普通文件（符号链接不算） | 全部 `REQUIRED_DOCS` | 结构 + 分类 + 路径 + `REQUIRED` 集合 + **SHA-256 / 大小** |
 
-- **`docs/upgrade.md` 是上游标记**：它只存在于本仓库，不随包发布。下游项目**不要**创建同名文件——一旦出现，`validate_kit.py` 会按上游 checkout 要求全部仓库文档，并把本地修改当哈希漂移报错。
+- **`docs/upgrade.md` 只切换文档集合，不是来源证明**：它是一个可复制的普通文件（不随包发布）。树里存在普通文件 `docs/upgrade.md` 时，`validate_kit.py` 仍按既有规则要求全部上游文档并比较清单哈希——这只能说明该树带了这份文件，**不能证明**它是上游 checkout。若它是符号链接，不据此切换树模式。
+- **下游项目不要创建同名文件**：一旦出现普通文件 `docs/upgrade.md`，`validate_kit.py` 会按上游 checkout 要求全部仓库文档，并把本地修改当哈希漂移报错。
+- **随包校验不做登记读取**：随包 `validate_kit` 不因 `docs/upgrade.md`（无论普通文件还是符号链接）调用 `repository_map_errors`、`legacy_path_errors`、`repository_map_coverage_errors` 或 `_safe_registry_stat`。这些读取保留给仓库测试直接调用，也不构成严格路径或扫描完整性的证明。
 - **下游放宽的只有哈希**：清单结构非法、分类错误、路径非法、`REQUIRED` 少列 / 多列、清单列出的文件缺失，在三种树下都是失败。下游项目保留官方 `MANIFEST.json` 当基线即可，自己的修改由 `check_drift.py` 报告（见 8.2）。
 - **纯净包与上游不降级**：包内或本仓库 checkout 里改动核心文件，`validate_kit.py` 仍以退出码 1 失败。
 
@@ -516,7 +520,7 @@ uv run python scripts/check_drift.py <项目根> --json   # stdout 只有 JSON�
 
 | 类别 | 含义 | 命中时算 drift？ |
 | --- | --- | --- |
-| `core` | 根目录契约与入口（`AGENTS.md`、`docs/orchestration.md`、`scripts/orchestrator.py` 等） | 缺失或被改动即 drift |
+| `core` | 根目录契约与入口（`AGENTS.md`、`kit/orchestration.md`、`scripts/orchestrator.py` 等） | 缺失或被改动即 drift |
 | `edition` | `editions/<edition>/` 下的底座增量 | 缺失或被改动即 drift |
 | `template` | `templates/` 下的模板 | 缺失或被改动即 drift |
 | `project-profile` | 每项目文件（`docs/PROJECT.md`、`PLAN.md`（旧根位置）、`docs/PLAN.md`（1.4 起）、`DESIGN.md`）；安装后本来就该被填写 | 否，单独列出 |

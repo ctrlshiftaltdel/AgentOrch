@@ -692,9 +692,10 @@ python3 scripts/build_release.py
 | --- | --- | --- | --- |
 | 纯净包 | `docs/` 不存在（1.7.1 桥接包即如此：契约在 `kit/orchestration.md`），或只含随包分发的 `REQUIRED` 文件 | 跳过 | 结构 + 分类 + 路径 + `REQUIRED` 集合 + SHA-256 / 大小 |
 | 下游项目 | 有 `docs/PROJECT.md`，没有 `docs/upgrade.md` | 只要求 `docs/PROJECT.md` 与 `docs/PLAN.md`（后者仍需“设计目标”章节） | 结构 + 分类 + 路径 + `REQUIRED` 集合 + 列出文件存在；**不比较哈希** |
-| 上游 checkout | 有 `docs/upgrade.md` | 全部仓库文档 | 结构 + 分类 + 路径 + `REQUIRED` 集合 + SHA-256 / 大小 |
+| 上游 checkout | `docs/upgrade.md` 是普通文件（符号链接不算） | 全部仓库文档 | 结构 + 分类 + 路径 + `REQUIRED` 集合 + SHA-256 / 大小 |
 
-- **`docs/upgrade.md` 是上游标记**：它只存在于上游仓库，不随包发布。下游项目**不要**创建同名文件；一旦出现，`validate_kit.py` 会按上游 checkout 要求全部仓库文档，并把本地修改当哈希漂移报错。
+- **`docs/upgrade.md` 只切换文档集合，不是来源证明**：它是可复制的普通文件。普通文件存在时，`validate_kit.py` 仍按既有规则要求全部上游文档并比较清单哈希——这只能说明该树带了这份文件，**不能证明**树来自上游仓库；符号链接不据此切换树模式。下游项目**不要**创建同名文件；一旦出现普通文件，`validate_kit.py` 会按上游 checkout 要求全部仓库文档，并把本地修改当哈希漂移报错。
+- **随包校验不做登记读取**：随包 `validate_kit` 不因 `docs/upgrade.md`（无论普通文件还是符号链接）调用 `repository_map_errors`、`legacy_path_errors`、`repository_map_coverage_errors` 或 `_safe_registry_stat`。这些登记读取保留给仓库测试直接调用，也不构成严格路径或扫描完整性的证明。
 - **下游放宽的只有哈希**：清单结构非法、分类错误、路径非法、`REQUIRED` 少列 / 多列、清单列出的文件缺失，在三种树下都是失败。
 - **本地修改仍要记账**：下游自己的改动由 `python3 scripts/check_drift.py <项目根>` 报告（`modified` / `missing` / `unknown`，退出码 `2`），`validate_kit.py` 不再因这些改动失败。两者分工见 `docs/README.md` 第 7、8 节（仓库文档）。
 - **升级前先确认模式**：如果 `validate_kit.py` 报出大量上游文档缺失，先检查树里是否误放了 `docs/upgrade.md`，而不是去补齐上游文档。
