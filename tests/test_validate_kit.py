@@ -2268,5 +2268,144 @@ class DocumentGateBoundaryTests(unittest.TestCase):
             self.assertNotIn(validate.PLAN_UNPROVEN_NOTE, result.stdout)
 
 
+class BridgeRegistryReadBoundaryTests(unittest.TestCase):
+    """The 1.7.1 bridge must not run reads the published v1.7.0 lacks.
+
+    `legacy_path_errors`, `_safe_registry_stat` and
+    `repository_map_coverage_errors` read the whole tree or stat registered
+    paths, and the published v1.7.0 validator has none of them. This release
+    does not claim those reads are complete, race-free or a security proof, so
+    they are restricted to a real upstream checkout (`docs/upgrade.md`). A
+    release package and a host project must never reach them, not even when the
+    host tree carries ordinary files such as `docs/notes.md` or `src/app.py`.
+    """
+
+    REGISTRY_FUNCTIONS = ('repository_map_errors', 'legacy_path_errors',
+                          '_safe_registry_stat', 'repository_map_coverage_errors')
+
+    def shipped_tree(self, root):
+        for rel in validate.REQUIRED:
+            target = root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT / rel, target)
+        return root
+
+    def package_tree(self, root):
+        return self.shipped_tree(root)
+
+    def downstream_tree(self, root):
+        self.shipped_tree(root)
+        (root / 'docs').mkdir(parents=True, exist_ok=True)
+        (root / 'docs' / 'PROJECT.md').write_text(
+            '# project\n\n- `edition`：`local`\n', encoding='utf-8')
+        (root / 'docs' / 'PLAN.md').write_text('# plan\n\n## 设计目标\n\nx\n',
+                                               encoding='utf-8')
+        # Ordinary project files. None of them is `docs/upgrade.md`, so none may
+        # switch the repository-only registry gates on.
+        (root / 'docs' / 'notes.md').write_text('# notes\n\nsee `kit/orchestration.md`\n',
+                                                encoding='utf-8')
+        (root / 'src').mkdir(exist_ok=True)
+        (root / 'src' / 'app.py').write_text('x = 1\n', encoding='utf-8')
+        (root / '.github' / 'workflows').mkdir(parents=True, exist_ok=True)
+        (root / '.github' / 'workflows' / 'ci.yml').write_text('name: ci\n', encoding='utf-8')
+        (root / 'README.md').write_text('# host project\n', encoding='utf-8')
+        return root
+
+    def registry_spies(self, calls):
+        def counting(name):
+            def spy(*args, **kwargs):
+                calls[name] += 1
+                return []
+            return spy
+        return [mock.patch.object(validate, name, counting(name))
+                for name in self.REGISTRY_FUNCTIONS]
+
+    def zero_calls(self):
+        return {name: 0 for name in self.REGISTRY_FUNCTIONS}
+
+    def assert_no_registry_reads(self, root):
+        calls = self.zero_calls()
+        patches = self.registry_spies(calls)
+        try:
+            for patch in patches:
+                patch.start()
+            errors, _ = validate.validate_kit(root)
+            consistency = validate.documentation_consistency_errors(root)
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+        self.assertEqual(errors, [])
+        self.assertEqual(consistency, [])
+        self.assertEqual(calls, self.zero_calls())
+
+    def test_package_validation_skips_the_registry_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.package_tree(Path(tmp))
+            self.assertEqual(validate.tree_mode(root), validate.TREE_PACKAGE)
+            self.assert_no_registry_reads(root)
+
+    def test_downstream_validation_skips_the_registry_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.downstream_tree(Path(tmp))
+            self.assertEqual(validate.tree_mode(root), validate.TREE_DOWNSTREAM)
+            self.assert_no_registry_reads(root)
+
+    def test_validation_never_reads_an_out_of_tree_canary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = self.downstream_tree(base / 'project')
+            canary = base / 'canary.md'
+            canary.write_text('# canary\n\nOUT-OF-TREE-CANARY\n', encoding='utf-8')
+            # A link inside the tree points at the canary. A scan that followed
+            # it would read a file outside the validated root.
+            (root / 'docs' / 'linked.md').symlink_to(canary)
+            reads = []
+            real_read_text, real_read_bytes = Path.read_text, Path.read_bytes
+
+            def read_text(path, *args, **kwargs):
+                reads.append(os.path.realpath(path))
+                return real_read_text(path, *args, **kwargs)
+
+            def read_bytes(path, *args, **kwargs):
+                reads.append(os.path.realpath(path))
+                return real_read_bytes(path, *args, **kwargs)
+
+            calls = self.zero_calls()
+            patches = self.registry_spies(calls)
+            try:
+                for patch in patches:
+                    patch.start()
+                with mock.patch.object(Path, 'read_text', read_text), \
+                        mock.patch.object(Path, 'read_bytes', read_bytes):
+                    errors, _ = validate.validate_kit(root)
+            finally:
+                for patch in reversed(patches):
+                    patch.stop()
+        self.assertEqual(errors, [])
+        self.assertEqual(calls, self.zero_calls())
+        self.assertNotIn(os.path.realpath(canary), reads)
+        self.assertNotIn(str(canary), reads)
+
+    def test_only_the_upstream_marker_document_enables_the_registry_gates(self):
+        # Positive control: the gate is not dead code. A tree that carries the
+        # marker reaches both repository-only readers even without a real map or
+        # lifecycle document; the spies prove the trigger, not their results.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'docs').mkdir()
+            (root / validate.UPSTREAM_MARKER_DOC).write_text('# upgrade\n', encoding='utf-8')
+            calls = self.zero_calls()
+            patches = self.registry_spies(calls)
+            try:
+                for patch in patches:
+                    patch.start()
+                validate.documentation_consistency_errors(root)
+            finally:
+                for patch in reversed(patches):
+                    patch.stop()
+        self.assertEqual(calls['repository_map_errors'], 1)
+        self.assertEqual(calls['legacy_path_errors'], 1)
+
+
 if __name__ == '__main__':
     unittest.main()

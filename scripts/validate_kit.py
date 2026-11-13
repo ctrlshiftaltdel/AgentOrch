@@ -742,6 +742,17 @@ def tree_mode(root=ROOT, errors=None):
     return TREE_PACKAGE if shipped <= set(REQUIRED) else TREE_DOWNSTREAM
 
 
+def is_upstream_tree(root=ROOT):
+    """True only for a checkout that carries the upstream marker document.
+
+    This is deliberately narrower than `tree_mode`: it never scans the tree, so a
+    release package or a host project cannot switch the repository-only document
+    gates on by carrying an ordinary file. The marker (`docs/upgrade.md`) is the
+    single, stat-only trigger; only a real upstream checkout has it.
+    """
+    return (Path(root) / UPSTREAM_MARKER_DOC).is_file()
+
+
 def required_doc_errors(root=ROOT):
     """Missing or structurally incomplete repository-only documents.
 
@@ -1785,7 +1796,11 @@ def documentation_consistency_errors(root=ROOT):
     errors = []
     errors.extend(docs_impact_template_errors(root))
     errors.extend(release_consistency_errors(root))
-    if tree_mode(root) == TREE_UPSTREAM:
+    # Repository-only gates. The trigger is the upstream marker document alone,
+    # not the general tree mode: a release package or a host project must never
+    # run the registration / legacy-path reads, which do not exist in the
+    # published v1.7.0 validator. See `is_upstream_tree`.
+    if is_upstream_tree(root):
         errors.extend(repository_map_errors(root))
         errors.extend(legacy_path_errors(root))
         errors.extend(plan_status_errors(root))
