@@ -1,6 +1,6 @@
 # Agent-Orchestration — 通用软件项目的启动与推进工具
 
-> 本文件是入口。协作契约与安全规则以 [AGENTS.md](../AGENTS.md) 和 [docs/orchestration.md](orchestration.md) 为准；本文件不删除、不弱化其中任何规则。
+> 本文件是入口。协作契约与安全规则以 [AGENTS.md](../AGENTS.md) 和 [kit/orchestration.md](../kit/orchestration.md) 为准；本文件不删除、不弱化其中任何规则。
 
 ## 1. 一句话定位
 
@@ -114,7 +114,7 @@
 
 > 从 `local` 迁移到 `github` 是**授权决策**，不是偏离：多地协同开发时 GitHub 的优势明显，项目逐步变大后 `github` 底座更合适。
 
-“先 `local` 后 `github`”是常见路径。迁移必须由项目所有者批准，**单向执行、一次性完成、禁止双写**：同一任务不能同时在任务库和 Issue 中维护状态。四步概览见 [docs/orchestration.md 第 6 节](orchestration.md#6-底座切换)，落地路径见本文第 4 节。
+“先 `local` 后 `github`”是常见路径。迁移必须由项目所有者批准，**单向执行、一次性完成、禁止双写**：同一任务不能同时在任务库和 Issue 中维护状态。四步概览见 [kit/orchestration.md 第 6 节「底座切换」](../kit/orchestration.md#6-底座切换)，落地路径见本文第 4 节。
 
 并发不设固定数量：**按当前机器性能动态判断**，只要任务可并行且 CPU / 内存 / 磁盘 / 测试资源仍有余量，就可以并行；同一 Worktree 同一时刻只允许一个测试进程。
 
@@ -479,7 +479,7 @@ uv run python scripts/report_metrics.py .orchestration/state.sqlite3 --json
 
 ### 7.3 合成回归场景（重大变更必跑）
 
-文档要求“该失败的要失败”，`scripts/run_delivery_scenarios.py` 用合成 fixture 证明这一点：A 治理/授权、B 迁移/版本、C 跨模块闭环、D 底座与证据失效四组，每组都有正向控制组与负向注入组。场景矩阵（前置 / 注入缺陷 / 预期拦截门 / 证据 / 清理）只在 `docs/testing/delivery-regression-scenarios.md`（本仓库文档，不随包发布）；`docs/orchestration.md` I 段把它列为套件重大变更的验收步骤。
+文档要求“该失败的要失败”，`scripts/run_delivery_scenarios.py` 用合成 fixture 证明这一点：A 治理/授权、B 迁移/版本、C 跨模块闭环、D 底座与证据失效四组，每组都有正向控制组与负向注入组。场景矩阵（前置 / 注入缺陷 / 预期拦截门 / 证据 / 清理）只在 `docs/testing/delivery-regression-scenarios.md`（本仓库文档，不随包发布）；`kit/orchestration.md` I 段把它列为套件重大变更的验收步骤。
 
 ```bash
 # 全量运行（人类摘要写到 stdout；--json 时 stdout 只有报告，摘要转 stderr）
@@ -747,7 +747,7 @@ uv run python -m scripts.update_agentorch.entry --project . \
 - **局部验收代替不了阶段审计**。任务级审查按 [templates/review-checklist.md](../templates/review-checklist.md) 逐条判定，只证明该任务自己达标；阶段级是否成立要用 `MILESTONE-AUDIT.md`。审计结论只用四类：`BLOCKING`、`NON_BLOCKING_HARDENING`、`OPTIONAL`、`NEEDS_HUMAN_DECISION`（核实无问题记 `PASS`）。
 - **范围证据可复现**：审查前跑 `uv run python scripts/check_scope.py --task <ID>`（只读本地任务库；缺省取任务 `approved_sha`，再退 `head_sha`，也可显式 `--base <40-hex>`），输出 base SHA 与越界路径，退出码 `0` 范围内 / `2` 越界 / `1` 无法判定。
 - **未验证不算通过**。`NOT_RUN` / `BLOCKED` / 没有证据的项不得计入通过；只要存在 `BLOCKING` 或 `NEEDS_HUMAN_DECISION`，阶段就不得标记完成。
-- **轻量模式**：小项目保留全部标题，不适用项写 `N/A: <理由>`（光写 `N/A` 不算），不强制产出冗长文档；模板也不复制状态机与 G1–G6 定义，需要时引用 [docs/orchestration.md](orchestration.md)。
+- **轻量模式**：小项目保留全部标题，不适用项写 `N/A: <理由>`（光写 `N/A` 不算），不强制产出冗长文档；模板也不复制状态机与 G1–G6 定义，需要时引用 [kit/orchestration.md](../kit/orchestration.md)。
 - `validate_kit.py` 会校验这三个模板的必备章节与相对链接；章节被删除会失败，而不是被当成“这项不需要回答”。
 
 ## 12. 治理文档导航
@@ -755,8 +755,8 @@ uv run python -m scripts.update_agentorch.entry --project . \
 | 文档 | 什么时候读 | 读完后做什么 |
 | --- | --- | --- |
 | [AGENTS.md](../AGENTS.md) | 每次接手项目、写代码或做审查之前 | 确认角色权限、Git 纪律、证据标准与安全边界 |
-| [docs/orchestration.md](orchestration.md) | 派发任务、改状态、审查合并、迁移底座之前 | 对照状态机、G1–G6、C1–C4 执行 |
-| [docs/orchestration.md](orchestration.md) | 每次会话开始时 | 判定底座、恢复真实状态、路由到对应流程 |
+| [kit/orchestration.md](../kit/orchestration.md) | 派发任务、改状态、审查合并、迁移底座之前 | 对照状态机、G1–G6、C1–C4 执行 |
+| [kit/orchestration.md](../kit/orchestration.md) | 每次会话开始时 | 判定底座、恢复真实状态、路由到对应流程 |
 | [docs/architecture/repository-map.md](architecture/repository-map.md) | 判断某个文件 / 目录归谁负责、是否随包发布、当前是否权威 | 按地图定位权威文件；承担规则时回到对应权威位置 |
 | [docs/architecture/document-lifecycle.md](architecture/document-lifecycle.md) | 新增、修改、弃用、迁移、归档或删除文档之前 | 按状态转换与 `outdated` 条件登记；不凭印象改状态 |
 | [docs/PROJECT.md](PROJECT.md) | 初始化项目或调整范围 / 验证命令时 | 填好 `edition`、路径边界、验证命令与并发策略 |
