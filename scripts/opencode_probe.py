@@ -3,6 +3,8 @@
 The caller must actually run OpenCode and provide its exit code. This module
 does not launch agents, grant permissions, validate isolation, approve changes,
 or advance task state. An observed response is not a successful task or review.
+When part.type or part.sessionID is present it must match the outer event;
+their absence is tolerated for compatibility with reduced event streams.
 """
 from __future__ import annotations
 
@@ -35,6 +37,11 @@ def classify(returncode, output):
             part = event.get('part')
             if not isinstance(part, dict) or finished:
                 return unknown
+            expected_type = {'step_start': 'step-start', 'text': 'text',
+                             'step_finish': 'step-finish'}.get(kind)
+            if ('sessionID' in part and part['sessionID'] != event_session) or (
+                    'type' in part and part['type'] != expected_type):
+                return unknown
             if kind == 'step_start' and not started:
                 started = True
             elif kind == 'text' and started and isinstance(part.get('text'), str):
@@ -45,7 +52,7 @@ def classify(returncode, output):
                 return unknown
     except (ValueError, TypeError):
         return unknown
-    if not started or not finished or not text:
+    if not started or not finished or not ''.join(text).strip():
         return unknown
     return {'status': 'OBSERVED', 'session_id': session, 'text': ''.join(text)}
 
@@ -56,7 +63,7 @@ def main(argv=None):
                         help='actual exit code of the OpenCode process')
     args = parser.parse_args(argv)
     result = classify(args.exit_code, sys.stdin.read())
-    print(json.dumps(result, ensure_ascii=False))
+    print(json.dumps({'status': result['status'], 'session_id': result['session_id']}))
     return 0 if result['status'] == 'OBSERVED' else 1
 
 
