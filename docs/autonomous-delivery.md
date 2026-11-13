@@ -82,7 +82,7 @@ python3 scripts/autonomous_delivery.py --repo <目标worktree> --issue 230 \
 
 1. 变更路径全部在 `paths` 内；符号链接、子模块、`.git` / `.orchestration` 一律拒绝；提交后再次复核，防止 hook 扩围。
 2. 每条验证命令在当前 head 上退出码为 0，且验证期间 head 与 diff 指纹不变。
-3. 审查会话：新会话、与执行会话不同、`opencode session export --sanitize` 可读、`outcome == succeeded`、工作目录等于任务 worktree、assistant 轮次以 `stop` 结束、使用的 Agent 等于声明的 reviewer，且该 Agent 的 `edit` 权限为 `deny`。
+3. 审查会话：新会话、与执行会话不同、`opencode session export` 可读（只持久化 outcome / 目录 / Agent / 轮次等元数据，不写转写文本）、`outcome == succeeded`、工作目录等于任务 worktree、assistant 轮次以 `stop` 结束、使用的 Agent 等于声明的 reviewer，且该 Agent 的 `edit` 权限为 `deny`。
 4. 审查结论是一个 `json` 代码块，包含 `verdict` / `head` / `diff_sha256` / `findings`；必须 `APPROVE`、绑定当前 head 与指纹、`findings` 为空，并且审查期间 worktree 与 head/指纹未变。
 5. 合并前：目标分支仍停在任务派发时记录的 `target_base`，目标 worktree 干净，任务 head 未变；冲突则 `git merge --abort` 并保持 `BLOCKED`。目标分支已包含该 head 时视为已合并，不重复合并。
 6. 合并后在同一目标分支上重跑验证；失败时状态停在 `MERGED`，绝不写成 `VERIFIED`。
@@ -97,7 +97,7 @@ journal 里的状态**不被直接信任**：`APPROVED` / `MERGED` / `VERIFIED` 
 
 | 文件 | 覆盖 |
 |---|---|
-| `tests/test_autonomous_delivery.py` | 真实 Linux 上的 Git 仓库夹具：完整合并闭环与依赖推进；审查会话/身份/目录/结论伪造；验证失败与重启不重派；`--retry` 的可恢复重置；`--resume` 的可重证恢复；合并幂等、目标分支移动、冲突中止；路径越界、反斜杠/盘符/`..`、符号链接与同字节符号链接指纹；journal 伪造状态、预置无哈希 journal、状态写入边界；argv 凭据不外泄；OpenCode 调用参数、尾部不完整事件、超时杀进程组；`session export --sanitize` 调用。 |
+| `tests/test_autonomous_delivery.py` | 真实 Linux 上的 Git 仓库夹具：完整合并闭环与依赖推进；审查会话/身份/目录/结论伪造；验证失败与重启不重派；`--retry` 的可恢复重置；`--resume` 的可重证恢复；合并幂等、目标分支移动、冲突中止；路径越界、反斜杠/盘符/`..`、符号链接与同字节符号链接指纹；journal 伪造状态、预置无哈希 journal、状态写入边界；argv 凭据不外泄；OpenCode 调用参数、尾部不完整事件、超时杀进程组；`session export` 调用与元数据解析。 |
 | `tests/test_opencode_probe.py` | 单次探针事件流的保守分类，不构成交付成功。 |
 | `scripts/opencode_probe.py` | 探针事件流分类辅助；不被执行器用来判定任务成功。 |
 

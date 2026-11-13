@@ -463,49 +463,71 @@ def _pid_alive(pid):
 # ---------------------------------------------------------------- OpenCode run
 
 def _classify_stream(returncode, output):
-    """Accept only a single-session stream whose *last* event is a clean finish."""
-    unknown = {'exit_code': None, 'session_id': None, 'text': ''}
-    if returncode != 0 or not output.strip():
-        return unknown
-    session, text, started, finished = None, [], False, False
+    """Accept only a single-session stream that ends with a clean stop.
+
+    Real tool-using runs contain several steps: an intermediate step_finish
+    carries ``tool-calls`` and is followed by another step_start. Only a
+    ``stop`` finish is terminal, and nothing may follow it.
+    """
+    unknown = {'exit_code': None, 'session_id': None, 'text': '',
+               'detail': 'stream is not a completed single-session run'}
+    if returncode != 0:
+        return dict(unknown, detail=f'OpenCode exit code {returncode}')
+    if not output.strip():
+        return dict(unknown, detail='OpenCode produced no events')
+    session, text = None, []
+    started = terminal = False
+    in_step = False
     try:
         for line in output.splitlines():
             if not line.strip():
                 continue
             event = json.loads(line)
-            if not isinstance(event, dict) or finished:
-                return unknown
+            if not isinstance(event, dict) or terminal:
+                return dict(unknown, detail='event after the terminal stop')
             sid = event.get('sessionID')
             if not isinstance(sid, str) or not sid.startswith('ses_'):
-                return unknown
+                return dict(unknown, detail='event without a usable session id')
             if session is not None and session != sid:
-                return unknown
+                return dict(unknown, detail='more than one session in the stream')
             session = sid
             part = event.get('part')
             if part is not None and not isinstance(part, dict):
-                return unknown
+                return dict(unknown, detail='event part is not an object')
             part = part or {}
             if part.get('sessionID') not in (None, sid):
-                return unknown
+                return dict(unknown, detail='event part names another session')
             kind = event.get('type')
             if kind == 'step_start':
-                if finished:
-                    return unknown
-                started = True
-            elif kind == 'text':
-                if not started:
-                    return unknown
-                text.append(part.get('text') or '')
+                if in_step:
+                    return dict(unknown, detail='step_start inside a running step')
+                in_step, started = True, True
+            elif kind in ('text', 'tool_use', 'tool'):
+                if not in_step:
+                    return dict(unknown, detail='output event outside a step')
+                if kind == 'text':
+                    text.append(part.get('text') or '')
             elif kind == 'step_finish':
-                if not started or part.get('reason') != 'stop':
-                    return unknown
-                finished = True
-            # tool / other events are tolerated mid-step, but never after finish
+                if not in_step:
+                    return dict(unknown, detail='step_finish without a running step')
+                in_step = False
+                reason = part.get('reason')
+                if reason == 'stop':
+                    terminal = True
+                elif reason not in ('tool-calls', 'tool_calls'):
+                    return dict(unknown, detail=f'unrecognized finish reason {reason!r}')
+            else:
+                return dict(unknown, detail=f'unexpected event type {kind!r}')
     except (ValueError, TypeError, AttributeError):
-        return unknown
-    if not started or not finished:
-        return unknown
-    return {'exit_code': returncode, 'session_id': session, 'text': ''.join(text)}
+        return dict(unknown, detail='stream is not readable JSON events')
+    if not started:
+        return dict(unknown, detail='stream never started a step')
+    if in_step:
+        return dict(unknown, detail='stream ended inside a step')
+    if not terminal:
+        return dict(unknown, detail='stream ended without a stop finish')
+    return {'exit_code': returncode, 'session_id': session, 'text': ''.join(text),
+            'detail': 'ok'}
 
 
 def _kill_group(process):
@@ -548,8 +570,14 @@ def opencode(worktree, prompt, role, *, agent_name=None, timeout=1800):
 
 
 def session_export(session_id, worktree, timeout=120):
-    """Read a session's own terminal record; this is identity, not success proof."""
-    argv = ['opencode', 'session', 'export', '--sanitize', session_id]
+    """Read a session's own terminal record; this is identity, not success proof.
+
+    The export is *not* sanitized because sanitizing also redacts the working
+    directory, which is the identity fact this gate needs. Only metadata
+    (outcome, directory, agent/model names, turn counts) is persisted; the
+    transcript is never written to the journal or printed.
+    """
+    argv = ['opencode', 'session', 'export', session_id]
     try:
         result = subprocess.run(argv, cwd=worktree, stdin=subprocess.DEVNULL,
                                 env=dict(os.environ, PWD=str(worktree)),
@@ -705,8 +733,10 @@ def _execute(context, spec, record):
               'repository. Leave the worktree clean of unrelated changes.\n\n' + spec['prompt'])
     execution = context.agent(work, packet, 'execution')
     record['execution_session'] = execution.get('session_id')
+    record['execution_detail'] = execution.get('detail')
     if execution.get('exit_code') != 0 or not execution.get('session_id'):
-        raise DeliveryError('execution failed or its terminal state is unknown', 'FAILED')
+        raise DeliveryError('execution failed or its terminal state is unknown: '
+                            + str(execution.get('detail') or 'no detail'), 'FAILED')
     probe = context.session_probe(execution['session_id'], work)
     _check_probe(probe, work, record.get('executor_agent'), 'execution', 'FAILED')
     record['execution_evidence'] = {
@@ -771,9 +801,10 @@ def _review(context, spec, record):
     work = _root(record['worktree'])
     review = context.agent(work, _review_prompt(spec, record), 'review')
     session = review.get('session_id')
+    record['review_detail'] = review.get('detail')
     if review.get('exit_code') != 0 or not session:
-        raise DeliveryError('review session failed or its terminal state is unknown',
-                            'REVIEW_REJECTED')
+        raise DeliveryError('review session failed or its terminal state is unknown: '
+                            + str(review.get('detail') or 'no detail'), 'REVIEW_REJECTED')
     if session == record.get('execution_session'):
         raise DeliveryError('review session equals execution session; independence is not '
                             'established', 'REVIEW_REJECTED')

@@ -679,6 +679,26 @@ class OpenCodeInvocationTests(DeliveryCase):
                                        return_value=self.process(output, code)):
                     self.assertIsNone(delivery.opencode(self.repo, 't', 'execution')['exit_code'])
 
+    def test_tool_steps_before_a_final_stop_are_accepted(self):
+        def event(kind, **part):
+            return json.dumps({'type': kind, 'sessionID': 'ses_x',
+                               'part': dict(part, sessionID='ses_x')})
+        stream = '\n'.join([
+            event('step_start', type='step-start'),
+            event('tool_use', type='tool', tool='read'),
+            event('step_finish', type='step-finish', reason='tool-calls'),
+            event('step_start', type='step-start'),
+            event('text', type='text', text='done'),
+            event('step_finish', type='step-finish', reason='stop'),
+        ])
+        with mock.patch.object(delivery, '_popen', return_value=self.process(stream)):
+            result = delivery.opencode(self.repo, 't', 'execution')
+        self.assertEqual(result['exit_code'], 0)
+        self.assertEqual(result['text'], 'done')
+        truncated = stream.rsplit('\n', 1)[0]
+        with mock.patch.object(delivery, '_popen', return_value=self.process(truncated)):
+            self.assertIsNone(delivery.opencode(self.repo, 't', 'execution')['exit_code'])
+
     def test_timeout_kills_the_process_group_and_is_not_success(self):
         proc = mock.Mock()
         proc.pid = 4242
@@ -690,7 +710,7 @@ class OpenCodeInvocationTests(DeliveryCase):
         self.assertIsNone(result['exit_code'])
         self.assertTrue(result['timeout'])
 
-    def test_session_export_command_is_sanitized(self):
+    def test_session_export_command_reads_the_session_record(self):
         payload = {'info': {'id': 'ses_x', 'outcome': 'succeeded',
                             'location': {'directory': str(self.repo)}},
                    'messages': [{'type': 'user'}, {'type': 'assistant', 'agent': 'plan',
@@ -698,8 +718,9 @@ class OpenCodeInvocationTests(DeliveryCase):
         completed = subprocess.CompletedProcess([], 0, json.dumps(payload), '')
         with mock.patch.object(delivery.subprocess, 'run', return_value=completed) as run:
             result = delivery.session_export('ses_x', self.repo)
-        self.assertEqual(run.call_args.args[0][:4],
-                         ['opencode', 'session', 'export', '--sanitize'])
+        self.assertEqual(run.call_args.args[0][:3],
+                         ['opencode', 'session', 'export'])
+        self.assertNotIn('--sanitize', run.call_args.args[0])
         self.assertTrue(result['ok'])
         self.assertEqual(result['agents'], ['plan'])
 
