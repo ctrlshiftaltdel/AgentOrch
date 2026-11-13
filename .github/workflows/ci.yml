@@ -10,6 +10,13 @@ on:
 permissions:
   contents: read
 
+# Keep full validation for the latest PR head while avoiding redundant runs
+# for superseded heads of the same PR. Separate PRs never share a group.
+# Only pull_request runs may cancel; main pushes and manual runs are retained.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # One encoding for every platform. The Windows runner otherwise starts Python
 # child processes on a legacy code page, so UTF-8 output (the kit's diagnostics
 # are UTF-8, and several of them are non-ASCII) fails to encode on the way out
