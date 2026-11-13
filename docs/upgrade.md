@@ -691,7 +691,7 @@ python3 scripts/build_release.py
 | 树 | 判定依据 | 仓库文档 | `MANIFEST.json` |
 | --- | --- | --- | --- |
 | 纯净包 | `docs/` 不存在（1.7.1 桥接包即如此：契约在 `kit/orchestration.md`），或只含随包分发的 `REQUIRED` 文件 | 跳过 | 结构 + 分类 + 路径 + `REQUIRED` 集合 + SHA-256 / 大小 |
-| 下游项目 | 有 `docs/PROJECT.md`，没有 `docs/upgrade.md` | 只要求 `docs/PROJECT.md` 与 `docs/PLAN.md`（后者仍需“设计目标”章节） | 结构 + 分类 + 路径 + `REQUIRED` 集合 + 列出文件存在；**不比较哈希** |
+| 下游项目 | 有 `docs/PROJECT.md`，没有普通文件 `docs/upgrade.md` | 只要求 `docs/PROJECT.md` 与 `docs/PLAN.md`（后者仍需“设计目标”章节） | 结构 + 分类 + 路径 + `REQUIRED` 集合 + 列出文件存在；**不比较哈希** |
 | 上游 checkout | `docs/upgrade.md` 是普通文件（符号链接不算） | 全部仓库文档 | 结构 + 分类 + 路径 + `REQUIRED` 集合 + SHA-256 / 大小 |
 
 - **`docs/upgrade.md` 只切换文档集合，不是来源证明**：它是可复制的普通文件。普通文件存在时，`validate_kit.py` 仍按既有规则要求全部上游文档并比较清单哈希——这只能说明该树带了这份文件，**不能证明**树来自上游仓库；符号链接不据此切换树模式。下游项目**不要**创建同名文件；一旦出现普通文件，`validate_kit.py` 会按上游 checkout 要求全部仓库文档，并把本地修改当哈希漂移报错。
