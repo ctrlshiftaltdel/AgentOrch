@@ -217,7 +217,7 @@ docs/README.md ─────┘  面向人的导航与使用说明
 
 - **派生、私有与归档例外（`derived-local`）**：`.local/`（除跟踪的 `README.md`）、`.orchestration/`、`.worktrees/`、`.workbuddy/`、`__pycache__/`、`.pytest_cache/`、`.mypy_cache/` 与 `docs/images/` 不入库或只作本机 / 展示用途，因此不要求逐文件登记；`docs/images/` 只按正文引用按需查看，禁止批量读取。该豁免必须写在本节，未写入的路径一律按未登记处理。
 - **归档例外**：`ARCHIVED` / `SUPERSEDED` 条目必须同时给出保留理由与替代项（或显式“无替代”），否则只能登记为 §9.3 的候选过期；状态与规则见 [document-lifecycle.md](document-lifecycle.md) §6.1。
-- `docs/architecture/repository-map.md` 与 `docs/architecture/document-lifecycle.md` 是本任务新增的文件责任 / 生命周期权威；它们不改变任何现有规则文件，也不把 `docs/` 除核心契约外的内容带入发行包。
+- `docs/architecture/repository-map.md` 与 `docs/architecture/document-lifecycle.md` 是本任务新增的文件责任 / 生命周期权威；它们不改变任何现有规则文件，也不把任何 `docs/` 文件带入发行包；随包契约在 `kit/orchestration.md`。
 - 这一发的唯一随包权威是 [`kit/orchestration.md`](../../kit/orchestration.md)。[`docs/orchestration.md`](../orchestration.md) 只是仓库内路径指针。迁到 `docs/` 留到下一发：已发布的 v1.7.0 更新器不会写入 `docs/`，删除 `kit/orchestration.md` 会让它失败关闭。迁移本身不改变状态机、G1–G6、C1–C4 / C1–C8 的语义。
 
 ## 10. 维护规则
