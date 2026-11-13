@@ -10,7 +10,7 @@ The loop is an orchestrator, not a new governance layer. It:
    reports ``NO_SOURCES`` / ``NOT_RUN`` / ``INCOMPLETE`` honestly instead of
    calling an unfinished scan "no new evidence";
 4. gates every lesson through :mod:`planning`, which needs an explicit spec and
-   escalates conflicts / high-risk surfaces;
+   escalates conflicts / evidenced high-risk changes and blocks unevidenced leads;
 5. hands only ``READY`` proposals to **one** carrier matching the edition, and
 6. writes a closure report with the current head SHA, the human decisions and
    every command it did not run (``NOT_RUN``).
@@ -59,8 +59,9 @@ LIMITATIONS = (
     'never used to change allowed paths or acceptance criteria.',
     'This loop does not create Issues or tasks, run validation commands, approve, merge, '
     'or close anything; the carriers here are dry-run records.',
-    'High-risk surfaces always end in NEEDS_HUMAN_DECISION here; an owner decision is '
-    're-planned as a normal task, not auto-unlocked by a flag.',
+    'Evidenced high-risk changes always end in NEEDS_HUMAN_DECISION here; a path or keyword '
+    'lead without a trustworthy diff stays BLOCKED with required evidence. An owner decision '
+    'is re-planned as a normal task, not auto-unlocked by a flag.',
 )
 
 

@@ -64,31 +64,295 @@ class EligibilityGateTests(unittest.TestCase):
 
 
 class RiskGateTests(unittest.TestCase):
-    def test_frozen_governance_path_needs_hd05(self):
-        spec = loop_support.spec(allowed_paths=['docs/orchestration.md'])
+    def test_state_machine_wording_alone_is_an_investigation_not_an_owner_decision(self):
+        spec = loop_support.spec(goal='修改任务状态机以允许跳过审查。')
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertIsNone(proposal['required_human_decision'])
+        self.assertTrue(proposal['required_evidence'])
+
+    def test_real_state_machine_code_change_is_high(self):
+        spec = loop_support.spec(
+            goal='修改任务状态机以允许跳过审查。',
+            allowed_paths=['scripts/orchestrator.py'],
+            change_evidence=loop_support.change_evidence(
+                'scripts/orchestrator.py',
+                old="if review_required: block('REVIEW')",
+                new="if review_required: allow('REVIEW')"))
         proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
         self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')
         self.assertEqual(proposal['required_human_decision'], 'HD-05')
         self.assertEqual(proposal['risk_level'], 'HIGH')
 
-    def test_state_machine_wording_escalates(self):
-        spec = loop_support.spec(goal='修改任务状态机以允许跳过审查。')
-        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
-        self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')
-        self.assertEqual(proposal['required_human_decision'], 'HD-05')
-
     def test_high_risk_wins_over_an_incomplete_packet(self):
-        spec = loop_support.spec(allowed_paths=['docs/orchestration.md'])
+        spec = loop_support.spec(
+            goal='修改任务状态机以允许跳过审查。',
+            allowed_paths=['scripts/orchestrator.py'],
+            change_evidence=loop_support.change_evidence(
+                'scripts/orchestrator.py',
+                old='return deny()',
+                new='return allow()'))
         spec.pop('validation_commands')
         proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
         self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')
         self.assertEqual(proposal['required_human_decision'], 'HD-05')
 
-    def test_contract_schema_wording_maps_to_hd13(self):
-        spec = loop_support.spec(goal='改变 lesson schema 的枚举取值。')
+    def test_contract_schema_code_change_maps_to_hd13(self):
+        spec = loop_support.spec(
+            goal='改变 lesson schema 的枚举取值。',
+            allowed_paths=['docs/contracts/lesson.schema.json'],
+            change_evidence=loop_support.change_evidence(
+                'docs/contracts/lesson.schema.json',
+                old='"enum": ["OBSERVED"]',
+                new='"enum": ["OBSERVED", "GENERALIZED"]'))
         proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
         self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')
         self.assertEqual(proposal['required_human_decision'], 'HD-13')
+
+
+class EvidenceRoutingTests(unittest.TestCase):
+    """Keywords and directories are leads; only evidence decides the gate."""
+
+    def test_permission_wording_typo_without_a_diff_needs_evidence(self):
+        spec = loop_support.spec(goal='修正不修改权限的说明错字。',
+                                 allowed_paths=['docs/example.md'])
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertIsNone(proposal['required_human_decision'])
+        self.assertTrue(any('权限' in lead for lead in proposal['risk_leads']))
+        self.assertTrue(proposal['required_evidence'])
+
+    def test_docs_design_text_change_without_a_diff_needs_evidence_not_an_owner(self):
+        spec = loop_support.spec(goal='修复错字。',
+                                 allowed_paths=['docs/design/example.md'])
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertIsNone(proposal['required_human_decision'])
+
+    def test_text_only_docs_diff_resolves_the_permission_wording(self):
+        spec = loop_support.spec(
+            goal='修正不修改权限的说明错字。',
+            allowed_paths=['docs/example.md'],
+            change_evidence=loop_support.change_evidence(
+                'docs/example.md', old='本步骤不修改权限。', new='本步骤不改动权限。'))
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'READY')
+        self.assertEqual(proposal['risk_level'], 'LOW')
+        self.assertIsNone(proposal['required_human_decision'])
+        self.assertTrue(any('caller-supplied' in item
+                            for item in proposal['risk_limitations']))
+
+    def test_real_one_line_permission_change_is_high(self):
+        spec = loop_support.spec(
+            goal='统一权限判定。',
+            allowed_paths=['scripts/self_improvement/planning.py'],
+            change_evidence=loop_support.change_evidence(
+                'scripts/self_improvement/planning.py',
+                old='allowed = False',
+                new='allowed = True'))
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')
+        self.assertEqual(proposal['required_human_decision'], 'HD-05')
+        self.assertEqual(proposal['risk_level'], 'HIGH')
+
+    def test_docs_permission_wording_does_not_make_a_separate_code_file_high(self):
+        two_file_diff = (
+            'diff --git a/docs/example.md b/docs/example.md\n'
+            '--- a/docs/example.md\n'
+            '+++ b/docs/example.md\n'
+            '@@ -1 +1 @@\n'
+            '-permission denied\n'
+            '+permission check\n'
+            'diff --git a/scripts/example.py b/scripts/example.py\n'
+            '--- a/scripts/example.py\n'
+            '+++ b/scripts/example.py\n'
+            '@@ -1 +1 @@\n'
+            '-return 1\n'
+            '+return 2\n')
+        spec = loop_support.spec(
+            goal='修正权限说明错字。',
+            allowed_paths=['docs/', 'scripts/'],
+            change_evidence=loop_support.change_evidence(
+                'docs/example.md', diff=two_file_diff))
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertIsNone(proposal['required_human_decision'])
+
+    def test_protected_execution_surface_change_is_high_without_keywords(self):
+        spec = loop_support.spec(
+            goal='调整提示文案。',
+            allowed_paths=['scripts/orchestrator.py'],
+            change_evidence=loop_support.change_evidence(
+                'scripts/orchestrator.py', old='return "old"', new='return "new"'))
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')
+        self.assertEqual(proposal['required_human_decision'], 'HD-05')
+
+    def test_governance_text_diff_without_authorization_needs_evidence(self):
+        spec = loop_support.spec(
+            goal='改进合并门说明。',
+            allowed_paths=['AGENTS.md'],
+            change_evidence=loop_support.change_evidence(
+                'AGENTS.md', old='旧规则说明。', new='新规则说明。'))
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertIsNone(proposal['required_human_decision'])
+        self.assertTrue(any('authorization' in item for item in proposal['required_evidence']))
+
+    def test_authorized_governance_text_diff_is_master_review_not_an_owner_decision(self):
+        spec = loop_support.spec(
+            goal='改进合并门说明。',
+            allowed_paths=['AGENTS.md'],
+            change_evidence=loop_support.change_evidence(
+                'AGENTS.md', old='旧规则说明。', new='新规则说明。'),
+            authorization=loop_support.authorization())
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'READY')
+        self.assertEqual(proposal['risk_level'], 'LOW')
+        self.assertIsNone(proposal['required_human_decision'])
+        self.assertTrue(any('authorization is caller-supplied' in item
+                            for item in proposal['risk_limitations']))
+
+    def test_governance_path_without_a_diff_needs_evidence(self):
+        spec = loop_support.spec(goal='改进规则说明。',
+                                 allowed_paths=['docs/orchestration.md'])
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertIsNone(proposal['required_human_decision'])
+
+    def test_similar_file_names_are_not_the_governance_file(self):
+        for path in ('AGENTS.md.backup', 'AGENTS.md.bak',
+                     'docs/orchestration.md.tmp', 'editions-backup/master.md'):
+            with self.subTest(path=path):
+                spec = loop_support.spec(goal='整理文件。', allowed_paths=[path])
+                proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+                self.assertEqual(proposal['status'], 'READY')
+                self.assertEqual(proposal['risk_level'], 'LOW')
+
+    def test_path_normalization_still_detects_the_real_sensitive_file(self):
+        for path in ('./AGENTS.md', 'docs//orchestration.md',
+                     'docs/design/../orchestration.md',
+                     'docs\\design\\..\\orchestration.md'):
+            with self.subTest(path=path):
+                spec = loop_support.spec(goal='整理文件。', allowed_paths=[path])
+                proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+                self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+                self.assertEqual(proposal['status'], 'BLOCKED')
+
+    def test_absolute_or_escaping_paths_need_evidence(self):
+        for path in ('/repo/AGENTS.md', '../AGENTS.md', 'C:\\repo\\AGENTS.md'):
+            with self.subTest(path=path):
+                spec = loop_support.spec(goal='整理文件。', allowed_paths=[path])
+                proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+                self.assertEqual(proposal['status'], 'BLOCKED')
+                self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+
+    def test_absolute_diff_path_is_not_trusted(self):
+        spec = loop_support.spec(
+            goal='修正文档错字。',
+            allowed_paths=['docs/example.md'],
+            change_evidence=loop_support.change_evidence(
+                'docs/example.md',
+                diff=('--- /tmp/example.md\n+++ /tmp/example.md\n'
+                      '@@ -1 +1 @@\n-旧说明\n+新说明\n')))
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+
+    def test_changed_paths_must_match_the_diff(self):
+        two_file_diff = (
+            'diff --git a/docs/example.md b/docs/example.md\n'
+            '--- a/docs/example.md\n'
+            '+++ b/docs/example.md\n'
+            '@@ -1 +1 @@\n'
+            '-旧说明\n'
+            '+新说明\n'
+            'diff --git a/docs/other.md b/docs/other.md\n'
+            '--- a/docs/other.md\n'
+            '+++ b/docs/other.md\n'
+            '@@ -1 +1 @@\n'
+            '-旧内容\n'
+            '+新内容\n')
+        evidence = loop_support.change_evidence(
+            'docs/example.md', diff=two_file_diff,
+            changed_paths=['docs/example.md'])
+        spec = loop_support.spec(
+            goal='修正文档错字。', allowed_paths=['docs/'],
+            change_evidence=evidence)
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertTrue(any('changed_paths' in item
+                            for item in proposal['required_evidence']))
+
+    def test_diff_path_outside_allowed_paths_is_not_silent(self):
+        spec = loop_support.spec(
+            goal='修正文档错字。',
+            allowed_paths=['docs/example.md'],
+            change_evidence=loop_support.change_evidence(
+                'docs/other.md', old='旧内容', new='新内容'))
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertTrue(any('outside allowed paths' in item
+                            for item in proposal['required_evidence']))
+
+    def test_unbound_diff_is_not_trusted(self):
+        evidence = loop_support.change_evidence(
+            'docs/example.md', old='本步骤不修改权限。', new='本步骤不改动权限。')
+        evidence.pop('head_sha')
+        spec = loop_support.spec(
+            goal='修正不修改权限的说明错字。',
+            allowed_paths=['docs/example.md'], change_evidence=evidence)
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+
+    def test_caller_flags_do_not_downgrade_missing_evidence(self):
+        spec = loop_support.spec(
+            goal='修正不修改权限的说明错字。',
+            allowed_paths=['docs/example.md'],
+            low_risk=True, approved=True)
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+
+    def test_caller_flags_do_not_downgrade_a_real_permission_change(self):
+        spec = loop_support.spec(
+            goal='统一权限判定。',
+            allowed_paths=['scripts/orchestrator.py'],
+            low_risk=True, approved=True,
+            change_evidence=loop_support.change_evidence(
+                'scripts/orchestrator.py',
+                old='allowed = False', new='allowed = True'))
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')
+        self.assertEqual(proposal['required_human_decision'], 'HD-05')
+
+    def test_old_format_docs_typo_without_evidence_keeps_the_low_risk_path(self):
+        spec = loop_support.spec(goal='修正文档错字。',
+                                 allowed_paths=['docs/example.md'])
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'READY')
+        self.assertEqual(proposal['risk_level'], 'LOW')
+        self.assertNotIn('change_evidence', proposal)
+
+    def test_irreversible_code_change_is_high(self):
+        spec = loop_support.spec(
+            goal='清理旧数据。',
+            allowed_paths=['scripts/migrate.py'],
+            change_evidence=loop_support.change_evidence(
+                'scripts/migrate.py',
+                old='pass', new='cursor.execute("DROP TABLE lessons")'))
+        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')
+        self.assertEqual(proposal['required_human_decision'], 'HD-05')
 
 
 class PacketCompletenessTests(unittest.TestCase):

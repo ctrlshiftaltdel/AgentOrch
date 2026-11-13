@@ -92,14 +92,14 @@
 
 ## 4. 高风险与人工决策门
 
-以下任一情况必须进入 `NEEDS_HUMAN_DECISION`，决策 ID 只引用 [`entrypoints-and-decisions.md`](entrypoints-and-decisions.md) §5：
+以下任一情况在真实 Diff / 可核验证据支持时进入 `NEEDS_HUMAN_DECISION`，决策 ID 只引用 [`entrypoints-and-decisions.md`](entrypoints-and-decisions.md) §5：
 
-- 权限 / 安全边界、锁 / 状态机、数据迁移、外部依赖、隐私、破坏兼容、不可逆动作 → `HD-05`（契约 / schema 级改为 `HD-13`）。
+- 实际改变权限 / 安全边界、锁 / 状态机、数据迁移、外部依赖、隐私、破坏兼容或不可逆动作 → `HD-05`（契约 / schema 级改为 `HD-13`）。
 - Lesson 冲突无法靠证据解除 → `HD-04`。
 - 把 Lesson 提升为通用规则且影响上述边界 → `HD-03`。
 - 来源访问授权问题 → `HD-01` / `HD-02`。
 
-`planning.py` 的 `assess_risk()` 对允许路径与 Lesson 文本做保守判定；命中即返回 `NEEDS_HUMAN_DECISION`，**不会**因为调用方传了“已批准”标记而自动放行。决策后重新规划仍是普通任务，不是闭环自动解锁。
+`planning.py` 的 `assess_risk()` 把允许路径与 Lesson / goal 中的关键词只当作**调查线索**，不当作判决。没有绑定 base/head SHA 的真实 Diff 时，命中线索的提案进入 `BLOCKED`（`risk_level: NEEDS_EVIDENCE`）并写出 `required_evidence`，由机器 / Agent 继续取证后重新规划；这既不是 `READY`，也不是自动询问 Owner。只有 Diff 证明实际改动了上述语义，或改动了受保护的执行 / 发布面，才升级 `NEEDS_HUMAN_DECISION`。治理文本变更须带 `authorization`（`granted_by`、`scope: governance-adjustment`、可定位 `source`），由 Master 审查。调用方的 `low_risk` / `approved` 布尔值不被采信；`change_evidence.changed_paths` 必须与 Diff 一致，Diff 中超出 `allowed_paths` 的路径不会被静默忽略。Diff 由调用方提供，规划器能拒绝不一致或越界的 Diff，但不能证明它覆盖工作树的全部实际变更；该限制写入提案的 `risk_limitations`，复核时仍必须对照真实工作树。决策后重新规划仍是普通任务，不是闭环自动解锁。
 
 **常规低风险工作也不得绕过 Master 审查、证据矩阵或合并门。**
 

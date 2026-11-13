@@ -636,33 +636,73 @@ def scenario_a13(ctx):
 
 
 def scenario_a14(ctx):
-    """A governance surface is a human decision, never a routine improvement task."""
+    """An unevidenced governance lead is blocked; an evidenced real change escalates."""
     si = _si()
     spec = _si_spec(allowed_paths=['AGENTS.md'],
                     goal='Adjust the merge-gate rule wording in the core contract.')
     plan = si.planning.plan_tasks(lesson_records=[_si_generalized_lesson()],
                                   specs={'LSN-SYNTH-001': spec}, edition='github')
     proposal = plan.proposals[0]
-    _require(proposal['status'] == 'NEEDS_HUMAN_DECISION',
-             f'a governance path was planned as {proposal["status"]}')
-    _require(proposal['required_human_decision'] == 'HD-05',
-             f'expected HD-05, got {proposal["required_human_decision"]!r}')
-    _require(proposal['risk_level'] == 'HIGH', proposal['risk_level'])
+    _require(proposal['status'] == 'BLOCKED',
+             f'a governance lead without evidence was planned as {proposal["status"]}')
+    _require(proposal['risk_level'] == 'NEEDS_EVIDENCE', proposal['risk_level'])
+    _require(proposal['required_human_decision'] is None,
+             f'a path name alone asked for an owner decision: '
+             f'{proposal["required_human_decision"]!r}')
     _require(any('AGENTS.md' in reason for reason in proposal['risk_reasons']),
              proposal['risk_reasons'])
+    _require(proposal['required_evidence'], 'no next evidence step was recorded')
     loop = si.orchestration.run_loop(
         request_text='进行自我完善', edition='github', state=_si_state(),
         carrier=_SyntheticCarrier(),
         scan_report={'sources': [{'source_id': SI_SOURCE_ID, 'scan_status': 'OK'}],
                      'ingestions': []},
         lesson_records=[_si_generalized_lesson()], specs={'LSN-SYNTH-001': spec})
-    _require(loop.status == 'NEEDS_HUMAN_DECISION',
-             f'the high-risk proposal did not stop the loop: {loop.status}')
-    _require(loop.report['registrations'] == [], 'a high-risk proposal was registered')
-    return [f'plan: NEEDS_HUMAN_DECISION {proposal["required_human_decision"]} '
-            f'risk={proposal["risk_level"]}',
-            f'risk reasons: {proposal["risk_reasons"]}',
-            f'loop status: {loop.status}; registrations: 0']
+    _require(loop.status == 'BLOCKED',
+             f'the unevidenced governance proposal did not stop the loop: {loop.status}')
+    _require(loop.report['registrations'] == [], 'an unevidenced proposal was registered')
+    _require(loop.report.get('decisions_required') == [],
+             f'an unevidenced lead raised a false owner decision: '
+             f'{loop.report.get("decisions_required")}')
+
+    high_spec = _si_spec(
+        allowed_paths=['scripts/orchestrator.py'],
+        goal='Change the merge-gate rule so review can be skipped.',
+        change_evidence={
+            'base_sha': 'b' * 40,
+            'head_sha': HEAD_SHA,
+            'diff': ('diff --git a/scripts/orchestrator.py b/scripts/orchestrator.py\n'
+                     '--- a/scripts/orchestrator.py\n'
+                     '+++ b/scripts/orchestrator.py\n'
+                     '@@ -1 +1 @@\n'
+                     '-return deny()\n'
+                     '+return allow()\n'),
+        })
+    high_plan = si.planning.plan_tasks(
+        lesson_records=[_si_generalized_lesson()],
+        specs={'LSN-SYNTH-001': high_spec}, edition='github')
+    high_proposal = high_plan.proposals[0]
+    _require(high_proposal['status'] == 'NEEDS_HUMAN_DECISION',
+             f'an evidenced permission change was planned as {high_proposal["status"]}')
+    _require(high_proposal['required_human_decision'] == 'HD-05',
+             f'expected HD-05, got {high_proposal["required_human_decision"]!r}')
+    _require(high_proposal['risk_level'] == 'HIGH', high_proposal['risk_level'])
+    high_loop = si.orchestration.run_loop(
+        request_text='进行自我完善', edition='github', state=_si_state(),
+        carrier=_SyntheticCarrier(),
+        scan_report={'sources': [{'source_id': SI_SOURCE_ID, 'scan_status': 'OK'}],
+                     'ingestions': []},
+        lesson_records=[_si_generalized_lesson()], specs={'LSN-SYNTH-001': high_spec})
+    _require(high_loop.status == 'NEEDS_HUMAN_DECISION',
+             f'the evidenced high-risk proposal did not stop the loop: {high_loop.status}')
+    _require(high_loop.report['registrations'] == [],
+             'an evidenced high-risk proposal was registered')
+    return [f'plan: BLOCKED / NEEDS_EVIDENCE for {proposal["risk_reasons"]}',
+            f'required evidence: {proposal["required_evidence"]}',
+            f'loop status: {loop.status}; registrations: 0; decisions: 0',
+            f'evidenced change: NEEDS_HUMAN_DECISION '
+            f'{high_proposal["required_human_decision"]} risk={high_proposal["risk_level"]}',
+            f'high-risk loop status: {high_loop.status}; registrations: 0']
 
 
 def scenario_a15(ctx):

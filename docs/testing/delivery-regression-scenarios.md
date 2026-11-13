@@ -84,7 +84,7 @@
 | A11 | A | 负向 | 两个合成 PR 用同一根因 / 影响分析 | 同一指纹因第二个证据 URL 再建一条 lesson | 去重：第二次摄取报 `duplicate`，只保留一条记录且合并两个证据 URL；未泛化记录不能成为任务 | ingestion 类型、存活 lesson ID 与证据 URL、`duplicate_of`、计划状态；沙箱删除 |
 | A12 | A | 负向 | 一条已 `VERIFIED` 的经验带一个 `OPEN` `CONTRADICTS` 冲突 | 冲突被忽略，继续按不完整任务包计划 | 规划：先抛 `HD-04` `NEEDS_HUMAN_DECISION`，任务包检查不得掩盖冲突；闭环停在该状态且零登记 | proposal 状态 / 决策 ID / 原因、loop 状态、决策清单、登记数；纯内存 |
 | A13 | A | 负向 | 一条 `E1_SOURCE_ARTIFACT` + `OBSERVED` 的缺陷记录 | 未验证经验直接计划成实现任务 | 生命周期：`can_generate_task` 拒绝、规划返回 `NO_TASK`、状态机拒绝 `OBSERVED → GENERALIZED`（跳过验证） | 资格原因、proposal 状态、状态机拒绝文本；纯内存 |
-| A14 | A | 负向 | 一条已泛化经验，任务包要改 `AGENTS.md` | 治理面被当成常规改进任务 | 风险门：`HD-05` `NEEDS_HUMAN_DECISION`，`risk_level=HIGH` 且原因可定位；闭环零登记 | proposal 状态 / 决策 ID / 风险原因、loop 状态、登记数；纯内存 |
+| A14 | A | 负向 | 一条已泛化经验，任务包要改 `AGENTS.md` 但没有 Diff；另有受保护执行面的一行权限变化 + 真实 Diff | 路径名被当成 Owner 决策，或真实权限变化被自动放行 | 风险门：无证据的治理线索为 `BLOCKED` / `NEEDS_EVIDENCE`，写出 `required_evidence` 且零登记、零 Owner 决策；有证据的受保护面权限变化为 `HD-05` `NEEDS_HUMAN_DECISION`，仍零登记 | proposal 状态 / 风险级别 / required evidence / 决策 ID、loop 状态、登记数；纯内存 |
 | A15 | A | 正向 | 合成来源扫描 + 一条经验走到 `GENERALIZED` + 合成载体 | 无（控制组） | 端到端：触发路由 → 状态恢复 → 扫描分类 → 计划门 → 登记一条 `executed=False` 的任务 → 一个已执行检查记 `PASS`、一个未执行命令记 `NOT_RUN` → 输出收口报告 | trigger / state / scan / plan / registration / validation / not_run 字段与报告章节；内存载体，沙箱删除 |
 | B5 | B | 正向 | 合成 v1.5 项目（含基线清单）+ v1.6 发行 zip | 无（控制组） | 安全更新：包校验全过、字节与清单被应用、项目自有文件不动、备份验证、独立应用后回归 0 命中 | 报告 result / 版本 / 10 项检查 / 备份 / 回滚、回归结论、命令退出码；合成树与 zip 随沙箱删除 |
 | B6 | B | 负向 | 干净升级前本地改过 `AGENTS.md` | 本地与上游同时修改同一路径 | 三方分类：`STOPPED_CONFLICT`、`THREE_WAY_CONFLICT`、零写入、`HD-10` | 报告 result、`AGENTS.md` 分类项、决策 ID、项目快照；沙箱删除 |

@@ -12,9 +12,11 @@ This module answers two questions and nothing else:
     Given lesson records that already exist (``scripts/self_improvement/lessons``)
     and an explicit, caller-written task specification, produce an improvement
     proposal. A proposal is ``READY`` only when the lesson is eligible, the task
-    packet is complete, dependencies are verified and no high-risk surface is
-    touched. Everything else is ``NO_TASK`` / ``BLOCKED`` /
-    ``NEEDS_HUMAN_DECISION``; nothing is invented from source text.
+    packet is complete, dependencies are verified and risk leads are either
+    absent or resolved by a trusted diff. A lead without a diff stays
+    ``BLOCKED`` (``risk_level: NEEDS_EVIDENCE``); only an evidenced, actual
+    semantic change reaches ``NEEDS_HUMAN_DECISION``. Everything else is
+    ``NO_TASK`` / ``BLOCKED``; nothing is invented from source text.
 
 What the module does **not** do: adopt a lesson, invent a root cause or an
 acceptance criterion, create an Issue / task, run a command, or approve a
@@ -25,6 +27,7 @@ Standard library only; no network, no subprocess, no carrier.
 """
 from __future__ import annotations
 
+import posixpath
 import re
 import unicodedata
 
@@ -202,23 +205,48 @@ DECISION_OPEN_CONFLICT = 'HD-04'
 DECISION_HIGH_RISK = 'HD-05'
 DECISION_CONTRACT = 'HD-13'
 
-# Governance surfaces whose meaning is frozen elsewhere. Changing them is a
-# human decision, never a routine self-improvement task.
-HIGH_RISK_PATH_PREFIXES = (
+RISK_LOW = 'LOW'
+RISK_HIGH = 'HIGH'
+# Keywords and directory names are investigation leads, not verdicts. When a
+# lead exists but no trustworthy diff is bound to a head SHA, the honest answer
+# is "collect evidence next", not "the owner must decide" and not "low risk".
+RISK_NEEDS_EVIDENCE = 'NEEDS_EVIDENCE'
+RISK_LEVELS = (RISK_LOW, RISK_HIGH, RISK_NEEDS_EVIDENCE)
+
+# Execution / state / release surfaces. A real code or configuration change
+# here is high risk on its own; a prose-only change is still reviewed.
+PROTECTED_PATH_PREFIXES = (
+    'scripts/orchestrator.py',
+    '.orchestration/',
+    '.github/workflows/',
+    'release/',
+)
+
+# Governance surfaces whose meaning is defined elsewhere. Text changes are
+# allowed only with explicit, source-linked authorization and remain subject to
+# Master review; they are not an automatic owner decision.
+GOVERNANCE_PATH_PREFIXES = (
     'AGENTS.md',
     'docs/orchestration.md',
     'kit/orchestration.md',
     'editions/',
     'docs/contracts/',
-    'docs/design/',
-    '.orchestration/',
-    'scripts/orchestrator.py',
-    '.github/workflows/',
-    'release/',
 )
 
+# Design documents are review surfaces, not frozen runtime behaviour. A normal
+# wording fix is allowed once the diff shows it is text-only.
+DESIGN_PATH_PREFIXES = ('docs/design/',)
+
+# Kept as the union for callers that only need to know "this path is a lead".
+HIGH_RISK_PATH_PREFIXES = (PROTECTED_PATH_PREFIXES + GOVERNANCE_PATH_PREFIXES
+                           + DESIGN_PATH_PREFIXES)
+
+DOCUMENTATION_SUFFIXES = ('.md', '.rst', '.txt', '.adoc')
+AUTHORIZATION_SCOPE = 'governance-adjustment'
+
 # (keyword, decision id). Terms follow AGENTS.md §5 and the HD-* catalogue; the
-# catalogue itself is not redefined here.
+# catalogue itself is not redefined here. A hit is a lead: it asks for evidence,
+# it does not by itself request an owner decision.
 HIGH_RISK_KEYWORDS = (
     ('权限', DECISION_HIGH_RISK),
     ('安全边界', DECISION_HIGH_RISK),
@@ -238,8 +266,94 @@ HIGH_RISK_KEYWORDS = (
     ('architecture contract', DECISION_CONTRACT),
 )
 
+_SHA_RE = re.compile(r'^[0-9a-f]{40}$')
+_PERMISSION_CODE_RE = re.compile(
+    r'\b(?:allow(?:ed|s)?|deny|denied|permission(?:s)?|'
+    r'authorize(?:d|s|ation)?|privilege(?:s)?|role(?:s)?|'
+    r'sudo|chmod|chown|setuid|setgid|credential(?:s)?|secret(?:s)?|'
+    r'token(?:s)?|password(?:s)?)\b', re.I)
+_IRREVERSIBLE_CODE_RE = re.compile(
+    r'(\bDROP\s+TABLE\b|\bTRUNCATE\b|\bDELETE\s+FROM\b|\brmtree\b|'
+    r'\bunlink\b|\bgit\s+push\s+--force\b)', re.I)
+_MIGRATION_CODE_RE = re.compile(
+    r'\b(?:migrat(?:e|ion)|ALTER\s+TABLE|schema_version)\b', re.I)
+
+
+def _append_unique(values, value):
+    if value and value not in values:
+        values.append(value)
+
+
+def _normalize_repo_path(value):
+    """Normalise a project-relative path without losing its boundary.
+
+    ``AGENTS.md.backup`` must not become ``AGENTS.md``; ``docs//design/../x``
+    must still resolve to the file it names. Backslashes are accepted so a
+    Windows-style caller cannot bypass the surface table.
+    """
+    text = str(value).replace('\\', '/').strip()
+    if not text:
+        return ''
+    while text.startswith('./'):
+        text = text[2:]
+    text = re.sub(r'/+', '/', text)
+    normalized = posixpath.normpath(text)
+    return '' if normalized == '.' else normalized
+
+
+def _is_absolute_path(value):
+    text = str(value).replace('\\', '/').strip()
+    return text.startswith('/') or bool(re.match(r'^[A-Za-z]:/', text))
+
+
+def _is_escaping_path(value):
+    normalized = _normalize_repo_path(value)
+    return normalized == '..' or normalized.startswith('../')
+
+
+def _path_at_or_below(path, prefix):
+    normalized_prefix = _normalize_repo_path(prefix).rstrip('/')
+    normalized_path = _normalize_repo_path(path)
+    if not normalized_prefix or not normalized_path:
+        return False
+    return (normalized_path == normalized_prefix
+            or normalized_path.startswith(normalized_prefix + '/'))
+
+
+def _matches_any(path, prefixes):
+    return any(_path_at_or_below(path, prefix) for prefix in prefixes)
+
+
+def _path_kind(path):
+    normalized = _normalize_repo_path(path)
+    if _matches_any(normalized, PROTECTED_PATH_PREFIXES):
+        return 'protected'
+    if _matches_any(normalized, GOVERNANCE_PATH_PREFIXES):
+        return 'governance'
+    if _matches_any(normalized, DESIGN_PATH_PREFIXES):
+        return 'design'
+    return 'ordinary'
+
+
+def _is_documentation_path(path):
+    normalized = _normalize_repo_path(path).lower()
+    return any(normalized.endswith(suffix) for suffix in DOCUMENTATION_SUFFIXES)
+
+
+def _is_test_path(path):
+    normalized = _normalize_repo_path(path)
+    return (normalized.startswith('tests/') or '/tests/' in normalized
+            or posixpath.basename(normalized).startswith('test_'))
+
+
+def _is_schema_path(path):
+    normalized = _normalize_repo_path(path).lower()
+    return ('schema' in posixpath.basename(normalized)
+            or normalized.endswith('.schema.json'))
+
 
 def _lesson_risk_text(lesson):
+    lesson = lesson or {}
     observation = lesson.get('observation') or {}
     applicability = lesson.get('applicability') or {}
     suggested = lesson.get('suggested_action') or {}
@@ -253,29 +367,437 @@ def _lesson_risk_text(lesson):
     return ' '.join(parts)
 
 
+def _collect_leads(proposal, lesson):
+    leads = []
+    required = []
+    keyword_hits = []
+    for path in proposal.get('allowed_paths') or []:
+        if not isinstance(path, str) or not path.strip():
+            continue
+        normalized = _normalize_repo_path(path)
+        if _is_absolute_path(path) or _is_escaping_path(path):
+            _append_unique(
+                leads,
+                f'allowed path is not project-relative and needs verification: {normalized}')
+            _append_unique(
+                required,
+                f'provide a project-relative allowed path for {normalized}')
+            continue
+        kind = _path_kind(normalized)
+        if kind in ('protected', 'governance', 'design'):
+            _append_unique(
+                leads,
+                f'allowed path touches a {kind} surface: {normalized}')
+            _append_unique(
+                required,
+                f'provide a real diff bound to base/head SHAs for {normalized}')
+    text = (_lesson_risk_text(lesson) + ' '
+            + str(proposal.get('goal') or '')).casefold()
+    for keyword, mapped in HIGH_RISK_KEYWORDS:
+        if keyword.casefold() in text:
+            keyword_hits.append((keyword, mapped))
+            _append_unique(leads,
+                           f'lesson or goal mentions high-risk area: {keyword}')
+            _append_unique(
+                required,
+                f'provide a real diff showing whether {keyword} semantics change')
+    return leads, required, keyword_hits
+
+
+def _strip_diff_prefix(path):
+    path = path.strip()
+    if path.startswith('a/') or path.startswith('b/'):
+        return path[2:]
+    return path
+
+
+def _parse_unified_diff(diff_text):
+    """Extract paths and changed lines from a caller-supplied unified diff.
+
+    This is deliberately a parser, not a Git client: the planner cannot prove
+    the diff is complete, so the report keeps that limitation visible.
+    """
+    paths = set()
+    added = []
+    removed = []
+    changes = {}
+    errors = []
+    current_paths = set()
+    in_hunk = False
+
+    def record(path):
+        paths.add(path)
+        changes.setdefault(path, {'added': [], 'removed': []})
+
+    for raw in str(diff_text or '').splitlines():
+        line = raw.rstrip('\r')
+        if line.startswith('diff --git '):
+            current_paths = set()
+            rest = line[len('diff --git '):]
+            if rest.startswith('a/'):
+                rest = rest[2:]
+            marker = ' b/'
+            index = rest.rfind(marker)
+            if index != -1:
+                for item in (rest[:index], rest[index + len(marker):]):
+                    item = _normalize_repo_path(_strip_diff_prefix(item))
+                    if item:
+                        record(item)
+                        current_paths.add(item)
+            in_hunk = False
+        elif (line.startswith('--- ') or line.startswith('+++ ')) and not in_hunk:
+            candidate = line[4:].split('\t', 1)[0].strip()
+            if candidate and candidate != '/dev/null':
+                candidate = _normalize_repo_path(_strip_diff_prefix(candidate))
+                if candidate:
+                    record(candidate)
+                    current_paths.add(candidate)
+                else:
+                    errors.append(f'unreadable diff path: {line}')
+            in_hunk = False
+        elif line.startswith('@@'):
+            in_hunk = True
+        elif line.startswith('+') and not line.startswith('+++'):
+            if in_hunk:
+                added.append(line[1:])
+                for path in current_paths:
+                    changes[path]['added'].append(line[1:])
+        elif line.startswith('-') and not line.startswith('---'):
+            if in_hunk:
+                removed.append(line[1:])
+                for path in current_paths:
+                    changes[path]['removed'].append(line[1:])
+        elif line.startswith(('rename from ', 'rename to ',
+                              'copy from ', 'copy to ')):
+            candidate = line.split(' ', 2)[-1]
+            candidate = _normalize_repo_path(_strip_diff_prefix(candidate))
+            if candidate:
+                record(candidate)
+                current_paths.add(candidate)
+        elif line.startswith('Binary files ') and line.endswith(' differ'):
+            body = line[len('Binary files '):-len(' differ')]
+            for part in body.split(' and '):
+                candidate = _normalize_repo_path(_strip_diff_prefix(part))
+                if candidate:
+                    record(candidate)
+    return {'paths': paths, 'added': added, 'removed': removed,
+            'changes': changes, 'errors': errors}
+
+
+def _untrusted_evidence(reason):
+    return {'status': 'UNTRUSTED', 'reasons': [reason], 'changed_paths': [],
+            'added': [], 'removed': [], 'changes': {}, 'outside': []}
+
+
+def _change_evidence_state(proposal):
+    evidence = proposal.get('change_evidence')
+    if evidence is None:
+        return {'status': 'MISSING', 'reasons': ['no change_evidence supplied'],
+                'changed_paths': [], 'added': [], 'removed': [],
+                'changes': {}, 'outside': []}
+    if not isinstance(evidence, dict):
+        return _untrusted_evidence('change_evidence must be a mapping')
+    diff = evidence.get('diff')
+    if not isinstance(diff, str) or not diff.strip():
+        return _untrusted_evidence('change_evidence.diff is required')
+    base_sha = str(evidence.get('base_sha') or '').strip().lower()
+    head_sha = str(evidence.get('head_sha') or '').strip().lower()
+    if not _SHA_RE.match(base_sha):
+        return _untrusted_evidence(
+            'change_evidence.base_sha must be a 40-character hex SHA')
+    if not _SHA_RE.match(head_sha):
+        return _untrusted_evidence(
+            'change_evidence.head_sha must be a 40-character hex SHA')
+    if base_sha == head_sha:
+        return _untrusted_evidence(
+            'change_evidence base_sha and head_sha must differ')
+
+    parsed = _parse_unified_diff(diff)
+    if parsed['errors']:
+        return _untrusted_evidence('; '.join(parsed['errors']))
+    if not parsed['paths']:
+        return _untrusted_evidence('change_evidence.diff names no changed files')
+    unsafe_paths = sorted(path for path in parsed['paths']
+                          if _is_absolute_path(path) or _is_escaping_path(path))
+    if unsafe_paths:
+        return _untrusted_evidence(
+            'change_evidence.diff paths must be project-relative: '
+            + ', '.join(unsafe_paths))
+    if not parsed['added'] and not parsed['removed']:
+        return _untrusted_evidence(
+            'change_evidence.diff contains no added or removed text lines')
+
+    declared = evidence.get('changed_paths')
+    if declared is not None:
+        if not isinstance(declared, (list, tuple)) or not declared:
+            return _untrusted_evidence(
+                'change_evidence.changed_paths must be a non-empty list')
+        declared_paths = {_normalize_repo_path(item) for item in declared
+                          if isinstance(item, str) and item.strip()}
+        if declared_paths != parsed['paths']:
+            missing = sorted(parsed['paths'] - declared_paths)
+            extra = sorted(declared_paths - parsed['paths'])
+            return _untrusted_evidence(
+                'change_evidence.changed_paths does not match the diff'
+                + (f'; missing from declared paths: {", ".join(missing)}'
+                   if missing else '')
+                + (f'; declared but not in diff: {", ".join(extra)}'
+                   if extra else ''))
+
+    allowed = [_normalize_repo_path(path)
+               for path in proposal.get('allowed_paths') or []
+               if isinstance(path, str) and path.strip()]
+    if not allowed:
+        return _untrusted_evidence(
+            'allowed_paths is required to verify the diff scope')
+    outside = sorted(path for path in parsed['paths']
+                     if not any(_path_at_or_below(path, item) for item in allowed))
+    return {'status': 'PRESENT', 'reasons': [],
+            'changed_paths': sorted(parsed['paths']),
+            'added': parsed['added'], 'removed': parsed['removed'],
+            'changes': parsed['changes'], 'outside': outside}
+
+
+def _authorization_granted(proposal):
+    authorization = proposal.get('authorization')
+    if not isinstance(authorization, dict):
+        return False
+    if not isinstance(authorization.get('granted_by'), str) \
+            or not authorization['granted_by'].strip():
+        return False
+    source = authorization.get('source')
+    if not isinstance(source, str) or not re.match(r'^https?://\S+$', source.strip()):
+        return False
+    scopes = authorization.get('scope')
+    if isinstance(scopes, str):
+        scopes = [scopes]
+    if not isinstance(scopes, (list, tuple)):
+        return False
+    normalized = {str(scope).strip().casefold() for scope in scopes
+                  if isinstance(scope, str) and scope.strip()}
+    return AUTHORIZATION_SCOPE in normalized
+
+
+def _non_comment_lines(lines):
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(('#', '//', '/*', '*', '<!--', '-- ')):
+            continue
+        result.append(stripped)
+    return result
+
+
+def _comments_only(lines):
+    non_empty = [line.strip() for line in lines if line.strip()]
+    return bool(non_empty) and all(
+        line.startswith(('#', '//', '/*', '*', '<!--', '-- '))
+        for line in non_empty)
+
+
+def _evidence_findings(proposal, evidence, leads, keyword_hits):
+    high = []
+    unresolved = []
+    low = []
+    decision_id = None
+    schema_keyword = any(keyword == 'schema' for keyword, _ in keyword_hits)
+
+    for path in evidence['changed_paths']:
+        path_change = evidence['changes'].get(path) or {'added': [], 'removed': []}
+        path_lines = path_change['added'] + path_change['removed']
+        changed_text = '\n'.join(_non_comment_lines(path_lines))
+        permission_like = bool(_PERMISSION_CODE_RE.search(changed_text))
+        irreversible = bool(_IRREVERSIBLE_CODE_RE.search(changed_text))
+        migration_like = bool(_MIGRATION_CODE_RE.search(changed_text))
+        comments_only = _comments_only(path_lines)
+        kind = _path_kind(path)
+        documentation = _is_documentation_path(path)
+        if kind == 'protected':
+            if documentation or comments_only:
+                _append_unique(
+                    unresolved,
+                    f'text-only change under a protected surface needs review: {path}')
+            else:
+                _append_unique(
+                    high,
+                    f'actual code/config change under a protected surface: {path}')
+                decision_id = decision_id or DECISION_HIGH_RISK
+        elif kind == 'governance':
+            if documentation:
+                if _authorization_granted(proposal):
+                    _append_unique(
+                        low,
+                        f'governance text change is covered by explicit '
+                        f'authorization: {path}')
+                else:
+                    _append_unique(
+                        unresolved,
+                        f'governance text change needs explicit authorization: {path}')
+            elif schema_keyword or _is_schema_path(path):
+                _append_unique(
+                    high,
+                    f'contract/schema change in a governance surface: {path}')
+                decision_id = decision_id or DECISION_CONTRACT
+            else:
+                _append_unique(
+                    high,
+                    f'code/config change in a governance surface: {path}')
+                decision_id = decision_id or DECISION_HIGH_RISK
+        elif kind == 'design':
+            if documentation or comments_only:
+                _append_unique(
+                    low, f'text-only design/documentation change: {path}')
+            else:
+                _append_unique(
+                    unresolved,
+                    f'non-text change in a design surface needs semantic review: {path}')
+        elif documentation:
+            _append_unique(low, f'text-only documentation change: {path}')
+        elif comments_only:
+            _append_unique(low, f'comment-only change: {path}')
+        elif irreversible:
+            _append_unique(
+                high, f'irreversible operation in the diff for {path}')
+            decision_id = decision_id or DECISION_HIGH_RISK
+        elif schema_keyword or _is_schema_path(path):
+            _append_unique(high, f'contract/schema change: {path}')
+            decision_id = decision_id or DECISION_CONTRACT
+        elif permission_like:
+            if _is_test_path(path):
+                _append_unique(
+                    unresolved,
+                    f'security-looking test change needs review: {path}')
+            elif leads:
+                _append_unique(
+                    high,
+                    f'permission/security-looking code change: {path}')
+                decision_id = decision_id or DECISION_HIGH_RISK
+            else:
+                _append_unique(
+                    unresolved,
+                    f'security-looking code change needs review: {path}')
+        elif migration_like and leads:
+            _append_unique(
+                unresolved,
+                f'migration-looking code change needs semantic review: {path}')
+        elif leads:
+            _append_unique(
+                unresolved,
+                f'actual code/config change cannot be proven unrelated to a '
+                f'flagged risk: {path}')
+        else:
+            _append_unique(low, f'ordinary code change with no risk lead: {path}')
+
+    for path in evidence['outside']:
+        if _path_kind(path) == 'protected' and not _is_documentation_path(path):
+            _append_unique(high, f'diff changes a path outside allowed_paths: {path}')
+            decision_id = decision_id or DECISION_HIGH_RISK
+        else:
+            _append_unique(
+                unresolved,
+                f'diff changes a path outside allowed_paths: {path}')
+    return high, unresolved, low, decision_id
+
+
+def assess_risk_details(proposal, lesson):
+    """Return a structured risk assessment for one proposal.
+
+    The only inputs that can produce ``HIGH`` are findings in a real diff (or
+    actual changed paths) - never a keyword or directory name by itself. A lead
+    without a usable diff yields ``NEEDS_EVIDENCE``: a machine/agent can collect
+    the evidence and re-plan, so it is neither ``READY`` nor a false owner
+    question.
+
+    ``limitations`` stays visible because the diff is caller-supplied: the
+    planner can reject an inconsistent or out-of-scope diff, but it cannot prove
+    the caller listed every working-tree change.
+    """
+    proposal = proposal or {}
+    leads, required, keyword_hits = _collect_leads(proposal, lesson)
+    evidence = _change_evidence_state(proposal)
+    limitations = ([
+        'change_evidence is caller-supplied; declared paths are checked against '
+        'allowed_paths, but completeness against the working tree is not proven '
+        'by this planner'
+    ] if evidence['status'] == 'PRESENT' else [])
+    if _authorization_granted(proposal):
+        limitations.append(
+            'authorization is caller-supplied; its shape and source URL are checked, '
+            'but the decision record is not fetched or independently verified here')
+
+    if evidence['status'] == 'UNTRUSTED':
+        reasons = leads + evidence['reasons']
+        for reason in evidence['reasons']:
+            _append_unique(required, f'fix change_evidence: {reason}')
+        return {'level': RISK_NEEDS_EVIDENCE, 'decision_id': None,
+                'reasons': reasons, 'leads': leads,
+                'required_evidence': required, 'limitations': limitations,
+                'evidence_status': evidence['status'],
+                'changed_paths': []}
+
+    if evidence['status'] == 'MISSING':
+        if not leads:
+            return {'level': RISK_LOW, 'decision_id': None, 'reasons': [],
+                    'leads': [], 'required_evidence': [], 'limitations': [],
+                    'evidence_status': 'MISSING', 'changed_paths': []}
+        reasons = leads + ['no trustworthy change evidence was supplied']
+        _append_unique(
+            required,
+            'supply change_evidence with base_sha, head_sha and the actual diff')
+        return {'level': RISK_NEEDS_EVIDENCE, 'decision_id': None,
+                'reasons': reasons, 'leads': leads,
+                'required_evidence': required, 'limitations': limitations,
+                'evidence_status': evidence['status'], 'changed_paths': []}
+
+    high, unresolved, low, decision_id = _evidence_findings(
+        proposal, evidence, leads, keyword_hits)
+    if high:
+        reasons = leads + high
+        return {'level': RISK_HIGH,
+                'decision_id': decision_id or DECISION_HIGH_RISK,
+                'reasons': reasons, 'leads': leads,
+                'required_evidence': required, 'limitations': limitations,
+                'evidence_status': evidence['status'],
+                'changed_paths': evidence['changed_paths']}
+    if unresolved:
+        reasons = leads + unresolved
+        for path in evidence['outside']:
+            _append_unique(
+                required,
+                f'diff changes a path outside allowed paths: {path}; amend '
+                f'allowed_paths through a scope decision or remove that change')
+        for reason in unresolved:
+            if 'explicit authorization' in reason:
+                _append_unique(
+                    required,
+                    'provide authorization with granted_by, scope '
+                    f'"{AUTHORIZATION_SCOPE}" and a source URL')
+            elif 'needs review' in reason:
+                _append_unique(
+                    required,
+                    'record why the actual change does not alter permissions, '
+                    'security, locks, the state machine, data, or compatibility')
+        return {'level': RISK_NEEDS_EVIDENCE, 'decision_id': None,
+                'reasons': reasons, 'leads': leads,
+                'required_evidence': required, 'limitations': limitations,
+                'evidence_status': evidence['status'],
+                'changed_paths': evidence['changed_paths']}
+    return {'level': RISK_LOW, 'decision_id': None, 'reasons': low,
+            'leads': leads, 'required_evidence': [], 'limitations': limitations,
+            'evidence_status': evidence['status'],
+            'changed_paths': evidence['changed_paths']}
+
+
 def assess_risk(proposal, lesson):
     """Return ``(level, decision_id, reasons)`` for one proposal.
 
-    Two independent inputs: governance paths in ``allowed_paths`` and risky
-    wording in the lesson / goal. The mapping to ``HD-*`` is a reference to the
-    catalogue, not a second definition.
+    Backwards-compatible tuple view of :func:`assess_risk_details`. ``level`` is
+    ``LOW``, ``HIGH`` or ``NEEDS_EVIDENCE``; only ``HIGH`` carries an ``HD-*``.
     """
-    reasons = []
-    decision_id = None
-    for path in proposal.get('allowed_paths') or []:
-        normalized = str(path).replace('\\', '/').strip()
-        for prefix in HIGH_RISK_PATH_PREFIXES:
-            if normalized == prefix or normalized.startswith(prefix):
-                reasons.append(f'allowed path touches a frozen governance surface: {prefix}')
-                decision_id = decision_id or DECISION_HIGH_RISK
-    text = (_lesson_risk_text(lesson) + ' ' + str(proposal.get('goal') or '')).casefold()
-    for keyword, mapped in HIGH_RISK_KEYWORDS:
-        if keyword.casefold() in text:
-            reasons.append(f'lesson or goal mentions high-risk area: {keyword}')
-            decision_id = decision_id or mapped
-    if reasons:
-        return 'HIGH', decision_id or DECISION_HIGH_RISK, reasons
-    return 'LOW', None, []
+    details = assess_risk_details(proposal, lesson)
+    return details['level'], details['decision_id'], details['reasons']
 
 
 # --------------------------------------------------------------------------- #
@@ -457,6 +979,11 @@ def _proposal_from_spec(lesson, spec, edition):
     for field in SCENARIO_FIELDS:
         value = spec.get(field)
         proposal[field] = _as_list(value) if isinstance(value, (list, tuple)) else value
+    # Optional evidence fields are copied only when the caller supplied them, so
+    # an old-format proposal keeps exactly its old shape.
+    for field in ('change_evidence', 'authorization'):
+        if field in spec:
+            proposal[field] = spec.get(field)
     proposal['validation_commands'] = _as_list(spec.get('validation_commands'))
     return proposal
 
@@ -465,8 +992,10 @@ def build_proposal(lesson, spec, *, edition, dependency_state=None, coverage=Non
                    existing_task=None):
     """Turn one lesson + one explicit spec into a gated proposal.
 
-    Status order is deliberate: a conflict or a high-risk surface is escalated
-    before any structural check, so a broken packet never hides a human decision.
+    Status order is deliberate: a conflict or an evidenced high-risk change is
+    escalated before any structural check, so a broken packet never hides a
+    human decision. A lead that still needs evidence blocks with a concrete
+    next step instead of becoming a false owner question.
     """
     if edition not in ('local', 'github'):
         raise ValueError(f'unknown edition {edition!r}')
@@ -504,15 +1033,26 @@ def build_proposal(lesson, spec, *, edition, dependency_state=None, coverage=Non
     if packet_errors:
         proposal['packet_errors'] = packet_errors
 
-    # Risk is assessed before any structural blocker so a high-risk surface is
-    # never hidden behind "the packet is incomplete".
-    level, decision_id, reasons = assess_risk(proposal, lesson)
+    # Risk is assessed before any structural blocker so a real high-risk change
+    # is never hidden behind "the packet is incomplete". A lead without evidence
+    # is a BLOCKED proposal with a concrete next step, not an owner question.
+    risk = assess_risk_details(proposal, lesson)
+    level = risk['level']
     proposal['risk_level'] = level
-    proposal['risk_reasons'] = reasons
-    if level == 'HIGH':
+    proposal['risk_reasons'] = risk['reasons']
+    proposal['risk_leads'] = risk['leads']
+    proposal['required_evidence'] = risk['required_evidence']
+    proposal['risk_limitations'] = risk['limitations']
+    proposal['change_evidence_status'] = risk['evidence_status']
+    if level == RISK_HIGH:
         proposal['status'] = 'NEEDS_HUMAN_DECISION'
-        proposal['status_reason'] = 'high-risk surface: ' + '; '.join(reasons)
-        proposal['required_human_decision'] = decision_id
+        proposal['status_reason'] = 'high-risk change: ' + '; '.join(risk['reasons'])
+        proposal['required_human_decision'] = risk['decision_id']
+        return proposal
+    if level == RISK_NEEDS_EVIDENCE:
+        proposal['status'] = 'BLOCKED'
+        proposal['status_reason'] = 'risk evidence is insufficient: ' + '; '.join(
+            risk['reasons'])
         return proposal
 
     if missing:

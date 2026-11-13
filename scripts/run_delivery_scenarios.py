@@ -454,13 +454,16 @@ SCENARIOS = (
              'state machine refuses OBSERVED -> GENERALIZED as skipped verification',
              'eligibility reason, proposal status, state-machine refusal text',
              'in-memory records only; sandbox removed', scenario_a13),
-    Scenario('A14', 'A', 'negative', 'high-risk surface left unresolved',
-             'a generalized lesson whose spec would edit AGENTS.md',
-             'a governance surface is treated as a routine improvement task',
-             'risk gate: HD-05 NEEDS_HUMAN_DECISION, risk_level HIGH with a locatable reason; '
-             'the loop registers nothing',
-             'proposal status / decision id / risk reasons, loop status, registrations',
-             'in-memory records only; sandbox removed', scenario_a14),
+    Scenario('A14', 'A', 'negative', 'risk lead without evidence / evidenced permission change',
+             'a generalized lesson whose spec would edit AGENTS.md without a diff, plus a '
+             'protected-surface permission change with a real diff',
+             'a path name is treated as an owner decision, or a real permission change is '
+             'auto-released',
+             'risk gate: the unevidenced governance lead is BLOCKED / NEEDS_EVIDENCE with a '
+             'concrete evidence step and zero registrations; the evidenced protected-surface '
+             'change is HD-05 NEEDS_HUMAN_DECISION and is not registered',
+             'proposal status / risk level / required evidence / decision id, loop status, '
+             'registrations', 'in-memory records only; sandbox removed', scenario_a14),
     Scenario('A15', 'A', 'positive', 'self-improvement loop end to end',
              'a synthetic source scan, one lesson driven to GENERALIZED and a synthetic carrier',
              'none (positive control)',

@@ -9,8 +9,12 @@ from . import support
 from agentorch_self_improvement import lessons, orchestration
 
 HEAD = 'd' * 40
+BASE_SHA = 'a' * 40
+CHANGE_HEAD_SHA = 'b' * 40
 NOW = support.T2
 PR_URL = 'https://github.com/ctrlshiftaltdel/TalkDND/pull/12'
+AUTHORIZATION_URL = ('https://github.com/ctrlshiftaltdel/AgentOrch/issues/230'
+                     '#issuecomment-0000000000')
 
 
 def general_lesson(**overrides):
@@ -57,6 +61,41 @@ def spec(**overrides):
         ],
         'risks': 'none identified for the low-risk path.',
         'declared_resources': [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def change_evidence(path='docs/example.md', old='旧说明', new='新说明', *,
+                    new_path=None, diff=None, **overrides):
+    """A synthetic, commit-bound unified diff for risk routing tests.
+
+    The content is invented; the shape mirrors ``git diff --no-ext-diff`` so the
+    planner can parse changed paths and added / removed lines without a repo.
+    """
+    target = new_path or path
+    if diff is None:
+        diff = (f'diff --git a/{path} b/{target}\n'
+                f'--- a/{path}\n'
+                f'+++ b/{target}\n'
+                '@@ -1 +1 @@\n'
+                f'-{old}\n'
+                f'+{new}\n')
+    payload = {
+        'base_sha': BASE_SHA,
+        'head_sha': CHANGE_HEAD_SHA,
+        'diff': diff,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def authorization(*, granted_by='project-owner', scope='governance-adjustment',
+                  source=AUTHORIZATION_URL, **overrides):
+    payload = {
+        'granted_by': granted_by,
+        'scope': scope,
+        'source': source,
     }
     payload.update(overrides)
     return payload

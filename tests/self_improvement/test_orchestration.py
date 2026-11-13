@@ -103,7 +103,11 @@ class NoNewEvidenceTests(unittest.TestCase):
 class GateTests(unittest.TestCase):
     def test_high_risk_candidate_needs_a_human_and_is_not_registered(self):
         record = loop_support.general_lesson()
-        spec = loop_support.spec(allowed_paths=['docs/orchestration.md'])
+        spec = loop_support.spec(
+            allowed_paths=['scripts/orchestrator.py'],
+            change_evidence=loop_support.change_evidence(
+                'scripts/orchestrator.py',
+                old='return deny()', new='return allow()'))
         carrier = loop_support.RecordingCarrier()
         outcome = run_loop(
             carrier=carrier, lesson_records=[record],
@@ -185,7 +189,11 @@ class CarrierParityTests(unittest.TestCase):
         for edition in ('local', 'github'):
             with self.subTest(edition=edition):
                 record = loop_support.general_lesson()
-                spec = loop_support.spec(allowed_paths=['editions/'])
+                spec = loop_support.spec(
+                    allowed_paths=['scripts/orchestrator.py'],
+                    change_evidence=loop_support.change_evidence(
+                        'scripts/orchestrator.py',
+                        old='return deny()', new='return allow()'))
                 carrier = orchestration.carrier_for(edition)
                 outcome = run_loop(
                     edition=edition, carrier=carrier,
