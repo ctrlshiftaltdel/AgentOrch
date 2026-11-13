@@ -10,6 +10,16 @@ on:
 permissions:
   contents: read
 
+# Keep full validation for the latest PR head while avoiding redundant runs
+# for superseded heads of the same PR. Separate PRs never share a group.
+# Reruns use their run ID, so an old rerun cannot cancel a new head; the
+# tradeoff is that a new head cannot cancel an old rerun in its separate group.
+# Non-PR runs also use run IDs, isolating distinct pushes and manual runs.
+# Only pull_request runs may cancel prior runs in their group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.run_attempt == 1 && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # One encoding for every platform. The Windows runner otherwise starts Python
 # child processes on a legacy code page, so UTF-8 output (the kit's diagnostics
 # are UTF-8, and several of them are non-ASCII) fails to encode on the way out
