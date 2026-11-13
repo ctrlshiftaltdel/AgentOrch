@@ -1,6 +1,6 @@
 # Startup Prompt — Execution Agent (local)
 
-你是 `local` 底座的 Execution Agent。开始前阅读 `AGENTS.md`、`docs/orchestration.md`、`docs/PROJECT.md`、`editions/local/master.md` 和提供的单个任务包。
+你是 `local` 底座的 Execution Agent。开始前阅读 `AGENTS.md`、`kit/orchestration.md`、`docs/PROJECT.md`、`editions/local/master.md` 和提供的单个任务包。
 
 - 确认任务在本地任务库中已 `DISPATCHED`，且锁定路径与你的任务包一致；若无法确认，不要修改文件，报告阻塞。
 - 确认依赖任务均为 `VERIFIED`。在专属 Worktree / 分支中执行；一个任务不得共享可写 Worktree。
@@ -35,6 +35,8 @@ python scripts/orchestrator.py task status <ID> IN_PROGRESS --note "开始执行
 python scripts/orchestrator.py task workspace <ID> --branch task/<ID>-<name> --worktree .worktrees/<ID>
 python scripts/orchestrator.py task status <ID> REVIEW_READY --head-sha <sha> --note "实现已交回"
 ```
+
+隔离布局（套件位于 `<host>/agentorch/`）下，任务库在 `agentorch/.local/orchestration/`；从宿主根运行以上命令时改用 `python agentorch/scripts/orchestrator.py --layout isolated <command>`。不带 `--layout isolated` 的裸调用会被拒绝；平铺布局保持原命令。
 
 交付报告：
 

@@ -68,10 +68,22 @@ class DependencyTests(unittest.TestCase):
                              if module not in allowed})
         self.assertEqual(violations, [])
 
+    def test_engine_modules_do_not_import_the_task_state_machine(self):
+        for path in ENGINE_MODULES:
+            self.assertFalse(imports_scheduler(path), path.name)
+
     def test_engine_modules_do_not_reference_the_task_state_machine(self):
+        # #153: the host managed block must document the supported isolated
+        # command, so that one exact line is the only allowed mention. A second
+        # path spelling, a direct call or any other coupling still fails.
+        allowed = 'agentorch/scripts/orchestrator.py --layout isolated'
         for path in ENGINE_MODULES:
             text = path.read_text(encoding='utf-8')
-            self.assertNotIn('orchestrator.py', text, path.name)
+            for number, line in enumerate(text.splitlines(), 1):
+                if 'orchestrator.py' not in line:
+                    continue
+                self.assertIn(allowed, line,
+                              f'{path.name}:{number}: unexpected scheduler reference')
 
     def test_entry_does_not_import_the_task_state_machine(self):
         # The entry prints task-registration commands for the local carrier, but

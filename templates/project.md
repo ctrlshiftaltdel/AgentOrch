@@ -33,12 +33,12 @@
 
 ## 运行配置
 
-本文件的 `edition` 键是底座选择的**唯一权威来源**。`.orchestration/config.json` 只描述本地 CLI 运行参数（`retry_cap`、`local_dir`），不决定底座，也不存在“缺省底座”；`python scripts/orchestrator.py config show` 可查看每个键的生效值与来源。`edition` 缺失、为空、重复声明、非法字符串或文件不可读时拒绝调度，并报出实际值与修复位置。
+本文件的 `edition` 键是底座选择的**唯一权威来源**。`.orchestration/config.json` 只描述本地 CLI 运行参数（`retry_cap`、`local_dir`），不决定底座，也不存在“缺省底座”；`python scripts/orchestrator.py config show` 可查看每个键的生效值与来源。`edition` 缺失、为空、重复声明、非法字符串或文件不可读时拒绝调度，并报出实际值与修复位置。隔离布局（套件位于 `<host>/agentorch/`）下，本机状态、配置与备份在 `agentorch/.local/orchestration/`，CLI 需显式带上 `--layout isolated`；平铺布局保持上面的路径与命令。
 
 - `edition`：`local`
 - 取值说明：只能写 `local` 或 `github`，值要单独成行、不要追加其它文字；模板示例为 `local`，按项目实际选择修改。
 - 并发策略：**按机器余量动态决定，不设固定上限**。派发前观察 CPU / 内存 / 磁盘 / 测试资源争用，有余量即可并行；同一 worktree 同一时刻只允许一个测试进程。把「本机实测可承载并发」作为参考记录，而不是规则常量。
-- 本地私有目录：`.local/`（`.env`、机器信息、发布扫描规则），永不入库、永不打包。
+- 本地私有目录：`.local/`（隔离布局下为 `agentorch/.local/`；`.env`、机器信息、发布扫描规则），永不入库、永不打包。
 
 ## 本地工作流
 

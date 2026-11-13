@@ -1,0 +1,5 @@
+[project]
+name = "synthetic-host"
+
+[tool.synthetic]
+layout = "flat"

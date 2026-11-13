@@ -13,6 +13,8 @@ import contextlib
 import hashlib
 import io
 import json
+import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -20,6 +22,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 # Import the module the way a reviewer does: `from scripts.orchestrator import
@@ -33,6 +36,21 @@ from scripts import orchestrator  # noqa: E402
 NEVER = '0' * 40
 
 
+def pin_text_handling(git_command):
+    """Make the fixture's committed bytes the bytes the tool will compare.
+
+    ``scripts/check_scope.py`` runs every Git command with system and global
+    configuration blanked, so it compares the working tree with the index
+    byte-for-byte and sees ``core.autocrlf`` as false. GitHub's Windows runners
+    set ``core.autocrlf=true`` globally, so a fixture that committed through the
+    ambient configuration would store LF while the working tree holds CRLF --
+    every committed text file would then be reported as a worktree change. The
+    repository-local value keeps the fixture and the tool on the same comparison
+    without teaching any assertion to ignore a real out-of-scope path.
+    """
+    git_command('config', 'core.autocrlf', 'false')
+
+
 class GitFixture:
     """A minimal repository with a real task database built by orchestrator.init."""
 
@@ -42,6 +60,7 @@ class GitFixture:
         self.git('config', 'user.name', 'Scope Test')
         self.git('config', 'user.email', 'scope@example.invalid')
         self.git('config', 'commit.gpgsign', 'false')
+        pin_text_handling(self.git)
         self.write('.gitignore', '.orchestration/\n')
         self.write('docs/PROJECT.md', '# Project\n\n- `edition`: `local`\n')
         self.base = self.commit('base')
@@ -319,6 +338,98 @@ class CheckScopeTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('task database', err)
 
+    def test_sqlite_error_text_is_never_forwarded(self):
+        # A view named ``tasks`` that selects from a missing table makes SQLite
+        # report the table name in its error. That text is schema content and
+        # must not reach the report.
+        self.fx.init_db()
+        marker = 'secret_schema_marker'
+        con = sqlite3.connect(self.fx.db_path)
+        try:
+            con.execute('DROP TABLE tasks')
+            con.execute(
+                "CREATE VIEW tasks AS SELECT 'T-1' AS id, 'DISPATCHED' AS status, "
+                "'t' AS title, '[\"src/\"]' AS paths_json, '' AS approved_sha, "
+                f"'' AS head_sha FROM {marker}")
+            con.commit()
+        finally:
+            con.close()
+        code, out, err = self.run_tool('--task', 'T-1', '--base', self.fx.base,
+                                       '--json')
+        self.assertEqual(code, 1)
+        self.assertNotIn(marker, out)
+        self.assertNotIn(marker, err)
+        self.assertEqual(json.loads(out)['status'], 'error')
+
+    def test_unreadable_allowed_paths_reports_a_fixed_diagnostic(self):
+        # Neither the task id nor the JSON parser text may appear in the error:
+        # both come from database content.
+        self.fx.init_db()
+        marker = 'T-SECRET-PATHS-MARKER'
+        self.fx.add_task(marker, ['src/'], head_sha=self.fx.base)
+        con = sqlite3.connect(self.fx.db_path)
+        try:
+            con.execute('UPDATE tasks SET paths_json=? WHERE id=?',
+                        ('not-json', marker))
+            con.commit()
+        finally:
+            con.close()
+        code, out, err = self.run_tool('--task', marker, '--base', self.fx.base,
+                                       '--json')
+        self.assertEqual(code, 1)
+        self.assertNotIn(marker, out)
+        self.assertNotIn(marker, err)
+        self.assertEqual(json.loads(out)['status'], 'error')
+
+    def test_mixed_database_and_wal_snapshot_is_refused(self):
+        # A controlled replacement can leave the database from one commit state
+        # next to a write-ahead log from another. Each file verifies on its own,
+        # but the pair is not one snapshot: the database alone says ``docs/``
+        # (out of scope) while the WAL frames rewrite the same row to ``src/``
+        # (in scope). A read-only check cannot prove the two belong together, so
+        # it must answer error/1 and leave both source files untouched.
+        # The stores live outside the fixture repository, so their files are
+        # not themselves untracked changes in the report.
+        stores = Path(tempfile.mkdtemp(prefix='scope-mixed-'))
+        self.addCleanup(shutil.rmtree, stores, True)
+        base = stores / 'base.sqlite3'
+        create_task_db(base, [('T-1', 'DISPATCHED', ['docs/'], self.fx.base)])
+        wal_store = stores / 'wal.sqlite3'
+        checkpointed = stores / 'checkpointed.sqlite3'
+        shutil.copyfile(base, wal_store)
+        shutil.copyfile(base, checkpointed)
+
+        con = sqlite3.connect(wal_store)
+        try:
+            con.execute('PRAGMA journal_mode=WAL')
+            con.execute('PRAGMA wal_autocheckpoint=0')
+            con.execute('UPDATE tasks SET paths_json=? WHERE id=?',
+                        (json.dumps(['src/']), 'T-1'))
+            con.commit()
+            wal_path = wal_store.with_name(wal_store.name + '-wal')
+            self.assertTrue(wal_path.is_file(), 'the fixture must keep a live WAL')
+            wal_bytes = wal_path.read_bytes()
+        finally:
+            con.close()
+
+        self.fx.db_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(checkpointed, self.fx.db_path)
+        source_wal = self.fx.db_path.with_name(self.fx.db_path.name + '-wal')
+        source_wal.write_bytes(wal_bytes)
+        self.fx.write('src/app.py', 'x\n')
+
+        db_before = self.fx.db_path.read_bytes()
+        code, report, _ = self.run_json('--task', 'T-1', '--base', self.fx.base)
+        self.assertEqual(code, 1, report)
+        self.assertEqual(report['status'], 'error')
+        self.assertIn('write-ahead log', report['error'])
+        self.assertEqual(report['in_scope'], [])
+        self.assertEqual(report['exit_code'], 1)
+        self.assertEqual(self.fx.db_path.read_bytes(), db_before)
+        self.assertEqual(source_wal.read_bytes(), wal_bytes)
+        self.assertFalse(
+            self.fx.db_path.with_name(self.fx.db_path.name + '-shm').exists())
+
     def test_root_outside_a_git_work_tree_returns_one(self):
         outside = Path(self.tmp.name) / 'plain'
         outside.mkdir()
@@ -373,6 +484,804 @@ class CheckScopeTest(unittest.TestCase):
         self.assertEqual(report['task']['id'], 'TASK-0001')
         self.assertEqual(report['task']['status'], 'DISPATCHED')
         self.assertEqual(report['task']['allowed_paths'], ['src'])
+
+    # --- AC-6 (isolated layout): default cwd and environment hardening --------
+    def test_flat_default_cwd_still_reads_the_current_directory(self):
+        self.fx.init_db()
+        self.fx.add_task('T-1', ['src/'], head_sha=self.fx.base)
+        self.fx.write('src/app.py', 'x\n')
+        previous = os.getcwd()
+        os.chdir(self.fx.root)
+        try:
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = check.main(['--task', 'T-1', '--json'])
+        finally:
+            os.chdir(previous)
+        self.assertEqual(code, 0, err.getvalue())
+        report = json.loads(out.getvalue())
+        self.assertEqual(report['root'], str(self.fx.root))
+        self.assertEqual(report['layout'], 'flat')
+
+    def test_flat_explicit_root_still_must_be_the_work_tree_top_level(self):
+        self.fx.init_db()
+        self.fx.add_task('T-1', ['src/'], head_sha=self.fx.base)
+        subdir = self.fx.root / 'src'
+        subdir.mkdir(exist_ok=True)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = check.main(['--root', str(subdir), '--task', 'T-1',
+                               '--base', self.fx.base])
+        self.assertEqual(code, 1)
+        self.assertIn('top level', err.getvalue())
+
+    def test_git_environment_redirection_is_ignored(self):
+        self.fx.init_db()
+        self.fx.add_task('T-1', ['src/'], head_sha=self.fx.base)
+        self.fx.write('src/app.py', 'x\n')
+
+        with tempfile.TemporaryDirectory() as other:
+            decoy = GitFixture(other)
+            decoy.write('decoy-only.txt', 'x\n')
+            saved = {name: os.environ.get(name) for name in ('GIT_DIR', 'GIT_WORK_TREE')}
+            os.environ['GIT_DIR'] = str(decoy.root / '.git')
+            os.environ['GIT_WORK_TREE'] = str(decoy.root)
+            try:
+                code, report, err = self.run_json('--task', 'T-1')
+            finally:
+                for name, value in saved.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+        self.assertEqual(code, 0, (report, err))
+        self.assertEqual(report['root'], str(self.fx.root))
+        self.assertIn('src/app.py', report['in_scope'])
+        self.assertNotIn('decoy-only.txt', [item['path'] for item in report['changes']])
+
+    def test_repository_configured_external_program_is_not_run(self):
+        self.fx.init_db()
+        self.fx.add_task('T-1', ['src/'], head_sha=self.fx.base)
+        self.fx.write('src/app.py', 'x\n')
+
+        with tempfile.TemporaryDirectory() as tools:
+            marker = Path(tools) / 'fsmonitor-ran'
+            script = Path(tools) / 'fsmonitor.sh'
+            script.write_text(f'#!/bin/sh\necho ran >> "{marker}"\nexit 0\n',
+                              encoding='utf-8')
+            os.chmod(script, 0o755)
+            self.fx.git('config', 'core.fsmonitor', str(script))
+
+            code, out, err = self.run_tool('--task', 'T-1')
+            self.assertEqual(code, 0, err)
+            self.assertFalse(
+                marker.exists(),
+                'check_scope must not let repository config run an external program')
+
+    def test_git_stderr_and_file_contents_are_never_forwarded(self):
+        self.fx.init_db()
+        self.fx.add_task('T-1', ['src/'], head_sha=self.fx.base)
+        secret = 'SECRET-FILE-CONTENT-MUST-NOT-LEAK'
+        # A failing Git child whose stderr carries material that must never reach
+        # the report. The child result is injected at the module seam: shadowing
+        # ``git`` through ``PATH`` needs an executable named ``git`` on POSIX and
+        # a real ``git.exe`` on Windows, which a standard-library test cannot
+        # build, so the same stimulus is supplied as the captured child result.
+        failing = subprocess.CompletedProcess(['git'], 128, stdout=b'',
+                                              stderr=secret.encode())
+        with mock.patch.object(check.subprocess, 'run', return_value=failing):
+            code, out, err = self.run_tool('--task', 'T-1', '--json')
+        self.assertEqual(code, 1)
+        self.assertNotIn(secret, out)
+        self.assertNotIn(secret, err)
+        payload = json.loads(out)
+        self.assertEqual(payload['status'], 'error')
+
+
+# --- isolated layout ---------------------------------------------------------
+
+AGENTORCH = 'agentorch'
+ISOLATED_SCRIPTS = ('check_scope.py', 'orchestrator.py')
+ISOLATED_DB = Path(AGENTORCH) / '.local' / 'orchestration' / 'state.sqlite3'
+
+
+def _git(root, *args, check_ok=True):
+    return subprocess.run(['git', '-C', str(root), *args],
+                          capture_output=True, text=True, check=check_ok)
+
+
+def _write(root, rel, text):
+    path = Path(root) / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding='utf-8')
+    return path
+
+
+def _commit(root, message):
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-q', '-m', message)
+    return _git(root, 'rev-parse', 'HEAD').stdout.strip()
+
+
+def build_host_repo(root):
+    """A host project with its own files, ignore rules and base commit."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    _git(root, 'init', '-q')
+    _git(root, 'config', 'user.name', 'Scope Test')
+    _git(root, 'config', 'user.email', 'scope@example.invalid')
+    _git(root, 'config', 'commit.gpgsign', 'false')
+    pin_text_handling(lambda *args: _git(root, *args))
+    _write(root, '.gitignore', '.orchestration/\n')
+    _write(root, 'AGENTS.md', '# Host rules\n')
+    _write(root, 'src/app.py', 'v1\n')
+    return _commit(root, 'host base')
+
+
+def build_isolated_host(tmp, linked=False):
+    """Host H plus ``H/agentorch`` K, optionally as a Git linked worktree."""
+    tmp = Path(tmp)
+    if linked:
+        main = tmp / 'main'
+        build_host_repo(main)
+        host = tmp / 'host'
+        _git(main, 'worktree', 'add', '-q', '-b', 'task/wt', str(host))
+    else:
+        main = None
+        host = tmp / 'host'
+        build_host_repo(host)
+    kit = host / AGENTORCH
+    (kit / 'scripts').mkdir(parents=True)
+    for name in ISOLATED_SCRIPTS:
+        shutil.copyfile(ROOT / 'scripts' / name, kit / 'scripts' / name)
+    _write(kit, 'VERSION.md', '# Agent-Orchestration Starter Kit\n\n- Format version: 1.7\n')
+    _write(kit, 'MANIFEST.json', '{"schema_version": 1}\n')
+    _write(kit, '.gitignore', '.local/\n__pycache__/\n')
+    scaffold = _commit(host, 'install agentorch')
+    return main, host, kit, scaffold
+
+
+def create_task_db(path, tasks):
+    """A minimal task table; check_scope reads exactly these columns."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path)
+    try:
+        con.execute(
+            'CREATE TABLE tasks(id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT \'\', '
+            'paths_json TEXT NOT NULL, status TEXT NOT NULL, '
+            'approved_sha TEXT NOT NULL DEFAULT \'\', '
+            'head_sha TEXT NOT NULL DEFAULT \'\')')
+        for task_id, status, paths, head_sha in tasks:
+            con.execute(
+                'INSERT INTO tasks(id,title,paths_json,status,approved_sha,head_sha) '
+                'VALUES(?,?,?,?,?,?)',
+                (task_id, task_id, json.dumps(paths), status, '', head_sha))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _insert_task(con, task_id, paths, status, head_sha):
+    con.execute(
+        'INSERT INTO tasks(id,title,description,paths_json,depends_json,'
+        'acceptance_json,status,head_sha,approved_sha,created_at,updated_at) '
+        'VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+        (task_id, task_id, '', json.dumps(paths), '[]', '["works"]', status,
+         head_sha, '', '2026-10-27T00:00:00+00:00', '2026-10-27T00:00:00+00:00'))
+
+
+def init_isolated_store(kit, tasks):
+    """Build the real task schema under ``<kit>/.local/orchestration``."""
+    state = Path(kit) / '.local' / 'orchestration'
+    with contextlib.redirect_stdout(io.StringIO()):
+        orchestrator.init(Path(kit), state)
+    con = sqlite3.connect(state / 'state.sqlite3')
+    try:
+        for task_id, status, paths, head_sha in tasks:
+            _insert_task(con, task_id, paths, status, head_sha)
+        con.commit()
+    finally:
+        con.close()
+    return state / 'state.sqlite3'
+
+
+def add_host_decoy(host, base, task_id='T-HOST', paths=('docs/',)):
+    """A permissive flat registry next to the host, which must never be read."""
+    create_task_db(Path(host) / '.orchestration' / 'state.sqlite3',
+                   [(task_id, 'DISPATCHED', list(paths), base)])
+
+
+def run_isolated(kit, args, cwd):
+    """Run the shipped script by path, so ``__file__`` decides the layout."""
+    env = os.environ.copy()
+    for name in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'PYTHONPATH'):
+        env.pop(name, None)
+    env['PYTHONDONTWRITEBYTECODE'] = '1'
+    return subprocess.run(
+        [sys.executable, '-B', str(Path(kit) / 'scripts' / 'check_scope.py'), *args],
+        cwd=str(cwd), capture_output=True, text=True, env=env)
+
+
+def _outside(tmp):
+    path = Path(tmp) / 'outside'
+    path.mkdir(exist_ok=True)
+    return path
+
+
+def _dir_listing(path):
+    return sorted(item.name for item in Path(path).iterdir())
+
+
+def _file_digests(path):
+    return {item.name: hashlib.sha256(item.read_bytes()).hexdigest()
+            for item in Path(path).iterdir() if item.is_file()}
+
+
+class IsolatedLayoutTest(unittest.TestCase):
+    """Git root H and task-store root K are separate; neither may be guessed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_linked_worktree_uses_host_root_and_agentorch_state(self):
+        main, host, kit, scaffold = build_isolated_host(self.base, linked=True)
+        # A linked worktree has a .git *file*; the tool must not need a .git dir.
+        self.assertTrue((host / '.git').is_file())
+        init_isolated_store(kit, [('T-1', 'DISPATCHED', ['src/'], scaffold)])
+
+        (host / 'src' / 'app.py').write_text('v2\n', encoding='utf-8')
+        (host / 'docs').mkdir()
+        (host / 'docs' / 'notes.md').write_text('out of scope\n', encoding='utf-8')
+        # The main worktree must not contribute changes to this report.
+        (main / 'src' / 'main_only.py').write_text('decoy\n', encoding='utf-8')
+
+        args = ['--task', 'T-1', '--base', scaffold, '--json']
+        proc = run_isolated(kit, args, _outside(self.base))
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        report = json.loads(proc.stdout)
+        self.assertEqual(report['status'], 'out-of-scope')
+        self.assertEqual(report['layout'], 'isolated')
+        self.assertEqual(report['task_database'],
+                         'agentorch/.local/orchestration/state.sqlite3')
+        self.assertEqual(report['root'], str(host.resolve()))
+        self.assertEqual(report['task']['id'], 'T-1')
+        self.assertIn('src/app.py', report['in_scope'])
+        self.assertEqual(report['out_of_scope'], ['docs/notes.md'])
+        paths = [item['path'] for item in report['changes']]
+        self.assertNotIn('src/main_only.py', paths)
+
+        explicit = run_isolated(kit, [*args, '--root', str(host)],
+                                _outside(self.base))
+        self.assertEqual(explicit.returncode, 2, explicit.stderr)
+
+    def test_explicit_root_outside_the_host_is_refused(self):
+        main, host, kit, scaffold = build_isolated_host(self.base, linked=True)
+        init_isolated_store(kit, [('T-1', 'DISPATCHED', ['src/'], scaffold)])
+        add_host_decoy(main, scaffold, task_id='T-MAIN', paths=('.',))
+
+        proc = run_isolated(kit, ['--json', '--root', str(main)],
+                            _outside(self.base))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertNotIn('in-scope', proc.stdout)
+        self.assertIn('host work-tree top level', proc.stderr)
+
+    def test_agentorch_database_wins_over_a_host_database_decoy(self):
+        _, host, kit, scaffold = build_isolated_host(self.base)
+        init_isolated_store(kit, [('T-KIT', 'DISPATCHED', ['src/'], scaffold)])
+        add_host_decoy(host, scaffold)
+        (host / 'docs').mkdir()
+        (host / 'docs' / 'notes.md').write_text('outside src\n', encoding='utf-8')
+
+        proc = run_isolated(kit, ['--json'], _outside(self.base))
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        report = json.loads(proc.stdout)
+        self.assertEqual(report['task']['id'], 'T-KIT')
+        self.assertEqual(report['out_of_scope'], ['docs/notes.md'])
+
+    def test_missing_agentorch_database_never_falls_back_to_host_database(self):
+        _, host, kit, scaffold = build_isolated_host(self.base)
+        add_host_decoy(host, scaffold)
+        (host / 'docs').mkdir()
+        (host / 'docs' / 'notes.md').write_text('outside src\n', encoding='utf-8')
+
+        proc = run_isolated(kit, ['--json'], _outside(self.base))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload['status'], 'error')
+        self.assertIn('task database', payload['error'])
+        self.assertNotIn('in-scope', proc.stdout)
+
+    def test_symlinked_agentorch_database_is_refused(self):
+        _, host, kit, scaffold = build_isolated_host(self.base)
+        real = self.base / 'real-store' / 'state.sqlite3'
+        create_task_db(real, [('T-REAL', 'DISPATCHED', ['.'], scaffold)])
+        state = kit / '.local' / 'orchestration'
+        state.mkdir(parents=True)
+        os.symlink(real, state / 'state.sqlite3')
+        add_host_decoy(host, scaffold)
+        (host / 'docs').mkdir()
+        (host / 'docs' / 'notes.md').write_text('outside src\n', encoding='utf-8')
+
+        proc = run_isolated(kit, ['--json'], _outside(self.base))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn('symlink', proc.stderr.lower())
+        self.assertNotIn('in-scope', proc.stdout)
+        self.assertNotIn('T-REAL', proc.stdout)
+
+    def test_hardlinked_agentorch_database_is_refused(self):
+        _, host, kit, scaffold = build_isolated_host(self.base)
+        real = self.base / 'real-store' / 'state.sqlite3'
+        create_task_db(real, [('T-REAL', 'DISPATCHED', ['.'], scaffold)])
+        state = kit / '.local' / 'orchestration'
+        state.mkdir(parents=True)
+        os.link(real, state / 'state.sqlite3')
+        add_host_decoy(host, scaffold)
+        (host / 'docs').mkdir()
+        (host / 'docs' / 'notes.md').write_text('outside src\n', encoding='utf-8')
+
+        proc = run_isolated(kit, ['--json'], _outside(self.base))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn('hard-linked', proc.stderr)
+        self.assertNotIn('in-scope', proc.stdout)
+
+    def test_symlinked_local_directory_is_refused(self):
+        # ``O_NOFOLLOW`` on the database only guards the last component. A link
+        # at ``agentorch/.local`` would redirect the whole store outside the
+        # work tree, so it must be refused before any read.
+        _, host, kit, scaffold = build_isolated_host(self.base)
+        external = self.base / 'external-local'
+        store = external / 'orchestration' / 'state.sqlite3'
+        create_task_db(store, [('T-EXTERNAL', 'DISPATCHED', ['.'], scaffold)])
+        store_bytes = store.read_bytes()
+        listing = _dir_listing(store.parent)
+        os.symlink(external, kit / '.local')
+        add_host_decoy(host, scaffold)
+        (host / 'docs').mkdir()
+        (host / 'docs' / 'notes.md').write_text('outside src\n', encoding='utf-8')
+
+        proc = run_isolated(kit, ['--json'], _outside(self.base))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn('symlink', proc.stderr.lower())
+        self.assertNotIn('in-scope', proc.stdout)
+        self.assertNotIn('T-EXTERNAL', proc.stdout)
+        self.assertEqual(store.read_bytes(), store_bytes)
+        self.assertEqual(_dir_listing(store.parent), listing)
+        self.assertFalse(Path(str(store) + '-shm').exists())
+
+    def test_symlinked_orchestration_directory_is_refused(self):
+        # Same boundary one level lower: the store directory itself is a link
+        # to an external directory that holds a readable task database.
+        _, host, kit, scaffold = build_isolated_host(self.base)
+        external = self.base / 'external-orchestration'
+        store = external / 'state.sqlite3'
+        create_task_db(store, [('T-EXTERNAL', 'DISPATCHED', ['.'], scaffold)])
+        store_bytes = store.read_bytes()
+        listing = _dir_listing(external)
+        (kit / '.local').mkdir()
+        os.symlink(external, kit / '.local' / 'orchestration')
+        add_host_decoy(host, scaffold)
+        (host / 'docs').mkdir()
+        (host / 'docs' / 'notes.md').write_text('outside src\n', encoding='utf-8')
+
+        proc = run_isolated(kit, ['--json'], _outside(self.base))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn('symlink', proc.stderr.lower())
+        self.assertNotIn('in-scope', proc.stdout)
+        self.assertNotIn('T-EXTERNAL', proc.stdout)
+        self.assertEqual(store.read_bytes(), store_bytes)
+        self.assertEqual(_dir_listing(external), listing)
+
+    def test_agentorch_shaped_directory_without_markers_is_refused(self):
+        _, host, kit, scaffold = build_isolated_host(self.base)
+        init_isolated_store(kit, [('T-KIT', 'DISPATCHED', ['src/'], scaffold)])
+        for name in ('VERSION.md', 'MANIFEST.json'):
+            (kit / name).unlink()
+        add_host_decoy(host, scaffold)
+        (host / 'docs').mkdir()
+        (host / 'docs' / 'notes.md').write_text('outside src\n', encoding='utf-8')
+
+        proc = run_isolated(kit, ['--json'], _outside(self.base))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn('isolated layout', proc.stderr.lower())
+        self.assertNotIn('in-scope', proc.stdout)
+
+    def test_corrupt_agentorch_database_is_refused(self):
+        _, host, kit, scaffold = build_isolated_host(self.base)
+        db = init_isolated_store(kit, [('T-KIT', 'DISPATCHED', ['src/'], scaffold)])
+        for sidecar in ('state.sqlite3-wal', 'state.sqlite3-shm'):
+            (db.parent / sidecar).unlink(missing_ok=True)
+        db.write_bytes(b'not a sqlite database at all')
+        add_host_decoy(host, scaffold)
+        (host / 'src' / 'app.py').write_text('v2\n', encoding='utf-8')
+
+        proc = run_isolated(kit, ['--json'], _outside(self.base))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn('task database', proc.stderr)
+        self.assertNotIn('in-scope', proc.stdout)
+
+    def test_live_wal_is_refused_because_one_snapshot_cannot_be_proven(self):
+        # Copying the database and its WAL separately cannot prove both files
+        # belong to one commit state; a controlled replacement could produce a
+        # mixed snapshot. The check must fail closed instead of replaying it.
+        _, _, kit, scaffold = build_isolated_host(self.base)
+        state = init_isolated_store(
+            kit, [('T-BASE', 'DISPATCHED', ['src/'], scaffold)]).parent
+        con = sqlite3.connect(state / 'state.sqlite3')
+        try:
+            con.execute('PRAGMA wal_autocheckpoint=0')
+            _insert_task(con, 'T-WAL', ['src/'], 'DISPATCHED', scaffold)
+            con.commit()
+            self.assertTrue((state / 'state.sqlite3-wal').is_file(),
+                            'the fixture must keep a live WAL')
+            digests = _file_digests(state)
+            proc = run_isolated(kit, ['--json', '--task', 'T-WAL'],
+                                _outside(self.base))
+            self.assertEqual(proc.returncode, 1, proc.stdout)
+            payload = json.loads(proc.stdout)
+            self.assertEqual(payload['status'], 'error')
+            self.assertIn('write-ahead log', payload['error'])
+            self.assertNotIn('in-scope', proc.stdout)
+            self.assertEqual(_file_digests(state), digests)
+        finally:
+            con.close()
+
+    def test_isolated_run_leaves_the_source_store_unchanged(self):
+        _, host, kit, scaffold = build_isolated_host(self.base)
+        db = init_isolated_store(kit, [('T-1', 'DISPATCHED', ['src/'], scaffold)])
+        state = db.parent
+        listing = _dir_listing(state)
+        digests = _file_digests(state)
+        (host / 'src' / 'app.py').write_text('v2\n', encoding='utf-8')
+
+        proc = run_isolated(kit, ['--json', '--task', 'T-1'],
+                            _outside(self.base))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(_dir_listing(state), listing)
+        self.assertEqual(_file_digests(state), digests)
+        self.assertFalse((state / 'state.sqlite3-shm').exists())
+
+
+class LinkedParentComponentTest(unittest.TestCase):
+    """A link in a *parent* component is a stop, not a redirect.
+
+    ``O_NOFOLLOW`` refuses a symlinked final component only. Opening
+    ``<repo>/.orchestration/state.sqlite3`` still follows a ``.orchestration``
+    link planted in the repository, so a perfectly regular external database is
+    reachable as "this repository's" task database. Every component from the Git
+    work-tree root to the file is therefore inspected without following it.
+
+    The inspection is a pre-read refusal, not atomic isolation: a same-UID
+    writer can swap a component after it is inspected. Ancestors *above* the
+    work-tree root are outside the boundary and must not be refused (macOS
+    ``/var`` -> ``/private/var``, Windows short names).
+    """
+
+    def setUp(self):
+        self.repo_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.repo_tmp.cleanup)
+        self.fx = GitFixture(self.repo_tmp.name)
+        self.outside = Path(tempfile.mkdtemp(prefix='scope-parent-'))
+        self.addCleanup(shutil.rmtree, self.outside, True)
+
+    def run_tool(self, *args, root=None):
+        out, err = io.StringIO(), io.StringIO()
+        target = self.fx.root if root is None else root
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = check.main(['--root', str(target), *args])
+        return code, out.getvalue(), err.getvalue()
+
+    def external_store(self):
+        path = self.outside / 'state.sqlite3'
+        create_task_db(path, [('T-CANARY', 'DISPATCHED', ['.'], self.fx.base)])
+        return path
+
+    def test_flat_symlinked_state_directory_fails_closed(self):
+        store = self.external_store()
+        store_bytes = store.read_bytes()
+        listing = sorted(item.name for item in self.outside.iterdir())
+        os.symlink(self.outside, self.fx.root / '.orchestration')
+        self.fx.write('docs/notes.md', 'out of scope\n')
+
+        code, out, err = self.run_tool('--json', '--base', self.fx.base)
+        self.assertEqual(code, 1, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload['status'], 'error')
+        self.assertIn('symlink', payload['error'].lower())
+        self.assertNotIn('T-CANARY', out)
+        self.assertNotIn('T-CANARY', err)
+        self.assertNotIn('in-scope', out)
+        # The external store is never opened, copied, or given a sidecar.
+        self.assertEqual(store.read_bytes(), store_bytes)
+        self.assertEqual(sorted(item.name for item in self.outside.iterdir()),
+                         listing)
+        self.assertFalse(Path(str(store) + '-shm').exists())
+        self.assertFalse(Path(str(store) + '-wal').exists())
+
+    def test_a_linked_root_path_is_not_treated_as_a_linked_component(self):
+        # The work-tree root itself may be reached through a link (a user alias,
+        # macOS /var -> /private/var). The root is canonicalised before the walk,
+        # so ordinary access through an alias must still succeed.
+        self.fx.init_db()
+        self.fx.add_task('T-1', ['src/'], head_sha=self.fx.base)
+        self.fx.write('src/app.py', 'x\n')
+        aliases = Path(tempfile.mkdtemp(prefix='scope-alias-'))
+        self.addCleanup(shutil.rmtree, aliases, True)
+        os.symlink(self.fx.root, aliases / 'through-link')
+
+        code, out, err = self.run_tool('--json', '--task', 'T-1',
+                                       '--base', self.fx.base,
+                                       root=aliases / 'through-link')
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(json.loads(out)['task']['id'], 'T-1')
+
+
+class NoFollowFallbackTest(unittest.TestCase):
+    """A platform without ``O_NOFOLLOW`` must fail closed, never follow a link.
+
+    ``O_NOFOLLOW`` is what lets the kernel refuse a final-component symlink at
+    open time. Where it is absent the fallback is ``lstat`` before the open plus
+    an identity comparison after it; an identity that cannot be reported is a
+    stop, because "cannot prove it was not followed" is not "may follow". These
+    tests hide both the module flag and ``os.O_NOFOLLOW`` so a regression to a
+    plain ``os.open`` cannot pass as a supported platform.
+    """
+
+    def setUp(self):
+        self.repo_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.repo_tmp.cleanup)
+        self.fx = GitFixture(self.repo_tmp.name)
+        # The canary lives outside the fixture repository: it is neither part of
+        # the change report nor reachable by a relative allowed path.
+        self.outside = Path(tempfile.mkdtemp(prefix='scope-canary-'))
+        self.addCleanup(shutil.rmtree, self.outside, True)
+
+    # --- helpers ------------------------------------------------------------
+    def hide_no_follow(self):
+        saved = getattr(os, 'O_NOFOLLOW', None)
+        if saved is not None:
+            del os.O_NOFOLLOW
+            self.addCleanup(setattr, os, 'O_NOFOLLOW', saved)
+        patcher = mock.patch.object(check, '_O_NOFOLLOW', 0, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def canary(self, name='canary.sqlite3'):
+        """A valid task database whose allowed paths would read as in-scope."""
+        path = self.outside / name
+        create_task_db(path, [('T-CANARY', 'DISPATCHED', ['.'], self.fx.base)])
+        return path
+
+    def place_database_symlink(self, target):
+        state = self.fx.root / '.orchestration'
+        state.mkdir(parents=True, exist_ok=True)
+        link = state / 'state.sqlite3'
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        os.symlink(target, link)
+        return link
+
+    def run_tool(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = check.main(['--root', str(self.fx.root), *args])
+        return code, out.getvalue(), err.getvalue()
+
+    def assert_canary_untouched(self, canary, canary_bytes, canary_listing):
+        self.assertEqual(canary.read_bytes(), canary_bytes)
+        self.assertEqual(sorted(p.name for p in canary.parent.iterdir()),
+                         canary_listing)
+
+    # --- the missing-flag fallback ------------------------------------------
+    def test_without_o_nofollow_a_symlinked_database_fails_closed(self):
+        canary = self.canary()
+        canary_bytes = canary.read_bytes()
+        canary_listing = sorted(p.name for p in canary.parent.iterdir())
+        link = self.place_database_symlink(canary)
+        self.fx.write('docs/notes.md', 'out of scope\n')
+        self.hide_no_follow()
+
+        code, out, err = self.run_tool('--json', '--base', self.fx.base)
+        self.assertEqual(code, 1, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload['status'], 'error')
+        self.assertIn('symlink', payload['error'].lower())
+        self.assertNotIn('T-CANARY', out)
+        self.assertNotIn('T-CANARY', err)
+        self.assertNotIn('in-scope', out)
+        self.assert_canary_untouched(canary, canary_bytes, canary_listing)
+        self.assertFalse(Path(str(link) + '-shm').exists())
+        self.assertFalse(Path(str(link) + '-wal').exists())
+
+    def test_without_o_nofollow_a_regular_database_is_still_read(self):
+        # The fallback is not a blanket refusal: a real regular database reads
+        # exactly as it does with the flag.
+        self.hide_no_follow()
+        self.fx.init_db()
+        self.fx.add_task('T-1', ['src/'], head_sha=self.fx.base)
+        self.fx.write('src/app.py', 'x\n')
+        code, out, err = self.run_tool('--json', '--task', 'T-1')
+        self.assertEqual(code, 0, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload['task']['id'], 'T-1')
+        self.assertIn('src/app.py', payload['in_scope'])
+
+    def test_without_o_nofollow_an_unprovable_identity_fails_closed(self):
+        # No (device, inode) means the opened descriptor cannot be proven to be
+        # the inspected entry. That is a stop before any byte is read.
+        self.hide_no_follow()
+        self.fx.init_db()
+        self.fx.add_task('T-1', ['src/'], head_sha=self.fx.base)
+        db_bytes = self.fx.db_path.read_bytes()
+        with mock.patch.object(check, '_file_identity', return_value=None,
+                               create=True):
+            code, out, err = self.run_tool('--json', '--task', 'T-1')
+        self.assertEqual(code, 1, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload['status'], 'error')
+        self.assertIn('identity', payload['error'].lower())
+        self.assertEqual(self.fx.db_path.read_bytes(), db_bytes)
+
+    def test_without_o_nofollow_a_mismatched_identity_is_refused(self):
+        # Simulate the swap window directly: the entry inspected as a regular
+        # file is replaced by another inode before the open completes. The
+        # pre-open inspection and the opened descriptor disagree, so no byte may
+        # be copied.
+        self.hide_no_follow()
+        source = self.canary('source.sqlite3')
+        source_bytes = source.read_bytes()
+        real = check._file_identity(os.lstat(source))
+        self.assertIsNotNone(real)
+        calls = []
+
+        def identity(info):
+            calls.append(info)
+            if len(calls) == 1:
+                return real
+            return (real[0], real[1] + 1)
+
+        with mock.patch.object(check, '_file_identity', side_effect=identity,
+                               create=True):
+            with self.assertRaises(check.ScopeError) as caught:
+                check._open_regular_file(source, 'task database')
+        self.assertIn('changed while it was being opened', str(caught.exception))
+        self.assertEqual(source.read_bytes(), source_bytes)
+
+    def test_without_o_nofollow_a_symlinked_state_directory_fails_closed(self):
+        # The fallback proves the final component's identity; it cannot prove a
+        # parent component was not followed. A parent link is therefore a stop
+        # before any byte of the external database is read.
+        canary = self.canary('state.sqlite3')
+        canary_bytes = canary.read_bytes()
+        canary_listing = sorted(p.name for p in canary.parent.iterdir())
+        os.symlink(canary.parent, self.fx.root / '.orchestration')
+        self.fx.write('docs/notes.md', 'out of scope\n')
+        self.hide_no_follow()
+
+        code, out, err = self.run_tool('--json', '--base', self.fx.base)
+        self.assertEqual(code, 1, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload['status'], 'error')
+        self.assertIn('symlink', payload['error'].lower())
+        self.assertNotIn('T-CANARY', out)
+        self.assertNotIn('T-CANARY', err)
+        self.assertNotIn('in-scope', out)
+        self.assert_canary_untouched(canary, canary_bytes, canary_listing)
+
+    def test_with_o_nofollow_a_symlinked_database_is_refused_in_the_flat_layout(self):
+        # The existing refusal semantics must not regress where the flag exists,
+        # and the flat layout must not rely on ``Path.is_file()`` following the
+        # link to discover an ordinary file.
+        canary = self.canary()
+        canary_bytes = canary.read_bytes()
+        canary_listing = sorted(p.name for p in canary.parent.iterdir())
+        link = self.place_database_symlink(canary)
+        code, out, err = self.run_tool('--json', '--base', self.fx.base)
+        self.assertEqual(code, 1, out + err)
+        payload = json.loads(out)
+        self.assertEqual(payload['status'], 'error')
+        self.assertNotIn('T-CANARY', out)
+        self.assertNotIn('in-scope', out)
+        self.assert_canary_untouched(canary, canary_bytes, canary_listing)
+        self.assertFalse(Path(str(link) + '-shm').exists())
+
+    def test_the_private_copy_is_created_exclusively(self):
+        # The destination is in the private temporary directory. A pre-existing
+        # entry there (a link planted by another same-UID process) must be
+        # refused rather than truncated: writing through it would put the copy
+        # outside the temporary directory.
+        source = self.canary('source.sqlite3')
+        written = self.outside / 'written-through'
+        destination = self.outside / 'copy.sqlite3'
+        os.symlink(written, destination)
+        with self.assertRaises(check.ScopeError):
+            check._copy_regular_file(source, destination, 'task database')
+        self.assertFalse(written.exists(),
+                         'the copy must not write through a link at its own path')
+
+    def test_an_existing_file_at_the_private_copy_path_is_refused(self):
+        # Any existing entry is a stop, not something to truncate: the file's
+        # bytes are unrelated to this copy and must survive untouched.
+        source = self.canary('source.sqlite3')
+        destination = self.outside / 'copy.sqlite3'
+        destination.write_bytes(b'not-a-copy')
+        with self.assertRaises(check.ScopeError) as caught:
+            check._copy_regular_file(source, destination, 'task database')
+        self.assertIn('already exists', str(caught.exception))
+        self.assertEqual(destination.read_bytes(), b'not-a-copy')
+
+    def test_a_dangling_destination_link_is_refused_when_lstat_follows_it(self):
+        # Windows has no ``O_NOFOLLOW``, so ``O_EXCL`` alone is the only kernel
+        # guard left - and a dangling link is not an "existing file" to an
+        # exclusive create, so the create would be satisfied by the link target
+        # and the copy would land outside the private directory. Simulate the
+        # worst case: the platform's ``lstat`` follows the dangling link and
+        # reports "no such file". The parent listing must still refuse it, and
+        # the link target must not be created.
+        source = self.canary('source.sqlite3')
+        written = self.outside / 'written-through'
+        destination = self.outside / 'copy.sqlite3'
+        os.symlink(written, destination)
+        real_lstat = os.lstat
+
+        def blind_lstat(path, *args, **kwargs):
+            if Path(path) == destination:
+                raise FileNotFoundError(2, 'No such file or directory', str(path))
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(os, 'lstat', blind_lstat):
+            with self.assertRaises(check.ScopeError) as caught:
+                check._copy_regular_file(source, destination, 'task database')
+        self.assertIn('is free', str(caught.exception))
+        self.assertFalse(written.exists(),
+                         'the copy must not write through a link at its own path')
+        self.assertTrue(destination.is_symlink())
+
+    def test_a_destination_replaced_by_a_link_after_the_create_is_refused(self):
+        # Written bytes are not proof of where they went. If the entry at the
+        # destination is a link after the create, the write target is unproven
+        # and the copy must not be accepted on content alone.
+        #
+        # The post-create state is staged directly rather than by swapping the
+        # entry in after the open: Windows refuses to remove a directory entry
+        # while a descriptor on that file is still open (WinError 32), so the
+        # open-then-replace sequence cannot be staged there. What the product
+        # inspects is the same on every platform - the descriptor names one
+        # regular file and the destination path is a link to another regular
+        # file - and the assertions below are unchanged.
+        real = self.outside / 'real.sqlite3'
+        real.write_bytes(b'real')
+        elsewhere = self.outside / 'elsewhere.sqlite3'
+        elsewhere.write_bytes(b'elsewhere')
+        destination = self.outside / 'copy.sqlite3'
+        descriptor = os.open(real, os.O_RDWR)
+        self.addCleanup(os.close, descriptor)
+        os.symlink(elsewhere, destination)
+
+        with self.assertRaises(check.ScopeError) as caught:
+            check._prove_copy_written_in_place(descriptor, destination,
+                                               'task database')
+        self.assertIn('symlink', str(caught.exception))
+        self.assertEqual(elsewhere.read_bytes(), b'elsewhere')
+
+    def test_a_copy_identity_that_cannot_be_reported_is_refused(self):
+        # Without ``O_NOFOLLOW`` the destination identity is the only proof that
+        # the bytes went to the path this call created. No identity is a stop.
+        self.hide_no_follow()
+        destination = self.outside / 'copy.sqlite3'
+        destination.write_bytes(b'copy')
+        descriptor = os.open(destination, os.O_RDWR)
+        self.addCleanup(os.close, descriptor)
+        with mock.patch.object(check, '_file_identity', return_value=None,
+                               create=True):
+            with self.assertRaises(check.ScopeError) as caught:
+                check._prove_copy_written_in_place(
+                    descriptor, destination, 'task database')
+        self.assertIn('identity', str(caught.exception))
 
 
 if __name__ == '__main__':

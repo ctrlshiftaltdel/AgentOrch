@@ -161,11 +161,13 @@ FORBIDDEN_REGEXES = [
 
 # Path segments that must never exist inside the package (belt and braces on top
 # of check a, which already pins the file set to REQUIRED).
-FORBIDDEN_SEGMENTS = frozenset({'.orchestration', 'release', '.worktrees', '.workbuddy', '.git'})
-# `docs/` is special: the core contract now lives there and must ship, while every
-# other repository document (design drafts, plans, upgrade notes, contracts) must
-# not. This allowlist is what keeps "all of docs/" from ever being packaged.
-PACKAGE_DOC_PATHS = frozenset({'docs/orchestration.md'})
+FORBIDDEN_SEGMENTS = frozenset({'.orchestration', 'release', '.worktrees', '.workbuddy',
+                                '.git', '.local'})
+# `docs/` must not ship in this bridge release. The published v1.7.0 updater
+# treats that prefix as project-owned and will not write a new file there.
+# The contract ships at kit/orchestration.md instead. Keep the allowlist empty
+# so a later docs/ path cannot enter the package by accident.
+PACKAGE_DOC_PATHS = frozenset()
 FORBIDDEN_PATHS = frozenset({'scripts/build_release.py'})
 
 # Optional per-machine / per-repository additions. Git-ignored (.gitignore keeps
@@ -195,13 +197,15 @@ def collect_sources(required):
 
     The per-project config is intentionally NOT shipped: downstream copies
     templates/project.md to docs/PROJECT.md and fills it in (self-check c proves
-    --project-ready fails until they do). Of the `docs/` tree only the core
-    contract (docs/orchestration.md) is allowed into the package; any other docs
-    path in REQUIRED is a build error rather than a silent widening of the
-    release contents.
+    --project-ready fails until they do). The core contract ships at
+    `kit/orchestration.md` for the 1.7.1 bridge release, so no `docs/` path is
+    allowed into the package; any docs path in REQUIRED is a build error rather
+    than a silent widening of the release contents.
     """
     files = {}
     for rel in required:
+        if '.orchestration' in rel.split('/'):
+            raise SystemExit(f'build error: private orchestration state cannot ship: {rel}')
         source = ROOT / rel
         if not source.is_file():
             raise SystemExit(f'build error: required source missing: {source}')
@@ -286,6 +290,37 @@ def indent(text, prefix='      '):
     return '\n'.join(prefix + line for line in lines)
 
 
+def package_set_errors(packaged, required, manifest_name=None):
+    """Self-check (a): the packaged set must equal REQUIRED + MANIFEST.json.
+
+    Split out of `run_self_check` so the rule can be negative-tested without
+    building an archive: a file that silently stopped shipping and a file that
+    should never ship are different defects and must both be reported.
+    """
+    manifest_name = manifest_name or MANIFEST_NAME
+    failures = []
+    expected_set = set(required) | {manifest_name}
+    packaged_set = set(packaged)
+    missing = sorted(expected_set - packaged_set)
+    extra = sorted(packaged_set - expected_set)
+    if missing:
+        failures.append(f'(a) package is missing REQUIRED files: {", ".join(missing)}')
+    if extra:
+        failures.append(f'(a) package contains files not in REQUIRED + {manifest_name}: '
+                        f'{", ".join(extra)}')
+    seen, duplicated = set(), []
+    for rel in packaged:
+        if rel in seen and rel not in duplicated:
+            duplicated.append(rel)
+        seen.add(rel)
+    if duplicated:
+        failures.append(f'(a) package lists a file more than once: {", ".join(sorted(duplicated))}')
+    if len(packaged) != len(expected_set):
+        failures.append(f'(a) package file count {len(packaged)} != '
+                        f'REQUIRED + {manifest_name} count {len(expected_set)}')
+    return failures
+
+
 def run_self_check(zip_path, required, top_dir, extra_patterns=()):
     """Run checks a-j and return a list of human-readable failure strings."""
     failures = []
@@ -295,18 +330,7 @@ def run_self_check(zip_path, required, top_dir, extra_patterns=()):
     packaged = [n[len(top_dir) + 1:] for n in names if n.startswith(top_dir + '/')]
 
     # (a) packaged file set == REQUIRED + MANIFEST.json
-    expected_set = set(required) | {MANIFEST_NAME}
-    packaged_set = set(packaged)
-    missing = sorted(expected_set - packaged_set)
-    extra = sorted(packaged_set - expected_set)
-    if missing:
-        failures.append(f'(a) package is missing REQUIRED files: {", ".join(missing)}')
-    if extra:
-        failures.append(f'(a) package contains files not in REQUIRED + {MANIFEST_NAME}: '
-                        f'{", ".join(extra)}')
-    if len(packaged) != len(expected_set):
-        failures.append(f'(a) package file count {len(packaged)} != '
-                        f'REQUIRED + {MANIFEST_NAME} count {len(expected_set)}')
+    failures.extend(package_set_errors(packaged, required))
 
     # (f, structural) forbidden path segments / files
     for rel in sorted(packaged):
@@ -379,7 +403,7 @@ def run_self_check(zip_path, required, top_dir, extra_patterns=()):
 
         # (h) the optional architecture checker must import and degrade to
         # diagnostic mode inside a package that carries no architecture contract
-        # (only docs/orchestration.md ships, no docs/contracts/). A non-zero exit,
+        # (the bridge package ships no docs/ at all). A non-zero exit,
         # a guessed ENFORCE mode or a report
         # without a bound head_sha would mean the shipped checker lies about
         # what it checked.

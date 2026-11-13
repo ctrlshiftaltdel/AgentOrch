@@ -212,6 +212,10 @@ class EditionDeliveryTests(unittest.TestCase):
             self.assertEqual(delivery['draft_pr']['base'], 'main')
             self.assertTrue(delivery['draft_pr']['head'].startswith('task/'))
             self.assertNotIn('orchestrator.py', ' '.join(delivery['next_steps']))
+            # The generated Issue must cite the contract path the package ships.
+            body = delivery['issue']['body']
+            self.assertIn('`kit/orchestration.md`', body)
+            self.assertNotIn('`docs/orchestration.md`', body)
 
     def test_both_editions_share_the_same_gate_record(self):
         with tempfile.TemporaryDirectory() as local_tmp, \
