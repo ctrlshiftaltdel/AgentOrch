@@ -49,8 +49,8 @@
 **第 1 步 B · 引入旧项目**（旧项目专用，代替第 1 步 A；发行包解压到项目外的临时目录，细节见第 4 节路径二）：
 
 > 这是把 Agent-Orchestration 套件引入我的旧项目，分四步做，全程不许覆盖我项目的现有文件：
-> 1. 先读方法：读 docs/orchestration.md 的会话入口、AGENTS.md、editions/local/master.md 的「已有项目接入」章节，给我用三句话概括这套流程的角色分工与合并门。
-> 2. 解压到项目外的临时目录，然后对照发行包文件清单（AGENTS.md、LICENSE.md、VERSION.md、kit/orchestration.md、editions/、templates/、scripts/、tests/）逐个检查我的项目里哪些位置会重名或被覆盖，输出冲突清单给我。
+> 1. 先把发行包解压到项目外的临时目录（不要解压进我的项目根），再读解压包里的 kit/orchestration.md 的会话入口、AGENTS.md，以及 editions/local/master.md 或 editions/github/master.md 的「已有项目接入」章节；给我用三句话概括这套流程的角色分工与合并门。
+> 2. 用上一步解压出的包对照发行包文件清单（AGENTS.md、LICENSE.md、VERSION.md、kit/orchestration.md、editions/、templates/、scripts/、tests/）逐个检查我的项目里哪些位置会重名或被覆盖，输出冲突清单给我。
 > 3. 经我确认后引入：无冲突的文件直接复制到位；与我已有文件重名的（尤其 AGENTS.md、LICENSE.md 和 docs/、scripts/、tests/ 里的同名文件），先给我看两边内容，按我决定的合并方式写入；套件的 scripts/ 与 tests/ 不得混进我项目自有的同名目录下已有的文件。
 > 4. 引入完成后列出项目根的最新状态给我复核。
 
@@ -222,7 +222,7 @@ uv run python -m unittest discover -s tests
 
 目标：在不破坏既有规则、**不覆盖旧项目任何重要文件**的前提下接入套件，恢复真实进度，再继续推进。对 Agent 说的话术见快速上手「第 1 步 B」，本节是它背后的完整步骤：
 
-1. **Agent 先读方法，再动手**：读 [docs/orchestration.md](orchestration.md) 的会话入口、[AGENTS.md](../AGENTS.md) 与 [editions/local/master.md](../editions/local/master.md)（github 底座为 [editions/github/master.md](../editions/github/master.md)）的「已有项目接入」章节，理解角色分工、合并门与证据要求后，才允许改你的项目。
+1. **Agent 先读方法，再动手**：读 [kit/orchestration.md](../kit/orchestration.md) 的会话入口、[AGENTS.md](../AGENTS.md) 与 [editions/local/master.md](../editions/local/master.md)（github 底座为 [editions/github/master.md](../editions/github/master.md)）的「已有项目接入」章节，理解角色分工、合并门与证据要求后，才允许改你的项目。
 2. **受限新安装与同来源升级**：仅当目标是专属、干净的 Git linked worktree、没有其他写入者且调用者显式声明时，隔离入口才允许把经官方 Release 校验的字节写入 `agentorch/`，并在根 `AGENTS.md` 追加唯一受管区块。升级只在“同来源且可重新认证”时可用：安装器按本地清单的 Format 提示取回旧版官方 Release，并要求已安装文件逐项匹配后才写入差异；本地 `MANIFEST.json` 与哈希不单独授权写入。声明是前提，不是强制隔离证明；显式跨进程回滚只在绑定记录复核通过时恢复，否则失败关闭，且不声称同 UID 强隔离。
 3. **旧根布局（受限迁移切片）**：默认保留旧文件，不自动删除、移动或覆盖；本地清单及哈希不能独立证明文件归属。唯一例外是旧根每个发布成员（含根 `MANIFEST.json`）与 APPLY 内重新获取并校验的官方历史 Release 逐字节一致、无本地修改、目标 `agentorch/` 不存在或为空且目标版本不低于历史版本：此时只新增 `agentorch/`，旧根保留原路径原字节（包括不写旧根 `AGENTS.md` 的受管区块）。任一不匹配、缺历史资产、目标冲突、符号链接 / 非普通文件或路径越界都保持 `STOPPED_CONFLICT` 且零写入。旧入口的直接调用不在支持范围，本套件不声称已在技术上阻止这类调用。真实官方历史 Release 资产、真实下游与跨平台的跨进程回滚、普通非 linked worktree 与跨平台能力仍未完成，AC-9 未通过。
 4. **人工评估接入**：盘点宿主规则与文件冲突，并由项目所有者决定后续；[升级指南](upgrade.md)记录当前限制。计划结果不是安装安全、并发隔离、真实运行时入口或跨平台回滚成功的证明。
@@ -231,7 +231,7 @@ uv run python -m unittest discover -s tests
 
 目标：把任务状态从本机任务库迁到 Issue / PR / CI，切换后只保留一个事实来源。
 
-入口：[docs/orchestration.md 第 6 节「底座切换」](orchestration.md#6-底座切换)。四步概览：
+入口：[kit/orchestration.md 第 6 节「底座切换」](../kit/orchestration.md#6-底座切换)。四步概览：
 
 1. **冻结写入并导出 Issue**：停止 `local` 派发与状态变更，记录切换点的主分支 SHA 与任务库备份位置；每个未完成任务按 [ISSUE-TEMPLATE.md](../editions/github/issue-template.md) 的五节导出一个 Issue，已完成任务只归档摘要。
 2. **建立平台保护与 CI**：配置默认分支保护、必需检查与 PR 模板，使合并门由平台强制执行。
