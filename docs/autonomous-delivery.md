@@ -97,7 +97,7 @@ python3 scripts/autonomous_delivery.py --repo <目标worktree> --issue 230 \
 journal 是私有 JSON（原子替换写入，`flock` / `msvcrt` 跨进程锁；无跨平台锁时拒绝运行）。任务状态：`PENDING`、`RUNNING`、`APPROVED`、`MERGED`、`VERIFIED`、`FAILED`、`REVIEW_REJECTED`、`BLOCKED`、`UNKNOWN`。
 
 - `--resume` 处理 `RUNNING` 与 `UNKNOWN`：先确认旧 runner 进程已不在、执行会话可核验，再从 Git 重算 changed paths 与指纹；验证/审查阶段可继续，合并阶段必须能证明全部前置门，否则 `BLOCKED`。
-- `--retry <id>` 只对 `FAILED` / `REVIEW_REJECTED` / `BLOCKED` / `UNKNOWN` 且阶段为执行/验证/审查的任务开放；**不 stash、不 reset**。工作区有未提交改动或失败尝试留下提交时直接拒绝，并要求人工检查；只有工作区干净且 head 仍等于基线、旧会话终局可核验时才重新派发。
+- `--retry <id>` 只对 `FAILED` / `REVIEW_REJECTED` / `BLOCKED` / `UNKNOWN` 且阶段为执行/验证/审查的任务开放；**不 stash、不 reset**。工作区有未提交改动时直接拒绝并要求人工检查（`UNKNOWN` 还要求旧进程不在）。执行阶段的失败重试要求工作区干净且 head 仍等于基线；验证/审查阶段的失败重试在 head 与失败尝试完全一致时保留原提交，只重跑验证并启动新的审查会话，不丢弃任何内容。旧会话没有可核验终局时拒绝重试。
 - 不自动重试、不自动在未知状态下重派。
 
 ## 6. 测试套件清单（本切片）
@@ -119,6 +119,7 @@ journal 是私有 JSON（原子替换写入，`flock` / `msvcrt` 跨进程锁；
 - **验证命令是受信输入**：不按 AC 自动生成检查，也不限制 argv 的程序；AC 只能经独立审查逐条判定，不能由「命令退出 0」单独充当批准。
 - **同一 journal 之外的并发写者**：仓库/worktree/journal 锁覆盖本工具的运行；不阻止其他工具或人直接写仓库。
 - **Windows**：进程存活检查为避免 `os.kill` 终止进程而直接 fail closed；锁使用 `msvcrt`，未在 Windows 真机实测。
+- **任务 worktree 需保留**：`VERIFIED` / `APPROVED` 的重证会重读该 worktree 与两个会话；worktree 被删除或会话被清理后，依赖它的后续任务会保持 `BLOCKED`，而不是跳过核验。
 
 ## 8. 实测记录（2026-11-13/14，本机 OpenCode v2.2.7）
 
