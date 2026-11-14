@@ -16,7 +16,15 @@ fail-closed:
   history, the journal, the execution session's metadata and the reviewer
   transcript are all writable and their mutual consistency is not evidence that
   this execution session produced the recorded head or that an independent
-  reviewer approved it;
+  reviewer approved it. Every approval still live in this process is re-proved
+  against its head, diff digest and clean worktree immediately before the
+  summary: a later trusted command that changed it blocks the approval without
+  re-running that command;
+* the edition is re-read from the project config at every side-effect boundary,
+  and an invalid, duplicate, empty or ambiguous declaration blocks immediately
+  instead of reusing the first check;
+* lock identity is the canonical real path, so a symlinked journal directory
+  cannot create a second lock identity for the same journal;
 * resume/retry re-prove the repository identity, the task packet, project
   authorization (including every *actual* changed path), the execution session's
   metadata, the reviewer profile and the full verification set before any side
@@ -178,6 +186,21 @@ def _edition_value(form, raw):
     if len(value) >= 2 and value.startswith('`') and value.endswith('`'):
         value = value[1:-1]
     return value
+
+
+def _require_edition(config, error=DeliveryError):
+    """Fail closed unless the project declares exactly one usable edition.
+
+    The edition is the only authority for the base and it is re-read at every
+    side-effect boundary, so a later invalid, duplicate, empty or ambiguous
+    declaration must block immediately instead of reusing the first check.
+    """
+    if config.get('edition_count') != 1 or config.get('edition') not in VALID_EDITIONS:
+        values = config.get('edition_values') or []
+        raise error('docs/PROJECT.md must declare exactly one `edition` of `local` or '
+                    f'`github` before any dispatch; found {config.get("edition_count")} '
+                    f'declaration(s), values {values!r} (edition parsed as '
+                    f'{config.get("edition")!r})')
 
 
 def _policy_paths(text, needle):
@@ -611,19 +634,24 @@ def _lock_dir(repo):
     return directory
 
 
+def _canonical(path):
+    """Resolve aliases (including a symlinked parent) to one lock identity."""
+    return Path(path).resolve()
+
+
 def lock_targets(repo, state_path, specs):
     """Every worktree and journal the run writes must be exclusively ours."""
     directory = _lock_dir(repo)
     targets = {'repo', 'journal'}
     for spec in specs:
         if spec.get('worktree'):
-            targets.add(str(Path(spec['worktree']).absolute()))
+            targets.add(str(_canonical(spec['worktree'])))
     return directory, sorted(targets)
 
 
 def acquire_locks(repo, state_path, specs):
     directory, targets = lock_targets(repo, state_path, specs)
-    journal = Path(state_path).absolute()
+    journal = _canonical(state_path)
     journal_lock = journal.parent / (
         '.agentorch-delivery-' + hashlib.sha256(str(journal).encode()).hexdigest()[:24]
         + '.lock')
@@ -1104,15 +1132,20 @@ def _prove_before_side_effect(context, spec, record, work, require_evidence):
     """The one re-proof shared by execute, verify, review, resume, retry and auth.
 
     It runs before any command or agent starts, so a failure stops the task with
-    no verification or session side effect: the task identity and authorization
-    are re-read, the reviewer profile is re-queried, and — once an attempt has
-    produced a head — every *actual* changed path and the execution session's own
-    Agent/directory/terminal state are re-proven. The session metadata is an
+    no verification or session side effect: the reviewer profile is re-queried,
+    then the edition and task authorization are re-read and re-validated, and —
+    once an attempt has produced a head — every *actual* changed path and the
+    execution session's own Agent/directory/terminal state are re-proven. The
+    session metadata is an
     identity check, not proof that the session produced the recorded commit:
     there is no independently verifiable execution artifact, so cross-process
     trust of a recorded head is refused separately.
     """
+    # Query the profile first: a config change made while the runtime answers
+    # the query must be seen by the config read below, not after the agent.
+    _reviewer_gate(context, spec, work, record)
     fresh = project_config(context.repo)
+    _require_edition(fresh)
     _authorize_paths(spec['paths'], fresh)
     if _status(work):
         raise DeliveryError('worktree is not clean; refusing to continue')
@@ -1126,7 +1159,6 @@ def _prove_before_side_effect(context, spec, record, work, require_evidence):
             raise DeliveryError('actual changed paths do not match the recorded set')
         for name in changed:
             _check_changed_path(work, name, spec['paths'], fresh)
-    _reviewer_gate(context, spec, work, record)
     if require_evidence:
         session = record.get('execution_session')
         if not session:
@@ -1169,9 +1201,10 @@ def _execute(context, spec, record):
     changed = _changes(work, base)
     if not changed:
         raise DeliveryError('execution produced no changes', 'FAILED')
-    # Re-read the project's authorization immediately before committing: the
-    # policy may have changed while the agent was running.
+    # Re-read the project's authorization and edition immediately before
+    # committing: either may have changed while the agent was running.
     fresh = project_config(context.repo)
+    _require_edition(fresh)
     _authorize_paths(spec['paths'], fresh)
     for name in changed:
         _check_changed_path(work, name, spec['paths'], fresh)
@@ -1190,6 +1223,7 @@ def _execute(context, spec, record):
         raise DeliveryError('execution committed nothing', 'FAILED')
     committed = _changes(work, base)
     fresh = project_config(context.repo)
+    _require_edition(fresh)
     _authorize_paths(spec['paths'], fresh)
     for name in committed:
         _check_changed_path(work, name, spec['paths'], fresh)
@@ -1349,6 +1383,38 @@ def _facts_match(record, work):
     if _fingerprint(work, record['base']) != record.get('diff_sha256'):
         return False, 'diff differs from the recorded digest'
     return True, ''
+
+
+def _recheck_approved(context):
+    """Re-prove every approval that is live in this process before the summary.
+
+    A trusted verification command from a later task, or any other writable
+    channel, can change an earlier task's worktree after it reached
+    ``PREPARED``. Nothing re-reads that record on the normal path, so the
+    summary would otherwise report stale approvals. This check only reads Git
+    state: it never re-runs a verification command, starts an agent or writes
+    to a worktree.
+    """
+    for ident in sorted(context.approved):
+        record = context.record(ident)
+        if record.get('status') != 'PREPARED':
+            continue
+        try:
+            work = _resolve_task(context, context.spec(ident))
+            ok, why = _facts_match(record, work)
+            if not ok:
+                raise DeliveryError(f'approved task {ident} no longer matches its approval: '
+                                    f'{why}')
+            changed = _changes(work, record['base'])
+            if changed != sorted(record.get('changed_paths') or []):
+                raise DeliveryError(f'approved task {ident} no longer has its reviewed paths')
+            if record.get('diff_digest'):
+                _, digest = _review_diff(work, record['base'], record['head'], changed)
+                if digest != record['diff_digest']:
+                    raise DeliveryError(f'approved task {ident} no longer has its reviewed diff')
+        except (DeliveryError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+            record.update(status='BLOCKED', reason=str(exc))
+    context.save()
 
 
 def _require_supported_state(record):
@@ -1583,7 +1649,8 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
     state_path = Path(state_path).absolute()
     if state_path.is_symlink() or not state_path.parent.is_dir():
         raise ValueError('state must be a regular file path in an existing directory')
-    if state_path.resolve().is_relative_to(repo):
+    state_path = state_path.resolve()
+    if state_path.is_relative_to(repo):
         raise ValueError('state must be outside the repository')
 
     executor_agent = executor_agent or plan.get('executor_agent') or 'build'
@@ -1592,12 +1659,7 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
         raise ValueError('reviewer agent must differ from the executor agent')
 
     config = project_config(repo)
-    if config.get('edition_count') != 1 or config.get('edition') not in VALID_EDITIONS:
-        values = config.get('edition_values') or []
-        raise ValueError('docs/PROJECT.md must declare exactly one `edition` of `local` or '
-                         f'`github` before any dispatch; found {config.get("edition_count")} '
-                         f'declaration(s), values {values!r} (edition parsed as '
-                         f'{config.get("edition")!r})')
+    _require_edition(config, ValueError)
     if _status(repo):
         raise ValueError('repository worktree is not clean')
     for spec in specs:
@@ -1726,6 +1788,7 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
                 except (OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
                     record.update(status='BLOCKED', reason=str(exc))
                     saver()
+        _recheck_approved(context)
         return state
     finally:
         for handle in locks:
