@@ -580,15 +580,37 @@ class RecoveryTests(DeliveryCase):
         self.assertNotIn('stash', record)
         self.assertEqual(_git(work, 'rev-parse', 'HEAD').stdout, head_before)
 
-    def test_retry_is_allowed_when_the_worktree_is_clean_at_the_baseline(self):
+    def test_retry_reruns_review_on_the_same_committed_head(self):
+        work = self.worktree('one')
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+
+        def reject(work, prompt, head, digest):
+            return {'exit_code': 0, 'session_id': 'ses_rev',
+                    'text': _verdict(head, digest, 'REJECT', [{'defect': 'typo'}])}
+
+        state, _ = self.run_delivery(plan, FakeAgents(self, review=reject))
+        self.assertEqual(state['tasks']['one']['status'], 'REVIEW_REJECTED')
+        head = state['tasks']['one']['head']
+        state, agents = self.run_delivery(plan, retry=['one'])
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'VERIFIED')
+        self.assertEqual(record['head'], head)
+        self.assertEqual(record['attempt'], 2)
+        self.assertNotIn('stash', record)
+
+    def test_retry_reruns_verification_without_discarding_the_committed_attempt(self):
         work = self.worktree('one')
         plan = self.plan([self.task('one', work, ['a.txt'],
                                     verify=[[PY, '-c', 'raise SystemExit(1)']])])
         state, _ = self.run_delivery(plan)
         self.assertEqual(state['tasks']['one']['status'], 'FAILED')
-        # The failed attempt committed its change; retry must not reset it.
+        head = state['tasks']['one']['head']
         state, agents = self.run_delivery(plan, retry=['one'])
-        self.assertIn('retry', state['tasks']['one']['reason'])
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'FAILED')
+        self.assertEqual(record['attempt'], 2)
+        self.assertEqual(record['head'], head)
+        self.assertNotIn('stash', record)
         self.assertEqual(agents.calls, [])
 
 
