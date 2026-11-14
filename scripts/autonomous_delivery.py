@@ -88,12 +88,16 @@ fail-closed:
 * no ``reset``, ``stash`` or delete is ever performed; a worktree that is not
   exactly at the target baseline, or that has uncommitted/committed leftovers,
   is refused and left untouched;
-* verification runs in its own process group so a timeout kills the whole tree.
-  Windows has no process group a plain ``Popen`` can signal, so the check's PID
-  tree is stopped with ``taskkill /T`` instead; a descendant that detaches from
-  that tree is still not guaranteed to be caught. A timeout stops the run at
-  that check — no later verification command, Agent or Git write starts — and a
-  kill that cannot be proven is recorded as unproven, never as killed.
+* verification runs in its own process group so a timeout tries to kill the whole
+  tree. Windows has no process group a plain ``Popen`` can signal, so the check's
+  PID tree is stopped with ``taskkill /T`` instead; a descendant that detaches
+  from that tree is still not guaranteed to be caught. The termination attempt
+  is kept separate from the proof that the group is gone: POSIX only claims a
+  kill once the group no longer answers signal 0, and Windows never claims one
+  because ``taskkill``'s zero exit only reports that the command succeeded. A
+  timeout stops the whole run at that check — no later task, closing approval
+  re-check, verification command, profile query, Agent or Git write starts — and
+  a kill that cannot be proven is recorded as unproven, never as killed.
 
 Nothing here is a sandbox. Worktrees, prompts, path checks and ``--standalone``
 do not restrict OpenCode's configured permissions: V2 can reach the host
@@ -177,6 +181,17 @@ class SharedGateError(DeliveryError, ValueError):
     declaration as a value problem to their direct callers, and those callers
     keep working unchanged while the runtime boundaries gain the shared-gate
     type they need to stop the whole run.
+    """
+
+
+class RunHaltError(DeliveryError):
+    """A failure that has to stop the whole run, not just the task that saw it.
+
+    A timed-out verification check is the producer: the process tree may still
+    be running on the host and can write to any worktree, so no later task, no
+    closing approval re-check and no profile query or Agent may start. The task
+    that observed the timeout is recorded ``BLOCKED``, and every approval still
+    live in this process loses its support in the same journal write.
     """
 
 
@@ -1239,39 +1254,83 @@ def _classify_stream(returncode, output):
             'detail': 'ok'}
 
 
-def _kill_group(process):
-    """Stop the check's process group; return True only when that is proven.
+KILL_GRACE = 30
 
-    A ``False`` answer means the surviving tree cannot be ruled out, and every
-    caller must report the timeout without claiming a kill.
+
+def _kill_group(process):
+    """Attempt to stop the check's process group; return ``(issued, pgid)``.
+
+    This is the **attempt**, not the proof. ``issued`` only says a termination
+    was sent: on POSIX a ``SIGKILL`` reached the process group (``pgid`` is that
+    group id); on Windows ``taskkill /T`` reported success and the direct child
+    was killed as well (``pgid`` is ``None``). Neither value says the tree is
+    gone — ``_prove_group_stopped`` performs that separate check.
     """
     if os.name == 'nt':
         # Windows has no process group a plain ``Popen`` can signal: killing the
         # direct child leaves the children it started running. ``taskkill /T``
         # walks the live tree of that PID, which is how the whole check is
         # stopped without a job object. Killing the direct child afterwards is a
-        # no-op when the tree kill already took it. Only a zero exit proves that
-        # the tree is gone; a failed or missing ``taskkill`` (access denied, PID
-        # reused, no such command) leaves descendants unaccounted for, so it is
-        # reported as unproven rather than assumed.
-        killed = False
+        # no-op when the tree kill already took it. A zero exit reports that the
+        # command succeeded, not that every descendant is gone; a failed or
+        # missing ``taskkill`` (access denied, PID reused, no such command)
+        # leaves even the attempt unproven.
+        issued = False
         try:
             result = subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)],
                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL, check=False)
-            killed = result.returncode == 0
+            issued = result.returncode == 0
         except OSError:
             pass
         try:
             process.kill()
         except OSError:
             pass
-        return killed
+        return issued, None
     try:
-        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        pgid = os.getpgid(process.pid)
+        os.killpg(pgid, signal.SIGKILL)
     except (OSError, AttributeError):
+        return False, None
+    return True, pgid
+
+
+def _prove_group_stopped(process, issued, pgid):
+    """Prove the timed-out check's process group is gone; True only then.
+
+    ``communicate`` returning means the direct child was reaped within the
+    grace period; a second timeout means it is not, so the tree cannot be shown
+    to be gone. On POSIX the group itself is then probed with signal 0: only
+    ``ESRCH`` shows no member is left. Windows has no group probe and
+    ``taskkill``'s zero exit is not that proof, so a Windows tree is never
+    claimed as terminated.
+    """
+    try:
+        process.communicate(timeout=KILL_GRACE)
+    except subprocess.TimeoutExpired:
         return False
-    return True
+    if not issued or os.name == 'nt' or pgid is None:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _stop_timed_out(process):
+    """Attempt to stop a timed-out check and return an honest detail string.
+
+    The attempt and the proof stay separate: a signal that was sent is only
+    called a kill once the group probe shows nothing is left.
+    """
+    issued, pgid = _kill_group(process)
+    if _prove_group_stopped(process, issued, pgid):
+        return 'timed out; process group killed'
+    return 'timed out; could not prove the process group was terminated'
 
 
 def _popen(argv, **kwargs):
@@ -1294,15 +1353,8 @@ def opencode(worktree, prompt, role, *, agent_name=None, timeout=1800):
     try:
         output, _ = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        killed = _kill_group(process)
-        try:
-            process.communicate(timeout=30)
-        except subprocess.TimeoutExpired:
-            pass
-        detail = ('timed out; process group killed' if killed else
-                  'timed out; could not prove the process group was terminated')
         return {'exit_code': None, 'session_id': None, 'text': '', 'timeout': True,
-                'detail': detail}
+                'detail': _stop_timed_out(process)}
     return _classify_stream(process.returncode, output or '')
 
 
@@ -1572,15 +1624,7 @@ def _run_check(command, work, timeout):
         output, _ = process.communicate(timeout=timeout)
         entry.update(exit_code=process.returncode, output_tail=(output or '')[-1000:])
     except subprocess.TimeoutExpired:
-        killed = _kill_group(process)
-        try:
-            process.communicate(timeout=30)
-        except subprocess.TimeoutExpired:
-            pass
-        entry.update(exit_code=None, timeout=True,
-                     output_tail=('timed out; process group killed' if killed else
-                                  'timed out; could not prove the process group was '
-                                  'terminated'))
+        entry.update(exit_code=None, timeout=True, output_tail=_stop_timed_out(process))
     return entry
 
 
@@ -1853,12 +1897,13 @@ def _verify(context, spec, record):
         record['verification'] = list(checks)
         context.save()
         if check.get('timeout'):
-            # A timed-out check may still have live descendants writing to the
-            # worktree, and the kill that was attempted may not be proven. Stop
-            # here: no later verification command, profile query, Agent or Git
-            # write may start, and the run is not retryable automatically.
-            raise DeliveryError('a verification process tree may still be running; '
-                                'refusing to continue or retry automatically')
+            # A timed-out check may still have live descendants writing to any
+            # worktree, and the kill that was attempted may not be proven. This
+            # is a run-wide failure: no later task, closing approval re-check,
+            # verification command, profile query, Agent or Git write may
+            # start, and the run is not retryable automatically.
+            raise RunHaltError('a verification process tree may still be running; '
+                               'refusing to continue or retry automatically')
         _require_live_config(context, spec)
     if not _all_zero(checks):
         raise DeliveryError('verification failed', 'FAILED')
@@ -2247,9 +2292,16 @@ def _authenticate(record, context, spec):
 
 def _reconcile(context, spec, record):
     """Continue an interrupted task only after re-proving every provable gate."""
+    _require_supported_state(record)
+    if _timed_out(record):
+        # A journal can carry a timeout from a runner that died before the
+        # halted-run write. The tree may still be alive, so this is not a
+        # task-scoped refusal: nothing else in this run may start.
+        raise RunHaltError('the journal records a timed-out verification check; its '
+                           'process tree may still be running, so the run cannot resume '
+                           'or continue')
     if _pid_alive(record.get('pid')) is not False:
         raise DeliveryError('previous runner process may still be alive; refusing to resume')
-    _require_supported_state(record)
     work = _resolve_task(context, spec)
     phase = record.get('phase')
     if phase in (None, 'execute'):
@@ -2358,8 +2410,10 @@ def _attempt_retry(context, spec, record):
     if record.get('status') == 'UNKNOWN' and _pid_alive(record.get('pid')) is not False:
         raise DeliveryError('retry refused: the previous runner process may still be alive')
     if _timed_out(record):
-        raise DeliveryError('retry refused: a verification check timed out and its process '
-                            'tree may still be running; inspect the host manually')
+        # A recorded timeout is run-wide: its tree may still be alive, so even
+        # an explicit retry cannot let another task start.
+        raise RunHaltError('retry refused: a verification check timed out and its process '
+                           'tree may still be running; inspect the host manually')
     work = _resolve_task(context, spec)
     if _status(work):
         raise DeliveryError('retry refused: the worktree has uncommitted changes. Inspect them '
@@ -2563,14 +2617,15 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
         for spec in specs:
             state['tasks'].setdefault(spec['id'], {'status': 'PENDING'})
 
-        # A shared-gate failure is not scoped to the task that observed it: the
-        # edition and the path authorization come from the one
-        # ``docs/PROJECT.md`` every task in this run proves itself against, and a
-        # later task would start its own `_root`/`rev-parse` (or Agent, or
-        # journal write) on a declaration the run did not begin with. It is
-        # recorded once, on that task, and then the run stops: nothing else
-        # starts, including the closing approval re-check, which reads Git and
-        # queries the runtime profiles.
+        # A run-wide failure is not scoped to the task that observed it. A
+        # shared-gate failure means the one ``docs/PROJECT.md`` every task
+        # proves itself against is no longer valid, so a later task would start
+        # its own `_root`/`rev-parse` (or Agent, or journal write) on a
+        # declaration the run did not begin with. A timed-out verification
+        # check means a process tree may still be alive and can write to any
+        # worktree. Either is recorded once, on that task, and then the run
+        # stops: nothing else starts, including the closing approval re-check,
+        # which reads Git and queries the runtime profiles.
         halt = []
 
         def halt_on_shared(ident, record, exc):
@@ -2590,6 +2645,27 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
                 live.update(status='BLOCKED', reason=(
                     f'the shared project gate failed while task {ident} was being '
                     f'processed: {exc}; every live approval depends on that gate'))
+            record.update(status=exc.status, reason=str(exc))
+            saver()
+            halt.append(exc)
+
+        def halt_run(ident, record, exc):
+            """Persist a run-wide failure that is not the shared project gate.
+
+            A timed-out check is the only producer: its process tree may still
+            be running and can write to any worktree. No later task, closing
+            approval re-check, profile query or Agent starts. Every approval
+            still live loses its support in this same write because its
+            worktree can no longer be shown to match what was reviewed.
+            """
+            for other in sorted(context.approved):
+                live = context.record(other)
+                if live.get('status') != TERMINAL_OK:
+                    continue
+                live.update(status='BLOCKED', reason=(
+                    f'the run stopped when task {ident} timed out: {exc}; a surviving '
+                    'process tree may have changed any worktree, so the approval is no '
+                    'longer supportable'))
             record.update(status=exc.status, reason=str(exc))
             saver()
             halt.append(exc)
@@ -2616,6 +2692,9 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
             except SharedGateError as exc:
                 halt_on_shared(spec['id'], record, exc)
                 break
+            except RunHaltError as exc:
+                halt_run(spec['id'], record, exc)
+                break
             except DeliveryError as exc:
                 record.update(status=exc.status, reason=str(exc))
                 saver()
@@ -2633,6 +2712,9 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
             except SharedGateError as exc:
                 halt_on_shared(ident, context.record(ident), exc)
                 break
+            except RunHaltError as exc:
+                halt_run(ident, context.record(ident), exc)
+                break
             except DeliveryError as exc:
                 context.record(ident).update(status=exc.status, reason=str(exc))
                 saver()
@@ -2648,6 +2730,9 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
                     progress = _process(context, spec, record) or progress
                 except SharedGateError as exc:
                     halt_on_shared(spec['id'], record, exc)
+                    break
+                except RunHaltError as exc:
+                    halt_run(spec['id'], record, exc)
                     break
                 except DeliveryError as exc:
                     record.update(status=exc.status, reason=str(exc))

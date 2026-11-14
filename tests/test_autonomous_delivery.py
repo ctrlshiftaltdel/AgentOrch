@@ -1710,48 +1710,74 @@ class CheckRunnerTests(DeliveryCase):
         time.sleep(3)
         self.assertFalse((work / 'child-marker').exists())
 
-    def test_a_windows_tree_kill_is_reported_only_when_taskkill_proved_it(self):
-        # `taskkill /T` is the only proof that the whole tree is gone on
-        # Windows. A non-zero exit (or a failed spawn) leaves descendants
-        # unaccounted for, so the caller must be told the kill was not proven.
+    def test_a_windows_taskkill_zero_is_an_attempt_not_a_proof(self):
+        # `taskkill /T` walks the live tree, but its zero exit only says the
+        # command succeeded: it does not prove that every descendant is gone.
+        # The attempt must never become the "killed" claim by itself.
         process = mock.Mock(pid=4242)
         failed = mock.Mock(returncode=128)
         with mock.patch.object(delivery.os, 'name', 'nt'), \
                 mock.patch.object(delivery.subprocess, 'run', return_value=failed) as run:
-            self.assertIs(delivery._kill_group(process), False)
+            self.assertEqual(delivery._kill_group(process), (False, None))
         self.assertEqual(run.call_args.args[0][:1], ['taskkill'])
         process.kill.assert_called()
         succeeded = mock.Mock(returncode=0)
         with mock.patch.object(delivery.os, 'name', 'nt'), \
                 mock.patch.object(delivery.subprocess, 'run', return_value=succeeded):
-            self.assertIs(delivery._kill_group(process), True)
+            self.assertEqual(delivery._kill_group(process), (True, None))
         with mock.patch.object(delivery.os, 'name', 'nt'), \
                 mock.patch.object(delivery.subprocess, 'run', side_effect=OSError('gone')):
-            self.assertIs(delivery._kill_group(process), False)
+            self.assertEqual(delivery._kill_group(process), (False, None))
+        with mock.patch.object(delivery.os, 'name', 'nt'):
+            self.assertFalse(delivery._prove_group_stopped(process, True, None))
+        process.communicate.return_value = ('', '')
+        with mock.patch.object(delivery.os, 'name', 'nt'), \
+                mock.patch.object(delivery.subprocess, 'run', return_value=succeeded):
+            detail = delivery._stop_timed_out(process)
+        self.assertIn('could not prove', detail)
+        self.assertNotIn('killed', detail)
 
     def test_a_timeout_never_claims_a_tree_kill_it_cannot_prove(self):
+        # The termination attempt is not proof: if the direct child still does
+        # not exit within the grace period, the tree cannot be shown to be
+        # gone, even when the group signal or `taskkill` reported success.
         process = mock.Mock(pid=4242)
         process.communicate.side_effect = subprocess.TimeoutExpired('check', 1)
         work = self.worktree('one')
-        with mock.patch.object(delivery, '_popen', return_value=process), \
-                mock.patch.object(delivery, '_kill_group', return_value=False):
-            entry = delivery._run_check([PY, '-c', 'pass'], work, timeout=1)
-        self.assertIsNone(entry['exit_code'])
-        self.assertIs(entry['timeout'], True)
-        self.assertIn('could not prove', entry['output_tail'])
-        self.assertNotIn('killed', entry['output_tail'])
-        with mock.patch.object(delivery, '_popen', return_value=process), \
-                mock.patch.object(delivery, '_kill_group', return_value=True):
-            entry = delivery._run_check([PY, '-c', 'pass'], work, timeout=1)
-        self.assertIs(entry['timeout'], True)
-        self.assertEqual(entry['output_tail'], 'timed out; process group killed')
+        for attempt in ((False, None), (True, 4242)):
+            with mock.patch.object(delivery, '_popen', return_value=process), \
+                    mock.patch.object(delivery, '_kill_group', return_value=attempt):
+                entry = delivery._run_check([PY, '-c', 'pass'], work, timeout=1)
+            self.assertIsNone(entry['exit_code'])
+            self.assertIs(entry['timeout'], True)
+            self.assertIn('could not prove', entry['output_tail'])
+            self.assertNotIn('killed', entry['output_tail'])
+
+    def test_a_timeout_is_killed_only_after_the_group_probe_is_gone(self):
+        process = mock.Mock(pid=4242)
+        process.communicate.return_value = ('', '')
+        with mock.patch.object(delivery.os, 'name', 'posix'), \
+                mock.patch.object(delivery.os, 'killpg', return_value=None), \
+                mock.patch.object(delivery, '_kill_group', return_value=(True, 4242)):
+            self.assertEqual(delivery._stop_timed_out(process),
+                             'timed out; could not prove the process group was terminated')
+        with mock.patch.object(delivery.os, 'name', 'posix'), \
+                mock.patch.object(delivery.os, 'killpg', side_effect=ProcessLookupError), \
+                mock.patch.object(delivery, '_kill_group', return_value=(True, 4242)):
+            self.assertEqual(delivery._stop_timed_out(process),
+                             'timed out; process group killed')
+        # A failed attempt is not turned into proof by the child exiting.
+        with mock.patch.object(delivery.os, 'name', 'posix'), \
+                mock.patch.object(delivery, '_kill_group', return_value=(False, None)):
+            self.assertEqual(delivery._stop_timed_out(process),
+                             'timed out; could not prove the process group was terminated')
 
     def test_a_timed_out_session_never_claims_a_kill_it_cannot_prove(self):
         work = self.worktree('one')
         process = mock.Mock(pid=4242)
         process.communicate.side_effect = subprocess.TimeoutExpired('opencode', 1)
         with mock.patch.object(delivery, '_popen', return_value=process), \
-                mock.patch.object(delivery, '_kill_group', return_value=False):
+                mock.patch.object(delivery, '_kill_group', return_value=(False, None)):
             result = delivery.opencode(work, 'prompt', 'execution', timeout=1)
         self.assertIs(result['timeout'], True)
         self.assertIn('could not prove', result['detail'])
@@ -2246,19 +2272,122 @@ class TimeoutTests(DeliveryCase):
         self.assertTrue(record['verification'][0]['timeout'])
 
     def test_timeout_is_blocked_and_not_retryable(self):
-        work = self.worktree('one')
-        task = self.task('one', work, ['a.txt'],
+        one, two = self.worktree('one'), self.worktree('two')
+        task = self.task('one', one, ['a.txt'],
                          verify=[[PY, '-c', 'import time; time.sleep(5)']])
         task['timeout'] = 1
-        plan = self.plan([task])
+        plan = self.plan([task, self.task('two', two, ['b.txt'])])
         state, agents = self.run_delivery(plan)
         self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
         self.assertIn('process tree', state['tasks']['one']['reason'])
         self.assertTrue(state['tasks']['one']['verification'][0]['timeout'])
+        # The timeout stopped the run, so task two never started.
+        self.assertEqual(state['tasks']['two']['status'], 'PENDING')
+        self.assertEqual(agents.calls, ['execution'])
         state, agents = self.run_delivery(plan, retry=['one'])
         self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
         self.assertIn('timed out', state['tasks']['one']['reason'])
+        # Retrying the timed-out task does not start task two either.
+        self.assertEqual(state['tasks']['two']['status'], 'PENDING')
         self.assertEqual(agents.calls, [])
+
+    def test_a_recorded_timeout_halts_a_resume_before_another_task(self):
+        # A runner can die after saving a timed-out check but before writing
+        # the halted-run state. The next process must not resume the journal
+        # and start another task while that tree may still be alive.
+        one, two = self.worktree('one'), self.worktree('two')
+        plan = self.plan([self.task('one', one, ['a.txt']),
+                          self.task('two', two, ['b.txt'])])
+        self.seed(plan, {'one': {
+            'status': 'UNKNOWN', 'phase': 'verify', 'pid': 999999,
+            'verification': [{'program': 'x', 'argv_sha256': '0' * 64,
+                              'exit_code': None, 'timeout': True}]}})
+        state, agents = self.run_delivery(plan, resume=True)
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('process tree', state['tasks']['one']['reason'])
+        self.assertEqual(state['tasks']['two']['status'], 'PENDING')
+        self.assertEqual(agents.calls, [])
+
+    def test_a_timeout_stops_the_whole_run_before_the_next_task(self):
+        # A timed-out check may leave a process tree running that can write to
+        # any worktree. The failure is therefore not scoped to the task that
+        # saw it: the run has to stop before task two starts, and nothing
+        # external (a Git read, a profile query or an Agent) may start after
+        # the timeout is recorded.
+        one, two = self.worktree('one'), self.worktree('two')
+        base_two = _head_of(two)
+        first = self.root / 'first-check-ran'
+        task = self.task('one', one, ['a.txt'], verify=[
+            [PY, '-c',
+             f'import pathlib,time; pathlib.Path({str(first)!r}).write_text("x"); '
+             'time.sleep(10)']])
+        task['timeout'] = 1
+        plan = self.plan([task, self.task('two', two, ['b.txt'])])
+        queried, git_calls = [], []
+        original_git = delivery.git
+
+        def profiles(where):
+            if first.exists():
+                queried.append(str(where))
+            return self.profiles(where)
+
+        def git_probe(where, *args):
+            if first.exists():
+                git_calls.append(args)
+            return original_git(where, *args)
+
+        with mock.patch.object(delivery, 'git', git_probe):
+            state, agents = self.run_delivery(plan, profiles=profiles)
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('process tree', state['tasks']['one']['reason'])
+        self.assertTrue(state['tasks']['one']['verification'][0]['timeout'])
+        # Task two never started: no Agent, no Git call, no history.
+        self.assertEqual(state['tasks']['two']['status'], 'PENDING')
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertEqual(_head_of(two), base_two)
+        # Nothing external ran after the timeout was recorded.
+        self.assertEqual(queried, [])
+        self.assertEqual(git_calls, [])
+
+    def test_a_timeout_stops_the_run_before_the_closing_approval_recheck(self):
+        # Task one reaches PREPARED, then task two's first check times out.
+        # The closing approval re-check reads Git and queries the reviewer
+        # profile; both are external calls a surviving tree could interfere
+        # with, so the run must stop without them. A live approval can no
+        # longer be shown to match what was reviewed and is closed in the same
+        # journal write that stops the run.
+        one, two = self.worktree('one'), self.worktree('two')
+        first = self.root / 'second-task-check-ran'
+        timed = self.task('two', two, ['b.txt'], verify=[
+            [PY, '-c',
+             f'import pathlib,time; pathlib.Path({str(first)!r}).write_text("x"); '
+             'time.sleep(10)']])
+        timed['timeout'] = 1
+        plan = self.plan([self.task('one', one, ['a.txt']), timed])
+        queried, git_calls = [], []
+        original_git = delivery.git
+
+        def profiles(where):
+            if first.exists():
+                queried.append(str(where))
+            return self.profiles(where)
+
+        def git_probe(where, *args):
+            if first.exists():
+                git_calls.append(args)
+            return original_git(where, *args)
+
+        with mock.patch.object(delivery, 'git', git_probe):
+            state, agents = self.run_delivery(plan, profiles=profiles)
+        self.assertEqual(agents.calls, ['execution', 'review', 'execution'])
+        self.assertEqual(state['tasks']['two']['status'], 'BLOCKED')
+        self.assertIn('process tree', state['tasks']['two']['reason'])
+        # The approval from task one loses its support with the halted run.
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('timed out', state['tasks']['one']['reason'])
+        self.assertEqual(queried, [])
+        self.assertEqual(git_calls, [])
+        self.assertEqual(self.journal()['tasks']['one']['status'], 'BLOCKED')
 
 
 class LockIdentityTests(DeliveryCase):
