@@ -3,7 +3,7 @@
 This slice deliberately has **no automatic merge**. It runs one real OpenCode
 execution session per task, verifies the diff with the plan's commands, starts a
 different session with a declared read-only agent for review, and leaves the
-task in ``APPROVED`` for a human or the Master to merge. Every write path is
+task in ``PREPARED`` for a human or the Master to review and merge. Every write path is
 fail-closed:
 
 * a plan may not ask for a merge; ``merge``/``--merge-into`` is refused before
@@ -38,25 +38,27 @@ import signal
 import subprocess
 import tempfile
 
-STATE_VERSION = 3
-TERMINAL_OK = 'APPROVED'
+STATE_VERSION = 4
+TERMINAL_OK = 'PREPARED'
 # A dependency is only satisfied by an integrated result. This prepare-only
 # slice never produces one, so dependent tasks stay PENDING instead of building
 # on a target that does not contain the dependency's change.
 INTEGRATED = ('VERIFIED',)
-ACTIVE = ('RUNNING', 'APPROVED')
+ACTIVE = ('RUNNING', 'PREPARED')
 STOPPED = ('FAILED', 'REVIEW_REJECTED', 'BLOCKED', 'UNKNOWN')
 BRANCH_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]*$')
 SHA_RE = re.compile(r'^[0-9a-f]{40}(?:[0-9a-f]{24})?$')
 DIGEST_RE = re.compile(r'^[0-9a-f]{64}$')
-VERDICT_KEYS = {'verdict', 'head', 'diff_sha256', 'paths', 'mode', 'acceptance', 'findings'}
+VERDICT_KEYS = {'verdict', 'head', 'base', 'diff_sha256', 'diff_digest', 'task_digest',
+                'paths', 'mode', 'acceptance', 'findings'}
+MAX_DIFF_BYTES = 65536
 MODE = 'prepare-only'
 # The runtime's write-capable tool actions we can name. MCP/plugin channels are
 # not enumerable here, so this gate is never presented as an OS read-only proof.
 MUTATING_ACTIONS = ('edit', 'shell')
 MERGE_REFUSAL = ('automatic merge is not implemented in this slice: it has no authoritative '
                  'task lock, atomic recovery or independent authorization binding. Run with '
-                 'merge disabled and let the Master merge the APPROVED head')
+                 'merge disabled and let the Master review the PREPARED head')
 
 
 class DeliveryError(Exception):
@@ -117,12 +119,16 @@ def project_config(repo):
     """Read edition and path authorization from the project's own config."""
     path = Path(repo) / 'docs' / 'PROJECT.md'
     if not path.is_file():
-        return {'edition': None, 'allowed': None, 'forbidden': []}
+        return {'edition': None, 'edition_count': 0, 'allowed': None, 'forbidden': [],
+                'secrets': []}
     text = path.read_text(encoding='utf-8', errors='replace')
     match = re.search(r'^\s*[-*]\s*`?edition`?\s*[:：]\s*`?([A-Za-z0-9_-]+)`?', text, re.M)
-    return {'edition': match.group(1) if match else None,
+    editions = re.findall(r'^\s*[-*]\s*`?edition`?\s*[:：]\s*`?([A-Za-z0-9_-]+)`?', text, re.M)
+    return {'edition': editions[0] if len(editions) == 1 else None,
+            'edition_count': len(editions),
             'allowed': _policy_paths(text, '允许改动路径'),
-            'forbidden': _policy_paths(text, '禁止改动路径')}
+            'forbidden': _policy_paths(text, '禁止改动路径'),
+            'secrets': _secret_patterns(text)}
 
 
 def _policy_paths(text, needle):
@@ -137,6 +143,20 @@ def _policy_paths(text, needle):
                     continue
             return paths or None
     return None
+
+
+def _secret_patterns(text):
+    for line in text.splitlines():
+        if '秘密与隐私文件模式' in line:
+            return [token.strip() for token in re.findall(r'`([^`]+)`', line) if token.strip()]
+    return []
+
+
+def _secret_path(name, patterns):
+    import fnmatch
+    basename = name.rsplit('/', 1)[-1]
+    return any(fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(basename, pattern)
+               for pattern in patterns)
 
 
 def _overlaps(left, right):
@@ -155,6 +175,8 @@ def _authorize_paths(paths, config):
         raise ValueError('cannot prove project authorization: docs/PROJECT.md has no '
                          'backticked 允许改动路径 list')
     for name in paths:
+        if _secret_path(name, config.get('secrets') or []):
+            raise ValueError(f'path {name!r} matches a project secret/private pattern')
         for forbidden in config['forbidden']:
             if _overlaps(name, forbidden):
                 raise ValueError(f'path {name!r} overlaps the forbidden path {forbidden!r} '
@@ -166,6 +188,9 @@ def _authorize_paths(paths, config):
 
 def _authorize_changed(name, allowed_paths, config):
     """Every actual changed path is checked, not only the declared prefixes."""
+    if _secret_path(name, config.get('secrets') or []):
+        raise DeliveryError(f'privacy boundary: {name} matches a project secret/private '
+                            'pattern and cannot be reviewed or committed')
     _check_changed_path_lexical(name, allowed_paths)
     for forbidden in config['forbidden']:
         if _overlaps(name, forbidden):
@@ -241,6 +266,8 @@ def _check_changed_path(work, name, allowed, config=None):
     """
     _safe_rel(name)
     if config is not None:
+        if _secret_path(name, config.get('secrets') or []):
+            raise DeliveryError(f'privacy boundary: {name} matches a project secret pattern')
         for forbidden in config['forbidden']:
             if _overlaps(name, forbidden):
                 raise DeliveryError(f'forbidden path: {name} overlaps the project-forbidden '
@@ -547,15 +574,22 @@ def lock_targets(repo, state_path, specs):
 
 def acquire_locks(repo, state_path, specs):
     directory, targets = lock_targets(repo, state_path, specs)
-    keys = [('repo', str(_common(repo))), ('journal', str(Path(state_path).absolute()))]
+    journal = Path(state_path).absolute()
+    journal_lock = journal.parent / (
+        '.agentorch-delivery-' + hashlib.sha256(str(journal).encode()).hexdigest()[:24]
+        + '.lock')
+    keys = [('repo', str(_common(repo)))]
     for value in targets:
         if value not in ('repo', 'journal'):
             keys.append(('worktree', value))
     handles = []
     try:
+        paths = [journal_lock]
         for kind, value in sorted(keys):
             key = hashlib.sha256((kind + '\0' + value).encode()).hexdigest()[:24]
-            handles.append(_lock(directory / f'{key}.lock'))
+            paths.append(directory / f'{key}.lock')
+        for path in sorted(set(paths)):
+            handles.append(_lock(path))
     except BaseException:
         for handle in handles:
             handle.close()
@@ -754,7 +788,16 @@ def agent_profiles(worktree, timeout=120):
 
 
 def _rule_matches(rule, action):
-    return rule.get('action') in (action, '*')
+    """OpenCode matches action patterns as globs; '*' and 's*' both cover shell."""
+    import fnmatch
+    pattern = rule.get('action')
+    if not isinstance(pattern, str):
+        return False
+    return pattern == '*' or fnmatch.fnmatchcase(action, pattern) or pattern == action
+
+
+def _covers_mutating(rule):
+    return any(_rule_matches(rule, action) for action in MUTATING_ACTIONS)
 
 
 def profile_gate(profile):
@@ -783,7 +826,10 @@ def profile_gate(profile):
         resource = rule.get('resource')
         if resource in (None, '*'):
             continue
-        if any(_rule_matches(rule, action) for action in MUTATING_ACTIONS):
+        # Any allow for a pattern that *could* cover edit/shell is unproven. A
+        # later identical-scope deny does not make it safe: the runner cannot
+        # enumerate what the glob reaches.
+        if _covers_mutating(rule):
             scoped_allows.append({'action': rule.get('action'), 'resource': resource})
     missing = [action for action in MUTATING_ACTIONS if effective.get(action) != 'deny']
     reasons = []
@@ -834,13 +880,17 @@ def _acceptance_ok(verdict, criteria):
     return True, ''
 
 
-def _verdict_matches(verdict, record, spec):
+def _verdict_matches(verdict, record, spec, context):
     if verdict.get('verdict') != 'APPROVE':
         return f'review verdict is {verdict.get("verdict")!r}, not APPROVE'
-    if verdict.get('head') != record['head']:
-        return 'review verdict binds a different head'
+    if verdict.get('head') != record['head'] or verdict.get('base') != record.get('base'):
+        return 'review verdict binds a different base or head'
     if verdict.get('diff_sha256') != record['diff_sha256']:
-        return 'review verdict binds a different diff'
+        return 'review verdict binds a different worktree diff'
+    if verdict.get('diff_digest') != record.get('diff_digest'):
+        return 'review verdict binds a different reviewed diff'
+    if verdict.get('task_digest') != _task_digest(context, spec, record):
+        return 'review verdict binds a different task packet'
     if verdict.get('mode') != MODE:
         return f'review verdict mode is {verdict.get("mode")!r}, not {MODE!r}'
     if sorted(verdict.get('paths') or []) != sorted(spec['paths']):
@@ -857,8 +907,9 @@ def _verdict_matches(verdict, record, spec):
 
 class _Context:
     def __init__(self, repo, plan, specs, state, agent, session_probe, profiles,
-                 state_saver, config):
+                 state_saver, config, state_path):
         self.repo = repo
+        self.state_path = state_path
         self.plan = plan
         self.specs = specs
         self.state = state
@@ -888,12 +939,17 @@ class _Context:
         return self._reviewer_ready[key]
 
 
-def _check_probe(probe, work, expected_agent, role, status='BLOCKED', require_text=False):
+def _check_probe(probe, work, expected_agent, role, status='BLOCKED', require_text=False,
+                 session=None):
     def fail(message):
         raise DeliveryError(message, status)
 
+    if not expected_agent:
+        fail(f'{role} agent identity is not defined by the current plan')
     if not probe.get('ok'):
         fail(f'{role} session is unverifiable: {probe.get("reason")}')
+    if session is not None and probe.get('session') != session:
+        fail(f'{role} export did not return the requested session id')
     if probe.get('outcome') != 'succeeded':
         fail(f'{role} session outcome is {probe.get("outcome")!r}, not succeeded')
     directory = probe.get('directory')
@@ -903,9 +959,11 @@ def _check_probe(probe, work, expected_agent, role, status='BLOCKED', require_te
         fail(f'{role} session has no user/assistant turn')
     if 'stop' not in (probe.get('finishes') or []):
         fail(f'{role} session has no completed assistant turn')
-    if expected_agent and any(name != expected_agent for name in probe.get('agents') or []):
-        fail(f'{role} session used agent(s) {probe.get("agents")}, '
-             f'not the declared {expected_agent}')
+    agents = probe.get('agents') or []
+    if not agents:
+        fail(f'{role} session export does not name an agent')
+    if any(name != expected_agent for name in agents):
+        fail(f'{role} session used agent(s) {agents}, not the declared {expected_agent}')
     if require_text and not ''.join(probe.get('texts') or []).strip():
         fail(f'{role} session transcript has no assistant text')
 
@@ -935,9 +993,14 @@ def _run_checks(commands, work, timeout):
                 process.communicate(timeout=30)
             except subprocess.TimeoutExpired:
                 pass
-            entry.update(exit_code=None, output_tail='timed out; process group killed')
+            entry.update(exit_code=None, timeout=True,
+                         output_tail='timed out; process group killed')
         checks.append(entry)
     return checks
+
+
+def _timed_out(record):
+    return any(check.get('timeout') for check in (record.get('verification') or []))
 
 
 def _all_zero(checks):
@@ -949,10 +1012,25 @@ def _criteria_prompt(spec):
                      for index, text in enumerate(spec['acceptance'], 1))
 
 
-def _task_root(spec):
+def _resolve_task(context, spec):
+    """The one identity gate every phase, resume, retry and auth path must pass."""
     if spec['errors'] and not spec['worktree']:
         raise DeliveryError('task configuration is invalid: ' + '; '.join(spec['errors']))
-    return _root(spec['worktree'])
+    work = _root(spec['worktree'])
+    if work == context.repo:
+        raise DeliveryError('task worktree is the repository worktree itself; refusing to '
+                            'operate on it')
+    if _common(work) != _common(context.repo):
+        raise DeliveryError('task worktree does not belong to the run repository')
+    branch = _branch(work)
+    if not branch or branch in ('main', 'master'):
+        raise DeliveryError('task worktree must be on a non-main branch')
+    if branch == _branch(context.repo):
+        raise DeliveryError('task worktree is on the repository worktree branch; refusing to '
+                            'commit there')
+    if context.state_path.resolve().is_relative_to(work):
+        raise DeliveryError('state journal is inside the task worktree')
+    return work
 
 
 def _reviewer_gate(context, spec, work, record):
@@ -961,21 +1039,15 @@ def _reviewer_gate(context, spec, work, record):
                                   'effective': gate['effective'],
                                   'missing_denies': gate['missing'],
                                   'scoped_allows': gate['scoped_allows'],
-                                  'read_only_proven': gate['ready']}
+                                  'unknown_channels_unproven': True,
+                                  'tool_gate_passed': gate['ready']}
     if not gate['ready']:
         raise DeliveryError('reviewer agent profile is not provably read-only: '
                             + '; '.join(gate['reasons']))
 
 
-def _repo_identity(context, work):
-    """A task worktree must still belong to the repository under review."""
-    if _common(work) != _common(context.repo):
-        raise DeliveryError('task worktree does not belong to the run repository')
-
-
 def _execute(context, spec, record):
-    work = _task_root(spec)
-    _repo_identity(context, work)
+    work = _resolve_task(context, spec)
     if _status(work):
         raise DeliveryError('task worktree is not clean')
     base = _head(work)
@@ -996,7 +1068,8 @@ def _execute(context, spec, record):
         raise DeliveryError('execution failed or its terminal state is unknown: '
                             + str(execution.get('detail') or 'no detail'), 'FAILED')
     probe = context.session_probe(execution['session_id'], work)
-    _check_probe(probe, work, record.get('executor_agent'), 'execution', 'FAILED')
+    _check_probe(probe, work, context.plan['executor_agent'], 'execution', 'FAILED',
+                 session=execution['session_id'])
     record['execution_evidence'] = {
         'session': execution['session_id'], 'outcome': probe.get('outcome'),
         'directory': probe.get('directory'), 'agents': probe.get('agents'),
@@ -1034,44 +1107,102 @@ def _execute(context, spec, record):
 
 
 def _verify(context, spec, record):
-    work = _task_root(spec)
-    _repo_identity(context, work)
+    work = _resolve_task(context, spec)
     if _head(work) != record['head'] or _fingerprint(work, record['base']) != record['diff_sha256']:
         raise DeliveryError('head or diff changed before verification')
     checks = _run_checks(spec['verify'], work, spec['raw'].get('timeout', 1800))
     record['verification'] = checks
     context.save()
+    if any(check.get('timeout') for check in checks):
+        raise DeliveryError('a verification process tree may still be running; refusing to '
+                            'continue or retry automatically')
     if not _all_zero(checks):
-        raise DeliveryError('verification failed or timed out', 'FAILED')
+        raise DeliveryError('verification failed', 'FAILED')
     if _head(work) != record['head'] or _fingerprint(work, record['base']) != record['diff_sha256']:
         raise DeliveryError('head or diff changed during verification')
     record['phase'] = 'review'
     context.save()
 
 
-def _review_prompt(spec, record):
+def _task_digest(context, spec, record):
+    payload = {
+        'id': spec['id'], 'prompt': spec['prompt'], 'paths': list(spec['paths']),
+        'acceptance': list(spec['acceptance']),
+        'verify': [hashlib.sha256(json.dumps(command).encode()).hexdigest()
+                   for command in spec['verify']],
+        'base': record.get('base'), 'head': record.get('head'),
+        'diff_sha256': record.get('diff_sha256'), 'diff_digest': record.get('diff_digest'),
+        'changed_paths': sorted(record.get('changed_paths') or []),
+        'mode': MODE,
+        'executor_agent': context.plan['executor_agent'],
+        'reviewer_agent': context.plan['reviewer_agent'],
+        'carrier_digest': (context.plan.get('carrier') or {}).get('digest'),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _review_diff(work, base, head, changed):
+    """The complete textual diff a reviewer needs, or a fail-closed error."""
+    if not changed:
+        raise DeliveryError('there is no changed path to review')
+    numstat = os.fsdecode(git(work, 'diff', '--numstat', '--no-renames', base, head, '--',
+                              *changed))
+    for line in numstat.splitlines():
+        parts = line.split('\t')
+        if len(parts) >= 2 and ('-' in parts[0] or '-' in parts[1]):
+            raise DeliveryError('binary change cannot be presented completely; refusing to '
+                                'start a review that could not see it')
+    patch = os.fsdecode(git(work, 'diff', '--no-ext-diff', '--no-color', '--no-renames',
+                            '--unified=3', base, head, '--', *changed))
+    if 'Binary files' in patch:
+        raise DeliveryError('binary change cannot be presented completely; refusing to review')
+    if len(patch.encode()) > MAX_DIFF_BYTES:
+        raise DeliveryError(f'diff is larger than {MAX_DIFF_BYTES} bytes; refusing to review '
+                            'a change the reviewer cannot see completely')
+    if not patch.strip():
+        raise DeliveryError('the reviewed diff is empty; refusing to review')
+    return patch, hashlib.sha256(patch.encode()).hexdigest()
+
+
+def _review_prompt(spec, record, patch):
     return ('You are an independent reviewer in a new session. Do not modify, create or '
             'delete any file, do not commit, do not run commands that change the worktree, '
             'do not approve or merge anything, and do not push. Review the change described '
             'below against each acceptance criterion and answer with exactly one fenced '
             '```json block and nothing else inside it: {"verdict": "APPROVE" or "REJECT", '
-            '"head": "<40-char head sha>", "diff_sha256": "<64-char digest>", '
+            '"head": "<40-char head sha>", "base": "<40-char base sha>", '
+            '"diff_sha256": "<64-char worktree digest>", "diff_digest": "<64-char digest of '
+            'the shown diff>", "task_digest": "<64-char task binding>", '
             '"mode": "prepare-only", "paths": [<the exact allowed path list>], '
             '"acceptance": [{"id": "AC-1", "criterion": "<the exact criterion text>", '
             '"status": "PASS" or "FAIL" or "NOT_RUN", "evidence": "what you checked"}], '
             '"findings": []}.\n\n'
-            'HEAD_SHA=' + record['head'] + '\nDIFF_SHA256=' + record['diff_sha256']
+            'BASE_SHA=' + record['base'] + '\nHEAD_SHA=' + record['head']
+            + '\nDIFF_SHA256=' + record['diff_sha256']
+            + '\nDIFF_DIGEST=' + record['diff_digest']
+            + '\nTASK_DIGEST=' + record['task_digest']
             + '\nMODE=' + MODE + '\nAllowed paths: ' + json.dumps(spec['paths'])
+            + '\nChanged paths: ' + json.dumps(record.get('changed_paths') or [])
+            + '\n\nThe complete diff produced by Git is below; review it directly.\n'
+            '--- BEGIN DIFF ---\n' + patch + '\n--- END DIFF ---\n'
             + '\nAcceptance criteria:\n' + _criteria_prompt(spec)
             + '\n\nThe verdict must quote the allowed path list and every criterion text '
-            'exactly. findings must be an empty list for APPROVE: put any non-defect note '
-            'inside the acceptance evidence instead. Task:\n' + spec['prompt'])
+            'exactly and echo BASE_SHA, HEAD_SHA, DIFF_SHA256, DIFF_DIGEST and TASK_DIGEST. '
+            'findings must be an empty list for APPROVE: put any non-defect note inside the '
+            'acceptance evidence instead. Task:\n' + spec['prompt'])
 
 
 def _review(context, spec, record):
-    work = _task_root(spec)
-    _repo_identity(context, work)
-    review = context.agent(work, _review_prompt(spec, record), 'review')
+    work = _resolve_task(context, spec)
+    changed = _changes(work, record['base'])
+    if changed != sorted(record.get('changed_paths') or []):
+        raise DeliveryError('changed paths moved before review; refusing to review')
+    patch, diff_digest = _review_diff(work, record['base'], record['head'], changed)
+    record['changed_paths'] = changed
+    record['diff_digest'] = diff_digest
+    record['task_digest'] = _task_digest(context, spec, record)
+    context.save()
+    review = context.agent(work, _review_prompt(spec, record, patch), 'review')
     session = review.get('session_id')
     record['review_detail'] = review.get('detail')
     if review.get('exit_code') != 0 or not session:
@@ -1081,8 +1212,8 @@ def _review(context, spec, record):
         raise DeliveryError('review session equals execution session; independence is not '
                             'established', 'REVIEW_REJECTED')
     probe = context.session_probe(session, work)
-    _check_probe(probe, work, record.get('reviewer_agent'), 'review', 'REVIEW_REJECTED',
-                 require_text=True)
+    _check_probe(probe, work, context.plan['reviewer_agent'], 'review', 'REVIEW_REJECTED',
+                 require_text=True, session=session)
     record['review_session'] = session
     record['review_evidence'] = {
         'session': session, 'outcome': probe.get('outcome'),
@@ -1101,7 +1232,7 @@ def _review(context, spec, record):
     if json.dumps(streamed, sort_keys=True) != json.dumps(verdict, sort_keys=True):
         raise DeliveryError('review stream and session transcript disagree; refusing the '
                             'verdict', 'REVIEW_REJECTED')
-    problem = _verdict_matches(verdict, record, spec)
+    problem = _verdict_matches(verdict, record, spec, context)
     if problem:
         raise DeliveryError(problem, 'REVIEW_REJECTED')
     if _status(work) or _head(work) != record['head'] \
@@ -1109,7 +1240,7 @@ def _review(context, spec, record):
         raise DeliveryError('review session changed the worktree or its head/diff',
                             'REVIEW_REJECTED')
     record['review_verdict'] = verdict
-    record['status'] = 'APPROVED'
+    record['status'] = 'PREPARED'
     record['phase'] = 'done'
     context.save()
 
@@ -1133,7 +1264,7 @@ def _require_supported_state(record):
 
 def _prove_common(context, spec, record, work):
     """Everything that must hold before any side effect on a recorded approval."""
-    _repo_identity(context, work)
+    work = _resolve_task(context, spec)
     fresh = project_config(context.repo)
     _authorize_paths(spec['paths'], fresh)
     ok, why = _facts_match(record, work)
@@ -1144,22 +1275,27 @@ def _prove_common(context, spec, record, work):
         raise DeliveryError('recorded path set does not match the worktree')
     for name in changed:
         _check_changed_path(work, name, spec['paths'], fresh)
+    patch, diff_digest = _review_diff(work, record['base'], record['head'], changed)
+    if diff_digest != record.get('diff_digest'):
+        raise DeliveryError('the reviewed diff no longer matches the worktree')
+    if _task_digest(context, spec, record) != record.get('task_digest'):
+        raise DeliveryError('the current task packet no longer matches the reviewed one')
     _reviewer_gate(context, spec, work, record)
     session = record.get('execution_session')
     if not session:
         raise DeliveryError('recorded state has no execution session')
     probe = context.session_probe(session, work)
-    _check_probe(probe, work, record.get('executor_agent'), 'execution')
+    _check_probe(probe, work, context.plan['executor_agent'], 'execution', session=session)
     review = record.get('review_session')
     if not review or review == session:
         raise DeliveryError('recorded state has no independent review session')
     review_probe = context.session_probe(review, work)
-    _check_probe(review_probe, work, record.get('reviewer_agent'), 'review',
-                 require_text=True)
+    _check_probe(review_probe, work, context.plan['reviewer_agent'], 'review',
+                 require_text=True, session=review)
     verdict = _verdict(''.join(review_probe.get('texts') or []))
     if verdict is None:
         raise DeliveryError('review transcript has no machine-readable verdict')
-    problem = _verdict_matches(verdict, record, spec)
+    problem = _verdict_matches(verdict, record, spec, context)
     if problem:
         raise DeliveryError('review transcript no longer supports the approval: ' + problem)
     recorded = record.get('review_verdict')
@@ -1172,7 +1308,7 @@ def _prove_common(context, spec, record, work):
 def _authenticate(record, context, spec):
     """Re-prove an approval from Git and the transcripts before trusting it."""
     _require_supported_state(record)
-    if record.get('status') != 'APPROVED':
+    if record.get('status') != 'PREPARED':
         return
     key = spec['id']
     if context.auth.get(key) == 'ok':
@@ -1182,13 +1318,16 @@ def _authenticate(record, context, spec):
         raise DeliveryError('recorded approval has no usable head')
     if not isinstance(digest, str) or not DIGEST_RE.match(digest):
         raise DeliveryError('recorded approval has no diff digest')
-    work = _task_root(spec)
+    work = _resolve_task(context, spec)
     # Non-executing proof first: identity, scope, sessions and transcript.
     _prove_common(context, spec, record, work)
     # Only then run the verification commands (the only side effect here).
     checks = _run_checks(spec['verify'], work, spec['raw'].get('timeout', 1800))
+    if any(check.get('timeout') for check in checks):
+        raise DeliveryError('a verification process tree may still be running; refusing to '
+                            'continue')
     if not _all_zero(checks):
-        raise DeliveryError('recorded approval does not pass verification when re-run')
+        raise DeliveryError('recorded preparation does not pass verification when re-run')
     if _head(work) != head or _fingerprint(work, record['base']) != digest:
         raise DeliveryError('worktree moved while re-proving the approval')
     context.auth[key] = 'ok'
@@ -1199,8 +1338,7 @@ def _reconcile(context, spec, record):
     if _pid_alive(record.get('pid')) is not False:
         raise DeliveryError('previous runner process may still be alive; refusing to resume')
     _require_supported_state(record)
-    work = _task_root(spec)
-    _repo_identity(context, work)
+    work = _resolve_task(context, spec)
     fresh = project_config(context.repo)
     _authorize_paths(spec['paths'], fresh)
     phase = record.get('phase')
@@ -1229,12 +1367,15 @@ def _reconcile(context, spec, record):
     if not session:
         raise DeliveryError('interrupted execution has no verifiable session')
     probe = context.session_probe(session, work)
-    _check_probe(probe, work, record.get('executor_agent'), 'execution')
+    _check_probe(probe, work, context.plan['executor_agent'], 'execution', session=session)
     _reviewer_gate(context, spec, work, record)
     # Re-run the full verification before handing the task to review again.
     checks = _run_checks(spec['verify'], work, spec['raw'].get('timeout', 1800))
     record['verification'] = checks
     record['changed_paths'] = changed
+    if any(check.get('timeout') for check in checks):
+        raise DeliveryError('a verification process tree may still be running; refusing to '
+                            'continue')
     if not _all_zero(checks):
         raise DeliveryError('verification failed when resuming; not continuing to review',
                             'FAILED')
@@ -1244,8 +1385,7 @@ def _reconcile(context, spec, record):
 
 
 def _configure(context, spec, record):
-    work = _root(spec['worktree'])
-    _repo_identity(context, work)
+    work = _resolve_task(context, spec)
     branch = _branch(work)
     if not branch or branch in ('main', 'master'):
         raise DeliveryError('task worktree must be on a non-main branch')
@@ -1269,7 +1409,9 @@ def _process(context, spec, record):
     if status == 'CANCELLED':
         return False
     _require_supported_state(record)
-    if status == 'APPROVED':
+    if status in ('PENDING', 'RUNNING', 'PREPARED'):
+        _resolve_task(context, spec)
+    if status == 'PREPARED':
         _authenticate(record, context, spec)
         return False
     if status in STOPPED:
@@ -1321,8 +1463,10 @@ def _attempt_retry(context, spec, record):
                             f'{record.get("phase")!r}')
     if record.get('status') == 'UNKNOWN' and _pid_alive(record.get('pid')) is not False:
         raise DeliveryError('retry refused: the previous runner process may still be alive')
-    work = _task_root(spec)
-    _repo_identity(context, work)
+    if _timed_out(record):
+        raise DeliveryError('retry refused: a verification check timed out and its process '
+                            'tree may still be running; inspect the host manually')
+    work = _resolve_task(context, spec)
     _authorize_paths(spec['paths'], project_config(context.repo))
     if _status(work):
         raise DeliveryError('retry refused: the worktree has uncommitted changes. Inspect them '
@@ -1376,9 +1520,10 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
         raise ValueError('reviewer agent must differ from the executor agent')
 
     config = project_config(repo)
-    if config.get('edition') not in ('local', 'github'):
-        raise ValueError('docs/PROJECT.md must declare edition `local` or `github` before any '
-                         f'dispatch; found {config.get("edition")!r}')
+    if config.get('edition_count') != 1 or config.get('edition') not in ('local', 'github'):
+        raise ValueError('docs/PROJECT.md must declare exactly one `edition` of `local` or '
+                         f'`github` before any dispatch; found {config.get("edition_count")} '
+                         f'declaration(s), value {config.get("edition")!r}')
     if _status(repo):
         raise ValueError('repository worktree is not clean')
     for spec in specs:
@@ -1409,7 +1554,9 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
         if state_path.resolve().is_relative_to(work):
             raise ValueError('state must be outside every task worktree')
         try:
-            if work == repo or _common(work) != _common(repo):
+            if work == repo:
+                raise ValueError('task worktree is the repository worktree itself')
+            if _common(work) != _common(repo):
                 raise ValueError('worktree does not belong to the repository')
             branch = _branch(work)
             if not branch or branch in ('main', 'master'):
@@ -1454,7 +1601,7 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
             _save(state_path, state)
 
         context = _Context(repo, plan, specs, state, agent, session_probe, profiles,
-                           saver, config)
+                           saver, config, state_path)
         for spec in specs:
             state['tasks'].setdefault(spec['id'], {'status': 'PENDING'})
         for spec in specs:
@@ -1516,13 +1663,21 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
 def _summary(state):
     tasks = {}
     for ident, record in sorted((state.get('tasks') or {}).items()):
+        verdict = record.get('review_verdict') or {}
+        safe_verdict = ({'verdict': verdict.get('verdict'), 'head': verdict.get('head'),
+                         'base': verdict.get('base'), 'diff_digest': verdict.get('diff_digest'),
+                         'task_digest': verdict.get('task_digest'),
+                         'paths': verdict.get('paths'), 'mode': verdict.get('mode'),
+                         'acceptance': [{'id': item.get('id'), 'status': item.get('status')}
+                                        for item in verdict.get('acceptance') or []]}
+                        if verdict else None)
         tasks[ident] = {
             'status': record.get('status'), 'phase': record.get('phase'),
             'attempt': record.get('attempt'), 'head': record.get('head'),
             'diff_sha256': record.get('diff_sha256'), 'changed_paths': record.get('changed_paths'),
             'execution_session': record.get('execution_session'),
             'review_session': record.get('review_session'),
-            'review_verdict': record.get('review_verdict'),
+            'review_verdict': safe_verdict,
             'reviewer_profile': record.get('reviewer_profile'),
             'verification': [{'program': check.get('program'),
                               'argv_sha256': check.get('argv_sha256'),
