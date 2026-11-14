@@ -904,6 +904,41 @@ class AuthenticateTests(DeliveryCase):
         self.assertEqual(agents.calls, [])
 
 
+class ApprovedRecheckTests(DeliveryCase):
+    def test_a_later_verification_cannot_change_an_earlier_approval(self):
+        # A trusted verification command belongs to the plan, but it can still
+        # write outside its own worktree. Once a task is PREPARED, nothing
+        # re-checks it; the runner must re-prove every live approval before the
+        # summary and must not re-run the untrusted command to do it.
+        one, two = self.worktree('one'), self.worktree('two')
+        counter = self.root / 'verify-count'
+        script = (f'import pathlib; '
+                  f'pathlib.Path({str(counter)!r}).open("a").write("x"); '
+                  f'pathlib.Path({str(one / "a.txt")!r}).write_text("tampered\\n")')
+        plan = self.plan([self.task('one', one, ['a.txt']),
+                          self.task('two', two, ['b.txt'], verify=[[PY, '-c', script]])])
+        state, agents = self.run_delivery(plan)
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('approved task one', state['tasks']['one']['reason'])
+        self.assertEqual(state['tasks']['two']['status'], 'PREPARED')
+        self.assertEqual(counter.read_text(), 'x')
+        self.assertEqual(agents.calls, ['execution', 'review', 'execution', 'review'])
+
+    def test_a_committed_write_to_an_earlier_approval_blocks_it(self):
+        one, two = self.worktree('one'), self.worktree('two')
+        message = 'trusted check'
+        script = (f'import pathlib, subprocess; '
+                  f'pathlib.Path({str(one / "a.txt")!r}).write_text("tampered\\n"); '
+                  f'subprocess.run(["git", "-C", {str(one)!r}, "commit", "-qam", '
+                  f'{message!r}], check=True)')
+        plan = self.plan([self.task('one', one, ['a.txt']),
+                          self.task('two', two, ['b.txt'], verify=[[PY, '-c', script]])])
+        state, _ = self.run_delivery(plan)
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('approved task one', state['tasks']['one']['reason'])
+        self.assertEqual(state['tasks']['two']['status'], 'PREPARED')
+
+
 class ScopeTests(DeliveryCase):
     def test_forbidden_path_cannot_be_reached_through_an_allowed_ancestor(self):
         (self.repo / 'docs' / 'secret.txt').write_text('secret')
@@ -1790,11 +1825,8 @@ class TimeoutTests(DeliveryCase):
 
 
 class LockIdentityTests(DeliveryCase):
-    def test_the_same_journal_cannot_point_at_two_repositories(self):
-        work = self.worktree('one')
-        plan = self.plan([self.task('one', work, ['a.txt'])])
-        specs = delivery._plan_tasks(plan)
-        other = self.root / 'other-repo'
+    def _other_repo(self, name='other-repo'):
+        other = self.root / name
         other.mkdir()
         _git(other, 'init', '-q', '-b', 'demo')
         _git(other, 'config', 'user.email', 'test@example.invalid')
@@ -1802,6 +1834,13 @@ class LockIdentityTests(DeliveryCase):
         (other / 'x').write_text('x')
         _git(other, 'add', 'x')
         _git(other, 'commit', '-q', '-m', 'base')
+        return other
+
+    def test_the_same_journal_cannot_point_at_two_repositories(self):
+        work = self.worktree('one')
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        specs = delivery._plan_tasks(plan)
+        other = self._other_repo()
         held = delivery.acquire_locks(self.repo, self.state, specs)
         try:
             with self.assertRaises(delivery.DeliveryError):
@@ -1809,6 +1848,53 @@ class LockIdentityTests(DeliveryCase):
         finally:
             for handle in held:
                 handle.close()
+
+    def test_a_journal_directory_alias_cannot_bypass_the_lock(self):
+        # Two repositories pointing at `real/journal.json` and at a symlink
+        # alias of its directory used to derive different journal lock names,
+        # so both processes could write the same journal at once. The lock
+        # identity must be the canonical real path.
+        repo = self.repo
+        real = self.root / 'real-journal'
+        real.mkdir()
+        alias = self.root / 'alias-journal'
+        alias.symlink_to(real, target_is_directory=True)
+        one = self.worktree('alias-one')
+        other = self._other_repo(name='alias-other-repo')
+        other_work = self.root / 'alias-other-work'
+        _git(other, 'worktree', 'add', '-q', '-b', 'task/alias-other', str(other_work))
+        holder_plan = self.plan([self.task('one', one, ['a.txt'])])
+        other_plan = self.plan([self.task('other', other_work, ['x'])])
+        holder = self.root / 'alias-holder.py'
+        holder.write_text(
+            'import os,sys,time\n'
+            'sys.path.insert(0, os.environ["PROJECT_ROOT"])\n'
+            'from scripts import autonomous_delivery as d\n'
+            'handles = d.acquire_locks(os.environ["REPO"], os.environ["STATE"],\n'
+            '                           d._plan_tasks(__import__("json").loads(\n'
+            '                               open(os.environ["PLAN"]).read())))\n'
+            'print("held", flush=True)\n'
+            'time.sleep(20)\n')
+        planfile = self.root / 'alias-plan.json'
+        planfile.write_text(json.dumps(holder_plan))
+        project = Path(__file__).resolve().parents[1]
+        env_a = dict(os.environ, PROJECT_ROOT=str(project), REPO=str(repo),
+                     STATE=str(real / 'journal.json'), PLAN=str(planfile))
+        child = subprocess.Popen([PY, str(holder)], env=env_a, stdout=subprocess.PIPE,
+                                 text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), 'held')
+            with self.assertRaises(delivery.DeliveryError) as caught:
+                delivery.acquire_locks(other, alias / 'journal.json',
+                                       delivery._plan_tasks(other_plan))
+            self.assertIn('locked', str(caught.exception))
+        finally:
+            child.kill()
+            child.wait(timeout=10)
+            if child.stdout is not None:
+                child.stdout.close()
+            if child.stderr is not None:
+                child.stderr.close()
 
 
 class EditionDuplicateTests(DeliveryCase):
@@ -1866,6 +1952,97 @@ class EditionDuplicateTests(DeliveryCase):
             with self.subTest(line=line):
                 self.state.unlink(missing_ok=True)
                 self._assert_rejected(prefix + line, needle='edition')
+
+
+class EditionBoundaryTests(DeliveryCase):
+    def _project(self):
+        return self.repo / 'docs' / 'PROJECT.md'
+
+    def _assert_mid_run_blocked(self, line, index):
+        self._project().write_text(PROJECT_LOCAL)
+        self.state.unlink(missing_ok=True)
+        work = self.worktree(f'edition{index}')
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        queried = []
+
+        def profiles(where):
+            queried.append(where)
+            if len(queried) == 1:
+                self._project().write_text(self._project().read_text() + line)
+            return self.profiles(where)
+
+        state, agents = self.run_delivery(plan, profiles=profiles)
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        self.assertEqual(agents.calls, [])
+
+    def test_an_edition_duplicate_added_during_the_profile_query_blocks_dispatch(self):
+        self._assert_mid_run_blocked('- **`edition`**: `github`\n', 0)
+
+    def test_an_edition_change_during_the_pre_execution_query_blocks_the_agent(self):
+        # The shared side-effect proof queries the runtime profile and then
+        # re-reads config. A change made while the profile query is answered
+        # must be seen before the execution agent starts, not after it.
+        work = self.worktree('one')
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        queried = []
+
+        def profiles(where):
+            queried.append(where)
+            if len(queried) == 2:
+                project = self._project()
+                project.write_text(project.read_text() + '- **`edition`**: `github`\n')
+            return self.profiles(where)
+
+        state, agents = self.run_delivery(plan, profiles=profiles)
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        self.assertEqual(agents.calls, [])
+        self.assertGreaterEqual(len(queried), 2)
+
+    def test_any_invalid_or_ambiguous_edition_added_mid_run_fails_closed(self):
+        # The first edition check must not be the only one: every boundary that
+        # re-reads project config re-validates the one authoritative edition.
+        for index, line in enumerate((
+                '- edition：`github`\n',
+                '- edition：\n',
+                '- edition：`cloud`\n',
+                '- ***`edition`***：`github`\n',
+                '- **`edition`**: `github` extra\n'), 1):
+            with self.subTest(line=line):
+                self._assert_mid_run_blocked(line, index)
+
+    def test_an_edition_change_during_execution_blocks_before_the_commit(self):
+        work = self.worktree('one')
+        project = self._project()
+
+        def execution(where, prompt):
+            self.write_default(where, prompt)
+            project.write_text(project.read_text() + '- **`edition`**: `github`\n')
+
+        state, agents = self.run_delivery(
+            self.plan([self.task('one', work, ['a.txt'])]),
+            FakeAgents(self, execution=execution))
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertIsNone(record.get('head'))
+        self.assertEqual(_head_of(work), _head_of(self.repo))
+
+    def test_an_edition_change_during_verification_blocks_before_review(self):
+        work = self.worktree('one')
+        project = self._project()
+        script = (f'import pathlib; p = pathlib.Path({str(project)!r}); '
+                  f'p.write_text(p.read_text() + "- **`edition`**: `github`\\n")')
+        plan = self.plan([self.task('one', work, ['a.txt'], verify=[[PY, '-c', script]])])
+        state, agents = self.run_delivery(plan)
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        self.assertEqual(agents.calls, ['execution'])
 
 
 class CliTests(DeliveryCase):
