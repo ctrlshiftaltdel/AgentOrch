@@ -1125,6 +1125,50 @@ class ApprovedRecheckTests(DeliveryCase):
             self.assertEqual(_head_of(work), record['head'])
             self.assertFalse(_git(work, 'status', '--porcelain').stdout.strip())
 
+    def test_the_first_summary_round_stops_on_the_first_shared_gate_failure(self):
+        # The first re-check round queries the shared reviewer profile once per
+        # live approval, and its exception used to block only the failing task.
+        # Query one returns the safe profile; query two widens the shared state
+        # and answers write-capable; a later query (the final pass) would answer
+        # safe again, reviving the earlier approval. The first observed shared
+        # gate failure must stop every later query and void *every* live
+        # approval, including the one whose own query had returned safe.
+        one, two = self.worktree('one'), self.worktree('two')
+        weak = {'scout': {'id': 'scout', 'permissions': [
+            {'action': '*', 'resource': '*', 'effect': 'allow'}]}}
+        round_state = {'active': False, 'calls': 0}
+
+        def profiles(where):
+            if round_state['active']:
+                round_state['calls'] += 1
+                if round_state['calls'] == 2:
+                    return weak
+            return self.profiles(where)
+
+        original = delivery._recheck_approved
+
+        def recheck(context):
+            round_state['active'] = True
+            return original(context)
+
+        plan = self.plan([self.task('one', one, ['a.txt']),
+                          self.task('two', two, ['b.txt'])])
+        with mock.patch.object(delivery, '_recheck_approved', recheck):
+            state, agents = self.run_delivery(plan, profiles=profiles)
+        self.assertEqual(agents.calls, ['execution', 'review', 'execution', 'review'])
+        # Exactly the two first-round queries ran; the third (which would have
+        # answered safe again) was never started.
+        self.assertEqual(round_state['calls'], 2)
+        for name, work in (('one', one), ('two', two)):
+            record = state['tasks'][name]
+            self.assertEqual(record['status'], 'BLOCKED')
+            self.assertIn('not provably read-only', record['reason'])
+            # The journal on disk says the same thing.
+            self.assertEqual(self.journal()['tasks'][name]['status'], 'BLOCKED')
+            # Nothing re-ran and the approved head is untouched.
+            self.assertEqual(_head_of(work), record['head'])
+            self.assertFalse(_git(work, 'status', '--porcelain').stdout.strip())
+
 
 class ScopeTests(DeliveryCase):
     def test_forbidden_path_cannot_be_reached_through_an_allowed_ancestor(self):
@@ -2299,6 +2343,63 @@ class EditionBoundaryTests(DeliveryCase):
         self.assertTrue(runs.read_text())
         self.assertEqual(project.read_text().count('edition'), 2)
 
+    def test_a_clean_filter_that_switches_to_a_valid_edition_blocks_the_carrier_query(self):
+        # Starting from `github`, a real clean filter rewrites the config to the
+        # equally valid `local` while the pre-dispatch status runs. The edition
+        # is the authority for the base, so a switch must fail closed exactly
+        # like an invalid value: the carrier query (`gh`) is the next external
+        # call and must not start from a different edition than the run began
+        # with.
+        project = self._project()
+        project.write_text(PROJECT_GITHUB)
+        _git(self.repo, 'add', 'docs/PROJECT.md')
+        _git(self.repo, 'commit', '-q', '-m', 'start on the github edition')
+        armed = self.root / 'filter-armed'
+        runs = self.root / 'filter-runs'
+        self._filter(
+            'pathlib.Path(' + repr(str(runs)) + ').open("a").write("x")\n'
+            'armed_path = pathlib.Path(' + repr(str(armed)) + ')\n'
+            'if armed_path.exists():\n'
+            '    armed_path.unlink()\n'
+            '    pathlib.Path(' + repr(str(project)) + ').write_text(\n'
+            '        text.replace("`github`", "`local`"))\n'
+            'sys.stdout.write(text)\n', ('docs/PROJECT.md',))
+        work = self.worktree('one')
+        queried = []
+
+        def gh(argv):
+            queried.append(argv)
+            raise AssertionError('the carrier query must not start')
+
+        self.gh = gh
+        original = delivery._status
+        state = {'armed': False}
+
+        def status(where):
+            if not state['armed']:
+                # Arm the real filter for this exact status call: the stale stat
+                # makes Git read the config through the clean filter.
+                state['armed'] = True
+                armed.write_text('x')
+                os.utime(project, ns=(1_000_000_000, 1_000_000_000))
+            return original(where)
+
+        plan = self.plan([self.task('one', work, ['a.txt'])],
+                         carrier={'kind': 'issue', 'number': 1,
+                                  'repo': 'owner/name', 'digest': '0' * 64})
+        agents = FakeAgents(self)
+        with mock.patch.object(delivery, '_status', status):
+            with self.assertRaises(ValueError) as caught:
+                self.run_delivery(plan, agents=agents)
+        self.assertIn('edition', str(caught.exception))
+        # No external query, no Agent and no journal were started.
+        self.assertEqual(queried, [])
+        self.assertEqual(agents.calls, [])
+        self.assertFalse(self.state.exists())
+        # The filter really ran inside Git, and the real switch landed.
+        self.assertTrue(runs.read_text())
+        self.assertIn('`local`', project.read_text())
+
     def test_any_invalid_or_ambiguous_edition_added_mid_run_fails_closed(self):
         # The first edition check must not be the only one: every boundary that
         # re-reads project config re-validates the one authoritative edition.
@@ -2733,6 +2834,80 @@ class CommitBoundaryTests(DeliveryCase):
         self.assertEqual(_git(work, 'status', '--porcelain', '--', 'a.txt').stdout,
                          b'?? a.txt\n')
 
+    def test_a_pre_add_status_that_switches_the_edition_starts_no_more_git(self):
+        # The status call that decides whether there is anything to stage runs a
+        # real clean filter. Here the filter switches `local` to the equally
+        # valid `github`. The pre-add proof used to start `git diff`/`ls-files`
+        # and only then read the config, so the invalid declaration was followed
+        # by more Git processes and a `git add` that staged the target file.
+        # After the status returns, the run must re-prove the edition first and
+        # start no Git process (and no add) once the switch is visible.
+        project = self.repo / 'docs' / 'PROJECT.md'
+        armed = self.root / 'filter-armed'
+        runs = self.root / 'filter-runs'
+        self._filter(
+            'pathlib.Path(' + repr(str(runs)) + ').open("a").write("x")\n'
+            'armed_path = pathlib.Path(' + repr(str(armed)) + ')\n'
+            'if armed_path.exists():\n'
+            '    armed_path.unlink()\n'
+            '    pathlib.Path(' + repr(str(project)) + ').write_text(\n'
+            '        text.replace("`local`", "`github`"))\n'
+            'sys.stdout.write(text)\n', ('docs/PROJECT.md',))
+        work = self.worktree('one')
+        base = _head_of(work)
+        marker = self.root / 'executed'
+        original_status = delivery._status
+        original_git = delivery.git
+        state = {'armed': False, 'invalidated': False}
+        after = []
+
+        def git_probe(where, *args):
+            if state['invalidated']:
+                after.append(args)
+            return original_git(where, *args)
+
+        def status(where):
+            armed_now = False
+            if (not state['armed'] and marker.exists()
+                    and os.path.realpath(where) == os.path.realpath(work)):
+                state['armed'] = True
+                armed_now = True
+                armed.write_text('x')
+                os.utime(where / 'docs' / 'PROJECT.md',
+                         ns=(1_000_000_000, 1_000_000_000))
+            result = original_status(where)
+            if armed_now:
+                # The filter has run inside this status; every later `git`
+                # call starts from an edition the run did not begin with.
+                state['invalidated'] = True
+            return result
+
+        def execution(where, prompt):
+            self.write_default(where, prompt)
+            marker.write_text('x')
+
+        with mock.patch.object(delivery, '_status', status), \
+                mock.patch.object(delivery, 'git', git_probe):
+            delivered, agents = self.run_delivery(
+                self.plan([self.task('one', work, ['a.txt'])]),
+                FakeAgents(self, execution=execution))
+        record = delivered['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertIsNone(record.get('head'))
+        self.assertEqual(_head_of(work), base)
+        # The filter really ran inside Git, and the real switch landed.
+        self.assertTrue(runs.read_text())
+        self.assertIn('`github`', project.read_text())
+        # The target file never entered the index: `git add` never started.
+        self.assertEqual(_git(work, 'diff', '--cached', '--name-only').stdout, b'')
+        self.assertEqual(_git(work, 'ls-files', '--', 'a.txt').stdout, b'')
+        self.assertEqual(_git(work, 'status', '--porcelain', '--', 'a.txt').stdout,
+                         b'?? a.txt\n')
+        # No Git process started after the invalid declaration appeared.
+        self.assertEqual(after, [])
+
 
 class CliTests(DeliveryCase):
     def _fake_opencode(self, exports):
@@ -2792,6 +2967,68 @@ class CliTests(DeliveryCase):
         record = self.journal()['tasks']['one']
         self.assertEqual(record['status'], 'BLOCKED')
         self.assertIn('independently verifiable', record['reason'])
+
+    def test_cli_proves_the_edition_before_the_issue_query(self):
+        # `--issue` used to call `gh issue view` inside `load_issue_plan` before
+        # `run` validated the project edition: with a preset invalid edition the
+        # fake `gh` had already started when the run refused. The CLI must prove
+        # the project's edition before any gh/network query, for a missing,
+        # illegal and duplicate declaration alike.
+        for index, (label, text) in enumerate((
+                ('missing', PROJECT_LOCAL.replace('- edition：`local`\n', '')),
+                ('invalid', PROJECT_LOCAL.replace('`local`', '`cloud`')),
+                ('duplicate', PROJECT_LOCAL + '- edition：`github`\n')), 1):
+            with self.subTest(label=label):
+                (self.repo / 'docs' / 'PROJECT.md').write_text(text)
+                self.state.unlink(missing_ok=True)
+                work = self.worktree(f'cli{index}')
+                loader = mock.Mock(return_value=self.plan(
+                    [self.task('one', work, ['a.txt'])]))
+                args = ['delivery', '--repo', str(self.repo), '--issue', '230',
+                        '--issue-repo', 'owner/repo', '--worktree', str(work),
+                        '--verify', '["true"]', '--acceptance', 'x',
+                        '--state', str(self.state), '--execute']
+                errors = io.StringIO()
+                with mock.patch('sys.argv', args), \
+                        mock.patch.object(delivery, 'load_issue_plan', loader), \
+                        contextlib.redirect_stderr(errors), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as caught:
+                        delivery.main()
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn('edition', errors.getvalue())
+                # The carrier query never started and no journal was created.
+                loader.assert_not_called()
+                self.assertFalse(self.state.exists())
+
+    def test_cli_refuses_an_edition_switch_during_the_issue_query(self):
+        # The CLI proves `local` before the carrier query, and the query is an
+        # external call that can run code the runner does not control. A switch
+        # to the equally valid `github` while it runs must be detected when
+        # `run` re-reads the config, before any Agent or journal write.
+        work = self.worktree('one')
+        project = self.repo / 'docs' / 'PROJECT.md'
+
+        def loader(*args, **kwargs):
+            project.write_text(PROJECT_GITHUB)
+            return self.plan([self.task('one', work, ['a.txt'])])
+
+        args = ['delivery', '--repo', str(self.repo), '--issue', '230',
+                '--issue-repo', 'owner/repo', '--worktree', str(work),
+                '--verify', '["true"]', '--acceptance', 'x',
+                '--state', str(self.state), '--execute']
+        errors = io.StringIO()
+        with mock.patch('sys.argv', args), \
+                mock.patch.object(delivery, 'load_issue_plan', loader), \
+                mock.patch.object(delivery, 'opencode') as started, \
+                contextlib.redirect_stderr(errors), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                delivery.main()
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn('edition', errors.getvalue())
+        started.assert_not_called()
+        self.assertFalse(self.state.exists())
 
     def test_cli_exit_code_reflects_approved_state_only(self):
         work = self.worktree('one')
