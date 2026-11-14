@@ -237,6 +237,45 @@ class DeliveryCase(unittest.TestCase):
         return delivery.hashlib.sha256(
             json.dumps(merged, sort_keys=True).encode()).hexdigest()
 
+    # -- real Git code paths ----------------------------------------------
+    def _filter(self, body, paths=('docs/PROJECT.md',)):
+        """A real clean filter; Git itself runs ``body`` inside its processes."""
+        script = self.root / 'poison-filter.py'
+        script.write_text(f'#!{PY}\nimport pathlib, sys\ntext = sys.stdin.read()\n' + body)
+        script.chmod(0o755)
+        (self.repo / '.gitattributes').write_text(
+            ''.join(f'{path} filter=poison\n' for path in paths))
+        _git(self.repo, 'add', '.gitattributes')
+        _git(self.repo, 'commit', '-q', '-m', 'attributes')
+        _git(self.repo, 'config', 'filter.poison.clean', f'{PY} {script}')
+        _git(self.repo, 'config', 'filter.poison.smudge', 'cat')
+        return script
+
+    def _churn_filter(self, body, paths):
+        """A real clean filter that makes Git re-read its paths on every call.
+
+        Git only runs a clean filter when it has to read the worktree content,
+        so each run bumps the filtered file's mtime. The stat Git cached in the
+        index is then stale and the *next* Git call runs the filter again, which
+        is what makes a filter inside `git status`/`git diff` reachable without
+        an intervening write.
+        """
+        return self._filter(
+            'import os, time\n'
+            'for name in ' + repr(list(paths)) + ':\n'
+            '    churned = pathlib.Path(name)\n'
+            '    if churned.exists():\n'
+            '        stamp = time.time_ns()\n'
+            '        os.utime(churned, ns=(stamp, stamp))\n'
+            + body, paths)
+
+    def _hook(self, marker):
+        hook = self.repo / '.git' / 'hooks' / 'pre-commit'
+        hook.write_text(f'#!{PY}\nimport pathlib\n'
+                        f'pathlib.Path({str(marker)!r}).write_text("x")\n')
+        hook.chmod(0o755)
+        return hook
+
 
 class PrepareOnlyTests(DeliveryCase):
     def test_prepare_only_approves_and_leaves_merge_to_a_human(self):
@@ -1014,6 +1053,34 @@ class ApprovedRecheckTests(DeliveryCase):
         self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
         self.assertIn('approved task one', state['tasks']['one']['reason'])
         self.assertEqual(state['tasks']['two']['status'], 'PREPARED')
+
+    def test_a_later_command_that_weakens_the_profile_voids_an_earlier_approval(self):
+        # The reviewer profile is shared runtime state. A later task's trusted
+        # verification command can widen it after an earlier task is PREPARED;
+        # the summary re-proof must re-query the profile, not only the project
+        # config, and block the approval that the weakened profile no longer
+        # supports.
+        one, two = self.worktree('one'), self.worktree('two')
+        weakened = self.root / 'profile-weakened'
+        weak = {'scout': {'id': 'scout', 'permissions': [
+            {'action': '*', 'resource': '*', 'effect': 'allow'}]}}
+
+        def profiles(where):
+            return weak if weakened.exists() else self.profiles(where)
+
+        script = f'import pathlib; pathlib.Path({str(weakened)!r}).write_text("x")'
+        plan = self.plan([self.task('one', one, ['a.txt']),
+                          self.task('two', two, ['b.txt'], verify=[[PY, '-c', script]])])
+        state, agents = self.run_delivery(plan, profiles=profiles)
+        self.assertEqual(agents.calls, ['execution', 'review', 'execution'])
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('not provably read-only', record['reason'])
+        # The journal on disk says the same thing.
+        self.assertEqual(self.journal()['tasks']['one']['status'], 'BLOCKED')
+        # Nothing re-ran the command and the approved head is untouched.
+        self.assertEqual(_head_of(one), record['head'])
+        self.assertFalse(_git(one, 'status', '--porcelain').stdout.strip())
 
 
 class ScopeTests(DeliveryCase):
@@ -2087,6 +2154,50 @@ class EditionBoundaryTests(DeliveryCase):
         self.assertEqual(agents.calls, [])
         self.assertEqual(len(queried), 2)
 
+    def test_a_clean_filter_in_git_status_blocks_before_the_execution_agent(self):
+        # The shared side-effect proof calls `git status` synchronously, and a
+        # real clean filter runs *inside* that process. A filter that adds a
+        # second edition declaration to the project config invalidates the
+        # edition while the proof is running; the execution agent must not start
+        # after that call returns, so the proof re-reads the config after its
+        # Git facts instead of only before them.
+        project = self._project()
+        armed = self.root / 'filter-armed'
+        runs = self.root / 'filter-runs'
+        self._churn_filter(
+            'pathlib.Path(' + repr(str(runs)) + ').open("a").write("x")\n'
+            'armed = pathlib.Path(' + repr(str(armed)) + ')\n'
+            'if armed.exists():\n'
+            '    armed.unlink()\n'
+            '    config = pathlib.Path(' + repr(str(project)) + ').read_text()\n'
+            '    if "`github`" not in config:\n'
+            '        pathlib.Path(' + repr(str(project)) + ').write_text(\n'
+            '            config + "- **`edition`**: `github`\\n")\n'
+            'sys.stdout.write(text)\n', ('base.txt',))
+        work = self.worktree('one')
+        base = _head_of(work)
+        # Start the re-read chain: Git only runs the filter when the indexed
+        # stat is stale, so the first status has to find a changed mtime.
+        os.utime(work / 'base.txt', ns=(1_000_000_000, 1_000_000_000))
+        original = delivery._prove_before_side_effect
+
+        def prove(*args, **kwargs):
+            armed.write_text('x')
+            return original(*args, **kwargs)
+
+        with mock.patch.object(delivery, '_prove_before_side_effect', prove):
+            state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]))
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        # The agent never started, and no head was recorded.
+        self.assertEqual(agents.calls, [])
+        self.assertIsNone(record.get('head'))
+        self.assertEqual(_head_of(work), base)
+        # The filter really ran inside Git, and the real attack landed.
+        self.assertTrue(runs.read_text())
+        self.assertEqual(project.read_text().count('edition'), 2)
+
     def test_any_invalid_or_ambiguous_edition_added_mid_run_fails_closed(self):
         # The first edition check must not be the only one: every boundary that
         # re-reads project config re-validates the one authoritative edition.
@@ -2315,24 +2426,6 @@ class EditionBoundaryTests(DeliveryCase):
 class CommitBoundaryTests(DeliveryCase):
     """`git add` and `git commit` are separate processes and separate risks."""
 
-    def _filter(self, body):
-        script = self.root / 'poison-filter.py'
-        script.write_text(f'#!{PY}\nimport pathlib, sys\ntext = sys.stdin.read()\n' + body)
-        script.chmod(0o755)
-        (self.repo / '.gitattributes').write_text('docs/PROJECT.md filter=poison\n')
-        _git(self.repo, 'add', '.gitattributes')
-        _git(self.repo, 'commit', '-q', '-m', 'attributes')
-        _git(self.repo, 'config', 'filter.poison.clean', f'{PY} {script}')
-        _git(self.repo, 'config', 'filter.poison.smudge', 'cat')
-        return script
-
-    def _hook(self, marker):
-        hook = self.repo / '.git' / 'hooks' / 'pre-commit'
-        hook.write_text(f'#!{PY}\nimport pathlib\n'
-                        f'pathlib.Path({str(marker)!r}).write_text("x")\n')
-        hook.chmod(0o755)
-        return hook
-
     def test_a_clean_filter_that_duplicates_the_edition_blocks_the_commit(self):
         # A real Git clean filter rewrites `docs/PROJECT.md` while `git add`
         # runs, so the *staged* blob gains a second edition declaration while
@@ -2386,6 +2479,74 @@ class CommitBoundaryTests(DeliveryCase):
         # The runner never resets: the staged content is left for a human.
         self.assertIn('docs/PROJECT.md',
                       _git(work, 'diff', '--cached', '--name-only').stdout.decode())
+
+    def test_a_clean_filter_inside_the_staged_proof_blocks_the_commit(self):
+        # `_prove_staged` reads the index *and* the worktree through Git
+        # processes, and a clean filter runs inside those calls as well. A
+        # filter that adds a second edition declaration to the project config
+        # therefore invalidates the edition after the staged proof's opening
+        # config read. `git commit` must not start from that state: the config
+        # is proved again after those Git calls and before the commit process.
+        project = self.repo / 'docs' / 'PROJECT.md'
+        hook_marker = self.root / 'pre-commit-ran'
+        armed = self.root / 'filter-armed'
+        runs = self.root / 'filter-runs'
+        self._churn_filter(
+            'pathlib.Path(' + repr(str(runs)) + ').open("a").write("x")\n'
+            'armed = pathlib.Path(' + repr(str(armed)) + ')\n'
+            'if armed.exists():\n'
+            '    armed.unlink()\n'
+            '    config = pathlib.Path(' + repr(str(project)) + ').read_text()\n'
+            '    if "`github`" not in config:\n'
+            '        pathlib.Path(' + repr(str(project)) + ').write_text(\n'
+            '            config + "- **`edition`**: `github`\\n")\n'
+            'sys.stdout.write(text)\n', ('a.txt',))
+        self._hook(hook_marker)
+        work = self.worktree('one')
+        base = _head_of(work)
+        original = delivery._unstaged
+
+        def unstaged(where):
+            # The staged proof's own Git read is where the filter is armed, so
+            # the attack lands inside `git diff`, after the opening proof.
+            armed.write_text('x')
+            return original(where)
+
+        with mock.patch.object(delivery, '_unstaged', unstaged):
+            state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]))
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertIsNone(record.get('head'))
+        # No commit was started and the hook never ran.
+        self.assertEqual(_head_of(work), base)
+        self.assertFalse(hook_marker.exists())
+        # The filter really ran inside Git, and the real attack landed.
+        self.assertTrue(runs.read_text())
+        self.assertEqual(project.read_text().count('edition'), 2)
+
+    def test_the_staged_proof_refuses_a_valid_edition_changed_during_its_git_reads(self):
+        # The index proof ends with a config read taken after its own Git calls.
+        # A config that changed to a *different valid* edition while the index
+        # was being read still no longer matches the staged blob, so the commit
+        # must not start.
+        work = self.worktree('one')
+        base = _head_of(work)
+        spec = delivery._plan_tasks(self.plan([self.task('one', work, ['a.txt'])]))[0]
+        (work / 'a.txt').write_text('x\n')
+        _git(work, 'add', 'a.txt')
+        local = {'edition': 'local', 'edition_count': 1, 'edition_values': ['local'],
+                 'allowed': ['a.txt'], 'forbidden': [], 'secrets': []}
+        github = dict(local, edition='github', edition_values=['github'])
+        reads = iter([local, github])
+        with mock.patch.object(delivery, 'project_config',
+                               side_effect=lambda repo: next(reads, github)):
+            with self.assertRaises(delivery.DeliveryError) as caught:
+                delivery._prove_staged(self.repo, spec, work, base, ['a.txt'])
+        self.assertIn('after the index proof', str(caught.exception))
+        self.assertEqual(_head_of(work), base)
+        self.assertIn('a.txt', _git(work, 'diff', '--cached', '--name-only').stdout.decode())
 
     def test_the_staged_proof_refuses_revoked_authorization_and_out_of_scope_paths(self):
         work = self.worktree('one')
