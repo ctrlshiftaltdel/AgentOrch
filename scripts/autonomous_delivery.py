@@ -489,35 +489,73 @@ def _configured_clean_filters(work):
     return keys
 
 
+# The exact spellings Git documents as boolean false, plus the explicit empty
+# value. Anything else that Git's parser maps to false (a case variant such as
+# ``FALSE``) is not normalized here: the stored bytes are what this proof
+# compares.
+_FSMONITOR_FALSE = ('', 'false', 'no', 'off', '0')
+
+
 def _configured_fsmonitor(work):
     """The fsmonitor configuration key when Git could run a helper program.
 
     ``core.fsmonitor`` is not a clean filter or a commit hook, but it is
     executable code that Git invokes while it refreshes the index inside
-    ``git commit``. Set to ``true`` Git starts its builtin daemon; set to a path
-    it runs that program, which can switch ``docs/PROJECT.md`` after the last
-    proof and before history is written. Only the key is reported, never the
-    configured value.
+    ``git commit``. Set to a boolean true Git starts its builtin daemon; set to
+    a path it runs that program, which can switch ``docs/PROJECT.md`` after the
+    last proof and before history is written. Only the key is reported, never
+    the configured value.
+
+    Git does not normalize the whitespace inside a configuration value: a value
+    of `` False `` is *not* Git's boolean false. Git's boolean parser rejects
+    it and Git then treats the text as the program to run, resolving it through
+    ``PATH``. Reading ``--get`` and stripping or lowercasing the line would
+    call that value disabled and let ``git commit`` start a helper that runs
+    inside it. The proof therefore compares the stored bytes against Git's
+    exact false spellings and asks Git's own boolean parser to settle the one
+    ambiguous case; anything not proven false — a path, a whitespace-wrapped,
+    case-variant or otherwise unparseable value — fails closed.
 
     A key with no value at all (``[core]`` followed by ``fsmonitor``) is Git's
-    implicit boolean true, and ``git config --get`` prints an empty line for it —
-    the same empty line an explicitly empty value produces. Git treats both as
-    enabled, so the only spellings that disable the helper are the explicit
-    false ones.
+    implicit boolean true. An explicitly empty value (``core.fsmonitor =``)
+    prints the same empty line from ``--get`` but is Git's boolean false, which
+    is why the proof asks the parser after reading the value instead of
+    trusting that line. Only the exact documented spellings (or an explicit
+    empty value) disable the helper here.
     """
-    result = subprocess.run(
-        ['git', '--no-optional-locks', 'config', '--get', 'core.fsmonitor'],
+    stored = subprocess.run(
+        ['git', '--no-optional-locks', 'config', '--null', '--get',
+         'core.fsmonitor'],
         cwd=work, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True)
-    if result.returncode not in (0, 1):
-        raise DeliveryError('cannot prove that git commit runs no fsmonitor helper')
-    if result.returncode == 1:
+    if stored.returncode == 1:
         return []
-    value = result.stdout.strip().lower()
-    # Every value except an explicit boolean false enables the helper: `true`
-    # means Git's builtin daemon, anything else is the hook program's path, and
-    # no value at all is the implicit true.
-    return [] if value in ('false', 'no', 'off', '0') else ['core.fsmonitor']
+    if stored.returncode != 0 or not stored.stdout.endswith('\0'):
+        return ['core.fsmonitor']
+    # `--null` makes the stored value unambiguous: drop only the terminator,
+    # never whitespace that is part of the value.
+    value = stored.stdout[:-1]
+    if value not in _FSMONITOR_FALSE:
+        # Not one of the exact false spellings: `true` is the builtin daemon, a
+        # path is the helper program, and a value Git's parser rejects (such as
+        # ` False `) is run as the command. Every one can execute inside the
+        # commit.
+        return ['core.fsmonitor']
+    # An empty value is ambiguous: `--get` prints the same empty line for an
+    # explicit empty value (Git boolean false) and for a valueless key (implicit
+    # true). Ask Git's parser *after* the raw read, so a value that became the
+    # implicit true in between is seen as enabled instead of trusted from the
+    # earlier read.
+    parsed = subprocess.run(
+        ['git', '--no-optional-locks', 'config', '--null', '--type=bool',
+         '--get', 'core.fsmonitor'],
+        cwd=work, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True)
+    if parsed.returncode == 1:
+        return []
+    if parsed.returncode != 0 or parsed.stdout != 'false\0':
+        return ['core.fsmonitor']
+    return []
 
 
 def _prove_commit_is_inert(context, spec, work):

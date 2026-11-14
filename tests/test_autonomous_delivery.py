@@ -3365,6 +3365,147 @@ class CommitBoundaryTests(DeliveryCase):
         self.assertIn('a.txt',
                       _git(work, 'diff', '--cached', '--name-only').stdout.decode())
 
+    def test_a_whitespace_wrapped_false_fsmonitor_never_starts_the_commit(self):
+        # Git does not normalize the whitespace inside a configuration value.
+        # ` False ` is not Git's boolean false: Git's boolean parser rejects it
+        # and Git instead treats the text as the command to run, resolving it
+        # through PATH to a program literally named `False`. The proof used to
+        # strip and lower the value, call it disabled and start `git commit`;
+        # the helper then ran *inside* the commit, switched `local` to the
+        # equally valid `github`, and only afterwards did the runner see it —
+        # with the switch already in history. Only a value Git's own parser
+        # proves false may let the commit start; a whitespace-wrapped value is
+        # not that and must fail closed without starting the commit.
+        project = self.repo / 'docs' / 'PROJECT.md'
+        tools = self.root / 'fsmonitor-bin'
+        tools.mkdir()
+        marker = self.root / 'fsmonitor-ran'
+        armed = self.root / 'fsmonitor-armed'
+        script = tools / 'False'
+        script.write_text(
+            f'#!{PY}\n'
+            'import os, pathlib, sys\n'
+            'if sys.argv[1:2] == ["version"]:\n'
+            '    sys.stdout.write("2\\n")\n'
+            '    raise SystemExit(0)\n'
+            'def in_commit():\n'
+            '    # Walk the ancestor chain where procfs exists; the test also arms\n'
+            '    # a marker when it sees the commit argv, so the gate is portable\n'
+            '    # to platforms without /proc.\n'
+            '    try:\n'
+            '        pid = os.getppid()\n'
+            '        for _ in range(5):\n'
+            '            try:\n'
+            '                argv = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\\0")\n'
+            '            except OSError:\n'
+            '                return False\n'
+            '            if b"commit" in argv:\n'
+            '                return True\n'
+            '            status = pathlib.Path(f"/proc/{pid}/status").read_text()\n'
+            '            line = [l for l in status.splitlines() if l.startswith("PPid:")][0]\n'
+            '            pid = int(line.split()[1])\n'
+            '    except (OSError, ValueError, IndexError):\n'
+            '        return False\n'
+            '    return False\n'
+            'if in_commit() or pathlib.Path(' + repr(str(armed)) + ').exists():\n'
+            '    pathlib.Path(' + repr(str(marker)) + ').open("a").write("x")\n'
+            '    config = pathlib.Path(' + repr(str(project)) + ').read_text()\n'
+            '    pathlib.Path(' + repr(str(project)) + ').write_text(\n'
+            '        config.replace("`local`", "`github`"))\n'
+            'sys.stdout.write("0\\n\\0")\n')
+        script.chmod(0o755)
+        work = self.worktree('one')
+        base = _head_of(work)
+        _git(self.repo, 'config', 'core.fsmonitorHookVersion', '2')
+        original_prove = delivery._prove_staged
+
+        def prove(*args, **kwargs):
+            result = original_prove(*args, **kwargs)
+            # Configure the whitespace-wrapped value only for the commit phase,
+            # after every proof that came before it.
+            _git(self.repo, 'config', 'core.fsmonitor', ' False ')
+            return result
+
+        commits = []
+        real_run = subprocess.run
+
+        def run_probe(argv, *args, **kwargs):
+            if isinstance(argv, list) and 'commit' in argv[:4]:
+                commits.append(list(argv))
+                # Arm the helper for this commit attempt; a platform without
+                # procfs still only runs it inside the commit process.
+                armed.write_text('x')
+            return real_run(argv, *args, **kwargs)
+
+        env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ.get('PATH', ''))
+        with mock.patch.object(delivery, '_prove_staged', prove), \
+                mock.patch.object(delivery.subprocess, 'run', run_probe), \
+                mock.patch.dict(os.environ, env):
+            state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]))
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        # It names the real boundary, and only the configuration key.
+        self.assertIn('fsmonitor', record['reason'])
+        self.assertIn('core.fsmonitor', record['reason'])
+        self.assertIn('not implemented', record['reason'])
+        # The commit process was never started: no helper, no new history.
+        self.assertEqual(commits, [])
+        self.assertFalse(armed.exists())
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertFalse(marker.exists())
+        self.assertEqual(_head_of(work), base)
+        self.assertIsNone(record.get('head'))
+        self.assertIn('`local`', project.read_text())
+        # Git itself does not read this value as boolean false: its parser
+        # rejects it, so the only safe treatment is "not proven false".
+        self.assertEqual(_git(work, 'config', '--type=bool', '--get',
+                              'core.fsmonitor', check=False).returncode, 128)
+        self.assertEqual(delivery._configured_fsmonitor(work), ['core.fsmonitor'])
+        # The staged change was left for a human, not reset.
+        self.assertIn('a.txt',
+                      _git(work, 'diff', '--cached', '--name-only').stdout.decode())
+        # The attack is genuine: a direct commit in the same worktree runs the
+        # PATH program, switches the edition and creates history.
+        armed.write_text('x')
+        direct = subprocess.run(['git', '--no-optional-locks', 'commit', '-q', '-m',
+                                 'control'], cwd=work, env=env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        self.assertEqual(direct.returncode, 0)
+        self.assertTrue(marker.exists())
+        self.assertIn('`github`', project.read_text())
+        self.assertNotEqual(_head_of(work), base)
+
+    def test_an_explicitly_empty_fsmonitor_is_gits_boolean_false(self):
+        # `core.fsmonitor =` (an explicit empty value) prints the same empty
+        # line as a valueless key from `--get`, but Git's boolean parser reads
+        # it as false, not true. The proof asks that parser instead of reading
+        # the line, so an explicit empty value is a *proven* false and does not
+        # by itself refuse the commit; a valueless key remains the implicit
+        # true above.
+        work = self.worktree('one')
+        _git(self.repo, 'config', 'core.fsmonitor', '')
+        self.assertEqual(_git(work, 'config', '--get', 'core.fsmonitor').stdout, b'\n')
+        self.assertEqual(_git(work, 'config', '--type=bool', '--get',
+                              'core.fsmonitor').stdout.strip(), b'false')
+        self.assertEqual(delivery._configured_fsmonitor(work), [])
+
+    def test_a_fsmonitor_false_spelling_must_be_exact_not_a_case_variant(self):
+        # Git's boolean parser accepts case variants, but the proof only lets a
+        # commit start for the exact false spellings Git documents. A variant
+        # is stored differently from what the proof compared, so it fails
+        # closed rather than being normalized here.
+        work = self.worktree('one')
+        for value in ('FALSE', 'False', 'No', 'OFF'):
+            _git(self.repo, 'config', 'core.fsmonitor', value)
+            self.assertEqual(_git(work, 'config', '--get', '--type=bool',
+                                  'core.fsmonitor').stdout.strip(), b'false')
+            self.assertEqual(delivery._configured_fsmonitor(work),
+                             ['core.fsmonitor'], value)
+        for value in ('false', 'no', 'off', '0', ''):
+            _git(self.repo, 'config', 'core.fsmonitor', value)
+            self.assertEqual(delivery._configured_fsmonitor(work), [], value)
+
     def test_a_configured_filter_value_is_not_written_to_the_journal_or_summary(self):
         # A clean-filter refusal must name the configuration key, never its
         # value: a filter value is an arbitrary command line and may carry a
