@@ -16,6 +16,46 @@ from scripts import autonomous_delivery as delivery
 
 PY = sys.executable
 
+# Host Git configuration is not part of what these tests exercise. GitHub's
+# Ubuntu runners register a global `filter.lfs` clean/process driver, and
+# `git commit` really does run a visible global filter, so production rightly
+# refuses to start a commit while one exists. That is a real limitation of the
+# runner (documented in docs/autonomous-delivery.md), not a property of the
+# synthetic repositories here: a repository with no filter must reach
+# `PREPARED`. Point system/global configuration at the null device for the
+# duration of this module, exactly as `scripts/check_scope.py` does for its own
+# plumbing reads. Production is untouched: a test that needs a *visible* global
+# filter sets `GIT_CONFIG_GLOBAL` itself (see
+# `CommitBoundaryTests.test_a_visible_global_lfs_filter_blocks_the_commit_without_starting_it`).
+_GIT_CONFIG_ISOLATION = {
+    'GIT_CONFIG_NOSYSTEM': '1',
+    'GIT_CONFIG_GLOBAL': os.devnull,
+    'GIT_CONFIG_SYSTEM': os.devnull,
+}
+_GIT_CONFIG_DROP = ('GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT')
+_saved_git_config_env = {}
+
+
+def setUpModule():
+    """Run the module with the host's Git configuration out of the picture."""
+    global _saved_git_config_env
+    _saved_git_config_env = {}
+    for name in (*_GIT_CONFIG_DROP, *_GIT_CONFIG_ISOLATION):
+        _saved_git_config_env[name] = os.environ.pop(name, None)
+    os.environ.update(_GIT_CONFIG_ISOLATION)
+
+
+def tearDownModule():
+    """Restore the environment the module found, so other suites are unaffected."""
+    global _saved_git_config_env
+    for name, value in _saved_git_config_env.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    _saved_git_config_env = {}
+
+
 PROJECT_LOCAL = """# 项目配置
 
 - 允许改动路径：`a.txt`、`b.txt`、`out.txt`、`shared.txt`、`same.txt`、`bin.dat`、`big.txt`、`docs/`、`token.txt`
@@ -3568,6 +3608,103 @@ class CommitBoundaryTests(DeliveryCase):
         # The persisted journal carries the same refusal without the value.
         self.assertEqual(json.loads(self.state.read_text())['tasks']['one']['status'],
                          'BLOCKED')
+
+    def test_a_visible_global_lfs_filter_blocks_the_commit_without_starting_it(self):
+        # GitHub's Ubuntu runners register a *global* `filter.lfs` clean/process
+        # driver, and `git commit` really does run a visible global filter. The
+        # test harness hides the host's Git configuration so a repository with
+        # no filters can be tested deterministically, but production must not
+        # paper over a filter that is genuinely visible: reading only `--local`
+        # would let the commit start and run the driver. This test installs an
+        # LFS-style driver in a global config file, proves production sees it,
+        # and proves `git commit` never starts. Only the configuration keys may
+        # be reported; the driver's command line must not leak into the reason,
+        # the journal or the CLI summary.
+        global_config = self.root / 'host.gitconfig'
+        global_config.write_text(
+            '[filter "lfs"]\n'
+            '\tclean = git-lfs clean -- %f\n'
+            '\tsmudge = git-lfs smudge -- %f\n'
+            '\tprocess = git-lfs filter-process\n'
+            '\trequired = true\n')
+        work = self.worktree('one')
+        base = _head_of(work)
+        commits = []
+        real_run = subprocess.run
+
+        def run_probe(argv, *args, **kwargs):
+            if isinstance(argv, list) and 'commit' in argv[:4]:
+                commits.append(list(argv))
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch.dict(os.environ, {'GIT_CONFIG_GLOBAL': str(global_config)}), \
+                mock.patch.object(delivery.subprocess, 'run', run_probe):
+            # The driver is visible through the same enumeration the commit
+            # proof uses; this is what makes `git commit` unsafe.
+            self.assertEqual(delivery._configured_clean_filters(work),
+                             ['filter.lfs.clean', 'filter.lfs.process'])
+            state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]))
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('filter.lfs.clean', record['reason'])
+        self.assertIn('filter.lfs.process', record['reason'])
+        self.assertIn('not implemented', record['reason'])
+        # The command line is arbitrary and may carry a secret; only keys are
+        # reported.
+        self.assertNotIn('git-lfs', record['reason'])
+        self.assertNotIn('-- %f', record['reason'])
+        self.assertNotIn('git-lfs', self.state.read_text())
+        self.assertNotIn('git-lfs', json.dumps(delivery._summary(state)))
+        # The commit process was never started and no history was created.
+        self.assertEqual(commits, [])
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertEqual(_head_of(work), base)
+        self.assertIsNone(record.get('head'))
+        # The staged change was left for a human, not reset.
+        self.assertIn('a.txt',
+                      _git(work, 'diff', '--cached', '--name-only').stdout.decode())
+
+
+class HostGitConfigTests(DeliveryCase):
+    """The runner's own Git configuration must not decide a test's outcome."""
+
+    def test_the_suite_hides_host_system_and_global_git_config(self):
+        # A GitHub runner registers `filter.lfs.clean`/`process` in its global
+        # Git configuration. The suite must run against a known-empty
+        # system/global configuration, or a repository that has no filter is
+        # refused by production and every "reaches PREPARED" test collapses to
+        # BLOCKED for a reason unrelated to the code under test. This is a
+        # test-environment concern only: production still refuses when a
+        # filter is visible, which the regression above proves.
+        self.assertEqual(os.environ.get('GIT_CONFIG_NOSYSTEM'), '1')
+        self.assertEqual(os.environ.get('GIT_CONFIG_GLOBAL'), os.devnull)
+        self.assertEqual(os.environ.get('GIT_CONFIG_SYSTEM'), os.devnull)
+
+    def test_a_host_level_lfs_filter_does_not_change_a_prepare_only_result(self):
+        # Reproduce the runner: a child process starts with a global LFS filter
+        # visible. The module's setup must hide it before the fixture
+        # repositories are created, so a filter-free task still reaches
+        # PREPARED. Before the harness isolated host configuration this child
+        # failed with `BLOCKED != PREPARED`.
+        host_config = self.root / 'host.gitconfig'
+        host_config.write_text(
+            '[filter "lfs"]\n'
+            '\tclean = git-lfs clean -- %f\n'
+            '\tsmudge = git-lfs smudge -- %f\n'
+            '\tprocess = git-lfs filter-process\n'
+            '\trequired = true\n')
+        project = Path(__file__).resolve().parents[1]
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=str(host_config),
+                   GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_NOSYSTEM='1')
+        result = subprocess.run(
+            [PY, '-m', 'unittest',
+             'tests.test_autonomous_delivery.PrepareOnlyTests.'
+             'test_prepare_only_approves_and_leaves_merge_to_a_human'],
+            cwd=project, env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+        detail = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, detail)
+        self.assertNotIn('BLOCKED', detail)
 
 
 class CliTests(DeliveryCase):
