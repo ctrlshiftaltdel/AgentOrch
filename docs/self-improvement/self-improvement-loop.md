@@ -96,7 +96,7 @@
 
 - 规划器**识别为**改变权限 / 安全边界、锁 / 状态机、数据迁移、外部依赖、隐私、破坏兼容或不可逆动作的变更 → `HD-05`（契约 / schema 级改为 `HD-13`）。
 - 任务目标 / 允许范围本身声明破坏性或不可逆动作（例如「删除全部用户数据」），而当前 diff 无法证明它时同样 `HD-05`；这条只看破坏性措辞，空 diff 不能作为「无风险」的反证。
-- 权限 / 安全 / 迁移等一般关键词只是线索，不单独升级：只有当**允许范围本身命中高风险路径**（authority surface、受保护执行面、安全命名的文件名、schema）并同时出现对应关键词时，空 diff 才升级 `HD-05`。目标写「调整用户权限」、允许 `a.md` 的空提交仍是 `NEEDS_EVIDENCE`，且**没有** decision ID；同一目标把允许范围改成 `AGENTS.md` 或 `docs/design/guide.md` 才升级 `HD-05`。空 diff 的 scope 线索一律是 `HD-05`：`HD-13` 只用于真实 diff 确实改动 schema / 契约路径的变更；空 diff 或仅允许范围里出现 schema 文件名不升级 `HD-13`。
+- 权限 / 安全 / 迁移等一般关键词只是线索，不单独升级：只有当**允许范围本身命中高风险路径**（authority surface、受保护执行面、安全命名的文件名、schema）并同时出现对应关键词时，空 diff 才升级 `HD-05`。目标写「调整用户权限」、允许 `a.md` 的空提交仍是 `NEEDS_EVIDENCE`，且**没有** decision ID；同一目标把允许范围改成 `AGENTS.md` 或 `docs/design/guide.md` 才升级 `HD-05`。空 diff 的 scope 线索一律是 `HD-05`：`HD-13` 只用于真实 diff 确实改动 schema / 契约路径的变更；空 diff、仅允许范围里出现 schema 文件 / 目录，或普通文档文件名含 schema，都不升级 `HD-13`。
 - Lesson 冲突无法靠证据解除 → `HD-04`。
 - 把 Lesson 提升为通用规则且影响上述边界 → `HD-03`。
 - 来源访问授权问题 → `HD-01` / `HD-02`。
@@ -105,7 +105,7 @@
 
 - 只有 `AGENTS.md`、`docs/orchestration.md`、`kit/orchestration.md`、`editions/`、`docs/contracts/`、`docs/design/` 这类 authority surface 上的权限 / 安全措辞变化才映射到 `HD-05`；
 - 普通文档（例如 `docs/help.md`）里出现「permission」等词不自动判为 `HD-05`，而是作为内容变化进入 `NEEDS_EVIDENCE` / `BLOCKED`，等待审查；
-- 命中受保护执行面（`scripts/orchestrator.py`、`.orchestration/`、`.github/workflows/`、`release/`）、schema、可执行位变化、不可逆操作的变更进入 `HD-05` / `HD-13`。
+- 命中受保护执行面（`scripts/orchestrator.py`、`.orchestration/`、`.github/workflows/`、`release/`）、schema、可执行位变化、不可逆操作的变更进入 `HD-05` / `HD-13`。这里的 schema 路径只指真正的 schema 数据文件（`schema.json` / `*.schema.json` 等）或 `schema/` / `schemas/` 目录下的数据文件；文件名里含 "schema" 的普通文档（例如 `docs/schema-notes.md`）仍按文档处理，不凭文件名升级 `HD-13`。
 
 `planning.py` 的 `assess_risk()` 只用仓库自己解析的 Git 证据，并把调用者提供的 `base_sha` / `head_sha` 参数与 `git_evidence` 交叉校验。**这些参数只是定位符和一致性检查，不是权威任务载体认证**：真实适配器未接入，任何调用者都可以传相同的字符串。规划器验证两个提交存在、base 是 head 的祖先、`HEAD` 与 head 一致、工作树干净且不是浅克隆，然后用 Git 生成完整 raw / numstat diff。它还会：
 

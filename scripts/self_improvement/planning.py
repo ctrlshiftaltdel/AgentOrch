@@ -37,7 +37,9 @@ them, so the planner fails closed and says so. ``core.fsmonitor``, hooks and
 lazy fetch are disabled through config overrides / environment. Git is then read
 through the local ``git`` executable so risk evidence is the repository's own
 diff, never a caller-supplied summary; every Git command repeats the preflight,
-including the public diff-digest helper.
+including the public diff-digest helper. Every revision or object id handed to
+Git is first validated as an exact 40-character lowercase hex string, so a
+caller or state value can never become a Git option.
 """
 from __future__ import annotations
 
@@ -252,6 +254,12 @@ PROTECTED_PATH_PREFIXES = (
 )
 
 DOCUMENTATION_SUFFIXES = ('.md', '.rst', '.txt', '.adoc')
+# Schema identity: an exact schema file name, a schema extension, or a file
+# living in a schema directory. A documentation suffix wins over a schema-ish
+# name so ``docs/schema-notes.md`` stays documentation, not a contract change.
+_SCHEMA_FILE_NAMES = frozenset({'schema.json', 'schema.yaml', 'schema.yml'})
+_SCHEMA_FILE_SUFFIXES = ('.schema.json', '.schema.yaml', '.schema.yml')
+_SCHEMA_DIR_NAMES = frozenset({'schema', 'schemas'})
 SECURITY_PATH_TOKENS = (
     'auth', 'permission', 'permissions', 'access', 'security', 'policy',
     'role', 'roles', 'credential', 'credentials', 'secret', 'secrets',
@@ -439,8 +447,21 @@ def _is_security_path(path):
 
 
 def _is_schema_path(path):
+    """True for a real schema / contract data path, not a schema-named document.
+
+    Schema identity comes from the file name / extension or from a
+    ``schema``/``schemas`` directory. A documentation file that merely mentions
+    "schema" in its name (``docs/schema-notes.md``) is ordinary documentation:
+    a filename is not proof of a contract change, so it must not widen HD-13.
+    """
     lower = path.lower()
-    return 'schema' in posixpath.basename(lower) or lower.endswith('.schema.json')
+    pieces = lower.split('/')
+    name = pieces[-1]
+    if name in _SCHEMA_FILE_NAMES or name.endswith(_SCHEMA_FILE_SUFFIXES):
+        return True
+    if _is_documentation_path(lower):
+        return False
+    return any(piece in _SCHEMA_DIR_NAMES for piece in pieces[:-1])
 
 
 def _resolve_path(value):
@@ -797,6 +818,16 @@ def _snapshot_digest(head_sha, base_sha, status, index, raw, numstat, ignored):
     return digest.hexdigest()
 
 
+def _is_full_sha(value):
+    """True only for an exact ``str`` of 40 lowercase hex characters.
+
+    No coercion and no trimming: a leading space, a trailing newline, a bytes
+    value or an object whose ``__str__`` looks like a SHA is not a SHA. ``$``
+    alone would match before a final newline, hence ``fullmatch``.
+    """
+    return isinstance(value, str) and _SHA_RE.fullmatch(value) is not None
+
+
 def _require_diff_sha(label, value):
     """Return a validated commit SHA or refuse before any Git process.
 
@@ -804,17 +835,14 @@ def _require_diff_sha(label, value):
     unvalidated value such as ``--ext-diff``, ``--textconv`` or
     ``--output=/path`` lands *after* the protective switches and overrides them:
     the first two run repository-configured helpers, the last overwrites a file.
-    Only a full 40-character hex SHA may reach Git, so option injection is
-    rejected here, before ``_run_git`` starts anything.
+    Only an exact 40-character lowercase hex SHA may reach Git, so option
+    injection and whitespace/non-string smuggling are rejected here, before
+    ``_run_git`` starts anything.
     """
-    if not isinstance(value, str):
+    if not _is_full_sha(value):
         raise GitEvidenceError(
             f'{label} must be a full 40-character hex Git SHA')
-    sha = value.strip().lower()
-    if not _SHA_RE.match(sha):
-        raise GitEvidenceError(
-            f'{label} must be a full 40-character hex Git SHA')
-    return sha
+    return value
 
 
 def _diff_digest(repo_root, base_sha, head_sha):
@@ -891,9 +919,10 @@ def _parse_numstat_binary(data):
 
 def _blob_is_unproven(repo_root, sha):
     """True when a blob cannot be treated as text by this planner."""
-    # Only a full hex object id may reach ``git cat-file``. Raw-diff headers come
-    # from Git, but never let a malformed token become a command-line option.
-    if not isinstance(sha, str) or not _SHA_RE.match(sha):
+    # Only an exact full hex object id may reach ``git cat-file``. Raw-diff
+    # headers come from Git, but never let a malformed token become a
+    # command-line option or smuggle a trailing newline into the argument.
+    if not _is_full_sha(sha):
         return True
     if set(sha) <= {'0'}:
         return False
@@ -931,25 +960,22 @@ def _git_evidence_state(proposal, repo_root, required_base_sha=None,
     head_sha = evidence.get('head_sha')
     if not isinstance(base_sha, str) or not isinstance(head_sha, str):
         return _untrusted_evidence('git_evidence.base_sha and head_sha are required')
-    base_sha = base_sha.strip().lower()
-    head_sha = head_sha.strip().lower()
-    if not _SHA_RE.match(base_sha) or not _SHA_RE.match(head_sha):
-        return _untrusted_evidence('git_evidence SHAs must be 40-character hex values')
+    if not _is_full_sha(base_sha) or not _is_full_sha(head_sha):
+        return _untrusted_evidence(
+            'git_evidence SHAs must be exactly 40 lowercase hex characters')
     if base_sha == head_sha:
         return _untrusted_evidence('git_evidence base_sha and head_sha must differ')
     if required_base_sha is not None:
-        expected_base = str(required_base_sha).strip().lower()
-        if not _SHA_RE.match(expected_base):
+        if not _is_full_sha(required_base_sha):
             return _untrusted_evidence(
                 'task carrier base_sha is not a 40-character hex value')
-        if base_sha != expected_base:
+        if base_sha != required_base_sha:
             return _untrusted_evidence(
                 'git_evidence.base_sha does not match the task carrier base_sha')
     if required_head_sha is not None:
-        expected = str(required_head_sha).strip().lower()
-        if not _SHA_RE.match(expected):
+        if not _is_full_sha(required_head_sha):
             return _untrusted_evidence('task carrier head_sha is not a 40-character hex value')
-        if head_sha != expected:
+        if head_sha != required_head_sha:
             return _untrusted_evidence(
                 'git_evidence.head_sha does not match the task carrier head_sha')
     root = Path(repo_root or os.getcwd()).expanduser()
@@ -1044,9 +1070,14 @@ def _git_evidence_state(proposal, repo_root, required_base_sha=None,
 
 
 def _diff_lines_for_path(state, path):
+    # This internal entry point validates its own state SHAs. The normal planning
+    # chain already checked them, but a handcrafted state must not turn
+    # ``--ext-diff`` / ``--output=<file>`` into a Git option and a side effect.
+    base_sha = _require_diff_sha('base_sha', state['base_sha'])
+    head_sha = _require_diff_sha('head_sha', state['head_sha'])
     completed = _run_git(state['repo_root'], [
         'diff', '-U0', '--no-color', '--no-ext-diff', '--no-textconv',
-        state['base_sha'], state['head_sha'], '--', path])
+        base_sha, head_sha, '--', path])
     if completed.returncode not in (0, 1):
         raise GitEvidenceError('cannot read file diff')
     lines = []

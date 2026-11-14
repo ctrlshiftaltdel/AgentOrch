@@ -18,6 +18,20 @@ from . import loop_support, support
 from agentorch_self_improvement import planning  # noqa: E402
 
 
+class _ShaLike:
+    """A non-string object whose ``__str__`` would look like a valid SHA.
+
+    ``_git_evidence_state`` used to call ``str()`` on the required task-carrier
+    SHA, so an object like this one reached Git as a seemingly valid commit id.
+    """
+
+    def __init__(self, value):
+        self._value = value
+
+    def __str__(self):
+        return self._value
+
+
 def plan_one(record, spec=None, **kwargs):
     kwargs.setdefault('edition', 'local')
     kwargs.setdefault('repo_root', loop_support.DEFAULT_REPO_ROOT)
@@ -558,6 +572,37 @@ class GitRiskTests(unittest.TestCase):
             goal='改变 lesson schema 的枚举取值。'))
         self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')
         self.assertEqual(proposal['required_human_decision'], 'HD-13')
+
+    def test_schema_named_documentation_typo_is_not_hd13(self):
+        """A document whose file name contains "schema" is not a schema.
+
+        ``docs/schema-notes.md`` only proves a documentation edit when its text
+        changes. A basename substring match used to escalate a typo fix to
+        HIGH / HD-13 even though no schema or contract changed.
+        """
+        base, head = self.commit_range(
+            {'docs/schema-notes.md': 'schema notes typo\n'},
+            {'docs/schema-notes.md': 'schema notes fixed\n'})
+        proposal = self.plan(self.spec(['docs/schema-notes.md'], base, head,
+                                       goal='修正文档错字。'), review=False)
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertIsNone(proposal['required_human_decision'])
+        self.assertFalse(any('contract/schema change' in reason
+                             for reason in proposal['risk_reasons']),
+                         proposal['risk_reasons'])
+        self.assertTrue(any('documentation' in reason
+                            for reason in proposal['risk_reasons']),
+                        proposal['risk_reasons'])
+
+    def test_schema_identity_is_not_a_filename_substring(self):
+        self.assertTrue(planning._is_schema_path(
+            'docs/contracts/schemas/lesson.schema.json'))
+        self.assertTrue(planning._is_schema_path(
+            'scripts/verification_planner/schema.json'))
+        self.assertFalse(planning._is_schema_path('docs/schema-notes.md'))
+        self.assertFalse(planning._is_schema_path('docs/schema.md'))
+        self.assertFalse(planning._is_schema_path('src/schema_helpers.py'))
 
     def test_irreversible_code_change_is_high(self):
         base, head = self.commit_range(
@@ -1227,6 +1272,165 @@ class GitIsolationTests(unittest.TestCase):
         # The valid range still produces a digest.
         self.assertTrue(planning.git_diff_digest(repo.root, base, head))
 
+    def test_git_diff_digest_rejects_whitespace_padded_shas(self):
+        """A SHA must be exact; leading/trailing whitespace is never trimmed."""
+        repo = loop_support.GitRepo('agentorch-risk-sha-space-')
+        self.addCleanup(repo.close)
+        base = repo.commit({'docs/note.md': 'one\n'}, message='base')
+        head = repo.empty_commit('head')
+        for label, base_value, head_value in (
+                ('leading space', ' ' + base, head),
+                ('trailing space', base + ' ', head),
+                ('trailing newline', base + '\n', head),
+                ('head trailing newline', base, head + '\n'),
+                ('head leading space', base, ' ' + head)):
+            with self.subTest(label=label):
+                self._assert_digest_refused_before_git(
+                    repo.root, base_value, head_value)
+        # The exact values still produce a digest.
+        self.assertTrue(planning.git_diff_digest(repo.root, base, head))
+
+    def test_evidence_entry_rejects_whitespace_padded_shas(self):
+        """Git evidence SHAs are validated verbatim before any Git process."""
+        repo = loop_support.GitRepo('agentorch-risk-evidence-space-')
+        self.addCleanup(repo.close)
+        base = repo.commit({'docs/note.md': 'one\n'}, message='base')
+        head = repo.empty_commit('head')
+        for label, base_value, head_value in (
+                ('base leading space', ' ' + base, head),
+                ('base trailing newline', base + '\n', head),
+                ('head trailing space', base, head + ' '),
+                ('head trailing newline', base, head + '\n')):
+            with self.subTest(label=label):
+                details, process_marker = self._assess_evidence_probe(
+                    {'allowed_paths': ['docs/note.md'],
+                     'git_evidence': loop_support.git_evidence(
+                         base_value, head_value)},
+                    repo_root=repo.root)
+                self.assertFalse(
+                    process_marker.exists(),
+                    f'{label}: evidence entry started Git before validating SHAs')
+                self.assertEqual(details['evidence_status'], 'UNTRUSTED')
+                self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+
+    def test_required_task_shas_must_be_exact_strings(self):
+        """The required carrier SHAs are not coerced with ``str()``/``strip()``."""
+        repo = loop_support.GitRepo('agentorch-risk-required-sha-')
+        self.addCleanup(repo.close)
+        base = repo.commit({'docs/note.md': 'one\n'}, message='base')
+        head = repo.empty_commit('head')
+        cases = (
+            ('non-string base', _ShaLike(base), head, 'task carrier base_sha'),
+            ('padded head', base, head + '\n', 'task carrier head_sha'),
+        )
+        for label, required_base, required_head, reason in cases:
+            with self.subTest(label=label):
+                details, process_marker = self._assess_evidence_probe(
+                    {'allowed_paths': ['docs/note.md'],
+                     'git_evidence': loop_support.git_evidence(base, head)},
+                    repo_root=repo.root, required_base_sha=required_base,
+                    required_head_sha=required_head)
+                self.assertFalse(
+                    process_marker.exists(),
+                    f'{label}: required SHA was passed to Git before validation')
+                self.assertEqual(details['evidence_status'], 'UNTRUSTED')
+                self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+                self.assertTrue(
+                    any(reason in item for item in details['reasons']),
+                    details['reasons'])
+
+    def test_blob_probe_rejects_a_newline_padded_object_id(self):
+        """``git cat-file`` must only see an exact full object id."""
+        repo = loop_support.GitRepo('agentorch-risk-blob-sha-')
+        self.addCleanup(repo.close)
+        base = repo.commit({'docs/note.md': 'text\n'}, message='base')
+        blob = repo._git('rev-parse', f'{base}:docs/note.md').stdout.decode().strip()
+        process_marker, bin_dir = self._git_process_probe()
+        path = str(bin_dir) + os.pathsep + os.environ['PATH']
+        with mock.patch.dict(os.environ, {'PATH': path}):
+            self.assertTrue(planning._blob_is_unproven(repo.root, blob + '\n'))
+            self.assertTrue(planning._blob_is_unproven(
+                repo.root, _ShaLike(blob)))
+        self.assertFalse(process_marker.exists(),
+                         'blob probe started Git for a malformed object id')
+        # The exact object id still reads the blob.
+        self.assertFalse(planning._blob_is_unproven(repo.root, blob))
+
+    def test_internal_diff_lines_entry_rejects_injected_state_shas(self):
+        """The internal diff entry validates state SHAs before starting Git.
+
+        ``_diff_lines_for_path`` reads its revisions from the evidence state. A
+        state value such as ``--ext-diff`` re-enables the repository external
+        diff after the protective switch and ``--textconv`` runs its textconv
+        driver; both used to execute a repository command even though the public
+        planning chain had validated a different copy of the SHA.
+        """
+        repo = loop_support.GitRepo('agentorch-risk-difflines-')
+        self.addCleanup(repo.close)
+        command = f'"{sys.executable}" "{self._script()}"'
+        repo.write('docs/evil.md', 'SAFE\n')
+        repo.write('.gitattributes', 'docs/evil.md diff=probe\n')
+        repo._git('config', 'diff.probe.textconv', command)
+        repo._git('config', 'diff.external', command)
+        repo._git('add', '-A')
+        repo._git('commit', '-qm', 'base')
+        repo.write('docs/evil.md', 'EVIL\n')
+        repo._git('commit', '-qam', 'head')
+        head = repo.head()
+        for option in ('--ext-diff', '--textconv'):
+            with self.subTest(option=option):
+                self._reset_marker()
+                self._assert_state_diff_refused_before_git(
+                    {'repo_root': str(repo.root), 'base_sha': option,
+                     'head_sha': head}, 'docs/evil.md')
+                self.assertFalse(
+                    self.marker.exists(),
+                    f'{option}: internal diff entry executed the repository diff surface')
+                self.assertEqual(
+                    (repo.root / 'docs/evil.md').read_text(encoding='utf-8'),
+                    'EVIL\n')
+
+    def test_internal_diff_lines_entry_rejects_output_option_injection(self):
+        """A state SHA named ``--output=<path>`` must not overwrite that file."""
+        repo = loop_support.GitRepo('agentorch-risk-difflines-output-')
+        self.addCleanup(repo.close)
+        base = repo.commit({'docs/evil.md': 'SAFE\n'}, message='base')
+        repo.write('docs/evil.md', 'EVIL\n')
+        repo._git('commit', '-qam', 'head')
+        head = repo.head()
+        target = self.marker_dir / 'difflines-output.txt'
+        target.write_text('original\n', encoding='utf-8')
+        self._assert_state_diff_refused_before_git(
+            {'repo_root': str(repo.root), 'base_sha': f'--output={target}',
+             'head_sha': head}, 'docs/evil.md')
+        self.assertEqual(target.read_text(encoding='utf-8'), 'original\n',
+                         'internal diff entry overwrote the caller-named file')
+        # The valid state still reads the real diff.
+        lines = planning._diff_lines_for_path(
+            {'repo_root': str(repo.root), 'base_sha': base, 'head_sha': head},
+            'docs/evil.md')
+        self.assertIn('EVIL', lines)
+        self.assertIn('SAFE', lines)
+
+    def _assess_evidence_probe(self, proposal, *, repo_root, **kwargs):
+        process_marker, bin_dir = self._git_process_probe()
+        path = str(bin_dir) + os.pathsep + os.environ['PATH']
+        with mock.patch.dict(os.environ, {'PATH': path}):
+            details = planning.assess_risk_details(
+                proposal, {}, repo_root=repo_root, **kwargs)
+        return details, process_marker
+
+    def _assert_state_diff_refused_before_git(self, state, path):
+        process_marker, bin_dir = self._git_process_probe()
+        search_path = str(bin_dir) + os.pathsep + os.environ['PATH']
+        with mock.patch.dict(os.environ, {'PATH': search_path}):
+            with self.assertRaises(planning.GitEvidenceError):
+                planning._diff_lines_for_path(state, path)
+        self.assertFalse(
+            process_marker.exists(),
+            'internal diff entry started Git before validating its state')
+        return process_marker
+
 
 class EmptyDiffPermissionWordingTests(unittest.TestCase):
     def test_permission_goal_without_high_risk_path_is_not_hd05(self):
@@ -1293,6 +1497,21 @@ class EmptyDiffPermissionWordingTests(unittest.TestCase):
         self.assertEqual(details['changed_paths'], [])
         self.assertEqual(details['level'], 'HIGH')
         self.assertEqual(details['decision_id'], 'HD-05')
+
+    def test_schema_named_documentation_is_not_a_high_risk_scope(self):
+        """A schema-sounding document name is a scope word, not a schema path."""
+        repo = loop_support.GitRepo('agentorch-risk-schema-doc-empty-')
+        self.addCleanup(repo.close)
+        path = 'docs/schema-notes.md'
+        base = repo.commit({path: 'notes\n'}, message='base')
+        head = repo.empty_commit('no change')
+        details = planning.assess_risk_details(
+            {'goal': '整理 schema 文档。', 'allowed_paths': [path],
+             'git_evidence': loop_support.git_evidence(base, head)},
+            {}, repo_root=repo.root)
+        self.assertEqual(details['changed_paths'], [])
+        self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+        self.assertIsNone(details['decision_id'])
 
 
 class PacketCompletenessTests(unittest.TestCase):
