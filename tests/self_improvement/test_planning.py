@@ -999,7 +999,7 @@ class GitIsolationTests(unittest.TestCase):
                 {}, repo_root=repo_root)
         return details, process_marker
 
-    def _parent_with_submodule_filter(self):
+    def _parent_with_submodule_filter(self, path='sub'):
         """A parent commit range whose submodule runs a clean filter on status."""
         parent = loop_support.GitRepo('agentorch-risk-parent-')
         self.addCleanup(parent.close)
@@ -1014,13 +1014,13 @@ class GitIsolationTests(unittest.TestCase):
         parent._git('commit', '-qm', 'base')
         base = parent.head()
         parent._git('-c', 'protocol.file.allow=always', 'submodule', 'add',
-                    str(sub_source.root), 'sub')
+                    str(sub_source.root), path)
         parent._git('commit', '-qm', 'add submodule')
         head = parent.head()
         # Configure the filter only after the fixture commits, so setup never runs it.
-        parent._git('-C', 'sub', 'config', 'filter.probe.clean',
+        parent._git('-C', path, 'config', 'filter.probe.clean',
                     f'"{sys.executable}" "{self._script(transform=True)}"')
-        data = parent.root / 'sub' / 'data'
+        data = parent.root / path / 'data'
         data.write_text('EVIL\n', encoding='utf-8')
         os.utime(data, None)
         return parent, base, head
@@ -1048,6 +1048,52 @@ class GitIsolationTests(unittest.TestCase):
         self.assertTrue(
             any('nested' in reason or 'submodule' in reason or 'filter' in reason
                 for reason in details['reasons']), details['reasons'])
+
+    def test_unlistable_submodule_parent_is_refused_before_git(self):
+        """A submodule under an unlistable directory must still block.
+
+        ``os.walk`` silently skips a directory with execute but no read
+        permission, so the nested-repository enumeration returned zero roots and
+        the preflight ran ``git status``. Git does not need to list that directory
+        to enter an already-registered submodule: it ran the submodule's clean
+        filter, wrote the marker and still reported PRESENT. A traversal failure
+        must be treated as an isolation failure and refuse before any Git process.
+        """
+        if os.name != 'posix' or os.geteuid() == 0:
+            self.skipTest('directory read/execute permission bits are POSIX-only')
+        parent, base, head = self._parent_with_submodule_filter(
+            path='private/sub')
+        private = parent.root / 'private'
+        allowed = ['docs/note.md', 'private/sub']
+        self._reset_marker()
+        details, process_marker = self._assess_with_git_probe(
+            parent.root, base, head, allowed)
+        # While ``private`` is listable the submodule is found and refused.
+        self.assertFalse(process_marker.exists(),
+                         'risk assessment started Git before proving isolation')
+        self.assertFalse(self.marker.exists(),
+                         'risk assessment executed the submodule clean filter')
+        self.assertNotEqual(details['evidence_status'], 'PRESENT')
+        self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+
+        private.chmod(0o111)
+        self.addCleanup(private.chmod, 0o755)
+        self._reset_marker()
+        details, process_marker = self._assess_with_git_probe(
+            parent.root, base, head, allowed)
+        self.assertFalse(
+            process_marker.exists(),
+            'an unlistable directory must refuse before any Git process starts')
+        self.assertFalse(
+            self.marker.exists(),
+            'risk assessment executed the submodule clean filter through '
+            'an unlistable parent directory')
+        self.assertNotEqual(details['evidence_status'], 'PRESENT')
+        self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+        self.assertEqual(details['changed_paths'], [])
+        self.assertTrue(
+            any('cannot be listed' in reason for reason in details['reasons']),
+            details['reasons'])
 
     def test_nested_repository_filter_config_is_refused(self):
         """A nested repository that is not a registered submodule still counts."""

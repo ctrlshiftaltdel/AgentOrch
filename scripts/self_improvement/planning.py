@@ -324,6 +324,10 @@ _UNREADABLE_CONFIG_MESSAGE = (
     'a repository config, info/attributes or alternates file cannot be read, so this '
     'planner cannot prove the repository is non-executable; it refuses before '
     'starting Git (not implemented)')
+_TRAVERSAL_ISOLATION_MESSAGE = (
+    'a directory in the worktree cannot be listed, so this planner cannot prove '
+    'that no nested repository (submodule) with an executable Git configuration '
+    'is hidden below it; it refuses before starting Git (not implemented)')
 _UNSAFE_GIT_ENV = (
     'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
     'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_COMMON_DIR',
@@ -772,6 +776,25 @@ def _config_isolation_reason(entries):
     return None
 
 
+class _UnlistableDirectoryError(Exception):
+    """A worktree directory could not be listed during the isolation scan."""
+
+
+def _walk_worktree(worktree):
+    """Yield ``os.walk`` entries, failing closed on an unlistable directory.
+
+    ``os.walk`` silently skips a directory it cannot list. A directory with
+    execute but no read permission is still traversable by Git, which does not
+    need to list it to enter an already-registered submodule. Skipping it would
+    hide that submodule's executable Git config, so every traversal error is
+    fatal here and the planner refuses before running any Git command.
+    """
+    def _fail(error):
+        raise _UnlistableDirectoryError(str(error)) from error
+
+    return os.walk(worktree, onerror=_fail)
+
+
 def _attribute_files(worktree):
     """Every ``.gitattributes`` in the worktree, including nested repositories.
 
@@ -779,7 +802,7 @@ def _attribute_files(worktree):
     attributes apply inside its own worktree, so they cannot be skipped.
     """
     paths = []
-    for dirpath, dirnames, filenames in os.walk(worktree):
+    for dirpath, dirnames, filenames in _walk_worktree(worktree):
         dirnames[:] = [name for name in dirnames if name != '.git']
         if '.gitattributes' in filenames:
             paths.append(Path(dirpath) / '.gitattributes')
@@ -794,7 +817,7 @@ def _nested_repository_roots(worktree):
     the parent enters an initialised submodule and runs its clean filter.
     """
     roots = []
-    for dirpath, dirnames, filenames in os.walk(worktree):
+    for dirpath, dirnames, filenames in _walk_worktree(worktree):
         path = Path(dirpath)
         nested = path != worktree and ('.git' in dirnames or '.git' in filenames)
         dirnames[:] = [name for name in dirnames if name != '.git']
@@ -857,7 +880,10 @@ def _repository_isolation_error(repo_root):
     make object reads fetch or run a helper. Reading config, attributes and
     alternates files is enough to know that isolation is not possible, so the
     planner fails closed here *before* the first Git command instead of running a
-    repository-defined command and reporting the side effect afterwards.
+    repository-defined command and reporting the side effect afterwards. A
+    worktree directory that cannot be listed is also fatal: Git can still enter a
+    submodule registered below it even though ``os.walk`` cannot enumerate that
+    directory, so the scan would otherwise miss an executable nested config.
     """
     layout = _git_layout(repo_root)
     if layout is None:
@@ -866,10 +892,17 @@ def _repository_isolation_error(repo_root):
     reason = _layout_isolation_reason(layout)
     if reason:
         return reason
-    for path in _attribute_files(worktree):
-        if _attributes_declare_filter(path):
-            return _FILTER_ISOLATION_MESSAGE
-    for root in _nested_repository_roots(worktree):
+    try:
+        for path in _attribute_files(worktree):
+            if _attributes_declare_filter(path):
+                return _FILTER_ISOLATION_MESSAGE
+        nested_roots = _nested_repository_roots(worktree)
+    except _UnlistableDirectoryError:
+        # A directory Git can still traverse may hide an initialised submodule
+        # with an executable config; refusing is the only way to stay before
+        # the first Git command.
+        return _TRAVERSAL_ISOLATION_MESSAGE
+    for root in nested_roots:
         try:
             label = str(root.relative_to(worktree))
         except ValueError:
