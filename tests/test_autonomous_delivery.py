@@ -276,6 +276,29 @@ class DeliveryCase(unittest.TestCase):
         hook.chmod(0o755)
         return hook
 
+    def _fsmonitor(self, body):
+        """A real ``core.fsmonitor`` hook; Git itself runs ``body`` before commands.
+
+        Git invokes this program while it refreshes the index for ``status``,
+        ``diff``, ``ls-files``, ``add`` and ``commit``, so it reaches the same
+        in-process code path a clean filter takes through a different config
+        key. The response is a valid (empty) v2 update so Git continues.
+        """
+        script = self.root / 'fsmonitor-hook.py'
+        script.write_text(
+            f'#!{PY}\nimport pathlib, sys\n'
+            'if sys.argv[1:2] == ["version"]:\n'
+            '    sys.stdout.write("2\\n")\n'
+            '    raise SystemExit(0)\n'
+            + body +
+            '\nsys.stdout.write("0\\n\\0")\n')
+        script.chmod(0o755)
+        return script
+
+    def _use_fsmonitor(self, script):
+        _git(self.repo, 'config', 'core.fsmonitor', str(script))
+        _git(self.repo, 'config', 'core.fsmonitorHookVersion', '2')
+
 
 class PrepareOnlyTests(DeliveryCase):
     def test_prepare_only_approves_and_leaves_merge_to_a_human(self):
@@ -2976,6 +2999,60 @@ class CommitBoundaryTests(DeliveryCase):
         # No Git process started after the invalid declaration appeared.
         self.assertEqual(after, [])
 
+    def test_a_fsmonitor_switch_inside_changes_starts_no_further_git(self):
+        # `_changes` runs `git diff`, `git diff --cached` and `git ls-files`
+        # back to back. Each is a synchronous Git process that can run a real
+        # configured `core.fsmonitor` hook, and that hook can switch
+        # `docs/PROJECT.md` from `local` to the equally valid `github`. The
+        # edition must be re-proved after *every* one of those calls before the
+        # next Git call starts, so the switch inside the first `diff` stops the
+        # sequence instead of letting `diff --cached` and `ls-files` run on an
+        # edition the run did not begin with.
+        project = self.repo / 'docs' / 'PROJECT.md'
+        runs = self.root / 'fsmonitor-runs'
+        armed = self.root / 'fsmonitor-armed'
+        script = self._fsmonitor(
+            'armed_path = pathlib.Path(' + repr(str(armed)) + ')\n'
+            'if armed_path.exists():\n'
+            '    armed_path.unlink()\n'
+            '    pathlib.Path(' + repr(str(runs)) + ').open("a").write("x")\n'
+            '    config = pathlib.Path(' + repr(str(project)) + ').read_text()\n'
+            '    pathlib.Path(' + repr(str(project)) + ').write_text(\n'
+            '        config.replace("`local`", "`github`"))\n')
+        work = self.worktree('one')
+        base = _head_of(work)
+        after = []
+        original_git = delivery.git
+
+        def git_probe(where, *args):
+            if runs.exists():
+                after.append(args)
+            return original_git(where, *args)
+
+        def execution(where, prompt):
+            self.write_default(where, prompt)
+            # The first Git call after the execution session is the `diff`
+            # inside `_changes`; configure and arm the hook for it only.
+            self._use_fsmonitor(script)
+            armed.write_text('x')
+
+        agents = FakeAgents(self, execution=execution)
+        with mock.patch.object(delivery, 'git', git_probe):
+            state, _ = self.run_delivery(
+                self.plan([self.task('one', work, ['a.txt'])]), agents)
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertIsNone(record.get('head'))
+        self.assertEqual(_head_of(work), base)
+        # The hook really ran inside Git, and the real switch landed.
+        self.assertTrue(runs.read_text())
+        self.assertIn('`github`', project.read_text())
+        # After the switch no further Git call started: `_changes` did not get
+        # to `diff --cached` or `ls-files`.
+        self.assertEqual(after, [])
+
     def test_a_commit_phase_filter_and_hook_never_start(self):
         # `git commit` runs its clean filters and pre-commit hook *inside* the
         # commit process. A filter can switch `local` to the equally valid
@@ -3047,6 +3124,93 @@ class CommitBoundaryTests(DeliveryCase):
         _git(work, 'commit', '-q', '-m', 'control', check=False)
         self.assertTrue(hook_marker.exists())
         self.assertTrue(filter_marker.exists())
+
+    def test_a_configured_fsmonitor_never_starts_the_commit(self):
+        # `git commit` also runs a configured `core.fsmonitor` program while it
+        # refreshes the index. It is executable code, sits behind a config key
+        # the clean-filter/hook proof did not look at, and runs after the last
+        # proof — a real hook can switch `docs/PROJECT.md` to `github` and the
+        # commit is then history before a later BLOCKED. The runner must prove
+        # that no fsmonitor helper can run before it starts `git commit`, and
+        # refuse to start it when it cannot.
+        project = self.repo / 'docs' / 'PROJECT.md'
+        marker = self.root / 'fsmonitor-ran'
+        armed = self.root / 'fsmonitor-armed'
+        script = self._fsmonitor(
+            'armed_path = pathlib.Path(' + repr(str(armed)) + ')\n'
+            'if armed_path.exists():\n'
+            '    armed_path.unlink()\n'
+            '    pathlib.Path(' + repr(str(marker)) + ').open("a").write("x")\n'
+            '    config = pathlib.Path(' + repr(str(project)) + ').read_text()\n'
+            '    pathlib.Path(' + repr(str(project)) + ').write_text(\n'
+            '        config.replace("`local`", "`github`"))\n')
+        work = self.worktree('one')
+        base = _head_of(work)
+        original_prove = delivery._prove_staged
+
+        def prove(*args, **kwargs):
+            result = original_prove(*args, **kwargs)
+            # Configure and arm the real hook only for the commit phase, after
+            # every proof that came before it.
+            self._use_fsmonitor(script)
+            armed.write_text('x')
+            return result
+
+        commits = []
+        real_run = subprocess.run
+
+        def run_probe(argv, *args, **kwargs):
+            if isinstance(argv, list) and 'commit' in argv[:4]:
+                commits.append(list(argv))
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch.object(delivery, '_prove_staged', prove), \
+                mock.patch.object(delivery.subprocess, 'run', run_probe):
+            state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]))
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        # It names the real boundary: the fsmonitor helper is executable code
+        # inside the commit process, not a second writer.
+        self.assertIn('fsmonitor', record['reason'])
+        self.assertIn('core.fsmonitor', record['reason'])
+        self.assertIn('not implemented', record['reason'])
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertIsNone(record.get('head'))
+        # No history was created and the commit process was never started.
+        self.assertEqual(_head_of(work), base)
+        self.assertEqual(commits, [])
+        self.assertFalse(marker.exists())
+        self.assertIn('`local`', project.read_text())
+        # The staged change was left for a human, not reset.
+        self.assertIn('a.txt',
+                      _git(work, 'diff', '--cached', '--name-only').stdout.decode())
+        # The real attack is genuine: a direct commit in the same worktree runs
+        # the fsmonitor hook and the switch lands, so refusing to start it was
+        # necessary.
+        armed.write_text('x')
+        _git(work, 'commit', '-q', '-m', 'control', check=False)
+        self.assertTrue(marker.exists())
+        self.assertIn('`github`', project.read_text())
+
+    def test_a_configured_filter_value_is_not_written_to_the_journal_or_summary(self):
+        # A clean-filter refusal must name the configuration key, never its
+        # value: a filter value is an arbitrary command line and may carry a
+        # secret. The refusal reason is written to the journal and the CLI
+        # summary, so neither may contain the value.
+        token = 'DEMO_FAKE_TOKEN_ABC123'
+        work = self.worktree('one')
+        _git(self.repo, 'config', 'filter.unused.clean', f'cat {token}')
+        state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]))
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        # The key is enough to act on; the unpublished driver is refused too.
+        self.assertIn('filter.unused.clean', record['reason'])
+        self.assertIn('clean filter', record['reason'])
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertIsNone(record.get('head'))
+        self.assertNotIn(token, record['reason'])
+        self.assertNotIn(token, self.state.read_text())
+        self.assertNotIn(token, json.dumps(delivery._summary(state)))
 
 
 class CliTests(DeliveryCase):

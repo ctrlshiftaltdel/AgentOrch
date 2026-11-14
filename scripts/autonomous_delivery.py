@@ -28,15 +28,18 @@ fail-closed:
   each verification command — is bracketed by that proof on both sides, so a
   declaration that goes bad while one of them is in flight stops the run at that
   call: no further query, export, session or command starts, and an invalid
-  config never yields a ``PREPARED`` record. That includes a clean filter, which
-  Git runs *inside* ``status``/``diff``: the shared side-effect proof re-reads
-  the config after those calls and before the agent or command it gates, the
-  repository status read before dispatch is followed by another config and
-  authorization proof before the carrier query or any Agent, the carrier
-  return is followed by one before any later Git call, lock, journal or Agent,
-  every consecutive Git call in the dispatch validation is followed by one
-  before the next, and the status read just before ``git add`` is followed by
-  one before the index is touched.
+  config never yields a ``PREPARED`` record. That includes a clean filter or a
+  ``core.fsmonitor`` hook, which Git runs *inside* ``status``/``diff``: the
+  shared side-effect proof re-reads the config after those calls and before the
+  agent or command it gates, the repository status read before dispatch is
+  followed by another config and authorization proof before the carrier query or
+  any Agent, the carrier return is followed by one before any later Git call,
+  lock, journal or Agent, every consecutive Git call in the dispatch validation
+  is followed by one before the next, and while a task is processed *every*
+  synchronously awaited Git call is followed by one before the next Git call,
+  Agent or write. A three-call sequence such as ``_changes``' ``diff``,
+  ``diff --cached`` and ``ls-files`` therefore stops after the call whose
+  in-process helper switched the declaration.
   The runtime profile is part of that gate, so it is re-queried *after* an
   export and *before* the reviewer session starts, and again before every
   verification command, not only once per phase;
@@ -48,15 +51,19 @@ fail-closed:
   index. The index proof then reads through Git itself, so it re-reads the
   project config after those calls;
 * ``git commit`` is a porcelain process that runs clean filters while it
-  refreshes the index and then its commit hooks, *inside* the process and after
-  the index proof. Git exposes no switch that keeps those from running
-  (``--no-verify --no-status`` still runs the clean filter), so a filter can
-  switch ``docs/PROJECT.md`` to another valid edition and a hook can run before
-  the runner sees it; a later ``BLOCKED`` cannot undo that history. This is not
-  a second-writer race. The runner therefore proves before starting the process
-  that no clean filter or commit hook can run, and refuses to start
-  ``git commit`` when it cannot: creating a commit under a filter or hook is an
-  unimplemented capability, and the staged change is left for a human;
+  refreshes the index, runs a configured ``core.fsmonitor`` helper in that same
+  refresh, and then its commit hooks, *inside* the process and after the index
+  proof. Git exposes no switch that keeps the clean filter from running
+  (``--no-verify --no-status`` still runs it), so a filter or fsmonitor helper
+  can switch ``docs/PROJECT.md`` to another valid edition and a hook can run
+  before the runner sees it; a later ``BLOCKED`` cannot undo that history. This
+  is not a second-writer race. The runner therefore proves before starting the
+  process that no clean filter, fsmonitor helper or commit hook can run, and
+  refuses to start ``git commit`` when it cannot: creating a commit under any of
+  them is an unimplemented capability, and the staged change is left for a
+  human. The refusal names only configuration keys, never their values, because
+  a filter or fsmonitor value is an arbitrary command line that may carry a
+  secret and is copied into the journal and the CLI summary;
 * the final summary re-proves the project config after its Git fact checks, and
   re-queries the reviewer profile, once more over every live approval before the
   journal is saved. The config and profile are shared: if that final pass sees
@@ -149,10 +156,24 @@ class DeliveryError(Exception):
 
 # --------------------------------------------------------------------------- git
 
+# Re-proof installed by ``run`` while a task is being processed. Every Git
+# process a runner starts and synchronously waits for is a boundary: a clean
+# filter or a ``core.fsmonitor`` hook runs *inside* it and can switch
+# ``docs/PROJECT.md`` to another valid edition. A call site that reads three
+# Git facts in a row therefore cannot prove the edition once at the start; the
+# proof has to follow each return. ``git`` is the only seam every one of those
+# calls goes through, including the ones inside ``_changes``, ``_prove_staged``
+# and the approval re-check, so the guard lives here.
+_GIT_GUARD = None
+
+
 def git(where, *args):
     result = subprocess.run(['git', '--no-optional-locks', *args], cwd=where,
                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, check=True)
+    guard = _GIT_GUARD
+    if guard is not None:
+        guard()
     return result.stdout
 
 
@@ -392,42 +413,85 @@ def _configured_clean_filters(work):
     --no-status`` still runs it, so porcelain cannot isolate the commit from
     this. The check is deliberately conservative: any configured driver is
     enough to refuse.
+
+    Only the configuration *key* is returned. The value is an arbitrary command
+    line, may carry a secret, and is copied into the refusal reason, the journal
+    and the CLI summary, so it must never leave this function.
     """
     result = subprocess.run(
         ['git', '--no-optional-locks', 'config', '--get-regexp',
          r'^filter\..*\.(clean|process)$'], cwd=work, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode not in (0, 1):
-        raise DeliveryError('cannot enumerate Git clean filters before commit: '
-                            + result.stderr.strip())
-    return [line for line in result.stdout.splitlines() if line.strip()]
+        # `git config` stderr can quote configuration material; report neither
+        # it nor the values above.
+        raise DeliveryError('cannot enumerate Git clean filters before commit')
+    keys = []
+    for line in result.stdout.splitlines():
+        key = line.split(None, 1)[0].strip() if line.strip() else ''
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _configured_fsmonitor(work):
+    """The fsmonitor configuration key when Git could run a helper program.
+
+    ``core.fsmonitor`` is not a clean filter or a commit hook, but it is
+    executable code that Git invokes while it refreshes the index inside
+    ``git commit``. Set to ``true`` Git starts its builtin daemon; set to a path
+    it runs that program, which can switch ``docs/PROJECT.md`` after the last
+    proof and before history is written. Only the key is reported, never the
+    configured value.
+    """
+    result = subprocess.run(
+        ['git', '--no-optional-locks', 'config', '--get', 'core.fsmonitor'],
+        cwd=work, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True)
+    if result.returncode not in (0, 1):
+        raise DeliveryError('cannot prove that git commit runs no fsmonitor helper')
+    if result.returncode == 1:
+        return []
+    value = result.stdout.strip().lower()
+    # Every value except an explicit boolean false enables the helper: `true`
+    # means Git's builtin daemon, anything else is the hook program's path.
+    return [] if value in ('', 'false', 'no', 'off', '0') else ['core.fsmonitor']
 
 
 def _prove_commit_is_inert(context, spec, work):
     """Refuse to start ``git commit`` unless it cannot run code of its own.
 
     ``git commit`` is a porcelain process that runs clean filters while it
-    refreshes the index and then runs its commit hooks. Both run *inside* the
-    process, after the index proof, so a filter can switch ``docs/PROJECT.md``
-    to another valid edition and a hook can run before the runner sees the
-    change; by then the commit is already history. Git exposes no switch that
-    keeps the clean filter from running (``--no-verify --no-status`` still runs
-    it), so this is not a second-writer race and another file read cannot close
-    it. The runner therefore proves *before* starting the process that no
-    filter or commit hook can run, and refuses otherwise. That refusal is an
-    unimplemented capability: the staged change is left for a human to commit.
+    refreshes the index and then runs its commit hooks. A configured
+    ``core.fsmonitor`` program runs in that same index refresh. All of it runs
+    *inside* the process, after the index proof, so a filter or fsmonitor hook
+    can switch ``docs/PROJECT.md`` to another valid edition and a commit hook
+    can run before the runner sees the change; by then the commit is already
+    history. Git exposes no switch that keeps the clean filter from running
+    (``--no-verify --no-status`` still runs it), so this is not a second-writer
+    race and another file read cannot close it. The runner therefore proves
+    *before* starting the process that no filter, fsmonitor helper or commit
+    hook can run, and refuses otherwise. That refusal is an unimplemented
+    capability: the staged change is left for a human to commit.
+
+    The other executable helpers a commit could reach are already excluded by
+    the command line: ``--no-gpg-sign`` skips the signing program and ``-m``
+    supplies the message so no editor is started.
     """
     hooks = _commit_hooks(work)
     filters = _configured_clean_filters(work)
-    # The two probes are Git processes; re-prove the config afterwards as the
+    fsmonitor = _configured_fsmonitor(work)
+    # The probes are Git processes; re-prove the config afterwards as the
     # last action before the caller starts `git commit`.
     fresh = project_config(context.repo)
     _require_edition(fresh, expected=context.config.get('edition'))
     _authorize_paths(spec['paths'], fresh)
-    if hooks or filters:
+    if hooks or filters or fsmonitor:
         parts = []
         if filters:
             parts.append('configured clean filter(s): ' + ', '.join(filters))
+        if fsmonitor:
+            parts.append('fsmonitor helper(s): ' + ', '.join(fsmonitor))
         if hooks:
             parts.append('commit hook(s): ' + ', '.join(hooks))
         raise DeliveryError(
@@ -1551,6 +1615,10 @@ def _execute(context, spec, record):
         subprocess.run(['git', '--no-optional-locks', 'commit', '--no-gpg-sign',
                         '-m', str(message)], cwd=work, stdin=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+        # The commit process is a synchronous Git call of its own. `git`'s guard
+        # cannot see this direct invocation, so re-prove the edition and the
+        # authorization before the next Git call (`status`) starts.
+        _require_live_config(context, spec)
     if _status(work):
         raise DeliveryError('task worktree still has uncommitted changes after commit')
     head = _head(work)
@@ -2220,10 +2288,22 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
     plan_hash = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
     carrier_digest = (plan.get('carrier') or {}).get('digest')
 
-    locks = acquire_locks(repo, state_path, specs)
+    global _GIT_GUARD
+    locks = []
     try:
-        # Lock acquisition ran a Git call of its own; prove the edition and the
-        # task authorization before the journal is read or written.
+        # From here on every Git call is followed by the same proof before the
+        # next Git, Agent or write starts. A clean filter or a `core.fsmonitor`
+        # hook runs inside each synchronous Git process, so proving once before
+        # a sequence (such as `_changes`' `diff`, `diff --cached` and
+        # `ls-files`) is not enough: the switch can land in the first call and
+        # the sequence would continue on an edition the run did not begin with.
+        # Installing the guard before lock acquisition also covers the Git call
+        # that resolves the common directory and the lock files written after it.
+        _GIT_GUARD = lambda: reprove(DeliveryError)
+        locks = acquire_locks(repo, state_path, specs)
+        # Lock acquisition ran Git calls of its own, each followed by the guard;
+        # prove the edition and the task authorization once more before the
+        # journal is read or written.
         reprove(DeliveryError)
         if state_path.exists():
             state = json.loads(state_path.read_text(encoding='utf-8'))
@@ -2308,6 +2388,7 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
         _recheck_approved(context)
         return state
     finally:
+        _GIT_GUARD = None
         for handle in locks:
             handle.close()
 
