@@ -40,7 +40,7 @@
 3. **项目自有内容不被覆盖**：更新引擎永不直接覆盖项目配置、业务代码、测试、私有文档与未登记文件。
 4. **零第三方运行依赖**：本地与运行时校验保持纯标准库；外部 JSON Schema 验证器只能作为 CI 可选工具。
 5. **未知不等于通过**：`UNKNOWN` / `NOT_RUN` / `BLOCKED` 不得折算为成功，也不得被下游默认值填补。
-6. **高风险进入人工决策**：受控仓库的真实 Git 证据显示会改变权限 / 安全边界、锁与状态机、数据迁移、破坏兼容、不可逆动作或新增外部依赖时，进入 `NEEDS_HUMAN_DECISION`。路径、关键词、调用者 Diff / SHA、spec 内审查或字面授权本身都不构成证据；baseline/head 必须来自任务载体，Git replace refs、隐藏 diff 配置、assume-unchanged / skip-worktree、ignored / untracked 工作树与快照变化都按不可证明处理。缺证据或证据不可验证时停在待取证 / 阻塞状态，不得自动放行，也不得仅凭词语询问 Owner。除空 diff 外没有自动低风险；独立审查 receipt 必须来自 trusted task carrier 并绑定完整 diff、head、scope 与身份。
+6. **高风险进入人工决策**：受控仓库的真实 Git 证据显示会改变权限 / 安全边界、锁与状态机、数据迁移、破坏兼容、不可逆动作或新增外部依赖时，进入 `NEEDS_HUMAN_DECISION`。路径、关键词、调用者 Diff / SHA、spec 内审查或字面授权本身都不构成证据；baseline/head 必须来自任务载体，Git replace refs、隐藏 diff 配置、assume-unchanged / skip-worktree、ignored / untracked 工作树与快照变化都按不可证明处理。缺证据或证据不可验证时停在待取证 / 阻塞状态，不得自动放行，也不得仅凭词语询问 Owner。除空 diff 且目标 / 范围无风险外没有自动低风险；当前没有接入权威任务载体适配器或真实独立审查，调用者 review / authorization / 自算摘要不能触发 READY，`review_status` 为 `NOT_WIRED`，只返回 `required_evidence` / `next_action`。
 
 ## 4. 非目标
 

@@ -138,15 +138,16 @@ start it.
    dirty or untracked worktree all block. There is no automatic low-risk verdict
    for non-empty content, including whitespace-only or Markdown changes.
 
-   A blocked content change can continue only with an independent review receipt
-   held by the trusted task carrier. The receipt must bind the task id, exact head,
-   complete diff SHA-256, changed-path scope, reviewer identity, role and review
-   time, with optional expiry / revocation. Receipts supplied in the proposal or
-   by an untrusted caller are ignored; authority surfaces need a Master/Owner
-   receipt, and evidenced permission / security changes still go to
-   `NEEDS_HUMAN_DECISION`. Both carrier shapes record the Git base/head, diff
-   SHA-256, changed paths and review status so a later session can explain why a
-   task was allowed. Registering a task is always a Master action on the current
+   A blocked content change currently stays `BLOCKED` / `NEEDS_EVIDENCE`.
+   This release has no authoritative task-carrier adapter and no wired
+   independent review: `state.task` is only a locator, and caller-supplied
+   review, authorization or self-computed digests never unlock READY. The
+   proposal records `required_evidence` and `next_action` for a future
+   Master/Agent evidence pass; `review_status` is `NOT_WIRED`. Evidenced
+   permission / security changes still go to `NEEDS_HUMAN_DECISION`. Both
+   carrier shapes record the Git base/head, diff SHA-256, changed paths, review
+   status and next action so a later session can see what evidence is still
+   missing. Registering a task is always a Master action on the current
    edition's carrier.
 
 Templates: [`proposal.md`](proposal.md), [`task-packet.md`](task-packet.md),

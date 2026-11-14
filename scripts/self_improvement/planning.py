@@ -29,7 +29,6 @@ caller-supplied summary.
 """
 from __future__ import annotations
 
-import datetime
 import hashlib
 import os
 import posixpath
@@ -533,6 +532,31 @@ def _parse_numstat_binary(data):
     return binary
 
 
+def _blob_is_unproven(repo_root, sha):
+    """True when a blob cannot be treated as text by this planner."""
+    if not sha or set(sha) <= {'0'}:
+        return False
+    size = _run_git(repo_root, ['cat-file', '-s', sha])
+    if size.returncode != 0:
+        return True
+    try:
+        length = int(_git_text(size.stdout))
+    except ValueError:
+        return True
+    if length > 5_000_000:
+        return True
+    blob = _run_git(repo_root, ['cat-file', '-p', sha])
+    if blob.returncode != 0:
+        return True
+    if b'\0' in blob.stdout:
+        return True
+    try:
+        blob.stdout.decode('utf-8')
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
 def _git_evidence_state(proposal, repo_root, required_base_sha=None,
                         required_head_sha=None):
     evidence = proposal.get('git_evidence')
@@ -632,6 +656,12 @@ def _git_evidence_state(proposal, repo_root, required_base_sha=None,
             raise GitEvidenceError('cannot read numstat')
         entries = _parse_raw_diff(raw.stdout)
         binary_paths = _parse_numstat_binary(numstat.stdout)
+        for entry in entries:
+            for sha in (entry['old_sha'], entry['new_sha']):
+                if _blob_is_unproven(repo, sha):
+                    binary_paths.add(entry['new_path'])
+                    if entry['old_path']:
+                        binary_paths.add(entry['old_path'])
         snapshot = _snapshot_digest(
             head_sha, base_sha, status.stdout, index.stdout, raw.stdout,
             numstat.stdout, ignored_paths)
@@ -822,90 +852,19 @@ def _classify_git_evidence(proposal, lesson, evidence):
     return result
 
 
-def _parse_time(value):
-    if not isinstance(value, str) or not value.strip():
-        return None
-    text = value.strip()
-    if text.endswith('Z'):
-        text = text[:-1] + '+00:00'
-    try:
-        parsed = datetime.datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-    return parsed
-
-
-def _review_receipt(trusted_task, evidence, *, requires_master=False):
-    """Validate a review receipt from the trusted task carrier.
-
-    The receipt is accepted only from the carrier state, never from the spec.
-    It must bind the task, exact head, complete diff digest and changed-path
-    scope; it must name an independent reviewer and must not be expired/revoked.
-    """
-    if not isinstance(trusted_task, dict):
-        return False, ['no trusted task carrier record was supplied']
-    if (trusted_task.get('base_sha') != evidence['base_sha']
-            or trusted_task.get('head_sha') != evidence['head_sha']):
-        return False, ['task carrier base/head do not match the verified range']
-    review = trusted_task.get('review')
-    if not isinstance(review, dict):
-        return False, ['no trusted independent review receipt in the task carrier']
-    if review.get('decision') != 'APPROVED':
-        return False, ['review decision is not APPROVED']
-    reviewer = review.get('reviewer')
-    if not isinstance(reviewer, str) or not reviewer.strip():
-        return False, ['review receipt has no reviewer identity']
-    executor = trusted_task.get('executor')
-    if isinstance(executor, str) and executor.strip() == reviewer.strip():
-        return False, ['reviewer and executor are the same identity']
-    role = review.get('role')
-    allowed_roles = ('master', 'owner') if requires_master else ('reviewer', 'master', 'owner')
-    if role not in allowed_roles:
-        return False, [f'review role {role!r} is not allowed for this surface']
-    if review.get('revoked'):
-        return False, ['review receipt is revoked']
-    if review.get('head_sha') != evidence['head_sha']:
-        return False, ['review receipt head_sha does not match the verified head']
-    if review.get('diff_sha256') != evidence['diff_sha256']:
-        return False, ['review receipt does not match the complete diff digest']
-    reviewed_at = _parse_time(review.get('reviewed_at'))
-    if reviewed_at is None:
-        return False, ['review receipt reviewed_at is missing or invalid']
-    expires_at = review.get('expires_at')
-    if expires_at is not None:
-        expiry = _parse_time(expires_at)
-        if expiry is None:
-            return False, ['review receipt expires_at is invalid']
-        if expiry < datetime.datetime.now(datetime.timezone.utc):
-            return False, ['review receipt has expired']
-    task_id = trusted_task.get('task_id')
-    if review.get('task_id') not in (None, task_id):
-        return False, ['review receipt task_id does not match the task']
-    scope = review.get('scope')
-    if isinstance(scope, str):
-        scope = [scope]
-    if not isinstance(scope, (list, tuple)) or not scope:
-        return False, ['review receipt has no path scope']
-    canonical_scope = [_canonical_allowed_path(item) for item in scope]
-    for path in _changed_paths(evidence):
-        if not any(_path_at_or_below(path, item) for item in canonical_scope):
-            return False, [f'review scope does not cover changed path: {path}']
-    return True, []
-
-
 def assess_risk_details(proposal, lesson, trusted_task=None, repo_root=None,
                         required_base_sha=None, required_head_sha=None):
     """Assess one proposal using *real Git evidence*, not caller text.
 
-    ``LOW`` is returned only for a verified commit range with no changed paths.
-    Every content change is ``NEEDS_EVIDENCE``, ``HIGH`` or unlockable only by a
-    trusted independent review receipt; a missing, forged or incomplete Git
-    claim stays ``NEEDS_EVIDENCE``. Whitespace equivalence is not semantic
-    safety, and caller diffs or caller authorization never decide.
+    ``LOW`` is returned only for a verified commit range with no changed paths
+    and no risky task scope. Every non-empty content change is
+    ``NEEDS_EVIDENCE`` or ``HIGH``; a missing, forged or incomplete Git claim
+    stays ``NEEDS_EVIDENCE``. No caller-supplied review or authorization is
+    accepted: the authoritative carrier adapter and independent review are not
+    wired in this slice.
     """
     proposal = proposal or {}
+    task_id = trusted_task.get('task_id') if isinstance(trusted_task, dict) else None
     path_errors = _path_policy_errors(proposal.get('allowed_paths'))
     if path_errors:
         return {
@@ -918,17 +877,19 @@ def assess_risk_details(proposal, lesson, trusted_task=None, repo_root=None,
             'evidence_status': 'MISSING', 'changed_paths': [],
             'snapshot': None, 'diff_sha256': None,
             'git_base_sha': None, 'git_head_sha': None,
-            'review_status': 'NOT_APPLICABLE',
+            'task_id': task_id, 'review_status': 'NOT_WIRED',
+            'next_action': 'INVESTIGATE',
         }
 
     evidence = _git_evidence_state(proposal, repo_root,
                                    required_base_sha=required_base_sha,
                                    required_head_sha=required_head_sha)
     base_limitations = []
-    if proposal.get('authorization') is not None:
+    if proposal.get('authorization') is not None or (
+            isinstance(trusted_task, dict) and trusted_task.get('review') is not None):
         base_limitations.append(
-            'caller-supplied authorization is ignored; only the authoritative '
-            'task carrier / Owner decision can authorize a governance change')
+            'caller-supplied review/authorization is ignored; the authoritative '
+            'task-carrier adapter and independent review are not wired')
 
     if evidence['status'] != 'PRESENT':
         reasons = evidence['reasons'] or ['no trustworthy Git evidence supplied']
@@ -944,7 +905,8 @@ def assess_risk_details(proposal, lesson, trusted_task=None, repo_root=None,
             'diff_sha256': evidence['diff_sha256'],
             'git_base_sha': evidence['base_sha'],
             'git_head_sha': evidence['head_sha'],
-            'review_status': 'NOT_APPLICABLE',
+            'task_id': task_id, 'review_status': 'NOT_WIRED',
+            'next_action': 'INVESTIGATE',
         }
 
     result = _classify_git_evidence(proposal, lesson, evidence)
@@ -965,6 +927,7 @@ def assess_risk_details(proposal, lesson, trusted_task=None, repo_root=None,
         'diff_sha256': evidence['diff_sha256'],
         'git_base_sha': evidence['base_sha'],
         'git_head_sha': evidence['head_sha'],
+        'task_id': task_id,
         'limitations': limitations,
     }
     if result['high']:
@@ -972,7 +935,7 @@ def assess_risk_details(proposal, lesson, trusted_task=None, repo_root=None,
                 'decision_id': result['decision_id'] or DECISION_HIGH_RISK,
                 'reasons': result['high'], 'leads': result['high'],
                 'required_evidence': [], 'review_status': 'NOT_APPLICABLE',
-                **common}
+                'next_action': 'OWNER_DECISION', **common}
     blocking = result['structural'] + result['scope']
     if blocking:
         required = []
@@ -989,36 +952,30 @@ def assess_risk_details(proposal, lesson, trusted_task=None, repo_root=None,
                 'resolve the structural Git evidence gap before planning')
         return {'level': RISK_NEEDS_EVIDENCE, 'decision_id': None,
                 'reasons': blocking, 'leads': blocking,
-                'required_evidence': required, 'review_status': 'NOT_APPLICABLE',
-                **common}
+                'required_evidence': required, 'review_status': 'NOT_WIRED',
+                'next_action': 'INVESTIGATE', **common}
     reviewable = result['content'] + result['authority']
     if reviewable:
-        valid, why = _review_receipt(
-            trusted_task, evidence, requires_master=bool(result['authority']))
-        if valid:
-            return {'level': RISK_LOW, 'decision_id': None,
-                    'reasons': ['trusted independent review accepted for the '
-                                'complete diff and exact head'],
-                    'leads': reviewable,
-                    'required_evidence': [], 'review_status': 'APPROVED',
-                    **common}
         required = [
-            'attach a trusted review receipt from the task carrier with '
-            'reviewer identity, role, task id, base/head, complete diff digest, '
-            'path scope, reviewed_at and optional expiry'
+            'the current planner cannot prove semantic safety or independent '
+            'review; a real task-carrier adapter and independent reviewer are '
+            'not wired. Required later: task_id, goal/allowed-path hashes, '
+            'base/head, complete diff digest, reviewer identity/role, scope, '
+            'review time and expiry/revocation from the authoritative carrier'
         ]
         if result['authority']:
             required.append(
-                'authority surfaces require a Master/Owner review receipt; '
-                'caller-supplied authorization is not accepted')
+                'authority surfaces additionally require a verifiable '
+                'Master/Owner decision from the carrier; caller-supplied '
+                'review/authorization is not accepted')
         return {'level': RISK_NEEDS_EVIDENCE, 'decision_id': None,
-                'reasons': reviewable + why, 'leads': reviewable,
-                'required_evidence': required, 'review_status': 'MISSING',
-                **common}
+                'reasons': reviewable, 'leads': reviewable,
+                'required_evidence': required, 'review_status': 'NOT_WIRED',
+                'next_action': 'MASTER_REVIEW', **common}
     return {'level': RISK_LOW, 'decision_id': None, 'reasons': result['low'],
             'leads': result['low'],
             'required_evidence': [], 'review_status': 'NOT_NEEDED',
-            **common}
+            'next_action': 'NONE', **common}
 
 
 def git_diff_digest(repo_root, base_sha, head_sha):
@@ -1315,7 +1272,9 @@ def build_proposal(lesson, spec, *, edition, dependency_state=None, coverage=Non
     proposal['diff_sha256'] = risk['diff_sha256']
     proposal['git_base_sha'] = risk.get('git_base_sha')
     proposal['git_head_sha'] = risk.get('git_head_sha')
-    proposal['review_status'] = risk.get('review_status', 'NOT_APPLICABLE')
+    proposal['task_id'] = risk.get('task_id')
+    proposal['review_status'] = risk.get('review_status', 'NOT_WIRED')
+    proposal['next_action'] = risk.get('next_action', 'INVESTIGATE')
     if level == RISK_HIGH:
         proposal['status'] = 'NEEDS_HUMAN_DECISION'
         proposal['status_reason'] = 'high-risk change: ' + '; '.join(risk['reasons'])
@@ -1404,7 +1363,7 @@ def _render_scenarios(proposal):
 def render_local_task_packet(proposal):
     """Markdown in the shape of ``templates/task-packet.md`` (local carrier)."""
     lines = ['# Local Task Packet', '', FIELD_REFERENCE, UNTRUSTED_NOTICE, '',
-             f"- **Task ID:** (assigned by `scripts/orchestrator.py` at dispatch)",
+             f"- **Task ID:** {proposal.get('task_id') or '(assigned by `scripts/orchestrator.py` at dispatch)'}",
              f"- **Title:** {proposal.get('title')}",
              f"- **Goal / user-visible result:** {proposal.get('goal')}",
              f"- **Context:** {proposal.get('context')}",
@@ -1418,7 +1377,8 @@ def render_local_task_packet(proposal):
              '- **Git diff SHA-256:** ' + (proposal.get('diff_sha256') or '(missing)'),
              '- **Changed paths:** ' + (', '.join(proposal.get('changed_paths') or [])
                                         or '(none)'),
-             '- **Review status:** ' + str(proposal.get('review_status') or 'NOT_APPLICABLE'),
+             '- **Review status:** ' + str(proposal.get('review_status') or 'NOT_WIRED'),
+             '- **Next action:** ' + str(proposal.get('next_action') or 'INVESTIGATE'),
              '- **Forbidden paths:** ' + (', '.join(proposal.get('forbidden_paths') or [])
                                           or '(missing)'),
              '- **declared_resources:** ' + (', '.join(
@@ -1450,6 +1410,7 @@ def render_github_issue_body(proposal):
              UNTRUSTED_NOTICE, '',
              str(proposal.get('goal')), '',
              str(proposal.get('context') or ''), '',
+             f"- Task ID: `{proposal.get('task_id') or '(unassigned)'}`",
              f"- Lesson: `{proposal.get('lesson_id')}`",
              '- Evidence: ' + (' '.join(f'<{url}>' for url in proposal.get(
                  'evidence_urls') or []) or '(none)'), '',
@@ -1459,7 +1420,8 @@ def render_github_issue_body(proposal):
              f"- Git diff SHA-256: `{proposal.get('diff_sha256') or '(missing)'}`",
              '- Changed paths: ' + (', '.join(
                  f'`{path}`' for path in proposal.get('changed_paths') or []) or '(none)'),
-             f"- Review status: `{proposal.get('review_status') or 'NOT_APPLICABLE'}`", '',
+             f"- Review status: `{proposal.get('review_status') or 'NOT_WIRED'}`",
+             f"- Next action: `{proposal.get('next_action') or 'INVESTIGATE'}`", '',
              '## 验收标准', '']
     lines.extend(_render_acceptance(proposal.get('acceptance_criteria')))
     lines.extend(['', FIELD_REFERENCE, '',

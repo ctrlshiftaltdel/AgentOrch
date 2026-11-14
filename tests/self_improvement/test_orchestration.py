@@ -263,7 +263,7 @@ class CarrierParityTests(unittest.TestCase):
                 self.assertTrue(any(item.get('decision_id') == 'HD-05'
                                     for item in outcome.report['decisions_required']))
 
-    def test_trusted_review_unlocks_a_docs_typo_for_both_editions(self):
+    def test_receipt_does_not_unlock_a_docs_typo_for_either_edition(self):
         for edition in ('local', 'github'):
             with self.subTest(edition=edition):
                 repo = loop_support.GitRepo()
@@ -289,8 +289,10 @@ class CarrierParityTests(unittest.TestCase):
                     specs={'LSN-TALKDND-001': spec},
                     scan_report=loop_support.scan_report(
                         ingestions=[loop_support.created('LSN-TALKDND-001')]))
-                self.assertEqual(outcome.status, 'COMPLETED')
-                self.assertEqual(len(outcome.report['registrations']), 1)
+                self.assertEqual(outcome.status, 'BLOCKED')
+                self.assertEqual(outcome.report['registrations'], [])
+                self.assertEqual(
+                    outcome.report['plan']['proposals'][0]['status'], 'BLOCKED')
 
     def test_a_mismatched_carrier_is_refused_before_it_is_called(self):
         carrier = loop_support.RecordingCarrier('github')

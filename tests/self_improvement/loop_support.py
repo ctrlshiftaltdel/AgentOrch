@@ -76,6 +76,10 @@ class GitRepo:
         self._git('commit', '-qm', message)
         return self.head()
 
+    def empty_commit(self, message='no content'):
+        self._git('commit', '--allow-empty', '-qm', message)
+        return self.head()
+
     def head(self):
         return self._git('rev-parse', 'HEAD').stdout.decode().strip()
 
@@ -87,14 +91,14 @@ _DEFAULT_REPO = GitRepo('agentorch-risk-default-')
 DEFAULT_REPO_ROOT = _DEFAULT_REPO.root
 DEFAULT_BASE_SHA = _DEFAULT_REPO.commit({'docs/example.md': 'old line\n'},
                                         message='base')
-DEFAULT_HEAD_SHA = _DEFAULT_REPO.commit({'docs/example.md': 'old line  \n'},
-                                        message='whitespace-only docs change')
+DEFAULT_HEAD_SHA = _DEFAULT_REPO.empty_commit('no content change')
 HEAD = DEFAULT_HEAD_SHA
 atexit.register(_DEFAULT_REPO.close)
 
 
 def review_receipt(repo_root, base_sha, head_sha, scope, *,
                    reviewer='reviewer-2', role='reviewer'):
+    """A forged caller receipt used only to prove it does NOT unlock READY."""
     return {
         'decision': 'APPROVED',
         'reviewer': reviewer,
@@ -104,10 +108,6 @@ def review_receipt(repo_root, base_sha, head_sha, scope, *,
         'diff_sha256': planning.git_diff_digest(repo_root, base_sha, head_sha),
         'scope': list(scope),
     }
-
-
-DEFAULT_REVIEW = review_receipt(
-    DEFAULT_REPO_ROOT, DEFAULT_BASE_SHA, DEFAULT_HEAD_SHA, ['docs/example.md'])
 
 
 def general_lesson(**overrides):
@@ -188,7 +188,6 @@ def state(edition='local', **overrides):
             'base_sha': DEFAULT_BASE_SHA,
             'head_sha': HEAD,
             'executor': 'executor-1',
-            'review': DEFAULT_REVIEW,
         },
         'workspace': {'status_short': [], 'clean': True},
         'active_tasks': [],

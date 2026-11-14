@@ -62,9 +62,10 @@ LIMITATIONS = (
     'Risk uses the repository’s own Git evidence and the task carrier base/head, not '
     'caller-supplied diffs, SHA strings, review or authorization fields. Replace refs and '
     'diff-hiding config are disabled, hidden index flags / ignored allowed paths / stale '
-    'snapshots block, and no non-empty content change is auto-LOW. A trusted review receipt '
-    'from the task carrier may continue a blocked content change; evidenced permission or '
-    'security changes still end in NEEDS_HUMAN_DECISION.',
+    'snapshots block, and no non-empty content change is auto-LOW. The authoritative '
+    'carrier adapter and independent review are not wired in this release, so blocked '
+    'content changes stay NEEDS_EVIDENCE with next_action; caller review cannot unlock '
+    'READY. Evidenced permission or security changes still end in NEEDS_HUMAN_DECISION.',
 )
 
 

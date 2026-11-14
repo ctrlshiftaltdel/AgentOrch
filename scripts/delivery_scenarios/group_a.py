@@ -384,9 +384,12 @@ def _risk_repo(ctx, name, base_files, head_files):
     git('add', '-A')
     git('commit', '-qm', 'base')
     base_sha = git('rev-parse', 'HEAD').stdout.decode().strip()
-    write(head_files)
-    git('add', '-A')
-    git('commit', '-qm', 'head')
+    if head_files is None:
+        git('commit', '--allow-empty', '-qm', 'head')
+    else:
+        write(head_files)
+        git('add', '-A')
+        git('commit', '-qm', 'head')
     head_sha = git('rev-parse', 'HEAD').stdout.decode().strip()
     return root, base_sha, head_sha
 
@@ -483,8 +486,7 @@ def scenario_a8(ctx):
     eligible, reason = si.lessons.can_generate_task(generalized)
     _require(eligible, f'the generalized lesson is not task-eligible: {reason}')
     risk_root, risk_base, risk_head = _risk_repo(
-        ctx, 'risk-a8', {'docs/example.md': 'No permisssion changes.\n'},
-        {'docs/example.md': 'No permission changes.\n'})
+        ctx, 'risk-a8', {'docs/example.md': 'no content change\n'}, None)
     spec = _si_spec(
         goal='整理合成说明的空白。', allowed_paths=['docs/example.md'],
         git_evidence={'base_sha': risk_base, 'head_sha': risk_head})
@@ -493,7 +495,7 @@ def scenario_a8(ctx):
         specs={generalized['lesson_id']: spec}, edition='github',
         repo_root=risk_root,
         trusted_task=_risk_task(si, risk_root, risk_base, risk_head,
-                                ['docs/example.md']),
+                                ['docs/example.md'], review=False),
         required_base_sha=risk_base, required_head_sha=risk_head)
     _require(len(plan.ready) == 1,
              f'expected one READY proposal, got {plan.counts()}: '
@@ -824,8 +826,7 @@ def scenario_a15(ctx):
     generalized = _si_verified_generalized(store.all()[0])
     carrier = _SyntheticCarrier()
     risk_root, risk_base, risk_head = _risk_repo(
-        ctx, 'risk-a15', {'docs/example.md': 'No permisssion changes.\n'},
-        {'docs/example.md': 'No permission changes.\n'})
+        ctx, 'risk-a15', {'docs/example.md': 'no content change\n'}, None)
     spec = _si_spec(
         goal='整理合成说明的空白。', allowed_paths=['docs/example.md'],
         git_evidence={'base_sha': risk_base, 'head_sha': risk_head})
@@ -835,7 +836,7 @@ def scenario_a15(ctx):
         state=_si_state(
             base_sha=risk_base, head_sha=risk_head,
             task=_risk_task(si, risk_root, risk_base, risk_head,
-                            ['docs/example.md'])),
+                            ['docs/example.md'], review=False)),
         carrier=carrier, scan_report=outcome,
         lesson_records=[generalized],
         specs={generalized['lesson_id']: spec}, repo_root=risk_root,

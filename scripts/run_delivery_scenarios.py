@@ -410,8 +410,7 @@ SCENARIOS = (
              'validator findings, refusal message, lock count', 'sandbox removed', scenario_d7),
     Scenario('A8', 'A', 'positive', 'synthetic source evidence becomes a reviewable task',
              'one synthetic merged pull request, one synthetic commit, one CI run, and a '
-             'real throw-away Git repository with a docs typo plus a trusted task-carrier '
-             'review receipt',
+             'real throw-away Git repository with a no-content commit range',
              'none (positive control)',
              'self-improvement: the lesson is verified, reclassified and generalized before '
              'planning; only READY reaches the carrier, which reports executed=False',
@@ -471,7 +470,7 @@ SCENARIOS = (
              scenario_a14),
     Scenario('A15', 'A', 'positive', 'self-improvement loop end to end',
              'a synthetic source scan, one lesson driven to GENERALIZED, a real throw-away Git '
-             'repository with a docs typo and a trusted review receipt, and a synthetic carrier',
+             'repository with a no-content commit range, and a synthetic carrier',
              'none (positive control)',
              'loop: trigger routed, state restored, scan classified, plan gated, one task '
              'registered with executed=False, one executed check recorded PASS and one '

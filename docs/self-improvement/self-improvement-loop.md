@@ -107,7 +107,9 @@
 
 调用者提供的 Diff、`changed_paths`、40 位 SHA 字符串、`low_risk` / `approved` 布尔值、spec 内 `review` 或 `authorization` 字段都不是证据；伪造或截断的 Diff 不能缩小真实 changed paths。`allowed_paths` 中的绝对路径、反斜杠、通配符和任何 `..` 段在任何证据之前直接拒绝，不能被其他合法路径或 Diff 冲掉。
 
-除空 diff 外，**没有自动 `LOW`**：纯空白等价、Markdown 代码块 / 命令、普通文档、代码和治理面都不再凭后缀或空白自动放行。所有内容变更保持 `NEEDS_EVIDENCE` / `BLOCKED`，可以经由任务载体中的独立审查 receipt 继续：receipt 必须绑定 task id、准确 head、完整 diff 的 SHA-256、changed-path scope、reviewer 身份、角色、`reviewed_at`，可选 `expires_at` / `revoked`，并且只能来自 trusted task carrier，不能来自 proposal。治理面要求 Master/Owner receipt；真实权限 / 安全 / 锁 / 状态机 / 数据 / 外部 / 不可逆变更或受保护执行面变化仍升级 `NEEDS_HUMAN_DECISION`。二进制、rename / copy / type change、symlink、submodule、删除、dirty / untracked / hidden-index 工作树、缺失或不可验证的提交都显式阻塞并写出 `required_evidence`。两种任务载体 payload 都会记录 Git base/head、diff SHA-256、changed paths 与 review status，换会话后可以解释为什么放行。决策后重新规划仍是普通任务，不是闭环自动解锁。
+除空 diff 且目标 / 范围无风险外，**没有自动 `LOW`**：纯空白等价、Markdown 代码块 / 命令、普通文档、代码和治理面都不再凭后缀或空白自动放行。任何非空内容变化都保持 `NEEDS_EVIDENCE` / `BLOCKED`，并写出结构化 `required_evidence` 与 `next_action`。
+
+**当前切片没有接入权威任务载体适配器或真实独立审查**：`state.task` 只能作为任务定位符；spec / `state.task` / 调用者提供的 review、authorization 或自算摘要都不会触发 READY。`review_status` 明确为 `NOT_WIRED`。未来路径必须由独立适配器从 local SQLite / GitHub 认证 PR Review / Owner 权限取证，并绑定 task id、目标与 allowed-path hash、base/head、完整 diff、reviewer 身份/角色/独立性与有效期/撤销；在这条链路实现前，普通错字也只能停在 `NEEDS_EVIDENCE`，不能声称已自动推进。治理面及真实权限 / 安全 / 锁 / 状态机 / 数据 / 外部 / 不可逆变化仍升级 `NEEDS_HUMAN_DECISION`。二进制、rename / copy / type change、symlink、submodule、删除、dirty / untracked / hidden-index 工作树、缺失或不可验证的提交都显式阻塞。两种任务载体 payload 记录 Git base/head、diff SHA-256、changed paths、review status 与 next_action，但记录的是待取证状态，不是授权。
 
 **常规低风险工作也不得绕过 Master 审查、证据矩阵或合并门。**
 
