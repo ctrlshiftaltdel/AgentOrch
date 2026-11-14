@@ -27,7 +27,19 @@ fail-closed:
   command — is bracketed by that proof on both sides, so a declaration that goes
   bad while one of them is in flight stops the run at that call: no further
   query, export, session or command starts, and an invalid config never yields a
-  ``PREPARED`` record;
+  ``PREPARED`` record. The runtime profile is part of that gate, so it is
+  re-queried *after* an export and *before* the reviewer session starts, and
+  again before every verification command, not only once per phase;
+* ``git add`` and ``git commit`` are two processes, so the pre-commit proof is
+  taken on the **index** between them: a clean filter that rewrites the staged
+  blob is refused before history exists. A hook that changes the tree is
+  outside that proof (it runs inside ``commit``); it is only caught afterwards,
+  and the commit it ran in already exists;
+* the final summary re-proves the project config after its Git fact checks and
+  once more over every live approval before the journal is saved. None of this
+  is atomic: the config, the worktrees and the runtime profiles are writable
+  files another process can change between any proof and the following action,
+  and this runner narrows that window instead of claiming to close it;
 * lock identity is the canonical real path, so a symlinked journal directory
   cannot create a second lock identity for the same journal;
 * resume/retry re-prove the repository identity, the task packet, project
@@ -147,6 +159,12 @@ def _status(where):
     return os.fsdecode(git(where, 'status', '--porcelain', '-z'))
 
 
+def _unstaged(where):
+    """Paths whose worktree content no longer matches the index."""
+    return os.fsdecode(git(where, 'diff', '--no-ext-diff', '--no-renames', '--name-only',
+                           '-z', '--'))
+
+
 def _is_ancestor(ancestor, descendant, where):
     result = subprocess.run(['git', '--no-optional-locks', 'merge-base', '--is-ancestor',
                              ancestor, descendant], cwd=where, stdin=subprocess.DEVNULL,
@@ -163,12 +181,17 @@ def project_config(repo):
         return {'edition': None, 'edition_count': 0, 'edition_values': [],
                 'allowed': None, 'forbidden': [], 'secrets': []}
     text = path.read_text(encoding='utf-8', errors='replace')
-    values = [_edition_value(form, rest) for form, rest in EDITION_RE.findall(text)]
+    values = _edition_values(text)
     return {'edition': values[0] if len(values) == 1 else None,
             'edition_count': len(values), 'edition_values': values,
             'allowed': _policy_paths(text, '允许改动路径'),
             'forbidden': _policy_paths(text, '禁止改动路径'),
             'secrets': _secret_patterns(text)}
+
+
+def _edition_values(text):
+    """Every ``edition`` declaration in ``text``, parsed or not."""
+    return [_edition_value(form, rest) for form, rest in EDITION_RE.findall(text)]
 
 
 def _edition_value(form, raw):
@@ -221,6 +244,66 @@ def _require_live_config(context, spec=None):
     if spec is not None:
         _authorize_paths(spec['paths'], fresh)
     return fresh
+
+
+def _index_text(work, rel):
+    """The exact bytes the next commit would record for ``rel``, or ``None``.
+
+    ``git show :path`` reads the index, not the worktree, so a clean filter
+    that rewrote the content while ``git add`` ran is visible here and nowhere
+    else in the tree.
+    """
+    if not git(work, 'ls-files', '-z', '--', rel):
+        return None
+    return os.fsdecode(git(work, 'show', ':' + rel))
+
+
+def _staged_config(work):
+    """The project config exactly as it is staged for the pending commit."""
+    text = _index_text(work, 'docs/PROJECT.md')
+    if text is None:
+        return None
+    values = _edition_values(text)
+    return {'edition': values[0] if len(values) == 1 else None,
+            'edition_count': len(values), 'edition_values': values}
+
+
+def _prove_staged(repo, spec, work, base, expected):
+    """Re-prove configuration, authorization and scope on what will be committed.
+
+    ``git add`` and ``git commit`` are separate processes, and both can run
+    code the runner does not control: a clean filter can rewrite the content
+    that gets staged, and a pre-commit hook can change the tree a commit
+    records. The pre-add proof therefore does not describe the commit that is
+    about to happen. This one reads the *index* — the exact blob and path set
+    the commit would record — plus the project authorization again, and it runs
+    while nothing has been committed yet, so a failure leaves staged changes
+    for a human instead of history.
+    """
+    fresh = project_config(repo)
+    _require_edition(fresh)
+    _authorize_paths(spec['paths'], fresh)
+    staged = _staged_config(work)
+    if staged is None:
+        raise DeliveryError('the staged tree has no docs/PROJECT.md; refusing to commit a '
+                            'change that removes the project configuration')
+    if staged['edition_count'] != 1 or staged['edition'] not in VALID_EDITIONS:
+        raise DeliveryError('the staged docs/PROJECT.md would commit an unusable `edition`: '
+                            f'{staged["edition_count"]} declaration(s), values '
+                            f'{staged["edition_values"]!r}')
+    if staged['edition'] != fresh['edition']:
+        raise DeliveryError('the staged docs/PROJECT.md would commit edition '
+                            f'{staged["edition"]!r}, but the project declares '
+                            f'{fresh["edition"]!r}')
+    if _unstaged(work):
+        raise DeliveryError('the worktree changed while staging; refusing to commit content '
+                            'the proof above did not see')
+    now = _changes(work, base)
+    if now != sorted(expected):
+        raise DeliveryError('the staged path set changed between staging and commit: '
+                            f'{now!r} instead of {sorted(expected)!r}')
+    for name in now:
+        _check_changed_path(work, name, spec['paths'], fresh)
 
 
 def _policy_paths(text, needle):
@@ -1259,6 +1342,12 @@ def _execute(context, spec, record):
         subprocess.run(['git', '--no-optional-locks', 'add', '-A', '--', '.'], cwd=work,
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, check=True)
+        # `add` and `commit` are separate processes, so the proof above (which
+        # ran before `add`) does not describe what `commit` would record. A
+        # clean filter can rewrite the staged blob and a hook can change the
+        # tree while `commit` runs, so the index itself is re-proved here —
+        # before the second process starts, not after history exists.
+        _prove_staged(context.repo, spec, work, base, changed)
         message = spec['raw'].get('message') or f'{spec["id"]}: autonomous delivery'
         subprocess.run(['git', '--no-optional-locks', 'commit', '--no-gpg-sign',
                         '-m', str(message)], cwd=work, stdin=subprocess.DEVNULL,
@@ -1287,12 +1376,12 @@ def _verify(context, spec, record):
     _prove_before_side_effect(context, spec, record, work, require_evidence=True)
     checks = []
     for command in spec['verify']:
-        # Each check is its own external side effect. The declaration is
-        # re-proved immediately before it starts and again as soon as it
-        # returns, so a check that invalidates the config cannot be followed by
-        # the next check. The finished entries are journalled first, so the
-        # evidence that did run is never lost to the block that follows.
-        _require_live_config(context, spec)
+        # Each check is its own external side effect, and a trusted command can
+        # change the runtime profiles as well as the project config. The whole
+        # gate — config, profile query, config again — is re-proved before the
+        # check starts, so a profile that the previous check widened cannot
+        # authorize the next one.
+        _reviewer_gate(context, spec, work, record)
         checks.append(_run_check(command, work, spec['raw'].get('timeout', 1800)))
         record['verification'] = list(checks)
         context.save()
@@ -1387,6 +1476,11 @@ def _review(context, spec, record):
     record['diff_digest'] = diff_digest
     record['task_digest'] = _task_digest(context, spec, record)
     context.save()
+    # The execution-session export above is an external call of its own, and
+    # the profile that gated this phase was read before it. Query the runtime
+    # again immediately before the reviewer starts, so a profile widened while
+    # that export was answered cannot start a write-capable review session.
+    _reviewer_gate(context, spec, work, record)
     review = context.agent(work, _review_prompt(spec, record, patch), 'review')
     # The review session is an external call and the export below is another:
     # re-prove the declaration before reading the verdict back.
@@ -1462,14 +1556,21 @@ def _recheck_approved(context):
     re-runs a verification command, starts an agent or writes to a worktree.
     An invalid project config therefore blocks every approval instead of being
     reported as prepared.
+
+    The Git facts are external reads of their own, so the config is re-proved
+    twice: once before them and once after them. A second pass over every
+    approval that is still live runs before the journal is saved, so an
+    approval that was checked before another task's check invalidated the
+    config cannot survive as ``PREPARED``.
     """
     for ident in sorted(context.approved):
         record = context.record(ident)
         if record.get('status') != 'PREPARED':
             continue
         try:
-            _require_live_config(context, context.spec(ident))
-            work = _resolve_task(context, context.spec(ident))
+            spec = context.spec(ident)
+            _require_live_config(context, spec)
+            work = _resolve_task(context, spec)
             ok, why = _facts_match(record, work)
             if not ok:
                 raise DeliveryError(f'approved task {ident} no longer matches its approval: '
@@ -1481,9 +1582,36 @@ def _recheck_approved(context):
                 _, digest = _review_diff(work, record['base'], record['head'], changed)
                 if digest != record['diff_digest']:
                     raise DeliveryError(f'approved task {ident} no longer has its reviewed diff')
+            _require_live_config(context, spec)
         except (DeliveryError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
             record.update(status='BLOCKED', reason=str(exc))
+    _void_stale_approvals(context)
     context.save()
+
+
+def _void_stale_approvals(context):
+    """A last config proof over every approval still live, before the journal is saved.
+
+    An approval can be checked before the config goes bad and never be looked
+    at again, so the per-approval check alone would leave it ``PREPARED``. This
+    pass runs after all of them and blocks every approval the current config no
+    longer authorizes, not only the one whose check saw the change.
+
+    It is **not atomic**: the project config is a file another process can
+    write between this read and the save or console output that follows, and
+    the same is true of any Git fact read earlier. Nothing here removes that
+    window; it only makes an approval depend on a proof as close to the
+    decision as this runner can place one, and it stops before reporting rather
+    than reporting an approval whose own config read failed.
+    """
+    for ident in sorted(context.approved):
+        record = context.record(ident)
+        if record.get('status') != 'PREPARED':
+            continue
+        try:
+            _require_live_config(context, context.spec(ident))
+        except (DeliveryError, OSError, ValueError, KeyError) as exc:
+            record.update(status='BLOCKED', reason=str(exc))
 
 
 def _require_supported_state(record):

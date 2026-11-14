@@ -480,7 +480,7 @@ class ReviewGateTests(DeliveryCase):
 
         def profiles(where):
             queried.append(str(where))
-            if len(queried) <= 3:
+            if len(queried) <= 4:
                 return safe(where)
             return {'scout': {'id': 'scout', 'permissions': [
                 {'action': '*', 'resource': '*', 'effect': 'allow'}]}}
@@ -491,7 +491,84 @@ class ReviewGateTests(DeliveryCase):
         self.assertIn('not provably read-only', record['reason'])
         self.assertTrue(marker.exists())
         self.assertEqual(agents.calls, ['execution'])
-        self.assertGreaterEqual(len(queried), 4)
+        self.assertGreaterEqual(len(queried), 5)
+
+    def test_a_profile_widened_during_the_execution_export_blocks_the_review_start(self):
+        # The export that re-reads the execution session is itself an external
+        # call, and it happens after the profile query that gated the review
+        # phase. A profile that becomes write-capable while that export is
+        # answered must stop the run *before* the reviewer session starts: the
+        # earlier answer may not be reused for the agent that follows.
+        work = self.worktree('one')
+        weak = {'scout': {'id': 'scout', 'permissions': [
+            {'action': '*', 'resource': '*', 'effect': 'allow'}]}}
+        events = []
+
+        def profiles(where):
+            events.append('query')
+            if events.count('export_exec') >= 3:
+                return weak
+            return self.profiles(where)
+
+        def probe(session, where):
+            events.append('export_review' if session.startswith('ses_rev')
+                          else 'export_exec')
+            return self.default_probe(session, where)
+
+        state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]),
+                                          profiles=profiles, session_probe=probe)
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('not provably read-only', record['reason'])
+        # Only the execution session was exported: the review never started and
+        # its verdict was never read back. (The first export follows execution,
+        # the second proves the session before verification, the third before
+        # review; the third is the one that goes bad.)
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertEqual(events.count('export_exec'), 3)
+        self.assertNotIn('export_review', events)
+        # The profile was queried again after the last export, and nothing
+        # external ran after that query.
+        self.assertEqual(events[-1], 'query')
+        last_export = max(index for index, name in enumerate(events)
+                          if name == 'export_exec')
+        self.assertIn('query', events[last_export + 1:])
+        self.assertIsNone(record.get('review_session'))
+        self.assertNotEqual(record['status'], 'PREPARED')
+
+    def test_a_check_that_widens_the_profile_blocks_the_next_check(self):
+        # A trusted verification command can change the runtime profiles. The
+        # profile is part of the gate, so it must be re-queried between the
+        # commands, not only the project config: the second command is another
+        # external side effect and may not start after the first invalidates it.
+        work = self.worktree('one')
+        first, second = self.root / 'first-check-ran', self.root / 'second-check-ran'
+        weak = {'scout': {'id': 'scout', 'permissions': [
+            {'action': '*', 'resource': '*', 'effect': 'allow'}]}}
+        queried = []
+
+        def profiles(where):
+            queried.append(str(where))
+            if first.exists():
+                return weak
+            return self.profiles(where)
+
+        plan = self.plan([self.task('one', work, ['a.txt'], verify=[
+            [PY, '-c', f'import pathlib; pathlib.Path({str(first)!r}).write_text("x")'],
+            [PY, '-c', f'import pathlib; pathlib.Path({str(second)!r}).write_text("x")']])])
+        state, agents = self.run_delivery(plan, profiles=profiles)
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('not provably read-only', record['reason'])
+        self.assertTrue(first.exists())
+        self.assertFalse(second.exists())
+        self.assertEqual(agents.calls, ['execution'])
+        # The finished command is journalled as evidence of what did run.
+        self.assertEqual(len(record['verification']), 1)
+        self.assertEqual(record['verification'][0]['exit_code'], 0)
+        # start-up, execution proof, verification proof, first pre-command gate,
+        # second pre-command gate: the last query is the one that blocked.
+        self.assertEqual(len(queried), 5)
 
 
 class ResumeTests(DeliveryCase):
@@ -2170,6 +2247,166 @@ class EditionBoundaryTests(DeliveryCase):
         self.assertEqual(record['status'], 'BLOCKED')
         self.assertIn('edition', record['reason'])
         self.assertNotEqual(state['tasks']['two']['status'], 'PREPARED')
+
+    def test_a_git_fact_check_that_invalidates_the_edition_voids_every_approval(self):
+        # The summary re-proves every live approval. Its first config read is
+        # not enough: it is followed by Git fact checks, and a declaration that
+        # goes bad while those are read must not leave an approval standing.
+        # The duplicate is injected from inside the *last* task's fact check, so
+        # only a proof after the Git facts can catch it, and it has to void the
+        # approval that was already checked as well.
+        one, two = self.worktree('one'), self.worktree('two')
+        project = self._project()
+        runs = {name: self.root / f'{name}-check-ran' for name in ('one', 'two')}
+        plan = self.plan([
+            self.task('one', one, ['a.txt'], verify=[
+                [PY, '-c', f'import pathlib; pathlib.Path({str(runs["one"])!r})'
+                           '.open("a").write("x")']]),
+            self.task('two', two, ['b.txt'], verify=[
+                [PY, '-c', f'import pathlib; pathlib.Path({str(runs["two"])!r})'
+                           '.open("a").write("x")']])])
+        original = delivery._facts_match
+        checked = []
+
+        def facts(record, work):
+            verdict = original(record, work)
+            checked.append(os.path.realpath(work))
+            if os.path.realpath(work) == os.path.realpath(two):
+                project.write_text(project.read_text() + '- **`edition`**: `github`\n')
+            return verdict
+
+        with mock.patch.object(delivery, '_facts_match', facts):
+            state, agents = self.run_delivery(plan)
+        self.assertEqual(agents.calls, ['execution', 'review', 'execution', 'review'])
+        self.assertEqual(checked, [os.path.realpath(one), os.path.realpath(two)])
+        for name, work in (('one', one), ('two', two)):
+            record = state['tasks'][name]
+            self.assertEqual(record['status'], 'BLOCKED')
+            self.assertIn('edition', record['reason'])
+            # The journal on disk says the same thing.
+            self.assertEqual(self.journal()['tasks'][name]['status'], 'BLOCKED')
+            # No verified command was re-run and no Git write happened: the
+            # files still hold exactly one run each and the head is intact.
+            self.assertEqual(runs[name].read_text(), 'x')
+            self.assertEqual(_head_of(work), record['head'])
+            self.assertFalse(_git(work, 'status', '--porcelain').stdout.strip())
+
+    def test_a_git_fact_check_that_revokes_authorization_voids_the_approval(self):
+        # The same window applies to the project authorization list, not only to
+        # the edition: authorization is re-proved after the Git facts.
+        work = self.worktree('one')
+        project = self._project()
+        original = delivery._facts_match
+
+        def facts(record, where):
+            verdict = original(record, where)
+            project.write_text(project.read_text().replace('`a.txt`', '`moved.txt`'))
+            return verdict
+
+        with mock.patch.object(delivery, '_facts_match', facts):
+            state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]))
+        record = state['tasks']['one']
+        self.assertEqual(agents.calls, ['execution', 'review'])
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('not authorized', record['reason'])
+        self.assertEqual(_head_of(work), record['head'])
+
+
+class CommitBoundaryTests(DeliveryCase):
+    """`git add` and `git commit` are separate processes and separate risks."""
+
+    def _filter(self, body):
+        script = self.root / 'poison-filter.py'
+        script.write_text(f'#!{PY}\nimport pathlib, sys\ntext = sys.stdin.read()\n' + body)
+        script.chmod(0o755)
+        (self.repo / '.gitattributes').write_text('docs/PROJECT.md filter=poison\n')
+        _git(self.repo, 'add', '.gitattributes')
+        _git(self.repo, 'commit', '-q', '-m', 'attributes')
+        _git(self.repo, 'config', 'filter.poison.clean', f'{PY} {script}')
+        _git(self.repo, 'config', 'filter.poison.smudge', 'cat')
+        return script
+
+    def _hook(self, marker):
+        hook = self.repo / '.git' / 'hooks' / 'pre-commit'
+        hook.write_text(f'#!{PY}\nimport pathlib\n'
+                        f'pathlib.Path({str(marker)!r}).write_text("x")\n')
+        hook.chmod(0o755)
+        return hook
+
+    def test_a_clean_filter_that_duplicates_the_edition_blocks_the_commit(self):
+        # A real Git clean filter rewrites `docs/PROJECT.md` while `git add`
+        # runs, so the *staged* blob gains a second edition declaration while
+        # the worktree still looks valid (Git compares it through the same
+        # filter). Reading the project config from the filesystem cannot see
+        # that, so the staged content itself must be re-proved before the
+        # second process (`git commit`) turns it into history. The pre-commit
+        # hook is the proof that no commit was started.
+        hook_marker = self.root / 'pre-commit-ran'
+        # The poison is armed by the execution session (outside the repository),
+        # so the run starts against a clean repository worktree.
+        armed = self.root / 'poison-armed'
+        self._filter(f'if pathlib.Path({str(armed)!r}).exists():\n'
+                     '    text += "- **`edition`**: `github`\\n"\n'
+                     'sys.stdout.write(text)\n')
+        self._hook(hook_marker)
+        work = self.worktree('one')
+        base = _head_of(work)
+        proofs = []
+        original = delivery._prove_staged
+
+        def prove(*args, **kwargs):
+            staged = _git(work, 'diff', '--cached', '--name-only').stdout.decode().split()
+            proofs.append(staged)
+            return original(*args, **kwargs)
+
+        def execution(where, prompt):
+            self.write_default(where, prompt)
+            project = where / 'docs' / 'PROJECT.md'
+            project.write_text(project.read_text() + '\n')
+            armed.write_text('x')
+
+        with mock.patch.object(delivery, '_prove_staged', prove):
+            state, agents = self.run_delivery(
+                self.plan([self.task('one', work, ['a.txt', 'docs/PROJECT.md'])]),
+                FakeAgents(self, execution=execution))
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertIsNone(record.get('head'))
+        # Nothing was committed and the hook never ran.
+        self.assertEqual(_head_of(work), base)
+        self.assertFalse(hook_marker.exists())
+        # The proof ran exactly once, on a non-empty index (i.e. between add and
+        # commit), and the poisoned blob really was staged.
+        self.assertEqual(len(proofs), 1)
+        self.assertIn('docs/PROJECT.md', proofs[0])
+        staged = _git(work, 'show', ':docs/PROJECT.md').stdout.decode()
+        self.assertEqual(staged.count('edition'), 2)
+        # The runner never resets: the staged content is left for a human.
+        self.assertIn('docs/PROJECT.md',
+                      _git(work, 'diff', '--cached', '--name-only').stdout.decode())
+
+    def test_the_staged_proof_refuses_revoked_authorization_and_out_of_scope_paths(self):
+        work = self.worktree('one')
+        base = _head_of(work)
+        spec = delivery._plan_tasks(self.plan([self.task('one', work, ['a.txt'])]))[0]
+        (work / 'a.txt').write_text('x\n')
+        _git(work, 'add', 'a.txt')
+        revoked = {'edition': 'local', 'edition_count': 1, 'edition_values': ['local'],
+                   'allowed': ['b.txt'], 'forbidden': [], 'secrets': []}
+        with mock.patch.object(delivery, 'project_config', return_value=revoked):
+            with self.assertRaises(ValueError) as caught:
+                delivery._prove_staged(self.repo, spec, work, base, ['a.txt'])
+        self.assertIn('not authorized', str(caught.exception))
+        # An out-of-scope path that only became staged fails the path proof.
+        (work / 'b.txt').write_text('y\n')
+        _git(work, 'add', 'b.txt')
+        with self.assertRaises(delivery.DeliveryError) as staged:
+            delivery._prove_staged(self.repo, spec, work, base, ['a.txt'])
+        self.assertIn('staged', str(staged.exception))
+        # Neither proof wrote history.
+        self.assertEqual(_head_of(work), base)
 
 
 class CliTests(DeliveryCase):
