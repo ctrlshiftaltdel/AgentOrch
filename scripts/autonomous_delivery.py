@@ -1895,15 +1895,28 @@ def _verify(context, spec, record):
         check = _run_check(command, work, spec['raw'].get('timeout', 1800))
         checks.append(check)
         record['verification'] = list(checks)
-        context.save()
         if check.get('timeout'):
             # A timed-out check may still have live descendants writing to any
             # worktree, and the kill that was attempted may not be proven. This
             # is a run-wide failure: no later task, closing approval re-check,
             # verification command, profile query, Agent or Git write may
             # start, and the run is not retryable automatically.
+            #
+            # The result must reach the journal before the run stops, but the
+            # caller's generic error path retries the save and then starts the
+            # next task, so a failed write here cannot be allowed to fall
+            # through to it. Stop the run instead; the halt write below may
+            # still succeed and record the timeout.
+            try:
+                context.save()
+            except OSError as exc:
+                raise RunHaltError(
+                    'a verification check timed out and the journal write that '
+                    f'records it failed ({exc}); the run stops here rather than '
+                    'continuing on a journal that may not be persisted') from None
             raise RunHaltError('a verification process tree may still be running; '
                                'refusing to continue or retry automatically')
+        context.save()
         _require_live_config(context, spec)
     if not _all_zero(checks):
         raise DeliveryError('verification failed', 'FAILED')
@@ -2292,14 +2305,15 @@ def _authenticate(record, context, spec):
 
 def _reconcile(context, spec, record):
     """Continue an interrupted task only after re-proving every provable gate."""
-    _require_supported_state(record)
     if _timed_out(record):
         # A journal can carry a timeout from a runner that died before the
         # halted-run write. The tree may still be alive, so this is not a
-        # task-scoped refusal: nothing else in this run may start.
+        # task-scoped refusal: nothing else in this run may start. It is
+        # checked before every task-scoped refusal so none can mask it.
         raise RunHaltError('the journal records a timed-out verification check; its '
                            'process tree may still be running, so the run cannot resume '
                            'or continue')
+    _require_supported_state(record)
     if _pid_alive(record.get('pid')) is not False:
         raise DeliveryError('previous runner process may still be alive; refusing to resume')
     work = _resolve_task(context, spec)
@@ -2401,6 +2415,14 @@ def _attempt_retry(context, spec, record):
     """Re-run work only when nothing the user owns can be touched."""
     if spec['errors']:
         raise DeliveryError('task configuration is invalid: ' + '; '.join(spec['errors']))
+    if _timed_out(record):
+        # A recorded timeout is run-wide: its tree may still be alive, so even
+        # an explicit retry cannot let another task start. This check comes
+        # before every task-scoped refusal below (an unsupported state, a phase
+        # that cannot retry, a still-live recorded PID), so none of them can
+        # mask the timeout.
+        raise RunHaltError('retry refused: a verification check timed out and its process '
+                           'tree may still be running; inspect the host manually')
     _require_supported_state(record)
     if record.get('status') not in STOPPED:
         raise DeliveryError(f'task {spec["id"]} is {record.get("status")}, not retryable')
@@ -2409,11 +2431,6 @@ def _attempt_retry(context, spec, record):
                             f'{record.get("phase")!r}')
     if record.get('status') == 'UNKNOWN' and _pid_alive(record.get('pid')) is not False:
         raise DeliveryError('retry refused: the previous runner process may still be alive')
-    if _timed_out(record):
-        # A recorded timeout is run-wide: its tree may still be alive, so even
-        # an explicit retry cannot let another task start.
-        raise RunHaltError('retry refused: a verification check timed out and its process '
-                           'tree may still be running; inspect the host manually')
     work = _resolve_task(context, spec)
     if _status(work):
         raise DeliveryError('retry refused: the worktree has uncommitted changes. Inspect them '
@@ -2646,7 +2663,16 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
                     f'the shared project gate failed while task {ident} was being '
                     f'processed: {exc}; every live approval depends on that gate'))
             record.update(status=exc.status, reason=str(exc))
-            saver()
+            try:
+                saver()
+            except OSError as write_error:
+                # The run is already stopping, so this is the only chance to
+                # report that the journal itself is now suspect. Raising keeps
+                # the caller from returning a summary built from state that may
+                # not have reached disk.
+                raise RunHaltError(
+                    f'{exc}; the journal could not be written ({write_error}), so it is '
+                    'not reliably persisted and the run is stopped') from None
             halt.append(exc)
 
         def halt_run(ident, record, exc):
@@ -2667,10 +2693,33 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
                     'process tree may have changed any worktree, so the approval is no '
                     'longer supportable'))
             record.update(status=exc.status, reason=str(exc))
-            saver()
+            try:
+                saver()
+            except OSError as write_error:
+                raise RunHaltError(
+                    f'{exc}; the journal could not be written ({write_error}), so it is '
+                    'not reliably persisted and the run is stopped') from None
             halt.append(exc)
 
+        # A recorded timeout is run-wide, not task-scoped: its process tree may
+        # still be alive and can write to any worktree. The whole journal is
+        # therefore checked before any task is processed, so a task-scoped
+        # refusal on another record -- an already-BLOCKED timeout, a still-live
+        # recorded PID, a worktree that is not retryable -- cannot mask it and
+        # let the next task start in this process.
+        for ident in sorted(state['tasks']):
+            record = state['tasks'][ident]
+            if not isinstance(record, dict) or not _timed_out(record):
+                continue
+            halt_run(ident, record, RunHaltError(
+                f'the journal records that a verification check for task {ident} timed '
+                'out; its process tree may still be running, so the run cannot resume or '
+                'continue'))
+            break
+
         for spec in specs:
+            if halt:
+                break
             record = context.record(spec['id'])
             try:
                 _require_supported_state(record)

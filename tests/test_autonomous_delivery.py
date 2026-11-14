@@ -2389,6 +2389,100 @@ class TimeoutTests(DeliveryCase):
         self.assertEqual(git_calls, [])
         self.assertEqual(self.journal()['tasks']['one']['status'], 'BLOCKED')
 
+    def test_a_resume_never_starts_another_task_after_a_recorded_timeout(self):
+        # The retired review reproduced the gap: after a timed-out check was
+        # persisted, one was already BLOCKED, so a resume never consulted the
+        # per-record timeout check. Task two then ran its execution and review
+        # and queried the profiles. An entire-journal timeout has to be found
+        # before any task in the next run is processed.
+        one, two = self.worktree('one'), self.worktree('two')
+        task = self.task('one', one, ['a.txt'],
+                         verify=[[PY, '-c', 'import time; time.sleep(5)']])
+        task['timeout'] = 1
+        plan = self.plan([task, self.task('two', two, ['b.txt'])])
+        state, agents = self.run_delivery(plan)
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertEqual(state['tasks']['two']['status'], 'PENDING')
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertTrue(self.journal()['tasks']['one']['verification'][0]['timeout'])
+
+        queried = []
+
+        def profiles(where):
+            queried.append(str(where))
+            return self.profiles(where)
+
+        agents_again = FakeAgents(self)
+        state, _ = self.run_delivery(plan, agents=agents_again, resume=True,
+                                     profiles=profiles)
+        self.assertEqual(state['tasks']['two']['status'], 'PENDING')
+        self.assertEqual(agents_again.calls, [])
+        self.assertEqual(queried, [])
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('timed out', state['tasks']['one']['reason'])
+
+    def test_a_retry_cannot_mask_a_recorded_timeout_behind_a_live_pid(self):
+        # The reviewer's second reproduction: an UNKNOWN record with a still
+        # live PID made `_attempt_retry` raise an ordinary DeliveryError before
+        # it looked at the recorded timeout. The retry error is task-scoped, so
+        # the loop continued and started task two. A recorded timeout must stop
+        # the whole run before any per-task refusal is considered.
+        one, two = self.worktree('one'), self.worktree('two')
+        plan = self.plan([self.task('one', one, ['a.txt']),
+                          self.task('two', two, ['b.txt'])])
+        self.seed(plan, {'one': {
+            'status': 'UNKNOWN', 'phase': 'verify', 'pid': os.getpid(),
+            'verification': [{'program': 'x', 'argv_sha256': '0' * 64,
+                              'exit_code': None, 'timeout': True}]}})
+        queried = []
+
+        def profiles(where):
+            queried.append(str(where))
+            return self.profiles(where)
+
+        state, agents = self.run_delivery(plan, retry=['one'], profiles=profiles)
+        self.assertEqual(state['tasks']['two']['status'], 'PENDING')
+        self.assertEqual(agents.calls, [])
+        self.assertEqual(queried, [])
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('timed out', state['tasks']['one']['reason'])
+
+    def test_a_timed_out_check_that_cannot_be_journalled_stops_the_run(self):
+        # The reviewer's third reproduction: `_verify` saved the timed-out
+        # result before consulting it. When that first write failed once, the
+        # caller's generic error path saved again and then started task two.
+        # Once a timeout is observed, a failed write must stop the run; the
+        # halt write may retry, but the loop must never continue on state that
+        # a failed write left uncertain.
+        one, two = self.worktree('one'), self.worktree('two')
+        task = self.task('one', one, ['a.txt'],
+                         verify=[[PY, '-c', 'import time; time.sleep(5)']])
+        task['timeout'] = 1
+        plan = self.plan([task, self.task('two', two, ['b.txt'])])
+        original = delivery._save
+        failed = []
+
+        def flaky_save(path, state):
+            if not failed and any(check.get('timeout')
+                                  for record in state['tasks'].values()
+                                  for check in record.get('verification') or []):
+                failed.append(str(path))
+                raise OSError('synthetic write failure')
+            return original(path, state)
+
+        with mock.patch.object(delivery, '_save', flaky_save):
+            state, agents = self.run_delivery(plan)
+        self.assertTrue(failed)
+        self.assertEqual(state['tasks']['two']['status'], 'PENDING')
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('journal', state['tasks']['one']['reason'])
+        # The halt write succeeded, so the timeout itself is in the journal.
+        journal = self.journal()
+        self.assertTrue(journal['tasks']['one']['verification'][0]['timeout'])
+        self.assertEqual(journal['tasks']['one']['status'], 'BLOCKED')
+        self.assertEqual(journal['tasks']['two']['status'], 'PENDING')
+
 
 class LockIdentityTests(DeliveryCase):
     def _other_repo(self, name='other-repo'):
