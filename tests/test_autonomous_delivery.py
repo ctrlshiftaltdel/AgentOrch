@@ -401,6 +401,21 @@ class ResumeTests(DeliveryCase):
         self.assertIn('resuming', state['tasks']['one']['reason'])
         self.assertEqual(agents.calls, [])
 
+    def test_resume_never_merges_when_verification_fails_even_if_the_target_has_the_head(self):
+        work, base, head = self._prepared()
+        # The target branch already contains the task head, as in the reported
+        # repro. There is no merge code, but the regression check asserts that a
+        # failing verification cannot produce an approved/merged outcome.
+        _git(self.repo, 'merge', '--no-ff', '--no-edit', 'task/one')
+        plan = self.plan([self.task('one', work, ['a.txt'],
+                                    verify=[[PY, '-c', 'raise SystemExit(73)']])])
+        self._seed_review(work, base, head, plan)
+        before = _git(self.repo, 'rev-parse', 'HEAD').stdout
+        state, agents = self.run_delivery(plan, resume=True)
+        self.assertEqual(state['tasks']['one']['status'], 'FAILED')
+        self.assertEqual(agents.calls, [])
+        self.assertEqual(_git(self.repo, 'rev-parse', 'HEAD').stdout, before)
+
     def test_resume_continues_only_after_reproving_everything(self):
         work, base, head = self._prepared()
         plan = self.plan([self.task('one', work, ['a.txt'])])
@@ -658,6 +673,23 @@ class NoDestructiveTests(DeliveryCase):
         self.assertEqual((work / 'private.txt').read_text(), 'user data\n')
         self.assertEqual(_git(work, 'status', '--porcelain', '--ignored').stdout,
                          b'!! private.txt\n')
+        self.assertEqual(agents.calls, [])
+
+    def test_behind_baseline_worktree_never_overwrites_an_ignored_file(self):
+        (self.repo / '.gitignore').write_text('ignored.txt\n')
+        _git(self.repo, 'add', '.gitignore')
+        _git(self.repo, 'commit', '-q', '-m', 'ignore it')
+        work = self.worktree('one')
+        (work / 'ignored.txt').write_text('OWN_FIXTURE_ORIGINAL')
+        self.assertTrue(_git(work, 'status', '--porcelain', '--ignored').stdout)
+        # Advance the target with a *tracked* file of the same name.
+        (self.repo / 'ignored.txt').write_text('tracked baseline')
+        _git(self.repo, 'add', '-f', 'ignored.txt')
+        _git(self.repo, 'commit', '-q', '-m', 'tracked baseline file')
+        state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]))
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('not exactly at the target baseline', state['tasks']['one']['reason'])
+        self.assertEqual((work / 'ignored.txt').read_text(), 'OWN_FIXTURE_ORIGINAL')
         self.assertEqual(agents.calls, [])
 
     def test_retry_refuses_and_preserves_uncommitted_work(self):
