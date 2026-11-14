@@ -517,17 +517,23 @@ class ReviewGateTests(DeliveryCase):
 
     def test_profile_is_checked_in_every_task_worktree(self):
         one, two = self.worktree('one'), self.worktree('two')
+        # The runtime reports the worktree it resolved. Route task two through a
+        # directory symlink so its written path differs from that report, the
+        # way /var and /private/var differ on macOS: the two forms name one
+        # directory and the check must compare canonical paths.
+        alias = self.root / 'work-two-alias'
+        alias.symlink_to(two, target_is_directory=True)
 
         def profiles(where):
             rules = [{'action': '*', 'resource': '*', 'effect': 'allow'},
                      {'action': 'edit', 'resource': '*', 'effect': 'deny'}]
-            if Path(where) != two:
+            if Path(where).resolve() != alias.resolve():
                 rules.append({'action': 'shell', 'resource': '*', 'effect': 'deny'})
             return {'scout': {'permissions': rules}}
 
         state, agents = self.run_delivery(
             self.plan([self.task('one', one, ['a.txt']),
-                       self.task('two', two, ['b.txt'])]), profiles=profiles)
+                       self.task('two', alias, ['b.txt'])]), profiles=profiles)
         self.assertEqual(state['tasks']['one']['status'], 'PREPARED')
         self.assertEqual(state['tasks']['two']['status'], 'BLOCKED')
         self.assertIn('not provably read-only', state['tasks']['two']['reason'])
@@ -1667,11 +1673,18 @@ class CheckRunnerTests(DeliveryCase):
         self.assertFalse((work / 'child-marker').exists())
 
     def test_checks_receive_pwd_and_cwd(self):
+        # Route the worktree through a directory symlink the way macOS exposes
+        # /var as /private/var: PWD and getcwd() then name one directory in two
+        # forms, and the check must compare them after resolution.
         work = self.worktree('one')
+        alias = self.root / 'work-one-alias'
+        alias.symlink_to(work, target_is_directory=True)
         checks = delivery._run_checks(
             [[PY, '-c',
-              'import os,sys; sys.exit(0 if os.environ.get("PWD")==os.getcwd() else 1)']],
-            work, timeout=60)
+              'import os,sys; sys.exit(0 if '
+              'os.path.realpath(os.environ.get("PWD"))'
+              '==os.path.realpath(os.getcwd()) else 1)']],
+            alias, timeout=60)
         self.assertEqual(checks[0]['exit_code'], 0)
 
 
@@ -2129,6 +2142,19 @@ class LockIdentityTests(DeliveryCase):
         _git(other, 'add', 'x')
         _git(other, 'commit', '-q', '-m', 'base')
         return other
+
+    def test_a_symlink_alias_cannot_hide_two_tasks_sharing_one_worktree(self):
+        # A worktree may be named through a symlinked directory, as /var is on
+        # macOS. Two tasks whose paths differ as strings but name the same
+        # directory must still be refused, or both would run in one worktree.
+        work = self.worktree('one')
+        alias = self.root / 'work-one-alias'
+        alias.symlink_to(work, target_is_directory=True)
+        plan = self.plan([self.task('one', work, ['a.txt']),
+                          self.task('two', alias, ['b.txt'])])
+        with self.assertRaises(ValueError) as caught:
+            delivery._plan_tasks(plan)
+        self.assertIn('share one worktree', str(caught.exception))
 
     def test_the_same_journal_cannot_point_at_two_repositories(self):
         work = self.worktree('one')
