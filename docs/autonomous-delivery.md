@@ -9,7 +9,7 @@
 能做：
 
 - 读真实载体：GitHub Issue（`--issue`）作为任务来源；Issue 的「可改路径」段落收窄为允许路径，正文摘要（sha256）在运行前重新比对。
-- 读项目自身配置：`docs/PROJECT.md` 的 `edition` 必须是 `local` 或 `github`；声明必须是**单行**的列表项，首个词是 `edition`（反引号或 Markdown 强调也算同一词，包括 `**`edition`**` 这类嵌套组合），并以 `:` 或 `：` 带值。只有 `edition` / `` `edition` `` 后接冒号的形式可解析；粗体、嵌套、非冒号等写法仍算一次声明但会被拒绝。值必须整行精确匹配（`github/invalid`、`???`、空值、带尾随文字都算非法）；**换行不能把值带到下一行**。缺失、非法、重复或无法解析的声明数量不为 1 时在派发前拒绝。**每次副作用边界重新读取配置时都会重新验证 edition**：执行/验证/审查/恢复/重试前与提交前后新增的非法、重复、空值或嵌套歧义声明立即失败关闭，不复用首次检查。任务的允许路径必须落在「允许改动路径」内，且不得与「禁止改动路径」互为祖先/后代。缺失或非法配置在派发前拒绝。
+- 读项目自身配置：`docs/PROJECT.md` 的 `edition` 必须是 `local` 或 `github`；声明必须是**单行**的列表项，首个词是 `edition`（反引号或 Markdown 强调也算同一词，包括 `**`edition`**` 这类嵌套组合），并以 `:` 或 `：` 带值。只有 `edition` / `` `edition` `` 后接冒号的形式可解析；粗体、嵌套、非冒号等写法仍算一次声明但会被拒绝。值必须整行精确匹配（`github/invalid`、`???`、空值、带尾随文字都算非法）；**换行不能把值带到下一行**。缺失、非法、重复或无法解析的声明数量不为 1 时在派发前拒绝。**每次副作用边界重新读取配置时都会重新验证 edition**：执行/验证/审查/恢复/重试前、每条验证命令前、`git add` 与 `git commit` 之间（读 index）以及提交前后，新增的非法、重复、空值或嵌套歧义声明立即失败关闭，不复用首次检查。任务的允许路径必须落在「允许改动路径」内，且不得与「禁止改动路径」互为祖先/后代。缺失或非法配置在派发前拒绝。
 - 启动真实 OpenCode 会话执行（`opencode run --standalone --format json`），不传 `--auto`，不复用会话。
 - 用计划里的命令验证真实 diff；退出码、head 与 diff 指纹都会记录，head 或 diff 在验证/审查期间变动即失败。
 - 用**另一个**新会话、以声明的 Agent 做审查；runner 把 Git 生成的 base..head 完整 diff（文本、受大小上限约束）交给审查者，结论必须来自该会话自身的 transcript，并绑定 base/head、diff 指纹、任务的完整摘要（描述、AC、路径、验证命令、Agent、载体）、模式与每条验收标准原文。
@@ -85,8 +85,9 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 1. **不可变绑定**：审查结论绑定审查时的 base/head、worktree diff 指纹、runner 展示的完整 diff 指纹、`mode=prepare-only`、允许路径**原文**、每条 AC **原文**，以及任务摘要（描述、验证命令、执行/审查 Agent、载体）。journal/plan 被改写后旧 transcript 不再匹配，任务不能继续被信任。二进制、超过大小上限、或命中项目隐私模式的变更在审查前 `BLOCKED`。
 2. **transcript 为准**：流式输出与 `session export` 得到的 transcript 必须一致；journal 里记录的结论只用于比对，不能单独作为证据。
    - 项目授权与 `edition` 在每个写操作前后都重新读取 `docs/PROJECT.md`；即使允许前缀更宽，实际变更路径命中禁改路径（含子文件）也会在提交前被拒绝；期间新增的非法、重复、空值或嵌套歧义 `edition` 声明同样立即失败关闭。
-3. **恢复先重证，再失败关闭**：`--resume` 处理 `RUNNING` 与 `UNKNOWN`。在运行任何验证命令前，先核验：同一 Git 仓库身份（common dir）、任务包与项目授权（含每个**实际**变更路径）、执行会话的 Agent/目录/终局、审查 Agent 的工具级门禁、worktree head 与指纹。**执行会话的元数据只是身份检查，不能证明它产出了当前 head/diff**；OpenCode 没有可独立核验的执行产物绑定，Git 历史与 journal 都可写，因此手工提交、可伪造的 trailer 和 journal 字段都不构成证明。只要中断前已经产生提交（`verify` / `review` 阶段），`--resume` 在完成上述可证检查后一律 `BLOCKED`，要求人工检查 worktree 并重做任务；只有尚未提交的执行阶段（无 head 可信任）才会重新派发执行。**跨进程的 `PREPARED` 批准同样失败关闭**：从 journal 读取的旧批准先做同样的非执行检查，然后一律 `BLOCKED`；Git、journal、执行会话元数据与可篡改 transcript 的相互一致既不证明执行来源，也不证明独立审查。拒绝发生在任何验证命令、Agent 启动与目标写入之前；journal 只记录 `BLOCKED` 与原因，不产生验证副作用。**本进程内仍然有效的批准也不是永久有效**：汇总前会逐个重新核验其 head、diff 指纹与 worktree 干净状态；后续任务的受信验证命令若改动了已批准任务，该批准立即 `BLOCKED`，且不会为复核而重跑任何受信命令。
-4. **审查门**：`--reviewer-agent` 的 profile 按规则顺序与 action 通配（如 `s*`）取最终匹配；`edit`、`shell` 必须最终为 `deny`，且不能存在无法证明范围的作用域 `allow`（例如先 `deny shell:*` 后 `allow s*:*`）。**每次** execute/verify/review/resume/retry/批准重证前的副作用边界都重新查询 profile，不按 worktree 缓存；查询失败或结果不再只读时在该命令或 Agent 启动前 `BLOCKED`。
+   - `git add` 与 `git commit` 是两个进程：`add` 返回后、`commit` 启动前，runner 从 **index**（即将被提交的内容）重读 `docs/PROJECT.md` 的 `edition`、重证项目授权与即将提交的路径集。真实 Git clean filter 在 `add` 期间改写暂存内容、或工作区在暂存后发生变化，都在产生历史之前 `BLOCKED`；此时 runner 不 reset，暂存内容留给人工处理，pre-commit hook 不会运行。
+3. **恢复先重证，再失败关闭**：`--resume` 处理 `RUNNING` 与 `UNKNOWN`。在运行任何验证命令前，先核验：同一 Git 仓库身份（common dir）、任务包与项目授权（含每个**实际**变更路径）、执行会话的 Agent/目录/终局、审查 Agent 的工具级门禁、worktree head 与指纹。**执行会话的元数据只是身份检查，不能证明它产出了当前 head/diff**；OpenCode 没有可独立核验的执行产物绑定，Git 历史与 journal 都可写，因此手工提交、可伪造的 trailer 和 journal 字段都不构成证明。只要中断前已经产生提交（`verify` / `review` 阶段），`--resume` 在完成上述可证检查后一律 `BLOCKED`，要求人工检查 worktree 并重做任务；只有尚未提交的执行阶段（无 head 可信任）才会重新派发执行。**跨进程的 `PREPARED` 批准同样失败关闭**：从 journal 读取的旧批准先做同样的非执行检查，然后一律 `BLOCKED`；Git、journal、执行会话元数据与可篡改 transcript 的相互一致既不证明执行来源，也不证明独立审查。拒绝发生在任何验证命令、Agent 启动与目标写入之前；journal 只记录 `BLOCKED` 与原因，不产生验证副作用。**本进程内仍然有效的批准也不是永久有效**：汇总前会逐个重新核验其 head、diff 指纹与 worktree 干净状态；后续任务的受信验证命令若改动了已批准任务，该批准立即 `BLOCKED`，且不会为复核而重跑任何受信命令。这些 Git 事实检查本身也是外部读取，因此**每个批准在 Git 事实之后、以及全部批准检查完后、保存 journal 之前**都会再次重证项目配置（`edition` 与授权）：只要当前配置不再成立，**所有**仍被本进程视为有效的批准一律 `BLOCKED`，而不是只阻断最后检查的那一个。这是收窄窗口，不是消除并发写入：两次读取之间配置仍可被同一用户改写，见 §7。
+4. **审查门**：`--reviewer-agent` 的 profile 按规则顺序与 action 通配（如 `s*`）取最终匹配；`edit`、`shell` 必须最终为 `deny`，且不能存在无法证明范围的作用域 `allow`（例如先 `deny shell:*` 后 `allow s*:*`）。**每次** execute/verify/review/resume/retry/批准重证前的副作用边界都重新查询 profile，不按 worktree 缓存；查询失败或结果不再只读时在该命令或 Agent 启动前 `BLOCKED`。profile 属于同一道门，因此**每条验证命令之前都重新查询**（不只读项目配置），且**在导出执行会话之后、启动审查会话之前再查询一次**：导出本身是外部调用，期间被放宽的 profile 不能授权随后启动的审查 Agent。
 5. **重试不破坏数据**：`--retry` 只在没有未提交改动时开放；执行阶段要求 head 等于基线，验证/审查阶段要求 head 等于失败尝试的 head。`--retry` 与 `--resume` 共用同一套重证（身份、实际变更路径、授权、reviewer profile、执行会话元数据），并在任何命令或 Agent 启动前停止。已提交的验证/审查尝试不能被重试：原因同 §4.3，无法证明该 head 由执行会话产出。它不 stash、不 reset；有提交或未提交内容时要求人工处理。
 6. **合并检查点不存在**：journal 中出现 `MERGED`/`VERIFIED` 或 `merge`/`post_verify` 阶段时直接 `BLOCKED`，因为本切片不产生也不信任这类状态。
 7. **并发**：按目标仓库、每个任务 worktree 与 journal 分别取得跨进程锁；仓库/worktree 锁位于仓库 Git common dir 下，journal 锁位于 journal 自身目录且不随 `TMPDIR` 变化，因此同一 journal 指向两个仓库也互斥。锁身份使用规范化后的真实路径：journal 的父目录是符号链接时，`real/journal.json` 与 `alias/journal.json` 仍落到同一个锁文件，不能借别名绕过互斥。它不能阻止其他工具或人直接写仓库。
@@ -96,7 +97,7 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 
 | 文件 | 覆盖 |
 |---|---|
-| `tests/test_autonomous_delivery.py` | 真实 Git 夹具：prepare-only 批准与目标不变；自动合并被拒绝且不启动 Agent；审查会话/身份/目录/transcript/AC 原文/路径集伪造；恢复先重证再失败关闭（已提交尝试不可恢复；未提交执行可重新派发；跨仓库 worktree、错误 Agent、未证只读 profile、可伪造 trailer、手工提交）；完整伪造 journal + 重放会话 + 可篡改 transcript 的跨进程 `PREPARED` 批准在验证命令前失败关闭（API 与 CLI，CLI 退出码非 0）；同一运行内 reviewer profile 变化后重新查询并失败关闭；重试共用实际路径/完整 session 身份/profile 重证；不执行 `reset`/`stash` 且保留 ignored 数据；禁改子路径与实际变更路径；edition 缺失/非法/重复/前缀歧义/跨行/非冒号/嵌套强调与反引号（含相反顺序），以及运行中途（profile 查询、执行提交前、验证后）新增的非法/重复/空值/嵌套歧义声明立即失败关闭；汇总前重证本进程批准任务的 head/diff/干净状态（后续受信命令改动即 `BLOCKED`，且不重跑该命令）；跨进程锁（不同 `TMPDIR`、journal 父目录符号链接别名）；验证命令超时杀掉整个进程树；journal 伪造与合并状态拒绝；argv 凭据不外泄。 |
+| `tests/test_autonomous_delivery.py` | 真实 Git 夹具：prepare-only 批准与目标不变；自动合并被拒绝且不启动 Agent；审查会话/身份/目录/transcript/AC 原文/路径集伪造；恢复先重证再失败关闭（已提交尝试不可恢复；未提交执行可重新派发；跨仓库 worktree、错误 Agent、未证只读 profile、可伪造 trailer、手工提交）；完整伪造 journal + 重放会话 + 可篡改 transcript 的跨进程 `PREPARED` 批准在验证命令前失败关闭（API 与 CLI，CLI 退出码非 0）；同一运行内 reviewer profile 变化后重新查询并失败关闭（含导出后启动审查前、以及每条验证命令之前，均按调用次数断言）；重试共用实际路径/完整 session 身份/profile 重证；不执行 `reset`/`stash` 且保留 ignored 数据；禁改子路径与实际变更路径；edition 缺失/非法/重复/前缀歧义/跨行/非冒号/嵌套强调与反引号（含相反顺序），以及运行中途（profile 查询、执行提交前、验证后）新增的非法/重复/空值/嵌套歧义声明立即失败关闭；`git add` 与 `git commit` 之间对 index 的重证（真实 Git clean filter 在暂存期间注入重复 edition 时 `BLOCKED`、pre-commit hook 从未运行、暂存内容保留；撤销授权与越界暂存路径同样拒绝）；汇总前重证本进程批准任务的 head/diff/干净状态，Git 事实之后再次重证配置/授权并使**所有** live 批准 `BLOCKED`（后续受信命令改动即阻断，且不重跑该命令）；跨进程锁（不同 `TMPDIR`、journal 父目录符号链接别名）；验证命令超时杀掉整个进程树；journal 伪造与合并状态拒绝；argv 凭据不外泄。 |
 | `tests/test_opencode_probe.py` | 单次探针事件流的保守分类，不构成交付成功。 |
 | `scripts/opencode_probe.py` | 探针事件流分类辅助；不被执行器用来判定任务成功。 |
 
@@ -106,8 +107,9 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 
 真实调用后的摘要，未包含会话标识或个人路径；原始 journal 只在本机受保护目录，不入库。
 
-- **较早候选版本**上，在 AgentOrch 本仓库（`github` edition）对一个文档任务做过 prepare-only 运行：真实执行与审查会话均为 `succeeded`、目录为该任务 worktree、Agent 不同；验证命令退出 0；审查 transcript 中全部验收标准 `PASS`、结论绑定该 commit 与 diff 指纹；最终 `PREPARED`，未改动目标分支与 `main`。该运行是历史证据，**不能代表当前 head 的完整实现**。
-- **当前 head** 的同一任务重跑：执行、提交与验证（退出 0）完成，但审查会话在 provider 侧返回 401（`User not found`），没有可用会话与结论；runner 按设计停在 `REVIEW_REJECTED`，没有伪造审查或继续。该失败是外部服务状态，不是审查门的否定结论。
+- **较早候选版本**上，在 AgentOrch 本仓库（`github` edition）对一个文档任务做过 prepare-only 运行：真实执行与审查会话均为 `succeeded`、目录为该任务 worktree、Agent 不同；验证命令退出 0；审查 transcript 中全部验收标准 `PASS`、结论绑定该 commit 与 diff 指纹；最终 `PREPARED`，未改动目标分支与 `main`。该运行的 head **没有被记录**，无法定位到具体提交；相关记录最早出现在提交 `17ca355d781eb89c711a514e4ac2a8747fd1699e`（2026-11-14）。它是历史证据，**不能代表当前候选 head 的完整实现**。
+- 同一任务的另一次重跑（同样是较早候选，head 未记录；该记录由提交 `17ca355` 引入）：执行、提交与验证（退出 0）完成，但审查会话在 provider 侧返回 401（`User not found`），没有可用会话与结论；runner 按设计停在 `REVIEW_REJECTED`，没有伪造审查或继续。该失败是外部服务状态，不是审查门的否定结论，**也不是当前候选 head 的运行结果**。
+- **当前候选 head：`NOT_RUN`**。本文件没有任何真实运行可以被当作当前候选的实现证据；`PREPARED`、退出码与审查结论都只有上面的历史候选记录，不得把它们归给当前候选。要更新本段，必须先在当前 head 上真实重跑并记录可定位的提交与结果。
 - 自动合并请求在启动 Agent 之前被拒绝；依赖任务在上游仅 `PREPARED` 时保持 `PENDING`；edition 缺失/非法在派发前拒绝。
 
 **没有验证、也不宣称的事项**：当前 head 上的真实审查结论、自动合并、GitHub PR/CI 接线、Issue/PR 状态同步、从 `docs/implementation-plan.md` 自动选任务、MCP/插件通道与 OS 隔离、模型独立、Windows 真机、真实 CI 触发。
@@ -118,6 +120,7 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 - **执行产物无法跨进程证明**：本切片不写“绑定提交”，也不把任何 Git trailer、提交或 journal 字段当作“执行会话产出了这个 head”的证据。有仓库写权限的人可以手工提交、伪造 trailer 或改写 journal。已提交的 `verify` / `review` 尝试因此不能恢复或重试；从 journal 读取的旧 `PREPARED` 批准也不能跨进程重证，而是一律失败关闭。要真正闭环，需要运行时提供可独立核验的执行产物绑定（例如签名或可信时间戳），这不在本切片内。
 - **transcript 不是签名证据**：审查结论来自运行时 `opencode session export`，同一用户权限下仍可被篡改。它比 journal 字段更接近独立证据，因为由运行时持有而非 runner 自述，但不提供防篡改或可信时间戳保证；因此可篡改的 transcript 不能单独把旧 `PREPARED` 记录变回可信批准。
 - 验证命令是受信输入；AC 只由独立审查逐条判定，命令退出 0 不能单独充当批准。受信命令也可以写到别的任务 worktree：runner 不会阻止它，只能在本进程汇总前重证已批准任务的 head/diff/干净状态并阻断被改动者；若命令把工作区恢复得与批准时逐字节一致，则没有可观察的变化。
+- **没有原子性，也不声称消除并发写入**：每一次“重证”都是一次普通文件或进程读取，没有事务、快照或签名。`docs/PROJECT.md`、worktree、index 与运行时 profile 都可能在同一用户的另一次写入中，于“证明通过”和“随后的动作/保存/输出”之间再次改变；运行时不提供可原子绑定“配置版本 + 提交 + 审查”的原语。runner 能做的是把证明尽量贴近决策点（每条验证命令前、导出后启动审查前、`add` 与 `commit` 之间读 index、Git 事实之后与保存前），并在证明失败时停在 `BLOCKED`；它不能证明证明之后没有任何写入。
 - `PREPARED` 只在产生它的同一进程内被当作实时批准；跨进程重证依赖保留任务 worktree 与会话记录，即使全部保留也一律 `BLOCKED`，而不是跳过核验。
 - 任务 worktree 必须是独立 linked worktree：等于仓库自身 worktree、或使用仓库当前分支的 worktree 会被拒绝；该检查在所有执行/恢复/重试/重证路径共用。
 - 审查 Agent 的只读性只覆盖 `edit`/`shell` 两个工具动作的通配规则与作用域 allow；未知工具、MCP/插件与操作系统权限未证实。
