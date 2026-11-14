@@ -1082,6 +1082,49 @@ class ApprovedRecheckTests(DeliveryCase):
         self.assertEqual(_head_of(one), record['head'])
         self.assertFalse(_git(one, 'status', '--porcelain').stdout.strip())
 
+    def test_the_final_pass_voids_every_approval_when_the_shared_profile_fails(self):
+        # The last gate queries the shared reviewer profile once per live
+        # approval. The first query returns the safe profile; the second one
+        # widens that shared runtime state and answers with a write-capable
+        # profile. The earlier answer is stale by then, and the gate it was
+        # consulted through is the same one for both tasks, so neither approval
+        # may stay PREPARED: the whole live set must be voided and persisted.
+        one, two = self.worktree('one'), self.worktree('two')
+        weak = {'scout': {'id': 'scout', 'permissions': [
+            {'action': '*', 'resource': '*', 'effect': 'allow'}]}}
+        final = {'active': False, 'calls': 0}
+
+        def profiles(where):
+            if final['active']:
+                final['calls'] += 1
+                if final['calls'] > 1:
+                    return weak
+            return self.profiles(where)
+
+        original = delivery._void_stale_approvals
+
+        def void(context):
+            final['active'] = True
+            return original(context)
+
+        plan = self.plan([self.task('one', one, ['a.txt']),
+                          self.task('two', two, ['b.txt'])])
+        with mock.patch.object(delivery, '_void_stale_approvals', void):
+            state, agents = self.run_delivery(plan, profiles=profiles)
+        self.assertEqual(agents.calls, ['execution', 'review', 'execution', 'review'])
+        # Both live approvals were queried in the final pass, and the second
+        # answer is the one that went weak.
+        self.assertEqual(final['calls'], 2)
+        for name, work in (('one', one), ('two', two)):
+            record = state['tasks'][name]
+            self.assertEqual(record['status'], 'BLOCKED')
+            self.assertIn('not provably read-only', record['reason'])
+            # The journal on disk says the same thing.
+            self.assertEqual(self.journal()['tasks'][name]['status'], 'BLOCKED')
+            # Nothing re-ran and the approved head is untouched.
+            self.assertEqual(_head_of(work), record['head'])
+            self.assertFalse(_git(work, 'status', '--porcelain').stdout.strip())
+
 
 class ScopeTests(DeliveryCase):
     def test_forbidden_path_cannot_be_reached_through_an_allowed_ancestor(self):
@@ -2198,6 +2241,64 @@ class EditionBoundaryTests(DeliveryCase):
         self.assertTrue(runs.read_text())
         self.assertEqual(project.read_text().count('edition'), 2)
 
+    def test_a_clean_filter_in_the_pre_dispatch_status_blocks_before_an_external_query(self):
+        # The first project-config read is followed by `git status` on the
+        # repository, and a real clean filter runs *inside* that synchronous
+        # process. A filter that adds a duplicate edition to the config while
+        # answering Git with the original text leaves the worktree looking clean
+        # but invalidates the declaration after that read; the carrier query
+        # (`gh`) is the next external call, so the config and the task
+        # authorization must be re-proved after the status returns and before
+        # that query starts.
+        project = self._project()
+        armed = self.root / 'filter-armed'
+        runs = self.root / 'filter-runs'
+        self._filter(
+            'pathlib.Path(' + repr(str(runs)) + ').open("a").write("x")\n'
+            'armed_path = pathlib.Path(' + repr(str(armed)) + ')\n'
+            'if armed_path.exists():\n'
+            '    armed_path.unlink()\n'
+            '    config = pathlib.Path(' + repr(str(project)) + ').read_text()\n'
+            '    if "`github`" not in config:\n'
+            '        pathlib.Path(' + repr(str(project)) + ').write_text(\n'
+            '            config + "- **`edition`**: `github`\\n")\n'
+            'sys.stdout.write(text)\n', ('docs/PROJECT.md',))
+        work = self.worktree('one')
+        queried = []
+
+        def gh(argv):
+            queried.append(argv)
+            raise AssertionError('the carrier query must not start')
+
+        self.gh = gh
+        original = delivery._status
+        state = {'armed': False}
+
+        def status(where):
+            if not state['armed']:
+                # Arm the real filter for this exact status call: the stale stat
+                # makes Git read the config through the clean filter.
+                state['armed'] = True
+                armed.write_text('x')
+                os.utime(project, ns=(1_000_000_000, 1_000_000_000))
+            return original(where)
+
+        plan = self.plan([self.task('one', work, ['a.txt'])],
+                         carrier={'kind': 'issue', 'number': 1,
+                                  'repo': 'owner/name', 'digest': '0' * 64})
+        agents = FakeAgents(self)
+        with mock.patch.object(delivery, '_status', status):
+            with self.assertRaises(ValueError) as caught:
+                self.run_delivery(plan, agents=agents)
+        self.assertIn('edition', str(caught.exception))
+        # No external query, no Agent and no journal were started.
+        self.assertEqual(queried, [])
+        self.assertEqual(agents.calls, [])
+        self.assertFalse(self.state.exists())
+        # The filter really ran inside Git, and the real attack landed.
+        self.assertTrue(runs.read_text())
+        self.assertEqual(project.read_text().count('edition'), 2)
+
     def test_any_invalid_or_ambiguous_edition_added_mid_run_fails_closed(self):
         # The first edition check must not be the only one: every boundary that
         # re-reads project config re-validates the one authoritative edition.
@@ -2568,6 +2669,69 @@ class CommitBoundaryTests(DeliveryCase):
         self.assertIn('staged', str(staged.exception))
         # Neither proof wrote history.
         self.assertEqual(_head_of(work), base)
+
+    def test_a_clean_filter_in_the_pre_add_status_blocks_before_git_add(self):
+        # The pre-add proof reads the project config, and the `git status` that
+        # follows it is a synchronous Git process that can run a real clean
+        # filter. A filter that adds a duplicate edition invalidates the
+        # declaration after that read; the runner must re-prove the config,
+        # authorization and scope after the status returns and before `git
+        # add`, so the target file never enters the index.
+        project = self.repo / 'docs' / 'PROJECT.md'
+        hook_marker = self.root / 'pre-commit-ran'
+        pending = self.root / 'filter-pending'
+        armed = self.root / 'filter-armed'
+        runs = self.root / 'filter-runs'
+        self._churn_filter(
+            'pathlib.Path(' + repr(str(runs)) + ').open("a").write("x")\n'
+            'armed_path = pathlib.Path(' + repr(str(armed)) + ')\n'
+            'if armed_path.exists():\n'
+            '    armed_path.unlink()\n'
+            '    config = pathlib.Path(' + repr(str(project)) + ').read_text()\n'
+            '    if "`github`" not in config:\n'
+            '        pathlib.Path(' + repr(str(project)) + ').write_text(\n'
+            '            config + "- **`edition`**: `github`\\n")\n'
+            'sys.stdout.write(text)\n', ('base.txt',))
+        self._hook(hook_marker)
+        work = self.worktree('one')
+        base = _head_of(work)
+        original = delivery._status
+
+        def status(where):
+            if pending.exists():
+                # Arm the real filter only for this exact status call: the
+                # stale stat makes Git re-read the path and run the clean
+                # filter inside `git status` itself.
+                pending.unlink()
+                armed.write_text('x')
+                os.utime(Path(where) / 'base.txt',
+                         ns=(1_000_000_000, 1_000_000_000))
+            return original(where)
+
+        def execution(where, prompt):
+            self.write_default(where, prompt)
+            pending.write_text('x')
+
+        with mock.patch.object(delivery, '_status', status):
+            state, agents = self.run_delivery(
+                self.plan([self.task('one', work, ['a.txt'])]),
+                FakeAgents(self, execution=execution))
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertIsNone(record.get('head'))
+        # No commit was started and the hook never ran.
+        self.assertEqual(_head_of(work), base)
+        self.assertFalse(hook_marker.exists())
+        # The filter really ran inside Git, and the real attack landed.
+        self.assertTrue(runs.read_text())
+        self.assertEqual(project.read_text().count('edition'), 2)
+        # The target file never entered the index: `git add` never started.
+        self.assertEqual(_git(work, 'diff', '--cached', '--name-only').stdout, b'')
+        self.assertEqual(_git(work, 'ls-files', '--', 'a.txt').stdout, b'')
+        self.assertEqual(_git(work, 'status', '--porcelain', '--', 'a.txt').stdout,
+                         b'?? a.txt\n')
 
 
 class CliTests(DeliveryCase):
