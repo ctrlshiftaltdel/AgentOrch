@@ -99,9 +99,15 @@
 - 把 Lesson 提升为通用规则且影响上述边界 → `HD-03`。
 - 来源访问授权问题 → `HD-01` / `HD-02`。
 
-`planning.py` 的 `assess_risk()` 只接受仓库自己解析的 Git 证据：`git_evidence` 提供 base/head SHA，规划器在受控仓库中验证两个提交存在、base 是 head 的祖先、`HEAD` 与 head 一致、`git_evidence.head_sha` 与任务载体 head 一致、工作树干净且不是浅克隆，然后用 Git 生成完整 raw / numstat diff。调用者提供的 Diff、`changed_paths`、40 位 SHA 字符串、`low_risk` / `approved` 布尔值或 `authorization` 字段都不是证据；伪造或截断的 Diff 不能缩小真实 changed paths。
+`planning.py` 的 `assess_risk()` 只接受仓库自己解析的 Git 证据，并从任务载体的 `state.base_sha` / `state.head_sha` 取得基线，而不是从 proposal 的 spec 自选 SHA。规划器验证两个提交存在、base 是 head 的祖先、`HEAD` 与 head 一致、`git_evidence`（若提供）与任务载体 base/head 一致、工作树干净且不是浅克隆，然后用 Git 生成完整 raw / numstat diff。它还会：
 
-`allowed_paths` 中的绝对路径、反斜杠、通配符和任何 `..` 段在任何证据之前直接拒绝，不能被其他合法路径或 Diff 冲掉。只有所有 changed paths 都在 `allowed_paths` 内、且变更是非权威 Markdown / 文本的纯空白变化时，才自动 `LOW` / `READY`；其他内容变更保持 `NEEDS_EVIDENCE` / `BLOCKED`。真实权限 / 安全 / 锁 / 状态机 / 数据 / 外部 / 不可逆变更或受保护执行面变化升级 `NEEDS_HUMAN_DECISION`。治理面变化即使带字面 `granted_by` / `source` 也不自动放行，必须由权威任务载体 / Owner 决定。二进制、rename / copy / type change、symlink、submodule、删除、未提交或未跟踪工作树、缺失或不可验证的提交都显式阻塞并写出 `required_evidence`。决策后重新规划仍是普通任务，不是闭环自动解锁。
+- 屏蔽 Git replace refs，并覆盖 `diff.ignoreSubmodules`、`core.fileMode`、`core.symlinks`、`core.ignoreCase`、external diff / textconv / 系统配置等可隐藏 changed paths 的配置与环境；
+- 拒绝带 assume-unchanged / skip-worktree 的索引、未提交 / 未跟踪工作树、以及落在 `allowed_paths` 内的 ignored 文件；
+- 记录 Git 快照，并在登记 / 交付前复查；快照变化即阻塞。
+
+调用者提供的 Diff、`changed_paths`、40 位 SHA 字符串、`low_risk` / `approved` 布尔值、spec 内 `review` 或 `authorization` 字段都不是证据；伪造或截断的 Diff 不能缩小真实 changed paths。`allowed_paths` 中的绝对路径、反斜杠、通配符和任何 `..` 段在任何证据之前直接拒绝，不能被其他合法路径或 Diff 冲掉。
+
+除空 diff 外，**没有自动 `LOW`**：纯空白等价、Markdown 代码块 / 命令、普通文档、代码和治理面都不再凭后缀或空白自动放行。所有内容变更保持 `NEEDS_EVIDENCE` / `BLOCKED`，可以经由任务载体中的独立审查 receipt 继续：receipt 必须绑定 task id、准确 head、完整 diff 的 SHA-256、changed-path scope、reviewer 身份、角色、`reviewed_at`，可选 `expires_at` / `revoked`，并且只能来自 trusted task carrier，不能来自 proposal。治理面要求 Master/Owner receipt；真实权限 / 安全 / 锁 / 状态机 / 数据 / 外部 / 不可逆变更或受保护执行面变化仍升级 `NEEDS_HUMAN_DECISION`。二进制、rename / copy / type change、symlink、submodule、删除、dirty / untracked / hidden-index 工作树、缺失或不可验证的提交都显式阻塞并写出 `required_evidence`。两种任务载体 payload 都会记录 Git base/head、diff SHA-256、changed paths 与 review status，换会话后可以解释为什么放行。决策后重新规划仍是普通任务，不是闭环自动解锁。
 
 **常规低风险工作也不得绕过 Master 审查、证据矩阵或合并门。**
 

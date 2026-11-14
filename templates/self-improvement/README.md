@@ -129,18 +129,25 @@ start it.
 4. Planning and the loop report live in `scripts/self_improvement/planning.py` and
    `scripts/self_improvement/orchestration.py`. A proposal is `READY` only for an
    eligible lesson, a complete task packet, verified dependencies and real Git
-   evidence: the repository must prove that the two commits exist, that base is an
-   ancestor of head, that `HEAD` matches head, that head matches the task carrier,
-   that the worktree is clean and that the complete diff stays inside
-   `allowed_paths`. Only a whitespace-only change in
-   non-authority Markdown / text is mechanically low risk. All other content
-   changes stay `BLOCKED` / `NEEDS_EVIDENCE` for Agent / Master review, and an
-   evidenced permission / security change goes to `NEEDS_HUMAN_DECISION`.
-   Caller-supplied diffs, `changed_paths`, SHA strings, boolean flags and
-   `authorization` fields are not evidence; literal `granted_by` / URL values are
-   not authorization. Binary, rename / copy / type, symlink, submodule, deletion or
-   a dirty / untracked worktree blocks instead of being treated as text. Registering
-   a task is always a Master action on the current edition's carrier.
+   evidence whose base/head come from the task carrier, not the proposal. The
+   repository must prove that both commits exist, that base is an ancestor of head,
+   that `HEAD` and the carrier head match, that the worktree is clean and that the
+   complete diff stays inside `allowed_paths`. Replace refs and diff-hiding config
+   / environment are disabled; assume-unchanged / skip-worktree, ignored files
+   under allowed paths, binary, rename / copy / type, symlink, submodule, deletion,
+   dirty or untracked worktree all block. There is no automatic low-risk verdict
+   for non-empty content, including whitespace-only or Markdown changes.
+
+   A blocked content change can continue only with an independent review receipt
+   held by the trusted task carrier. The receipt must bind the task id, exact head,
+   complete diff SHA-256, changed-path scope, reviewer identity, role and review
+   time, with optional expiry / revocation. Receipts supplied in the proposal or
+   by an untrusted caller are ignored; authority surfaces need a Master/Owner
+   receipt, and evidenced permission / security changes still go to
+   `NEEDS_HUMAN_DECISION`. Both carrier shapes record the Git base/head, diff
+   SHA-256, changed paths and review status so a later session can explain why a
+   task was allowed. Registering a task is always a Master action on the current
+   edition's carrier.
 
 Templates: [`proposal.md`](proposal.md), [`task-packet.md`](task-packet.md),
 [`closure-report.md`](closure-report.md). Field meanings and the G1–G6 gates are

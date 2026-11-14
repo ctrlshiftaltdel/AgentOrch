@@ -29,6 +29,8 @@ caller-supplied summary.
 """
 from __future__ import annotations
 
+import datetime
+import hashlib
 import os
 import posixpath
 import re
@@ -244,6 +246,24 @@ SECURITY_PATH_TOKENS = (
 _SPECIAL_MODES = frozenset({'120000', '160000'})
 _EXECUTABLE_MODE = '100755'
 _SHA_RE = re.compile(r'^[0-9a-f]{40}$')
+_SAFE_GIT_CONFIG = (
+    'diff.ignoreSubmodules=none',
+    'diff.noprefix=false',
+    'diff.mnemonicPrefix=false',
+    'diff.relative=false',
+    'diff.renames=true',
+    'core.fileMode=true',
+    'core.symlinks=true',
+    'core.ignoreCase=false',
+    'core.excludesFile=' + os.devnull,
+)
+_UNSAFE_GIT_ENV = (
+    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_COMMON_DIR',
+    'GIT_CONFIG', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS',
+    'GIT_REPLACE_REF_BASE', 'GIT_SHALLOW_FILE', 'GIT_QUARANTINE_PATH',
+    'GIT_PREFIX', 'GIT_EXTERNAL_DIFF', 'GIT_DIFF_OPTS',
+)
 _SECURITY_CHANGE_RE = re.compile(
     r'(?i)(?:\bonly\s+owner\b|\banyone\b|\bmay\s+approve\b|'
     r'\bis_admin\b|\bpermission(?:s)?\b|\bauthoriz(?:e|ed|ation)\b|'
@@ -253,6 +273,16 @@ _SECURITY_CHANGE_RE = re.compile(
 _IRREVERSIBLE_CHANGE_RE = re.compile(
     r'(?i)(?:\bdrop\s+table\b|\btruncate\b|\bdelete\s+from\b|'
     r'\brmtree\b|\bunlink\b|\bpush\s+--force\b)')
+SCOPE_KEYWORDS = (
+    '权限', '安全边界', '安全模型', '锁', '状态机', '数据迁移', '迁移',
+    '外部依赖', '隐私', '凭据', '破坏兼容', '不兼容', '不可逆', '销毁',
+    'schema', 'architecture contract', 'permission', 'permissions',
+    'security', 'state machine', 'lock', 'locks', 'migration',
+    'external dependency', 'privacy', 'credential', 'credentials',
+    'incompatible', 'irreversible', 'destroy', 'skip review',
+    'bypass review', 'approve without review', '跳过审查', '绕过审查',
+    '无审查', '权限扩大', '扩大权限', '外部项目', '外部仓库', '不可逆迁移',
+)
 
 
 class GitEvidenceError(Exception):
@@ -308,6 +338,8 @@ def _path_policy_errors(paths):
 def _safe_git_path(value):
     if any(ord(char) < 32 for char in value):
         raise GitEvidenceError(f'control character in diff path: {value!r}')
+    if value != value.strip():
+        raise GitEvidenceError(f'leading/trailing whitespace in diff path: {value!r}')
     try:
         return _canonical_allowed_path(value)
     except ValueError as exc:
@@ -317,6 +349,10 @@ def _safe_git_path(value):
 def _path_at_or_below(path, prefix):
     prefix = prefix.rstrip('/')
     return path == prefix or path.startswith(prefix + '/')
+
+
+def _paths_overlap(first, second):
+    return _path_at_or_below(first, second) or _path_at_or_below(second, first)
 
 
 def _is_authority_path(path):
@@ -343,10 +379,28 @@ def _is_schema_path(path):
     return 'schema' in posixpath.basename(lower) or lower.endswith('.schema.json')
 
 
+def _git_environment():
+    env = {key: value for key, value in os.environ.items()
+           if key not in _UNSAFE_GIT_ENV
+           and not key.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_'))}
+    env['GIT_NO_REPLACE_OBJECTS'] = '1'
+    env['GIT_CONFIG_NOSYSTEM'] = '1'
+    env['GIT_CONFIG_GLOBAL'] = os.devnull
+    env['GIT_CONFIG_SYSTEM'] = os.devnull
+    env['GIT_ATTR_NOSYSTEM'] = '1'
+    env['GIT_TERMINAL_PROMPT'] = '0'
+    env['GIT_OPTIONAL_LOCKS'] = '0'
+    return env
+
+
 def _run_git(repo_root, args):
+    command = ['git', '--no-replace-objects']
+    for setting in _SAFE_GIT_CONFIG:
+        command.extend(['-c', setting])
+    command.extend(['-C', str(repo_root), *args])
     try:
-        return subprocess.run(['git', '-C', str(repo_root), *args],
-                              capture_output=True, timeout=60)
+        return subprocess.run(command, capture_output=True, timeout=60,
+                              env=_git_environment())
     except (OSError, subprocess.TimeoutExpired) as exc:
         # Do not echo the caller's path into a report; name the failed action.
         raise GitEvidenceError('cannot execute git in the supplied repository') from exc
@@ -359,13 +413,63 @@ def _git_text(data):
 def _missing_evidence(reason):
     return {'status': 'MISSING', 'reasons': [reason], 'repo_root': None,
             'base_sha': None, 'head_sha': None, 'entries': [],
-            'binary_paths': set(), 'whitespace_only': False}
+            'binary_paths': set(), 'ignored_paths': [], 'snapshot': None,
+            'diff_sha256': None}
 
 
 def _untrusted_evidence(reason):
     return {'status': 'UNTRUSTED', 'reasons': [reason], 'repo_root': None,
             'base_sha': None, 'head_sha': None, 'entries': [],
-            'binary_paths': set(), 'whitespace_only': False}
+            'binary_paths': set(), 'ignored_paths': [], 'snapshot': None,
+            'diff_sha256': None}
+
+
+def _parse_status(data):
+    """Return ``(dirty, ignored_paths)`` from ``git status --porcelain -z``."""
+    dirty = False
+    ignored = []
+    for record in data.split(b'\0'):
+        if not record:
+            continue
+        if record.startswith(b'!! '):
+            ignored.append(_safe_git_path(os.fsdecode(record[3:])))
+        else:
+            dirty = True
+    return dirty, ignored
+
+
+def _hidden_index_flags(data):
+    """List paths whose index entry hides worktree changes from ``status``."""
+    flagged = []
+    for record in data.split(b'\0'):
+        if not record:
+            continue
+        if len(record) < 3 or record[1:2] != b' ':
+            raise GitEvidenceError('unreadable index flag record')
+        flag = record[:1]
+        path = _safe_git_path(os.fsdecode(record[2:]))
+        if flag != b'H':
+            flagged.append(path)
+    return flagged
+
+
+def _snapshot_digest(head_sha, base_sha, status, index, raw, numstat, ignored):
+    digest = hashlib.sha256()
+    for item in (head_sha.encode('ascii'), base_sha.encode('ascii'),
+                 status, index, raw, numstat,
+                 '\0'.join(ignored).encode('utf-8', 'surrogateescape')):
+        digest.update(item)
+        digest.update(b'\0')
+    return digest.hexdigest()
+
+
+def _diff_digest(repo_root, base_sha, head_sha):
+    completed = _run_git(repo_root, [
+        'diff', '--binary', '--full-index', '--no-ext-diff', '--no-textconv',
+        base_sha, head_sha])
+    if completed.returncode != 0:
+        raise GitEvidenceError('cannot read the full diff digest')
+    return hashlib.sha256(completed.stdout).hexdigest()
 
 
 def _parse_raw_diff(data):
@@ -429,10 +533,13 @@ def _parse_numstat_binary(data):
     return binary
 
 
-def _git_evidence_state(proposal, repo_root, required_head_sha=None):
+def _git_evidence_state(proposal, repo_root, required_base_sha=None,
+                        required_head_sha=None):
     evidence = proposal.get('git_evidence')
     if evidence is None:
-        return _missing_evidence('no git_evidence supplied')
+        if required_base_sha is None or required_head_sha is None:
+            return _missing_evidence('no trusted task baseline/head supplied')
+        evidence = {'base_sha': required_base_sha, 'head_sha': required_head_sha}
     if not isinstance(evidence, dict):
         return _untrusted_evidence('git_evidence must be a mapping')
     base_sha = evidence.get('base_sha')
@@ -445,6 +552,14 @@ def _git_evidence_state(proposal, repo_root, required_head_sha=None):
         return _untrusted_evidence('git_evidence SHAs must be 40-character hex values')
     if base_sha == head_sha:
         return _untrusted_evidence('git_evidence base_sha and head_sha must differ')
+    if required_base_sha is not None:
+        expected_base = str(required_base_sha).strip().lower()
+        if not _SHA_RE.match(expected_base):
+            return _untrusted_evidence(
+                'task carrier base_sha is not a 40-character hex value')
+        if base_sha != expected_base:
+            return _untrusted_evidence(
+                'git_evidence.base_sha does not match the task carrier base_sha')
     if required_head_sha is not None:
         expected = str(required_head_sha).strip().lower()
         if not _SHA_RE.match(expected):
@@ -483,12 +598,30 @@ def _git_evidence_state(proposal, repo_root, required_head_sha=None):
         if _git_text(current.stdout).lower() != head_sha:
             raise GitEvidenceError(
                 'checked-out HEAD does not match git_evidence.head_sha')
-        status = git(['status', '--porcelain=v1', '-z', '--untracked-files=all'])
+        status = git(['status', '--porcelain=v1', '-z',
+                      '--untracked-files=all', '--ignored=matching'])
         if status.returncode != 0:
             raise GitEvidenceError('cannot read worktree status')
-        if status.stdout:
+        dirty, ignored_paths = _parse_status(status.stdout)
+        if dirty:
             raise GitEvidenceError(
                 'working tree has uncommitted or untracked changes')
+        allowed = [_canonical_allowed_path(item)
+                   for item in proposal.get('allowed_paths') or []]
+        overlapping = [path for path in ignored_paths
+                       if any(_paths_overlap(path, item) for item in allowed)]
+        if overlapping:
+            raise GitEvidenceError(
+                'ignored worktree paths overlap allowed_paths: '
+                + ', '.join(overlapping[:5]))
+        index = git(['ls-files', '-v', '-z'])
+        if index.returncode != 0:
+            raise GitEvidenceError('cannot read index flags')
+        flagged = _hidden_index_flags(index.stdout)
+        if flagged:
+            raise GitEvidenceError(
+                'index has assume-unchanged or skip-worktree entries: '
+                + ', '.join(flagged[:5]))
         raw = git(['diff', '--raw', '-z', '--find-renames', '--find-copies',
                    '--no-ext-diff', '--no-textconv', base_sha, head_sha])
         if raw.returncode != 0:
@@ -497,16 +630,17 @@ def _git_evidence_state(proposal, repo_root, required_head_sha=None):
                        '--no-ext-diff', '--no-textconv', base_sha, head_sha])
         if numstat.returncode != 0:
             raise GitEvidenceError('cannot read numstat')
-        whitespace = git(['diff', '--quiet', '--ignore-all-space',
-                          '--ignore-blank-lines', base_sha, head_sha])
-        if whitespace.returncode not in (0, 1):
-            raise GitEvidenceError('cannot test whitespace-only change')
+        entries = _parse_raw_diff(raw.stdout)
+        binary_paths = _parse_numstat_binary(numstat.stdout)
+        snapshot = _snapshot_digest(
+            head_sha, base_sha, status.stdout, index.stdout, raw.stdout,
+            numstat.stdout, ignored_paths)
         return {
             'status': 'PRESENT', 'reasons': [], 'repo_root': repo,
             'base_sha': base_sha, 'head_sha': head_sha,
-            'entries': _parse_raw_diff(raw.stdout),
-            'binary_paths': _parse_numstat_binary(numstat.stdout),
-            'whitespace_only': whitespace.returncode == 0,
+            'entries': entries, 'binary_paths': binary_paths,
+            'ignored_paths': ignored_paths, 'snapshot': snapshot,
+            'diff_sha256': _diff_digest(repo, base_sha, head_sha),
         }
     except GitEvidenceError as exc:
         return _untrusted_evidence(str(exc))
@@ -540,18 +674,44 @@ def _changed_paths(evidence):
     return sorted(paths)
 
 
-def _classify_git_evidence(proposal, evidence):
-    high = []
-    unresolved = []
-    low = []
-    decision_id = None
+def _lesson_scope_text(lesson):
+    lesson = lesson or {}
+    observation = lesson.get('observation') or {}
+    applicability = lesson.get('applicability') or {}
+    suggested = lesson.get('suggested_action') or {}
+    return ' '.join([
+        str(lesson.get('title') or ''),
+        str(observation.get('root_cause') or ''),
+        str(observation.get('impact') or ''),
+        str(suggested.get('summary') or ''),
+        ' '.join(applicability.get('applies_to') or []),
+    ])
+
+
+def _scope_leads(proposal, lesson):
+    text = (_lesson_scope_text(lesson) + ' '
+            + str(proposal.get('goal') or '')).casefold()
+    keyword_hits = [keyword for keyword in SCOPE_KEYWORDS
+                    if keyword.casefold() in text]
+    high_paths = []
+    for path in proposal.get('allowed_paths') or []:
+        normalized = _canonical_allowed_path(path)
+        if (_is_protected_path(normalized) or _is_security_path(normalized)
+                or _is_schema_path(normalized)):
+            high_paths.append(normalized)
+    return keyword_hits, high_paths
+
+
+def _classify_git_evidence(proposal, lesson, evidence):
+    result = {'high': [], 'content': [], 'authority': [], 'structural': [],
+              'scope': [], 'low': [], 'decision_id': None}
     allowed = [_canonical_allowed_path(path)
                for path in proposal.get('allowed_paths') or []]
 
     for path in _changed_paths(evidence):
         if not any(_path_at_or_below(path, prefix) for prefix in allowed):
             _append_unique(
-                unresolved,
+                result['structural'],
                 f'diff changes a path outside allowed_paths: {path}')
 
     for entry in evidence['entries']:
@@ -559,47 +719,47 @@ def _classify_git_evidence(proposal, evidence):
         path = entry['new_path']
         if code in ('R', 'C', 'T'):
             _append_unique(
-                unresolved,
+                result['structural'],
                 f'rename/copy/type change cannot be proven text-only: {path}')
             continue
         if code == 'D':
             _append_unique(
-                unresolved,
+                result['structural'],
                 f'deletion cannot be proven safe: {path}')
             continue
         if entry['old_mode'] in _SPECIAL_MODES or entry['new_mode'] in _SPECIAL_MODES:
             _append_unique(
-                unresolved,
+                result['structural'],
                 f'symlink or submodule change cannot be proven safe: {path}')
             continue
         modes_changed = entry['old_mode'] != entry['new_mode']
         if modes_changed and _EXECUTABLE_MODE in (entry['old_mode'], entry['new_mode']):
             _append_unique(
-                high,
+                result['high'],
                 f'file mode/permission change: {path}')
-            decision_id = decision_id or DECISION_HIGH_RISK
+            result['decision_id'] = result['decision_id'] or DECISION_HIGH_RISK
             continue
         if (modes_changed and '000000' not in (entry['old_mode'], entry['new_mode'])):
             _append_unique(
-                high,
+                result['high'],
                 f'file mode change: {path}')
-            decision_id = decision_id or DECISION_HIGH_RISK
+            result['decision_id'] = result['decision_id'] or DECISION_HIGH_RISK
             continue
         if _is_protected_path(path):
             _append_unique(
-                high,
+                result['high'],
                 f'protected execution/release surface change: {path}')
-            decision_id = decision_id or DECISION_HIGH_RISK
+            result['decision_id'] = result['decision_id'] or DECISION_HIGH_RISK
             continue
         if _is_schema_path(path):
             _append_unique(
-                high,
+                result['high'],
                 f'contract/schema change: {path}')
-            decision_id = decision_id or DECISION_CONTRACT
+            result['decision_id'] = result['decision_id'] or DECISION_CONTRACT
             continue
         if path in evidence['binary_paths']:
             _append_unique(
-                unresolved,
+                result['structural'],
                 f'binary change cannot be proven text-only: {path}')
             continue
         changed = _diff_lines_for_path(evidence, path)
@@ -609,54 +769,141 @@ def _classify_git_evidence(proposal, evidence):
         if _is_authority_path(path):
             if security_change or irreversible:
                 _append_unique(
-                    high,
+                    result['high'],
                     f'authority surface permission/security change: {path}')
-                decision_id = decision_id or DECISION_HIGH_RISK
+                result['decision_id'] = result['decision_id'] or DECISION_HIGH_RISK
             else:
                 _append_unique(
-                    unresolved,
-                    f'authority surface change needs authoritative review: {path}')
+                    result['authority'],
+                    f'authority surface change needs Master review: {path}')
         elif documentation:
-            if evidence['whitespace_only']:
-                _append_unique(
-                    low,
-                    f'whitespace-only documentation change: {path}')
-            else:
-                _append_unique(
-                    unresolved,
-                    f'documentation change cannot be proven semantic-neutral: {path}')
+            _append_unique(
+                result['content'],
+                f'documentation change needs review: {path}')
         elif irreversible:
             _append_unique(
-                high,
+                result['high'],
                 f'irreversible operation in the real diff: {path}')
-            decision_id = decision_id or DECISION_HIGH_RISK
+            result['decision_id'] = result['decision_id'] or DECISION_HIGH_RISK
         elif security_change:
             _append_unique(
-                high,
+                result['high'],
                 f'permission/security-looking code change: {path}')
-            decision_id = decision_id or DECISION_HIGH_RISK
+            result['decision_id'] = result['decision_id'] or DECISION_HIGH_RISK
         elif _is_security_path(path):
             _append_unique(
-                unresolved,
+                result['content'],
                 f'security-sensitive code change needs review: {path}')
         else:
             _append_unique(
-                unresolved,
-                f'code change cannot be proven semantic-neutral: {path}')
+                result['content'],
+                f'code change needs review: {path}')
+
+    keyword_hits, high_paths = _scope_leads(proposal, lesson)
+    if high_paths and keyword_hits:
+        _append_unique(
+            result['high'],
+            'task scope requests a high-risk change not proven by the current '
+            'diff: ' + ', '.join(sorted(set(keyword_hits + high_paths))))
+        result['decision_id'] = result['decision_id'] or DECISION_HIGH_RISK
+    elif high_paths:
+        _append_unique(
+            result['scope'],
+            'task scope touches a high-risk path not proven by the current '
+            'diff: ' + ', '.join(sorted(set(high_paths))))
+    elif keyword_hits:
+        _append_unique(
+            result['content'],
+            'task wording mentions a high-risk area; review the actual diff: '
+            + ', '.join(sorted(set(keyword_hits))))
 
     if not evidence['entries']:
-        low.append('no changed paths in the verified commit range')
-    return high, unresolved, low, decision_id
+        result['low'].append('no changed paths in the verified commit range')
+    return result
 
 
-def assess_risk_details(proposal, lesson, repo_root=None, required_head_sha=None):
+def _parse_time(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed
+
+
+def _review_receipt(trusted_task, evidence, *, requires_master=False):
+    """Validate a review receipt from the trusted task carrier.
+
+    The receipt is accepted only from the carrier state, never from the spec.
+    It must bind the task, exact head, complete diff digest and changed-path
+    scope; it must name an independent reviewer and must not be expired/revoked.
+    """
+    if not isinstance(trusted_task, dict):
+        return False, ['no trusted task carrier record was supplied']
+    if (trusted_task.get('base_sha') != evidence['base_sha']
+            or trusted_task.get('head_sha') != evidence['head_sha']):
+        return False, ['task carrier base/head do not match the verified range']
+    review = trusted_task.get('review')
+    if not isinstance(review, dict):
+        return False, ['no trusted independent review receipt in the task carrier']
+    if review.get('decision') != 'APPROVED':
+        return False, ['review decision is not APPROVED']
+    reviewer = review.get('reviewer')
+    if not isinstance(reviewer, str) or not reviewer.strip():
+        return False, ['review receipt has no reviewer identity']
+    executor = trusted_task.get('executor')
+    if isinstance(executor, str) and executor.strip() == reviewer.strip():
+        return False, ['reviewer and executor are the same identity']
+    role = review.get('role')
+    allowed_roles = ('master', 'owner') if requires_master else ('reviewer', 'master', 'owner')
+    if role not in allowed_roles:
+        return False, [f'review role {role!r} is not allowed for this surface']
+    if review.get('revoked'):
+        return False, ['review receipt is revoked']
+    if review.get('head_sha') != evidence['head_sha']:
+        return False, ['review receipt head_sha does not match the verified head']
+    if review.get('diff_sha256') != evidence['diff_sha256']:
+        return False, ['review receipt does not match the complete diff digest']
+    reviewed_at = _parse_time(review.get('reviewed_at'))
+    if reviewed_at is None:
+        return False, ['review receipt reviewed_at is missing or invalid']
+    expires_at = review.get('expires_at')
+    if expires_at is not None:
+        expiry = _parse_time(expires_at)
+        if expiry is None:
+            return False, ['review receipt expires_at is invalid']
+        if expiry < datetime.datetime.now(datetime.timezone.utc):
+            return False, ['review receipt has expired']
+    task_id = trusted_task.get('task_id')
+    if review.get('task_id') not in (None, task_id):
+        return False, ['review receipt task_id does not match the task']
+    scope = review.get('scope')
+    if isinstance(scope, str):
+        scope = [scope]
+    if not isinstance(scope, (list, tuple)) or not scope:
+        return False, ['review receipt has no path scope']
+    canonical_scope = [_canonical_allowed_path(item) for item in scope]
+    for path in _changed_paths(evidence):
+        if not any(_path_at_or_below(path, item) for item in canonical_scope):
+            return False, [f'review scope does not cover changed path: {path}']
+    return True, []
+
+
+def assess_risk_details(proposal, lesson, trusted_task=None, repo_root=None,
+                        required_base_sha=None, required_head_sha=None):
     """Assess one proposal using *real Git evidence*, not caller text.
 
-    ``LOW`` is returned only for a verified commit range whose changed paths are
-    all non-authority documentation and whose diff is whitespace-only. Every
-    other content change is ``NEEDS_EVIDENCE`` or ``HIGH``; a missing, forged or
-    incomplete Git claim stays ``NEEDS_EVIDENCE``. Keywords, path names, caller
-    diffs and caller authorization never decide.
+    ``LOW`` is returned only for a verified commit range with no changed paths.
+    Every content change is ``NEEDS_EVIDENCE``, ``HIGH`` or unlockable only by a
+    trusted independent review receipt; a missing, forged or incomplete Git
+    claim stays ``NEEDS_EVIDENCE``. Whitespace equivalence is not semantic
+    safety, and caller diffs or caller authorization never decide.
     """
     proposal = proposal or {}
     path_errors = _path_policy_errors(proposal.get('allowed_paths'))
@@ -669,9 +916,13 @@ def assess_risk_details(proposal, lesson, repo_root=None, required_head_sha=None
                 'backslashes, wildcards or any .. segment'],
             'limitations': [],
             'evidence_status': 'MISSING', 'changed_paths': [],
+            'snapshot': None, 'diff_sha256': None,
+            'git_base_sha': None, 'git_head_sha': None,
+            'review_status': 'NOT_APPLICABLE',
         }
 
     evidence = _git_evidence_state(proposal, repo_root,
+                                   required_base_sha=required_base_sha,
                                    required_head_sha=required_head_sha)
     base_limitations = []
     if proposal.get('authorization') is not None:
@@ -689,61 +940,115 @@ def assess_risk_details(proposal, lesson, repo_root=None, required_head_sha=None
                 'repository; a diff or SHA supplied by the caller is not proof'],
             'limitations': base_limitations,
             'evidence_status': evidence['status'], 'changed_paths': [],
+            'snapshot': evidence['snapshot'],
+            'diff_sha256': evidence['diff_sha256'],
+            'git_base_sha': evidence['base_sha'],
+            'git_head_sha': evidence['head_sha'],
+            'review_status': 'NOT_APPLICABLE',
         }
 
-    high, unresolved, low, decision_id = _classify_git_evidence(proposal, evidence)
+    result = _classify_git_evidence(proposal, lesson, evidence)
     limitations = base_limitations + [
         'Git evidence proves the checked-out commit range and a clean worktree '
         'at assessment time; it does not cover later edits or another carrier',
-        'auto-LOW covers only whitespace-only changes in non-authority '
-        'documentation; code, authority surfaces, binary, rename/copy/type, '
-        'symlink, submodule, deletion and worktree state are outside that proof']
-    if high:
-        return {
-            'level': RISK_HIGH,
-            'decision_id': decision_id or DECISION_HIGH_RISK,
-            'reasons': high, 'leads': high,
-            'required_evidence': [], 'limitations': limitations,
-            'evidence_status': 'PRESENT',
-            'changed_paths': _changed_paths(evidence),
-        }
-    if unresolved:
+        'no content change is auto-LOW: documentation, code, authority '
+        'surfaces, binary, rename/copy/type, symlink, submodule, deletion and '
+        'worktree state all need a trusted review or remain blocked']
+    if evidence.get('ignored_paths'):
+        limitations.append(
+            'ignored worktree paths outside allowed_paths were observed: '
+            + ', '.join(evidence['ignored_paths'][:10]))
+    common = {
+        'evidence_status': 'PRESENT',
+        'changed_paths': _changed_paths(evidence),
+        'snapshot': evidence['snapshot'],
+        'diff_sha256': evidence['diff_sha256'],
+        'git_base_sha': evidence['base_sha'],
+        'git_head_sha': evidence['head_sha'],
+        'limitations': limitations,
+    }
+    if result['high']:
+        return {'level': RISK_HIGH,
+                'decision_id': result['decision_id'] or DECISION_HIGH_RISK,
+                'reasons': result['high'], 'leads': result['high'],
+                'required_evidence': [], 'review_status': 'NOT_APPLICABLE',
+                **common}
+    blocking = result['structural'] + result['scope']
+    if blocking:
         required = []
-        if any('outside allowed_paths' in reason for reason in unresolved):
+        if any('outside allowed_paths' in reason for reason in blocking):
             required.append(
                 'amend allowed_paths through a scope decision or remove the '
                 'out-of-scope change')
-        if any('authority surface' in reason for reason in unresolved):
+        if any('task scope' in reason for reason in blocking):
             required.append(
-                'attach the authoritative task-carrier decision (Master/Owner) '
-                'for the authority surface; caller-supplied authorization is '
-                'not accepted')
+                'separate the high-risk scope into an independently reviewed '
+                'task; the current diff does not cover it')
         if not required:
             required.append(
-                'investigate the real Git diff and record why it does not '
-                'change permissions, security, locks, state, data, or '
-                'compatibility')
-        return {
-            'level': RISK_NEEDS_EVIDENCE, 'decision_id': None,
-            'reasons': unresolved, 'leads': unresolved,
-            'required_evidence': required, 'limitations': limitations,
-            'evidence_status': 'PRESENT',
-            'changed_paths': _changed_paths(evidence),
-        }
-    return {
-        'level': RISK_LOW, 'decision_id': None, 'reasons': low, 'leads': low,
-        'required_evidence': [], 'limitations': limitations,
-        'evidence_status': 'PRESENT',
-        'changed_paths': _changed_paths(evidence),
-    }
+                'resolve the structural Git evidence gap before planning')
+        return {'level': RISK_NEEDS_EVIDENCE, 'decision_id': None,
+                'reasons': blocking, 'leads': blocking,
+                'required_evidence': required, 'review_status': 'NOT_APPLICABLE',
+                **common}
+    reviewable = result['content'] + result['authority']
+    if reviewable:
+        valid, why = _review_receipt(
+            trusted_task, evidence, requires_master=bool(result['authority']))
+        if valid:
+            return {'level': RISK_LOW, 'decision_id': None,
+                    'reasons': ['trusted independent review accepted for the '
+                                'complete diff and exact head'],
+                    'leads': reviewable,
+                    'required_evidence': [], 'review_status': 'APPROVED',
+                    **common}
+        required = [
+            'attach a trusted review receipt from the task carrier with '
+            'reviewer identity, role, task id, base/head, complete diff digest, '
+            'path scope, reviewed_at and optional expiry'
+        ]
+        if result['authority']:
+            required.append(
+                'authority surfaces require a Master/Owner review receipt; '
+                'caller-supplied authorization is not accepted')
+        return {'level': RISK_NEEDS_EVIDENCE, 'decision_id': None,
+                'reasons': reviewable + why, 'leads': reviewable,
+                'required_evidence': required, 'review_status': 'MISSING',
+                **common}
+    return {'level': RISK_LOW, 'decision_id': None, 'reasons': result['low'],
+            'leads': result['low'],
+            'required_evidence': [], 'review_status': 'NOT_NEEDED',
+            **common}
 
 
-def assess_risk(proposal, lesson, repo_root=None, required_head_sha=None):
+def git_diff_digest(repo_root, base_sha, head_sha):
+    """Return the SHA-256 of the complete Git diff for a review receipt."""
+    return _diff_digest(repo_root, base_sha, head_sha)
+
+
+def recheck_git_evidence(proposal, repo_root=None, required_base_sha=None,
+                         required_head_sha=None):
+    """Re-read Git immediately before registration and compare the snapshot."""
+    state = _git_evidence_state(
+        proposal, repo_root, required_base_sha=required_base_sha,
+        required_head_sha=required_head_sha)
+    if state['status'] != 'PRESENT':
+        return False, list(state['reasons'])
+    expected = proposal.get('git_snapshot')
+    if expected and state['snapshot'] != expected:
+        return False, ['worktree or index changed between planning and registration']
+    return True, []
+
+
+def assess_risk(proposal, lesson, trusted_task=None, repo_root=None,
+                required_base_sha=None, required_head_sha=None):
     """Return ``(level, decision_id, reasons)`` for one proposal.
 
     Backwards-compatible tuple view of :func:`assess_risk_details`.
     """
-    details = assess_risk_details(proposal, lesson, repo_root=repo_root,
+    details = assess_risk_details(proposal, lesson, trusted_task=trusted_task,
+                                  repo_root=repo_root,
+                                  required_base_sha=required_base_sha,
                                   required_head_sha=required_head_sha)
     return details['level'], details['decision_id'], details['reasons']
 
@@ -930,7 +1235,8 @@ def _proposal_from_spec(lesson, spec, edition):
 
 
 def build_proposal(lesson, spec, *, edition, dependency_state=None, coverage=None,
-                   existing_task=None, repo_root=None, required_head_sha=None):
+                   existing_task=None, trusted_task=None, repo_root=None,
+                   required_base_sha=None, required_head_sha=None):
     """Turn one lesson + one explicit spec into a gated proposal.
 
     Status order is deliberate: illegal paths are rejected first, then an
@@ -993,7 +1299,9 @@ def build_proposal(lesson, spec, *, edition, dependency_state=None, coverage=Non
     # is never hidden behind "the packet is incomplete". Missing or untrusted
     # Git evidence is a BLOCKED proposal with a concrete next step, not an owner
     # question.
-    risk = assess_risk_details(proposal, lesson, repo_root=repo_root,
+    risk = assess_risk_details(proposal, lesson, trusted_task=trusted_task,
+                               repo_root=repo_root,
+                               required_base_sha=required_base_sha,
                                required_head_sha=required_head_sha)
     level = risk['level']
     proposal['risk_level'] = level
@@ -1003,6 +1311,11 @@ def build_proposal(lesson, spec, *, edition, dependency_state=None, coverage=Non
     proposal['risk_limitations'] = risk['limitations']
     proposal['git_evidence_status'] = risk['evidence_status']
     proposal['changed_paths'] = risk['changed_paths']
+    proposal['git_snapshot'] = risk['snapshot']
+    proposal['diff_sha256'] = risk['diff_sha256']
+    proposal['git_base_sha'] = risk.get('git_base_sha')
+    proposal['git_head_sha'] = risk.get('git_head_sha')
+    proposal['review_status'] = risk.get('review_status', 'NOT_APPLICABLE')
     if level == RISK_HIGH:
         proposal['status'] = 'NEEDS_HUMAN_DECISION'
         proposal['status_reason'] = 'high-risk change: ' + '; '.join(risk['reasons'])
@@ -1038,8 +1351,8 @@ def build_proposal(lesson, spec, *, edition, dependency_state=None, coverage=Non
 
 
 def plan_tasks(*, lesson_records, specs=None, edition, dependency_state=None,
-               coverage=None, existing_tasks=None, repo_root=None,
-               required_head_sha=None):
+               coverage=None, existing_tasks=None, trusted_task=None,
+               repo_root=None, required_base_sha=None, required_head_sha=None):
     """Gate every lesson through :func:`build_proposal`."""
     specs = specs or {}
     existing_tasks = existing_tasks or {}
@@ -1050,7 +1363,9 @@ def plan_tasks(*, lesson_records, specs=None, edition, dependency_state=None,
             lesson, specs.get(lesson_id), edition=edition,
             dependency_state=dependency_state, coverage=coverage,
             existing_task=existing_tasks.get(lesson_id),
-            repo_root=repo_root, required_head_sha=required_head_sha))
+            trusted_task=trusted_task, repo_root=repo_root,
+            required_base_sha=required_base_sha,
+            required_head_sha=required_head_sha))
     return PlanResult(proposals)
 
 
@@ -1098,6 +1413,12 @@ def render_local_task_packet(proposal):
                  'evidence_urls') or []) or '(none)'),
              '- **Allowed paths:** ' + (', '.join(proposal.get('allowed_paths') or [])
                                         or '(missing)'),
+             '- **Git base SHA:** ' + (proposal.get('git_base_sha') or '(missing)'),
+             '- **Git head SHA:** ' + (proposal.get('git_head_sha') or '(missing)'),
+             '- **Git diff SHA-256:** ' + (proposal.get('diff_sha256') or '(missing)'),
+             '- **Changed paths:** ' + (', '.join(proposal.get('changed_paths') or [])
+                                        or '(none)'),
+             '- **Review status:** ' + str(proposal.get('review_status') or 'NOT_APPLICABLE'),
              '- **Forbidden paths:** ' + (', '.join(proposal.get('forbidden_paths') or [])
                                           or '(missing)'),
              '- **declared_resources:** ' + (', '.join(
@@ -1132,6 +1453,13 @@ def render_github_issue_body(proposal):
              f"- Lesson: `{proposal.get('lesson_id')}`",
              '- Evidence: ' + (' '.join(f'<{url}>' for url in proposal.get(
                  'evidence_urls') or []) or '(none)'), '',
+             '## 风险证据', '',
+             f"- Git base SHA: `{proposal.get('git_base_sha') or '(missing)'}`",
+             f"- Git head SHA: `{proposal.get('git_head_sha') or '(missing)'}`",
+             f"- Git diff SHA-256: `{proposal.get('diff_sha256') or '(missing)'}`",
+             '- Changed paths: ' + (', '.join(
+                 f'`{path}`' for path in proposal.get('changed_paths') or []) or '(none)'),
+             f"- Review status: `{proposal.get('review_status') or 'NOT_APPLICABLE'}`", '',
              '## 验收标准', '']
     lines.extend(_render_acceptance(proposal.get('acceptance_criteria')))
     lines.extend(['', FIELD_REFERENCE, '',

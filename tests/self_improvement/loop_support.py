@@ -13,7 +13,7 @@ import tempfile
 from pathlib import Path
 
 from . import support
-from agentorch_self_improvement import lessons, orchestration
+from agentorch_self_improvement import lessons, orchestration, planning
 
 NOW = support.T2
 PR_URL = 'https://github.com/ctrlshiftaltdel/TalkDND/pull/12'
@@ -93,6 +93,23 @@ HEAD = DEFAULT_HEAD_SHA
 atexit.register(_DEFAULT_REPO.close)
 
 
+def review_receipt(repo_root, base_sha, head_sha, scope, *,
+                   reviewer='reviewer-2', role='reviewer'):
+    return {
+        'decision': 'APPROVED',
+        'reviewer': reviewer,
+        'role': role,
+        'reviewed_at': support.T2,
+        'head_sha': head_sha,
+        'diff_sha256': planning.git_diff_digest(repo_root, base_sha, head_sha),
+        'scope': list(scope),
+    }
+
+
+DEFAULT_REVIEW = review_receipt(
+    DEFAULT_REPO_ROOT, DEFAULT_BASE_SHA, DEFAULT_HEAD_SHA, ['docs/example.md'])
+
+
 def general_lesson(**overrides):
     """A lesson that is allowed to become a task: GENERAL_LESSON + GENERALIZED."""
     payload = {
@@ -164,7 +181,15 @@ def state(edition='local', **overrides):
     payload = {
         'edition': edition,
         'branch': 'task/50-self-improvement-loop',
+        'base_sha': DEFAULT_BASE_SHA,
         'head_sha': HEAD,
+        'task': {
+            'task_id': 'TASK-0001',
+            'base_sha': DEFAULT_BASE_SHA,
+            'head_sha': HEAD,
+            'executor': 'executor-1',
+            'review': DEFAULT_REVIEW,
+        },
         'workspace': {'status_short': [], 'clean': True},
         'active_tasks': [],
         'open_pull_requests': [],

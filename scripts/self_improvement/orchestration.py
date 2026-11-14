@@ -59,11 +59,12 @@ LIMITATIONS = (
     'never used to change allowed paths or acceptance criteria.',
     'This loop does not create Issues or tasks, run validation commands, approve, merge, '
     'or close anything; the carriers here are dry-run records.',
-    'Risk uses the repository’s own Git evidence, not caller-supplied diffs, SHA strings or '
-    'authorization fields; the evidence head must also match the task carrier head. Evidenced '
-    'permission/security changes end in NEEDS_HUMAN_DECISION; missing, forged or incomplete '
-    'evidence stays BLOCKED with required evidence. An owner decision is re-planned as a '
-    'normal task, not auto-unlocked by a flag.',
+    'Risk uses the repository’s own Git evidence and the task carrier base/head, not '
+    'caller-supplied diffs, SHA strings, review or authorization fields. Replace refs and '
+    'diff-hiding config are disabled, hidden index flags / ignored allowed paths / stale '
+    'snapshots block, and no non-empty content change is auto-LOW. A trusted review receipt '
+    'from the task carrier may continue a blocked content change; evidenced permission or '
+    'security changes still end in NEEDS_HUMAN_DECISION.',
 )
 
 
@@ -201,14 +202,22 @@ def restore_state(state, *, edition):
     head_sha = state.get('head_sha')
     if not isinstance(head_sha, str) or not SHA_RE.match(head_sha):
         errors.append('state.head_sha must be the full 40-character commit SHA')
+    base_sha = state.get('base_sha')
+    if not isinstance(base_sha, str) or not SHA_RE.match(base_sha):
+        errors.append('state.base_sha must be the full 40-character task baseline SHA')
     branch = state.get('branch')
     if not isinstance(branch, str) or not branch.strip():
         errors.append('state.branch is missing')
+    task = state.get('task')
+    if task is not None and not isinstance(task, dict):
+        errors.append('state.task must be the trusted task-carrier record')
     workspace = state.get('workspace') or {}
     normalized = {
         'edition': declared,
         'branch': branch,
+        'base_sha': base_sha,
         'head_sha': head_sha,
+        'task': task,
         'workspace_clean': workspace.get('clean'),
         'workspace_status': list(workspace.get('status_short') or []),
         'active_tasks': list(state.get('active_tasks') or []),
@@ -417,6 +426,8 @@ def run_loop(*, request_text, edition, state, carrier=None, scan_report=None,
         lesson_records=list(lesson_records), specs=specs or {}, edition=edition,
         dependency_state=dependency_state or {}, coverage=coverage or {},
         existing_tasks=existing_tasks or {}, repo_root=repo_root,
+        trusted_task=normalized_state.get('task'),
+        required_base_sha=normalized_state['base_sha'],
         required_head_sha=normalized_state['head_sha'])
     report['plan'] = plan.as_dict()
 
@@ -433,6 +444,16 @@ def run_loop(*, request_text, edition, state, carrier=None, scan_report=None,
                 'lesson_id'), 'reason': proposal.get('status_reason')})
 
     for proposal in plan.ready:
+        stable, why = planning.recheck_git_evidence(
+            proposal, repo_root=repo_root,
+            required_base_sha=normalized_state['base_sha'],
+            required_head_sha=normalized_state['head_sha'])
+        if not stable:
+            report['blocked'].append({
+                'kind': 'git_recheck', 'lesson_id': proposal.get('lesson_id'),
+                'reason': 'Git evidence changed or could not be re-verified '
+                          'before registration: ' + '; '.join(why)})
+            continue
         try:
             registration = register(proposal)
         except CarrierError as exc:

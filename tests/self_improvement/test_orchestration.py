@@ -8,9 +8,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from . import loop_support, support
-from agentorch_self_improvement import lessons, orchestration, pipeline, sources  # noqa: E402
+from agentorch_self_improvement import lessons, orchestration, pipeline, planning, sources  # noqa: E402
 
 
 def run_loop(**overrides):
@@ -121,7 +122,10 @@ class GateTests(unittest.TestCase):
         outcome = run_loop(
             carrier=carrier, lesson_records=[record],
             specs={record['lesson_id']: spec}, repo_root=repo.root,
-            state=loop_support.state(head_sha=repo.head()),
+            state=loop_support.state(
+                base_sha=base, head_sha=head,
+                task={'task_id': 'TASK-RISK', 'base_sha': base,
+                      'head_sha': head, 'executor': 'executor-1'}),
             scan_report=loop_support.scan_report(
                 ingestions=[loop_support.created(record['lesson_id'])]))
         self.assertEqual(outcome.status, 'NEEDS_HUMAN_DECISION')
@@ -129,6 +133,42 @@ class GateTests(unittest.TestCase):
         self.assertEqual(carrier.calls, [])
         decisions = outcome.report['decisions_required']
         self.assertTrue(any(item.get('decision_id') == 'HD-05' for item in decisions))
+
+    def test_safe_docs_diff_does_not_register_a_high_risk_scope(self):
+        repo = loop_support.GitRepo()
+        self.addCleanup(repo.close)
+        base = repo.commit({'docs/readme.md': 'old line\n'}, message='base')
+        head = repo.commit({'docs/readme.md': 'old line  \n'}, message='head')
+        spec = loop_support.spec(
+            goal='修改任务状态机以允许跳过审查。',
+            allowed_paths=['docs/', 'scripts/orchestrator.py'],
+            git_evidence=loop_support.git_evidence(base, head))
+        task = {'task_id': 'TASK-SCOPE', 'base_sha': base, 'head_sha': head,
+                'executor': 'executor-1'}
+        carrier = loop_support.RecordingCarrier()
+        outcome = run_loop(
+            carrier=carrier, repo_root=repo.root,
+            state=loop_support.state(base_sha=base, head_sha=head, task=task),
+            lesson_records=[loop_support.general_lesson()],
+            specs={'LSN-TALKDND-001': spec},
+            scan_report=loop_support.scan_report(
+                ingestions=[loop_support.created('LSN-TALKDND-001')]))
+        self.assertEqual(outcome.status, 'NEEDS_HUMAN_DECISION')
+        self.assertEqual(outcome.report['registrations'], [])
+        self.assertEqual(carrier.calls, [])
+        self.assertTrue(any(item.get('decision_id') == 'HD-05'
+                            for item in outcome.report['decisions_required']))
+
+    def test_registration_rechecks_git_evidence(self):
+        carrier = loop_support.RecordingCarrier()
+        with mock.patch.object(planning, 'recheck_git_evidence',
+                               return_value=(False, ['worktree changed'])):
+            outcome = run_loop(carrier=carrier, **ready_case())
+        self.assertEqual(outcome.status, 'BLOCKED')
+        self.assertEqual(outcome.report['registrations'], [])
+        self.assertEqual(carrier.calls, [])
+        self.assertTrue(any(item.get('kind') == 'git_recheck'
+                            for item in outcome.report['blocked']))
 
     def test_incomplete_packet_blocks_the_loop(self):
         record = loop_support.general_lesson()
@@ -211,7 +251,10 @@ class CarrierParityTests(unittest.TestCase):
                 carrier = orchestration.carrier_for(edition)
                 outcome = run_loop(
                     edition=edition, carrier=carrier, repo_root=repo.root,
-                    state=loop_support.state(edition, head_sha=repo.head()),
+                    state=loop_support.state(
+                        edition, base_sha=base, head_sha=head,
+                        task={'task_id': 'TASK-RISK', 'base_sha': base,
+                              'head_sha': head, 'executor': 'executor-1'}),
                     lesson_records=[record], specs={record['lesson_id']: spec},
                     scan_report=loop_support.scan_report(
                         ingestions=[loop_support.created(record['lesson_id'])]))
@@ -219,6 +262,35 @@ class CarrierParityTests(unittest.TestCase):
                 self.assertEqual(outcome.report['registrations'], [])
                 self.assertTrue(any(item.get('decision_id') == 'HD-05'
                                     for item in outcome.report['decisions_required']))
+
+    def test_trusted_review_unlocks_a_docs_typo_for_both_editions(self):
+        for edition in ('local', 'github'):
+            with self.subTest(edition=edition):
+                repo = loop_support.GitRepo()
+                self.addCleanup(repo.close)
+                base = repo.commit({'docs/help.md': 'No permisssion changes.\n'},
+                                   message='base')
+                head = repo.commit({'docs/help.md': 'No permission changes.\n'},
+                                   message='head')
+                review = loop_support.review_receipt(
+                    repo.root, base, head, ['docs/help.md'])
+                spec = loop_support.spec(
+                    allowed_paths=['docs/help.md'], goal='修正文档错字。',
+                    git_evidence=loop_support.git_evidence(base, head))
+                task = {'task_id': 'TASK-DOC', 'base_sha': base,
+                        'head_sha': head, 'executor': 'executor-1',
+                        'review': review}
+                carrier = orchestration.carrier_for(edition)
+                outcome = run_loop(
+                    edition=edition, carrier=carrier, repo_root=repo.root,
+                    state=loop_support.state(
+                        edition, base_sha=base, head_sha=head, task=task),
+                    lesson_records=[loop_support.general_lesson()],
+                    specs={'LSN-TALKDND-001': spec},
+                    scan_report=loop_support.scan_report(
+                        ingestions=[loop_support.created('LSN-TALKDND-001')]))
+                self.assertEqual(outcome.status, 'COMPLETED')
+                self.assertEqual(len(outcome.report['registrations']), 1)
 
     def test_a_mismatched_carrier_is_refused_before_it_is_called(self):
         carrier = loop_support.RecordingCarrier('github')

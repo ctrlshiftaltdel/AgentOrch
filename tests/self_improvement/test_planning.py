@@ -18,6 +18,9 @@ from agentorch_self_improvement import planning  # noqa: E402
 def plan_one(record, spec=None, **kwargs):
     kwargs.setdefault('edition', 'local')
     kwargs.setdefault('repo_root', loop_support.DEFAULT_REPO_ROOT)
+    kwargs.setdefault('trusted_task', loop_support.state()['task'])
+    kwargs.setdefault('required_base_sha', loop_support.DEFAULT_BASE_SHA)
+    kwargs.setdefault('required_head_sha', loop_support.DEFAULT_HEAD_SHA)
     return planning.plan_tasks(
         lesson_records=[record], specs={record['lesson_id']: spec if spec is not None
                                         else loop_support.spec()},
@@ -76,12 +79,33 @@ class GitRiskTests(unittest.TestCase):
         self.repo = loop_support.GitRepo()
         self.addCleanup(self.repo.close)
 
-    def plan(self, spec):
-        return self.plan_in(spec, self.repo.root)
+    def task_for(self, base, head, scope, *, review=True, role='reviewer',
+                 repo_root=None):
+        task = {'task_id': 'TASK-RISK', 'base_sha': base, 'head_sha': head,
+                'executor': 'executor-1'}
+        if review:
+            task['review'] = loop_support.review_receipt(
+                repo_root or self.repo.root, base, head, scope, role=role)
+        return task
 
-    def plan_in(self, spec, repo_root):
-        return plan_one(loop_support.general_lesson(), spec,
-                        repo_root=repo_root).proposals[0]
+    def plan(self, spec, *, review=True, role='reviewer', repo_root=None):
+        repo_root = repo_root or self.repo.root
+        evidence = spec.get('git_evidence') or {}
+        base = evidence.get('base_sha') or loop_support.DEFAULT_BASE_SHA
+        head = evidence.get('head_sha') or loop_support.DEFAULT_HEAD_SHA
+        task = self.task_for(base, head, spec.get('allowed_paths') or [],
+                             review=False, repo_root=repo_root)
+        if review:
+            try:
+                task['review'] = loop_support.review_receipt(
+                    repo_root, base, head, spec.get('allowed_paths') or [],
+                    role=role)
+            except Exception:
+                pass
+        return plan_one(
+            loop_support.general_lesson(), spec, repo_root=repo_root,
+            trusted_task=task, required_base_sha=base,
+            required_head_sha=head).proposals[0]
 
     def commit_range(self, base_files, head_files):
         base = self.repo.commit(base_files, message='base')
@@ -158,11 +182,11 @@ class GitRiskTests(unittest.TestCase):
             {'AGENTS.md': 'old rule\n'}, {'AGENTS.md': 'new rule\n'})
         proposal = self.plan(self.spec(
             ['AGENTS.md'], base, head, goal='改进规则说明。',
-            authorization=loop_support.authorization()))
+            authorization=loop_support.authorization()), review=False)
         self.assertEqual(proposal['status'], 'BLOCKED')
         self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
         self.assertIsNone(proposal['required_human_decision'])
-        self.assertTrue(any('authoritative' in item
+        self.assertTrue(any('Master' in item or 'authoritative' in item
                             for item in proposal['required_evidence']))
         self.assertTrue(any('caller-supplied authorization' in item
                             for item in proposal['risk_limitations']))
@@ -182,7 +206,7 @@ class GitRiskTests(unittest.TestCase):
             {'docs/example.md': 'old docs\n', 'src/app.py': 'return 1\n'},
             {'docs/example.md': 'new docs\n', 'src/app.py': 'return 2\n'})
         proposal = self.plan(self.spec(['docs/example.md'], base, head,
-                                       goal='修正文档错字。'))
+                                       goal='修正文档错字。'), review=False)
         self.assertEqual(proposal['status'], 'BLOCKED')
         self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
         self.assertIn('src/app.py', ' '.join(proposal['risk_reasons']))
@@ -221,8 +245,12 @@ class GitRiskTests(unittest.TestCase):
         self.assertNotEqual(details['level'], 'LOW')
         self.assertIn('scripts/self_improvement/planning.py',
                       details['changed_paths'])
-        proposal = plan_one(loop_support.general_lesson(), spec,
-                            repo_root=tmp).proposals[0]
+        task = {'task_id': 'TASK-REAL', 'base_sha': base, 'head_sha': head,
+                'executor': 'executor-1'}
+        proposal = plan_one(
+            loop_support.general_lesson(), spec, repo_root=tmp,
+            trusted_task=task, required_base_sha=base,
+            required_head_sha=head).proposals[0]
         self.assertIn(proposal['status'], ('BLOCKED', 'NEEDS_HUMAN_DECISION'))
         self.assertIn(proposal['risk_level'], ('NEEDS_EVIDENCE', 'HIGH'))
         self.assertNotIn(proposal['status'], ('READY', 'NO_TASK'))
@@ -284,6 +312,7 @@ class GitRiskTests(unittest.TestCase):
         base = self.repo.commit({'README.md': 'base\n'}, message='base')
         self.repo._git('-c', 'protocol.file.allow=always', 'submodule', 'add',
                        str(sub.root), 'sub')
+        self.repo._git('config', 'diff.ignoreSubmodules', 'all')
         head = self.repo.commit({}, message='submodule')
         proposal = self.plan(self.spec(['README.md', 'sub', '.gitmodules'], base, head))
         self.assertEqual(proposal['status'], 'BLOCKED')
@@ -352,7 +381,8 @@ class GitRiskTests(unittest.TestCase):
              str(clone)], capture_output=True)
         self.assertEqual(completed.returncode, 0,
                          completed.stderr.decode('utf-8', 'replace'))
-        proposal = self.plan_in(self.spec(['docs/example.md'], base, head), clone)
+        proposal = self.plan(self.spec(['docs/example.md'], base, head),
+                             repo_root=clone, review=False)
         self.assertEqual(proposal['status'], 'BLOCKED')
         self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
         self.assertIn('shallow', ' '.join(proposal['risk_reasons']))
@@ -363,12 +393,13 @@ class GitRiskTests(unittest.TestCase):
         proposal = plan_one(
             loop_support.general_lesson(),
             self.spec(['docs/example.md'], base, head),
-            repo_root=self.repo.root, required_head_sha='d' * 40).proposals[0]
+            repo_root=self.repo.root, trusted_task=None,
+            required_base_sha=base, required_head_sha='d' * 40).proposals[0]
         self.assertEqual(proposal['status'], 'BLOCKED')
         self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
         self.assertIn('task carrier head_sha', ' '.join(proposal['risk_reasons']))
 
-    def test_whitespace_only_docs_change_is_ready(self):
+    def test_docs_change_with_trusted_review_is_ready(self):
         proposal = plan_one(loop_support.general_lesson(),
                             loop_support.spec()).proposals[0]
         self.assertEqual(proposal['status'], 'READY')
@@ -377,14 +408,16 @@ class GitRiskTests(unittest.TestCase):
     def test_non_whitespace_docs_change_is_not_ready(self):
         base, head = self.commit_range(
             {'docs/example.md': 'old text\n'}, {'docs/example.md': 'new text\n'})
-        proposal = self.plan(self.spec(['docs/example.md'], base, head))
+        proposal = self.plan(self.spec(['docs/example.md'], base, head),
+                             review=False)
         self.assertEqual(proposal['status'], 'BLOCKED')
         self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
 
     def test_code_change_is_not_ready(self):
         base, head = self.commit_range(
             {'scripts/example.py': 'return 1\n'}, {'scripts/example.py': 'return 2\n'})
-        proposal = self.plan(self.spec(['scripts/example.py'], base, head))
+        proposal = self.plan(self.spec(['scripts/example.py'], base, head),
+                             review=False)
         self.assertEqual(proposal['status'], 'BLOCKED')
         self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
 
@@ -437,10 +470,175 @@ class GitRiskTests(unittest.TestCase):
         self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')
         self.assertEqual(proposal['required_human_decision'], 'HD-05')
 
+    def test_safe_docs_diff_does_not_prove_a_high_risk_task_scope(self):
+        base, head = self.commit_range(
+            {'docs/readme.md': 'old line\n'},
+            {'docs/readme.md': 'old line  \n'})
+        proposal = self.plan(self.spec(
+            ['docs/', 'scripts/orchestrator.py'], base, head,
+            goal='修改任务状态机以允许跳过审查。'), review=True)
+        self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')
+        self.assertEqual(proposal['required_human_decision'], 'HD-05')
+        self.assertEqual(proposal['risk_level'], 'HIGH')
+        self.assertIn('not proven by the current diff',
+                      ' '.join(proposal['risk_reasons']))
+
+    def test_spec_cannot_choose_an_arbitrary_hidden_baseline(self):
+        first = self.repo.commit(
+            {'src/auth.py': 'def can(user):\n    return user.is_admin\n'},
+            message='base')
+        hidden = self.repo.commit(
+            {'src/auth.py': 'def can(user):\n    return True\n'},
+            message='hidden permission change')
+        head = self.repo.commit(
+            {'docs/example.md': 'old line  \n'}, message='docs whitespace')
+        task = {'task_id': 'TASK-BASE', 'base_sha': first, 'head_sha': head,
+                'executor': 'executor-1'}
+        proposal = plan_one(
+            loop_support.general_lesson(),
+            self.spec(['docs/example.md'], hidden, head),
+            repo_root=self.repo.root, trusted_task=task,
+            required_base_sha=first, required_head_sha=head).proposals[0]
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertIn('base_sha', ' '.join(proposal['risk_reasons']))
+
+        spec = loop_support.spec(
+            allowed_paths=['docs/example.md'], goal='修正文档错字。')
+        spec.pop('git_evidence')
+        proposal = plan_one(
+            loop_support.general_lesson(), spec, repo_root=self.repo.root,
+            trusted_task=task, required_base_sha=first,
+            required_head_sha=head).proposals[0]
+        self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')
+        self.assertEqual(proposal['required_human_decision'], 'HD-05')
+
+    def test_replace_ref_cannot_hide_an_auth_change(self):
+        base = self.repo.commit(
+            {'src/auth.py': 'def can(user):\n    return user.is_admin\n'},
+            message='base')
+        head = self.repo.commit(
+            {'src/auth.py': 'def can(user):\n    return True\n'},
+            message='head')
+        self.repo._git('replace', base, head)
+        proposal = self.plan(self.spec(['src/auth.py'], base, head),
+                             review=False)
+        self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')
+        self.assertEqual(proposal['required_human_decision'], 'HD-05')
+
+    def test_assume_unchanged_cannot_hide_a_worktree_change(self):
+        base, head = self.commit_range(
+            {'docs/example.md': 'old line\n'},
+            {'docs/example.md': 'old line  \n'})
+        self.repo._git('update-index', '--assume-unchanged', 'docs/example.md')
+        self.repo.write('docs/example.md', 'hidden permission change\n')
+        proposal = self.plan(self.spec(['docs/example.md'], base, head),
+                             review=False)
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertIn('assume-unchanged', ' '.join(proposal['risk_reasons']))
+
+    def test_skip_worktree_cannot_hide_a_worktree_change(self):
+        base, head = self.commit_range(
+            {'docs/example.md': 'old line\n'},
+            {'docs/example.md': 'old line  \n'})
+        self.repo._git('update-index', '--skip-worktree', 'docs/example.md')
+        self.repo.write('docs/example.md', 'hidden permission change\n')
+        proposal = self.plan(self.spec(['docs/example.md'], base, head),
+                             review=False)
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertIn('skip-worktree', ' '.join(proposal['risk_reasons']))
+
+    def test_ignored_file_under_allowed_path_blocks(self):
+        base = self.repo.commit(
+            {'.gitignore': 'src/auth.py\n', 'docs/example.md': 'old line\n'},
+            message='base')
+        head = self.repo.commit(
+            {'docs/example.md': 'old line  \n'}, message='head')
+        self.repo.write('src/auth.py', 'def can(user):\n    return True\n')
+        proposal = self.plan(
+            self.spec(['docs/example.md', 'src/auth.py'], base, head),
+            review=False)
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertIn('ignored', ' '.join(proposal['risk_reasons']))
+
+    def test_recheck_detects_a_worktree_change_after_planning(self):
+        base, head = self.commit_range(
+            {'docs/help.md': 'No permisssion changes.\n'},
+            {'docs/help.md': 'No permission changes.\n'})
+        proposal = self.plan(
+            self.spec(['docs/help.md'], base, head, goal='修正文档错字。'),
+            review=True)
+        self.assertEqual(proposal['status'], 'READY')
+        self.repo.write('docs/help.md', 'changed after planning\n')
+        stable, why = planning.recheck_git_evidence(
+            proposal, repo_root=self.repo.root,
+            required_base_sha=base, required_head_sha=head)
+        self.assertFalse(stable)
+        self.assertTrue(why)
+
+    def test_whitespace_only_code_block_change_is_not_low(self):
+        base, head = self.commit_range(
+            {'docs/help.md': '```sh\nchmod 0 777 secret\n```\n'},
+            {'docs/help.md': '```sh\nchmod 0777 secret\n```\n'})
+        proposal = self.plan(
+            self.spec(['docs/help.md'], base, head, goal='整理文档空白。'),
+            review=False)
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+
+    def test_whitespace_only_shell_comment_change_is_not_low(self):
+        base, head = self.commit_range(
+            {'docs/help.md': '```sh\necho safe #; rm -rf /target\n```\n'},
+            {'docs/help.md': '```sh\necho safe#; rm -rf /target\n```\n'})
+        proposal = self.plan(
+            self.spec(['docs/help.md'], base, head, goal='整理文档空白。'),
+            review=False)
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+
+    def test_docs_typo_with_trusted_review_is_ready(self):
+        base, head = self.commit_range(
+            {'docs/help.md': 'No permisssion changes.\n'},
+            {'docs/help.md': 'No permission changes.\n'})
+        proposal = self.plan(
+            self.spec(['docs/help.md'], base, head, goal='修正文档错字。'),
+            review=True)
+        self.assertEqual(proposal['status'], 'READY')
+        self.assertEqual(proposal['risk_level'], 'LOW')
+        self.assertEqual(proposal['review_status'], 'APPROVED')
+
+    def test_docs_typo_without_trusted_review_is_blocked(self):
+        base, head = self.commit_range(
+            {'docs/help.md': 'No permisssion changes.\n'},
+            {'docs/help.md': 'No permission changes.\n'})
+        proposal = self.plan(
+            self.spec(['docs/help.md'], base, head, goal='修正文档错字。'),
+            review=False)
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertTrue(proposal['required_evidence'])
+
+    def test_review_in_the_spec_is_not_a_trusted_receipt(self):
+        base, head = self.commit_range(
+            {'docs/help.md': 'No permisssion changes.\n'},
+            {'docs/help.md': 'No permission changes.\n'})
+        spec = self.spec(
+            ['docs/help.md'], base, head, goal='修正文档错字。',
+            review=loop_support.review_receipt(
+                self.repo.root, base, head, ['docs/help.md']))
+        proposal = self.plan(spec, review=False)
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+
     def test_missing_git_evidence_is_blocked_with_a_next_step(self):
         spec = loop_support.spec()
         spec.pop('git_evidence')
-        proposal = plan_one(loop_support.general_lesson(), spec).proposals[0]
+        proposal = plan_one(
+            loop_support.general_lesson(), spec, trusted_task=None,
+            required_base_sha=None, required_head_sha=None).proposals[0]
         self.assertEqual(proposal['status'], 'BLOCKED')
         self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
         self.assertTrue(proposal['required_evidence'])
@@ -545,8 +743,13 @@ class CompletePacketTests(unittest.TestCase):
             self.assertIn('4.1', text)
             self.assertIn('`kit/orchestration.md` 4.1', text)
             self.assertNotIn('`docs/orchestration.md` 4.1', text)
+            self.assertIn(proposal['git_base_sha'], text)
+            self.assertIn(proposal['git_head_sha'], text)
+            self.assertIn(proposal['diff_sha256'], text)
         self.assertIn('## 可改路径', github_body)
+        self.assertIn('## 风险证据', github_body)
         self.assertIn('- **Allowed paths:**', local_packet)
+        self.assertIn('- **Git base SHA:**', local_packet)
 
     def test_lesson_without_a_spec_is_not_invented(self):
         empty = planning.plan_tasks(
