@@ -231,12 +231,17 @@ def _edition_value(form, raw):
     return value
 
 
-def _require_edition(config, error=DeliveryError):
+def _require_edition(config, error=DeliveryError, expected=None):
     """Fail closed unless the project declares exactly one usable edition.
 
     The edition is the only authority for the base and it is re-read at every
     side-effect boundary, so a later invalid, duplicate, empty or ambiguous
     declaration must block immediately instead of reusing the first check.
+
+    ``expected`` is the edition the run began with. A declaration that changed
+    to a *different valid* edition is not usable either: the run's task
+    authorization and carrier provenance were proved against the starting one,
+    so the switch is refused exactly like an invalid value.
     """
     if config.get('edition_count') != 1 or config.get('edition') not in VALID_EDITIONS:
         values = config.get('edition_values') or []
@@ -244,18 +249,22 @@ def _require_edition(config, error=DeliveryError):
                     f'`github` before any dispatch; found {config.get("edition_count")} '
                     f'declaration(s), values {values!r} (edition parsed as '
                     f'{config.get("edition")!r})')
+    if expected is not None and config.get('edition') != expected:
+        raise error('docs/PROJECT.md switched the project edition from '
+                    f'{expected!r} to {config.get("edition")!r} while the run was live; '
+                    'refusing to continue from an edition the run did not begin with')
 
 
 def _require_live_config(context, spec=None):
-    """Re-read the project config and fail closed unless the edition is valid.
+    """Re-read the project config and fail closed unless the edition is unchanged.
 
     Every external operation — profile query, Agent session, session export and
     each verification command — is bracketed by this call, so a declaration
-    invalidated by any other writer at any point stops the run *at* that call.
-    Nothing external may start or continue after it fails.
+    invalidated or switched by any other writer at any point stops the run *at*
+    that call. Nothing external may start or continue after it fails.
     """
     fresh = project_config(context.repo)
-    _require_edition(fresh)
+    _require_edition(fresh, expected=context.config.get('edition'))
     if spec is not None:
         _authorize_paths(spec['paths'], fresh)
     return fresh
@@ -283,7 +292,7 @@ def _staged_config(work):
             'edition_count': len(values), 'edition_values': values}
 
 
-def _prove_staged(repo, spec, work, base, expected):
+def _prove_staged(repo, spec, work, base, expected, *, edition=None):
     """Re-prove configuration, authorization and scope on what will be committed.
 
     ``git add`` and ``git commit`` are separate processes, and both can run
@@ -301,9 +310,12 @@ def _prove_staged(repo, spec, work, base, expected):
     config and the task authorization are proved once more as the **last**
     action: a plain file read, with no Git call after it, so the caller's
     ``git commit`` cannot start from a declaration this proof has not seen.
+    ``edition`` is the edition the run began with; a switch to another valid
+    edition fails the first proof rather than being compared only with the
+    staged blob.
     """
     fresh = project_config(repo)
-    _require_edition(fresh)
+    _require_edition(fresh, expected=edition)
     _authorize_paths(spec['paths'], fresh)
     staged = _staged_config(work)
     if staged is None:
@@ -323,7 +335,7 @@ def _prove_staged(repo, spec, work, base, expected):
     # `_unstaged` is a Git process and can run a clean filter of its own; prove
     # the config again before the last Git fact read starts.
     fresh = project_config(repo)
-    _require_edition(fresh)
+    _require_edition(fresh, expected=edition)
     _authorize_paths(spec['paths'], fresh)
     now = _changes(work, base)
     if now != sorted(expected):
@@ -337,7 +349,7 @@ def _prove_staged(repo, spec, work, base, expected):
     # with this later read also catches a config that changed to a different
     # *valid* edition while the index was being proved.
     fresh = project_config(repo)
-    _require_edition(fresh)
+    _require_edition(fresh, expected=edition)
     _authorize_paths(spec['paths'], fresh)
     if staged['edition'] != fresh['edition']:
         raise DeliveryError('the staged docs/PROJECT.md would commit edition '
@@ -362,7 +374,7 @@ def _prove_before_add(context, spec, work, base, expected):
         raise DeliveryError('the worktree changed between the pre-add proof and staging: '
                             f'{actual!r} instead of {sorted(expected)!r}')
     fresh = project_config(context.repo)
-    _require_edition(fresh)
+    _require_edition(fresh, expected=context.config.get('edition'))
     _authorize_paths(spec['paths'], fresh)
     for name in actual:
         _check_changed_path(work, name, spec['paths'], fresh)
@@ -1418,15 +1430,21 @@ def _execute(context, spec, record):
     # Re-read the project's authorization and edition immediately before
     # committing: either may have changed while the agent was running.
     fresh = project_config(context.repo)
-    _require_edition(fresh)
+    _require_edition(fresh, expected=context.config.get('edition'))
     _authorize_paths(spec['paths'], fresh)
     for name in changed:
         _check_changed_path(work, name, spec['paths'], fresh)
-    if _status(work):
-        # `status` is a Git process of its own and a clean filter runs inside
-        # it, so the proof above may already be stale. Configuration,
-        # authorization and the actual scope are re-proved after it returns;
-        # an invalid or out-of-scope state must not reach `git add`.
+    dirty = bool(_status(work))
+    # `status` is a Git process of its own and a clean filter runs inside it,
+    # so the proof above may already be stale. Prove the edition from the file
+    # *now* — before another Git process (`diff`, `ls-files`) reads the tree, so
+    # an invalid or switched declaration starts no further Git call — and only
+    # then decide whether staging is needed.
+    _require_live_config(context, spec)
+    if dirty:
+        # Configuration, authorization and the actual scope are re-proved after
+        # the pre-add proof's own Git reads; an invalid or out-of-scope state
+        # must not reach `git add`.
         _prove_before_add(context, spec, work, base, changed)
         subprocess.run(['git', '--no-optional-locks', 'add', '-A', '--', '.'], cwd=work,
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -1436,7 +1454,8 @@ def _execute(context, spec, record):
         # clean filter can rewrite the staged blob and a hook can change the
         # tree while `commit` runs, so the index itself is re-proved here —
         # before the second process starts, not after history exists.
-        _prove_staged(context.repo, spec, work, base, changed)
+        _prove_staged(context.repo, spec, work, base, changed,
+                      edition=context.config.get('edition'))
         # `_prove_staged` reads the index and the worktree through Git, and a
         # clean filter runs inside those calls; it ends with a config proof, and
         # this one is immediately before the commit process starts. The only
@@ -1455,7 +1474,7 @@ def _execute(context, spec, record):
         raise DeliveryError('execution committed nothing', 'FAILED')
     committed = _changes(work, base)
     fresh = project_config(context.repo)
-    _require_edition(fresh)
+    _require_edition(fresh, expected=context.config.get('edition'))
     _authorize_paths(spec['paths'], fresh)
     for name in committed:
         _check_changed_path(work, name, spec['paths'], fresh)
@@ -1659,19 +1678,34 @@ def _recheck_approved(context):
     The Git facts are external reads of their own, so the config is re-proved
     before them, and the full gate — config, profile query, config again — runs
     *after* them, so a change made while those reads were answered is seen
-    before the approval is kept. A second pass over every approval that is still
-    live runs before the journal is saved, so an approval checked before another
-    task's check invalidated the config cannot survive as ``PREPARED``; when
-    that pass observes the shared config/profile gate fail, it voids every live
-    approval, not only the one whose query failed.
+    before the approval is kept. A failure of one worktree's facts blocks only
+    that approval; the project config and the reviewer profile are shared, so
+    the first shared-gate failure stops every later query and blocks every
+    still-live approval, including those this round already checked as safe. A
+    second pass over every approval that is still live runs before the journal
+    is saved, so a shared gate that only goes bad after this round cannot leave
+    an approval ``PREPARED``; when that pass observes the shared
+    config/profile gate fail, it voids every live approval, not only the one
+    whose query failed.
     """
+    shared_failure = None
     for ident in sorted(context.approved):
         record = context.record(ident)
         if record.get('status') != 'PREPARED':
             continue
+        spec = context.spec(ident)
+        # The project config is shared state. Once it fails, no further query
+        # may start and every live approval — including the ones already checked
+        # against the old config — loses its support.
         try:
-            spec = context.spec(ident)
             _require_live_config(context, spec)
+        except (DeliveryError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+            record.update(status='BLOCKED', reason=str(exc))
+            shared_failure = (ident, exc)
+            break
+        # The facts of one worktree are task-specific: this approval is blocked
+        # and the next one is still checked.
+        try:
             work = _resolve_task(context, spec)
             ok, why = _facts_match(record, work)
             if not ok:
@@ -1684,9 +1718,28 @@ def _recheck_approved(context):
                 _, digest = _review_diff(work, record['base'], record['head'], changed)
                 if digest != record['diff_digest']:
                     raise DeliveryError(f'approved task {ident} no longer has its reviewed diff')
+        except (DeliveryError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+            record.update(status='BLOCKED', reason=str(exc))
+            continue
+        # The reviewer profile is shared runtime state and the gate query is the
+        # last external call for this approval. Its first failure stops the
+        # round: a later query could answer safe again and revive an approval
+        # the shared state no longer supports.
+        try:
             _reviewer_gate(context, spec, work, record)
         except (DeliveryError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
             record.update(status='BLOCKED', reason=str(exc))
+            shared_failure = (ident, exc)
+            break
+    if shared_failure is not None:
+        source, cause = shared_failure
+        for ident in sorted(context.approved):
+            record = context.record(ident)
+            if record.get('status') != 'PREPARED':
+                continue
+            record.update(status='BLOCKED', reason=(
+                f'the shared reviewer/config gate failed while checking {source}: {cause}; '
+                'every live approval depends on that gate'))
     _void_stale_approvals(context)
     context.save()
 
@@ -1976,7 +2029,8 @@ def _attempt_retry(context, spec, record):
 
 def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
         profiles=agent_profiles, gh=gh_run, resume=False, retry=(),
-        executor_agent=None, reviewer_agent=None, timeout=1800):
+        executor_agent=None, reviewer_agent=None, timeout=1800,
+        expected_edition=None):
     repo = _root(repo)
     if plan.get('merge') or plan.get('merge_into'):
         raise DeliveryError(MERGE_REFUSAL)
@@ -1994,7 +2048,10 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
         raise ValueError('reviewer agent must differ from the executor agent')
 
     config = project_config(repo)
-    _require_edition(config, ValueError)
+    # `expected_edition` is the edition the CLI already proved before its Issue
+    # query; a switch while that external call ran must be refused here.
+    _require_edition(config, ValueError, expected=expected_edition)
+    edition = config['edition']
     if _status(repo):
         raise ValueError('repository worktree is not clean')
     # `_status` is a Git process of its own and a clean filter runs inside it,
@@ -2002,7 +2059,7 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
     # task authorization again after it returns, before the carrier query or
     # any Agent starts; an invalid declaration must not reach either.
     config = project_config(repo)
-    _require_edition(config, ValueError)
+    _require_edition(config, ValueError, expected=edition)
     for spec in specs:
         if spec['errors']:
             continue
@@ -2197,9 +2254,16 @@ def main(argv=None):
     if args.merge_into:
         parser.exit(2, MERGE_REFUSAL + '\n')
     try:
+        edition = None
         if args.issue is not None:
             if not args.issue_repo or not args.worktree:
                 parser.error('--issue needs --issue-repo and --worktree')
+            # The project edition is the authority for the base and it must be
+            # proved before the carrier query starts: `gh issue view` is the
+            # first external call of this mode.
+            config = project_config(_root(args.repo))
+            _require_edition(config, ValueError)
+            edition = config['edition']
             plan = load_issue_plan(args.issue, args.issue_repo, worktree=args.worktree,
                                    verify=args.verify, acceptance=args.acceptance,
                                    allows=args.allow, instruction=args.instruction)
@@ -2207,7 +2271,7 @@ def main(argv=None):
             plan = _load_plan_file(args.plan)
         state = run(args.repo, plan, args.state, resume=args.resume, retry=args.retry,
                     executor_agent=args.executor_agent, reviewer_agent=args.reviewer_agent,
-                    timeout=args.timeout)
+                    timeout=args.timeout, expected_edition=edition)
     except (ValueError, OSError, subprocess.SubprocessError, DeliveryError) as exc:
         parser.exit(2, f'{exc}\n')
     print(json.dumps(_summary(state), ensure_ascii=False, indent=2, sort_keys=True))
