@@ -14,6 +14,15 @@ from scripts import autonomous_delivery as delivery
 
 PY = sys.executable
 
+PROJECT_LOCAL = """# 项目配置
+
+- 允许改动路径：`a.txt`、`b.txt`、`out.txt`、`shared.txt`、`same.txt`、`docs/`
+- 永远禁止改动路径 / 文件：`LICENSE.md`
+- edition：`local`
+"""
+
+PROJECT_GITHUB = PROJECT_LOCAL.replace('`local`', '`github`')
+
 
 def _git(where, *args, check=True):
     return subprocess.run(['git', '--no-optional-locks', *args], cwd=where, check=check,
@@ -21,14 +30,17 @@ def _git(where, *args, check=True):
                           stderr=subprocess.PIPE)
 
 
-def _verdict(head, digest, verdict='APPROVE', findings=None):
+def _verdict(head, digest, verdict='APPROVE', findings=None, acceptance=None):
     return 'Review complete.\n```json\n' + json.dumps({
         'verdict': verdict, 'head': head, 'diff_sha256': digest,
-        'findings': list(findings or [])}) + '\n```\n'
+        'findings': list(findings or []),
+        'acceptance': list(acceptance or [{'id': 'AC-1', 'status': 'PASS',
+                                           'evidence': 'check'}]),
+    }) + '\n```\n'
 
 
 class FakeAgents:
-    """Real worktree writes; session ids and probes are injected, not real ones."""
+    """Real worktree writes; session ids, probes and transcripts are injected."""
 
     def __init__(self, case, *, execution=None, review=None, sessions=('ses_exec', 'ses_rev')):
         self.case = case
@@ -44,15 +56,21 @@ class FakeAgents:
                 self.execution(work, prompt)
             else:
                 self.case.write_default(work, prompt)
-            return {'exit_code': 0, 'session_id': self.exec_session}
+            self.case.transcripts[self.exec_session] = 'execution finished'
+            return {'exit_code': 0, 'session_id': self.exec_session, 'detail': 'ok'}
         head = re.search(r'HEAD_SHA=([0-9a-f]{40})', prompt).group(1)
         digest = re.search(r'DIFF_SHA256=([0-9a-f]{64})', prompt).group(1)
+        acceptance = [{'id': ident, 'status': 'PASS', 'evidence': 'checked'}
+                      for ident in re.findall(r'^- (AC-\d+):', prompt, re.M)]
         if self.review is not None:
             custom = self.review(work, prompt, head, digest)
             if custom is not None:
+                self.case.transcripts[custom.get('session_id')] = custom.get('text') or ''
                 return custom
+        text = _verdict(head, digest, acceptance=acceptance)
+        self.case.transcripts[self.review_session] = text
         return {'exit_code': 0, 'session_id': self.review_session,
-                'text': _verdict(head, digest)}
+                'text': text, 'detail': 'ok'}
 
 
 class DeliveryCase(unittest.TestCase):
@@ -66,16 +84,19 @@ class DeliveryCase(unittest.TestCase):
         _git(self.repo, 'config', 'user.email', 'test@example.invalid')
         _git(self.repo, 'config', 'user.name', 'Test')
         (self.repo / 'base.txt').write_text('base')
-        _git(self.repo, 'add', 'base.txt')
+        (self.repo / 'docs').mkdir()
+        (self.repo / 'docs' / 'PROJECT.md').write_text(PROJECT_LOCAL)
+        _git(self.repo, 'add', 'base.txt', 'docs/PROJECT.md')
         _git(self.repo, 'commit', '-q', '-m', 'base')
         self.state = self.root / 'state.json'
-        self.probe = self.default_probe
+        self.transcripts = {}
         self.profiles = lambda where: {
-            'build': {'id': 'build', 'permissions': [{'action': '*', 'resource': '*',
-                                                      'effect': 'allow'}]},
+            'build': {'id': 'build', 'permissions': [
+                {'action': '*', 'resource': '*', 'effect': 'allow'}]},
             'plan': {'id': 'plan', 'permissions': [
                 {'action': '*', 'resource': '*', 'effect': 'allow'},
-                {'action': 'edit', 'resource': '*', 'effect': 'deny'}]},
+                {'action': 'edit', 'resource': '*', 'effect': 'deny'},
+                {'action': 'shell', 'resource': '*', 'effect': 'deny'}]},
         }
         self.gh = None
 
@@ -89,16 +110,18 @@ class DeliveryCase(unittest.TestCase):
         agent = 'build' if session_id.startswith('ses_exec') else 'plan'
         return {'ok': True, 'outcome': 'succeeded', 'directory': str(work),
                 'user_messages': 1, 'assistant_messages': 1, 'agents': [agent],
-                'finishes': ['stop'], 'models': [{'id': 'test-model'}]}
+                'finishes': ['stop'], 'models': [{'id': 'test-model'}],
+                'texts': [self.transcripts.get(session_id, '')]}
 
     def write_default(self, work, prompt):
         match = re.search(r'paths: (\[[^\]]*\])', prompt)
         name = json.loads(match.group(1))[0]
         (work / name).write_text(f'{Path(work).name}\n')
 
-    def task(self, ident, work, paths, verify=None, depends=None):
+    def task(self, ident, work, paths, verify=None, depends=None, acceptance=None):
         return {'id': ident, 'worktree': str(work), 'prompt': f'{ident}: make a change',
                 'paths': paths, 'depends': list(depends or []),
+                'acceptance': list(acceptance or [f'{ident} does the required change']),
                 'verify': verify or [[PY, '-c', 'raise SystemExit(0)']]}
 
     def plan(self, tasks, **extra):
@@ -108,8 +131,9 @@ class DeliveryCase(unittest.TestCase):
 
     def run_delivery(self, plan, agents=None, **kwargs):
         agents = agents or FakeAgents(self)
-        kwargs.setdefault('session_probe', self.probe)
+        kwargs.setdefault('session_probe', self.default_probe)
         kwargs.setdefault('profiles', self.profiles)
+        kwargs.setdefault('reviewer_agent', 'plan')
         if self.gh is not None:
             kwargs.setdefault('gh', self.gh)
         return delivery.run(self.repo, plan, self.state, agent=agents, **kwargs), agents
@@ -135,8 +159,6 @@ class DeliveryCase(unittest.TestCase):
             json.dumps(merged, sort_keys=True).encode()).hexdigest()
 
 
-
-
 class FullLoopTests(DeliveryCase):
     def test_dependent_task_runs_after_verified_merge(self):
         one, two = self.worktree('one'), self.worktree('two')
@@ -150,6 +172,9 @@ class FullLoopTests(DeliveryCase):
         self.assertEqual(agents.calls, ['execution', 'review', 'execution', 'review'])
         self.assertEqual(_git(self.repo, 'show', 'integration:a.txt').stdout, b'work-one\n')
         self.assertEqual(_git(self.repo, 'show', 'integration:b.txt').stdout, b'work-two\n')
+        # The later task is re-baselined onto the target head the earlier merge produced.
+        self.assertEqual(state['tasks']['two']['base'],
+                         state['tasks']['one']['merge_commit'])
         self.assertEqual(_git(self.repo, 'rev-list', '--merges', '--count',
                               'integration').stdout.strip(), b'2')
         for name in ('one', 'two'):
@@ -170,6 +195,68 @@ class FullLoopTests(DeliveryCase):
         self.assertEqual(agents.calls, ['execution', 'review'])
 
 
+class MergeBindingTests(DeliveryCase):
+    def test_merge_uses_the_reviewed_sha_when_the_branch_ref_moves(self):
+        work = self.worktree('one')
+
+        def move_ref(where, prompt, head, digest):
+            # Reproduce the review-window attack: detach the worktree at the
+            # reviewed commit and point the branch ref at an unreviewed commit.
+            (where / 'bad.txt').write_text('unreviewed\n')
+            _git(where, 'add', 'bad.txt')
+            _git(where, 'commit', '-q', '-m', 'unreviewed')
+            bad = _git(where, 'rev-parse', 'HEAD').stdout.decode().strip()
+            _git(where, 'checkout', '-q', '--detach', head)
+            _git(where, 'update-ref', 'refs/heads/task/one', bad)
+            return None
+
+        state, _ = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]),
+                                     FakeAgents(self, review=move_ref))
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'VERIFIED')
+        merge = record['merge_commit']
+        self.assertEqual(_git(self.repo, 'rev-parse', f'{merge}^2').stdout.decode().strip(),
+                         record['head'])
+        self.assertNotEqual(_git(self.repo, 'cat-file', '-e',
+                                 'integration:bad.txt', check=False).returncode, 0)
+
+    def test_pre_existing_commits_cannot_be_smuggled_into_the_target(self):
+        work = self.worktree('one')
+        (work / 'forbidden.txt').write_text('smuggled\n')
+        _git(work, 'add', 'forbidden.txt')
+        _git(work, 'commit', '-q', '-m', 'pre-existing out-of-scope commit')
+        agents = FakeAgents(self)
+        state, _ = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]), agents)
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertEqual(agents.calls, [])
+        # The target did not receive the pre-existing commit or file.
+        self.assertNotEqual(_git(self.repo, 'cat-file', '-e',
+                                 'integration:forbidden.txt', check=False).returncode, 0)
+        self.assertFalse((self.repo / 'forbidden.txt').exists())
+
+    def test_worktree_with_unreviewed_commits_is_rejected_at_dispatch(self):
+        work = self.worktree('one')
+        (work / 'bad.txt').write_text('extra\n')
+        _git(work, 'add', 'bad.txt')
+        _git(work, 'commit', '-q', '-m', 'extra work')
+        extra = _git(work, 'rev-parse', 'HEAD').stdout.decode().strip()
+        state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]))
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('target baseline', record['reason'])
+        self.assertEqual(agents.calls, [])
+        self.assertEqual(_git(self.repo, 'cat-file', '-e', extra, check=False).returncode, 0)
+
+    def test_later_task_rebases_only_when_it_has_no_commits(self):
+        one, two = self.worktree('one'), self.worktree('two')
+        plan = self.plan([self.task('one', one, ['a.txt']),
+                          self.task('two', two, ['b.txt'], depends=['one'])])
+        state, _ = self.run_delivery(plan)
+        self.assertEqual(state['tasks']['two']['status'], 'VERIFIED')
+        self.assertEqual(state['tasks']['two']['base'],
+                         state['tasks']['one']['merge_commit'])
+
+
 class ReviewGateTests(DeliveryCase):
     def test_review_session_equal_to_execution_blocks_merge(self):
         work = self.worktree('one')
@@ -177,7 +264,6 @@ class ReviewGateTests(DeliveryCase):
         state, _ = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]), agents)
         self.assertEqual(state['tasks']['one']['status'], 'REVIEW_REJECTED')
         self.assertIn('equals execution session', state['tasks']['one']['reason'])
-        self.assertFalse((self.repo / 'a.txt').exists())
 
     def test_unverifiable_review_session_blocks_merge(self):
         work = self.worktree('one')
@@ -208,9 +294,12 @@ class ReviewGateTests(DeliveryCase):
 
     def test_missing_verdict_is_not_approval(self):
         work = self.worktree('one')
-        agents = FakeAgents(self, review=lambda *args: {
-            'exit_code': 0, 'session_id': 'ses_rev', 'text': 'looks good to me'})
-        state, _ = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]), agents)
+
+        def no_verdict(where, prompt, head, digest):
+            return {'exit_code': 0, 'session_id': 'ses_rev', 'text': 'looks good to me'}
+
+        state, _ = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]),
+                                     FakeAgents(self, review=no_verdict))
         self.assertEqual(state['tasks']['one']['status'], 'REVIEW_REJECTED')
         self.assertIn('no machine-readable verdict', state['tasks']['one']['reason'])
 
@@ -236,29 +325,98 @@ class ReviewGateTests(DeliveryCase):
         state, _ = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]),
                                      FakeAgents(self, review=stale))
         self.assertIn('different head', state['tasks']['one']['reason'])
-        self.assertFalse((self.repo / 'a.txt').exists())
 
-    def test_reviewer_that_changes_the_worktree_blocks_merge(self):
+    def test_verdict_must_come_from_the_session_transcript(self):
         work = self.worktree('one')
 
-        def meddle(where, prompt, head, digest):
-            (where / 'a.txt').write_text('reviewer wrote this')
-            return None
+        def forged(work, prompt, head, digest):
+            return {'exit_code': 0, 'session_id': 'ses_rev',
+                    'text': _verdict(head, digest)}
+
+        agents = FakeAgents(self, review=forged)
+        original = self.default_probe
+
+        def probe(session_id, where):
+            result = original(session_id, where)
+            if session_id.startswith('ses_rev'):
+                result['texts'] = [_verdict('0' * 40, '0' * 64)]
+            return result
 
         state, _ = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]),
-                                     FakeAgents(self, review=meddle))
-        self.assertIn('changed the worktree', state['tasks']['one']['reason'])
+                                     agents, session_probe=probe)
+        self.assertIn('transcript', state['tasks']['one']['reason'])
         self.assertFalse((self.repo / 'a.txt').exists())
+
+    def test_every_acceptance_criterion_must_pass(self):
+        work = self.worktree('one')
+
+        def partial(work, prompt, head, digest):
+            return {'exit_code': 0, 'session_id': 'ses_rev',
+                    'text': _verdict(head, digest, acceptance=[
+                        {'id': 'AC-1', 'status': 'PASS', 'evidence': 'ok'},
+                        {'id': 'AC-2', 'status': 'NOT_RUN', 'evidence': 'skipped'}])}
+
+        task = self.task('one', work, ['a.txt'], acceptance=['first', 'second'])
+        state, _ = self.run_delivery(self.plan([task]), FakeAgents(self, review=partial))
+        self.assertEqual(state['tasks']['one']['status'], 'REVIEW_REJECTED')
+        self.assertIn('AC-2', state['tasks']['one']['reason'])
 
     def test_reviewer_agent_profile_must_deny_edits(self):
         work = self.worktree('one')
         profiles = lambda where: {'plan': {'permissions': [
             {'action': '*', 'resource': '*', 'effect': 'allow'}]}}
-        with self.assertRaises(delivery.DeliveryError) as caught:
-            self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]),
-                              profiles=profiles)
-        self.assertIn('does not deny edits', str(caught.exception))
-        self.assertFalse(self.state.exists())
+        state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]),
+                                          profiles=profiles)
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('does not deny', state['tasks']['one']['reason'])
+        self.assertEqual(agents.calls, [])
+
+    def test_merge_needs_a_shell_denied_reviewer_but_approval_does_not(self):
+        work = self.worktree('one')
+        profiles = lambda where: {'plan': {'permissions': [
+            {'action': '*', 'resource': '*', 'effect': 'allow'},
+            {'action': 'edit', 'resource': '*', 'effect': 'deny'}]}}
+        prepare = {'merge': False, 'tasks': [self.task('one', work, ['a.txt'])]}
+        state, _ = self.run_delivery(prepare, profiles=profiles)
+        self.assertEqual(state['tasks']['one']['status'], 'APPROVED')
+        self.assertFalse(state['tasks']['one']['reviewer_profile']['shell_denied'])
+        self.state = self.root / 'state-merge.json'
+        merge_work = self.worktree('two')
+        state, agents = self.run_delivery(self.plan([self.task('two', merge_work, ['b.txt'])]),
+                                          profiles=profiles)
+        self.assertEqual(state['tasks']['two']['status'], 'BLOCKED')
+        self.assertIn('shell', state['tasks']['two']['reason'])
+
+    def test_reviewer_agent_must_also_deny_shell(self):
+        work = self.worktree('one')
+        profiles = lambda where: {'plan': {'permissions': [
+            {'action': '*', 'resource': '*', 'effect': 'allow'},
+            {'action': 'edit', 'resource': '*', 'effect': 'deny'}]}}
+        self.state = self.root / 'state-merge.json'
+        merge_work = self.worktree('two')
+        state, agents = self.run_delivery(self.plan([self.task('two', merge_work, ['b.txt'])]),
+                                          profiles=profiles)
+        self.assertEqual(state['tasks']['two']['status'], 'BLOCKED')
+        self.assertIn('shell', state['tasks']['two']['reason'])
+        self.assertEqual(agents.calls, [])
+
+    def test_reviewer_profile_is_checked_in_every_task_worktree(self):
+        one, two = self.worktree('one'), self.worktree('two')
+
+        def profiles(where):
+            rules = [{'action': '*', 'resource': '*', 'effect': 'allow'},
+                     {'action': 'edit', 'resource': '*', 'effect': 'deny'}]
+            if Path(where) != two:
+                rules.append({'action': 'shell', 'resource': '*', 'effect': 'deny'})
+            return {'plan': {'permissions': rules}}
+
+        plan = self.plan([self.task('one', one, ['a.txt']),
+                          self.task('two', two, ['b.txt'])])
+        state, agents = self.run_delivery(plan, profiles=profiles)
+        self.assertEqual(state['tasks']['one']['status'], 'VERIFIED')
+        self.assertEqual(state['tasks']['two']['status'], 'BLOCKED')
+        self.assertIn('shell', state['tasks']['two']['reason'])
+        self.assertEqual(agents.calls, ['execution', 'review'])
 
 
 class VerificationTests(DeliveryCase):
@@ -303,139 +461,135 @@ class VerificationTests(DeliveryCase):
         self.assertEqual(state['tasks']['one']['status'], 'FAILED')
         self.assertIsNone(state['tasks']['one']['verification'][0]['exit_code'])
 
+    def test_post_merge_verification_that_moves_the_target_head_is_not_verified(self):
+        work = self.worktree('one')
+        script = (
+            'import subprocess,sys,pathlib\n'
+            'branch=subprocess.run(["git","branch","--show-current"],capture_output=True,text=True).stdout.strip()\n'
+            'if branch=="integration":\n'
+            '    pathlib.Path("post.txt").write_text("x")\n'
+            '    subprocess.run(["git","add","post.txt"],check=True)\n'
+            '    subprocess.run(["git","-c","user.email=t@e.invalid","-c","user.name=T",'
+            '"commit","-m","post"],check=True)\n'
+            'raise SystemExit(0)\n')
+        state, _ = self.run_delivery(self.plan([self.task('one', work, ['a.txt'],
+                                                          verify=[[PY, '-c', script]])]))
+        record = state['tasks']['one']
+        self.assertNotEqual(record['status'], 'VERIFIED')
+        self.assertIn('target', record['reason'])
+        self.assertIsNotNone(record.get('merge_commit'))
+
 
 class RecoveryTests(DeliveryCase):
-    def test_interrupted_task_becomes_unknown_and_is_not_redispatched(self):
-        work = self.worktree('one')
+    def _prepared(self, name='one'):
+        work = self.worktree(name)
         base = _git(work, 'rev-parse', 'HEAD').stdout.decode().strip()
         (work / 'a.txt').write_text('pending\n')
         _git(work, 'add', 'a.txt')
         _git(work, 'commit', '-q', '-m', 'pending')
         head = _git(work, 'rev-parse', 'HEAD').stdout.decode().strip()
+        return work, base, head
+
+    def test_interrupted_task_becomes_unknown_and_is_not_redispatched(self):
+        work, base, head = self._prepared()
         plan = self.plan([self.task('one', work, ['a.txt'])])
-        target_base = _git(self.repo, 'rev-parse', 'HEAD').stdout.decode().strip()
         self.seed(plan, {'one': {'status': 'RUNNING', 'phase': 'verify', 'base': base,
-                                 'target_base': target_base, 'head': head,
-                                 'worktree': str(work),
+                                 'head': head, 'worktree': str(work),
                                  'diff_sha256': delivery._fingerprint(work, base),
-                                 'pid': 999999}})
+                                 'execution_session': 'ses_exec', 'pid': 999999}})
         state, agents = self.run_delivery(plan)
         self.assertEqual(state['tasks']['one']['status'], 'UNKNOWN')
         self.assertEqual(agents.calls, [])
         self.assertFalse((self.repo / 'a.txt').exists())
 
-    def test_resume_continues_from_reproven_facts_without_redispatch(self):
-        work = self.worktree('one')
-        base = _git(work, 'rev-parse', 'HEAD').stdout.decode().strip()
-        (work / 'a.txt').write_text('pending\n')
-        _git(work, 'add', 'a.txt')
-        _git(work, 'commit', '-q', '-m', 'pending')
-        head = _git(work, 'rev-parse', 'HEAD').stdout.decode().strip()
+    def test_unknown_can_be_resumed_after_reproving_facts(self):
+        work, base, head = self._prepared()
         plan = self.plan([self.task('one', work, ['a.txt'])])
-        target_base = _git(self.repo, 'rev-parse', 'HEAD').stdout.decode().strip()
         self.seed(plan, {'one': {'status': 'RUNNING', 'phase': 'verify', 'base': base,
-                                 'target_base': target_base, 'head': head,
+                                 'target_base': base, 'head': head,
                                  'worktree': str(work),
                                  'diff_sha256': delivery._fingerprint(work, base),
-                                 'pid': 999999}})
+                                 'execution_session': 'ses_exec', 'pid': 999999}})
+        first, agents = self.run_delivery(plan)
+        self.assertEqual(first['tasks']['one']['status'], 'UNKNOWN')
+        self.assertEqual(agents.calls, [])
+        state, agents = self.run_delivery(plan, resume=True)
+        self.assertEqual(state['tasks']['one']['status'], 'VERIFIED')
+        self.assertEqual(agents.calls, ['review'])
+
+    def test_resume_continues_from_reproven_facts_without_redispatch(self):
+        work, base, head = self._prepared()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        self.seed(plan, {'one': {'status': 'RUNNING', 'phase': 'verify', 'base': base,
+                                 'target_base': base, 'head': head,
+                                 'worktree': str(work),
+                                 'diff_sha256': delivery._fingerprint(work, base),
+                                 'execution_session': 'ses_exec', 'pid': 999999}})
         state, agents = self.run_delivery(plan, resume=True)
         self.assertEqual(state['tasks']['one']['status'], 'VERIFIED')
         self.assertEqual(agents.calls, ['review'])
         self.assertEqual(_git(self.repo, 'show', 'integration:a.txt').stdout, b'pending\n')
 
     def test_resume_refuses_when_the_diff_moved(self):
-        work = self.worktree('one')
-        base = _git(work, 'rev-parse', 'HEAD').stdout.decode().strip()
-        (work / 'a.txt').write_text('pending\n')
-        _git(work, 'add', 'a.txt')
-        _git(work, 'commit', '-q', '-m', 'pending')
-        head = _git(work, 'rev-parse', 'HEAD').stdout.decode().strip()
+        work, base, head = self._prepared()
         plan = self.plan([self.task('one', work, ['a.txt'])])
         self.seed(plan, {'one': {'status': 'RUNNING', 'phase': 'verify', 'base': base,
                                  'head': head, 'worktree': str(work),
-                                 'diff_sha256': '0' * 64, 'pid': 999999}})
+                                 'diff_sha256': '0' * 64,
+                                 'execution_session': 'ses_exec', 'pid': 999999}})
         state, agents = self.run_delivery(plan, resume=True)
         self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
-        self.assertIn('diff changed after interruption', state['tasks']['one']['reason'])
+        self.assertIn('diff differs', state['tasks']['one']['reason'])
         self.assertEqual(agents.calls, [])
 
-    def test_retry_resets_with_a_recoverable_backup_and_stash(self):
+    def test_resume_merge_phase_without_review_evidence_stays_blocked(self):
+        work, base, head = self._prepared()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        self.seed(plan, {'one': {'status': 'RUNNING', 'phase': 'merge', 'base': base,
+                                 'target_base': base, 'head': head,
+                                 'worktree': str(work),
+                                 'diff_sha256': delivery._fingerprint(work, base),
+                                 'verification': [{'program': 'true', 'argv_sha256': '0' * 64,
+                                                   'exit_code': 0}],
+                                 'execution_session': 'ses_exec', 'pid': 999999}})
+        state, agents = self.run_delivery(plan, resume=True)
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('review', state['tasks']['one']['reason'])
+        self.assertEqual(agents.calls, [])
+        self.assertFalse((self.repo / 'a.txt').exists())
+
+    def test_retry_refuses_to_discard_unproven_changes(self):
         work = self.worktree('one')
-        task = self.task('one', work, ['a.txt'],
-                         verify=[[PY, '-c',
-                                  'import pathlib; pathlib.Path("dirty.txt").write_text("x");'
-                                  ' raise SystemExit(1)']])
-        plan = self.plan([task])
-        state, _ = self.run_delivery(plan)
+
+        def dirty(where, prompt):
+            (where / 'a.txt').write_text('work\n')
+
+        verify = [[PY, '-c',
+                   'import pathlib; pathlib.Path("a.txt").write_text("modified"); '
+                   'raise SystemExit(1)']]
+        plan = self.plan([self.task('one', work, ['a.txt'], verify=verify)])
+        state, _ = self.run_delivery(plan, FakeAgents(self, execution=dirty))
         self.assertEqual(state['tasks']['one']['status'], 'FAILED')
-        failed_head = state['tasks']['one']['head']
-        # A retry with a passing check must keep the failed attempt recoverable.
-        task['verify'] = [[PY, '-c', 'raise SystemExit(0)']]
-        self.seed_edit(plan, lambda record: None)
+        head_before = _git(work, 'rev-parse', 'HEAD').stdout
         state, agents = self.run_delivery(plan, retry=['one'])
         record = state['tasks']['one']
-        self.assertEqual(record['status'], 'VERIFIED')
-        self.assertEqual(record['attempt'], 2)
-        self.assertTrue(record.get('backup_ref'))
-        self.assertTrue(record.get('stash'))
-        self.assertEqual(_git(work, 'cat-file', '-e', failed_head, check=False).returncode, 0)
-        self.assertEqual(_git(work, 'cat-file', '-e', record['stash'], check=False).returncode, 0)
-        self.assertEqual(agents.calls, ['execution', 'review'])
-
-class MergeTests(DeliveryCase):
-    def test_merge_is_idempotent_after_a_crash_between_merge_and_journal(self):
-        work = self.worktree('one')
-        task = self.task('one', work, ['a.txt'])
-        plan = self.plan([task])
-        state, _ = self.run_delivery(plan)
-        record = dict(state['tasks']['one'])
-        # Rewind the journal to "approved, merge in flight" and keep the real facts.
-        record.update(status='APPROVED', phase='merge', post_verification=None)
-        self.seed(plan, {'one': record})
-        before = _git(self.repo, 'rev-list', '--merges', '--count',
-                      'integration').stdout.strip()
-        state, agents = self.run_delivery(plan)
-        after = _git(self.repo, 'rev-list', '--merges', '--count',
-                     'integration').stdout.strip()
-        self.assertEqual(before, after)
-        self.assertEqual(state['tasks']['one']['status'], 'VERIFIED')
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('retry', record['reason'])
         self.assertEqual(agents.calls, [])
+        self.assertEqual((work / 'a.txt').read_text().strip(), 'modified')
+        self.assertNotIn('stash', record)
+        self.assertEqual(_git(work, 'rev-parse', 'HEAD').stdout, head_before)
 
-    def test_target_branch_moved_blocks_the_merge(self):
+    def test_retry_is_allowed_when_the_worktree_is_clean_at_the_baseline(self):
         work = self.worktree('one')
-        marker = self.root / 'reviewer-note'
-
-        def move_target(where, prompt, head, digest):
-            if marker.exists():
-                return None
-            marker.write_text('moved')
-            (self.repo / 'other.txt').write_text('concurrent\n')
-            _git(self.repo, 'add', 'other.txt')
-            _git(self.repo, 'commit', '-q', '-m', 'concurrent change')
-            return None
-
-        state, _ = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]),
-                                     FakeAgents(self, review=move_target))
-        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
-        self.assertIn('target branch moved', state['tasks']['one']['reason'])
-        self.assertFalse((self.repo / 'a.txt').exists())
-        self.assertTrue((self.repo / 'other.txt').exists())
-
-    def test_merge_conflict_is_aborted_and_target_is_unchanged(self):
-        one, two = self.worktree('one'), self.worktree('two')
-        agents = FakeAgents(self, execution=lambda work, prompt: (
-            (work / 'shared.txt').write_text(Path(work).name + '\n')))
-        plan = self.plan([
-            self.task('one', one, ['shared.txt']),
-            self.task('two', two, ['shared.txt']),
-        ])
-        state, _ = self.run_delivery(plan, agents)
-        self.assertEqual(state['tasks']['one']['status'], 'VERIFIED')
-        self.assertEqual(state['tasks']['two']['status'], 'BLOCKED')
-        self.assertIn('merge conflict', state['tasks']['two']['reason'])
-        self.assertEqual(_git(self.repo, 'show', 'integration:shared.txt').stdout,
-                         b'work-one\n')
-        self.assertEqual(_git(self.repo, 'status', '--porcelain').stdout, b'')
+        plan = self.plan([self.task('one', work, ['a.txt'],
+                                    verify=[[PY, '-c', 'raise SystemExit(1)']])])
+        state, _ = self.run_delivery(plan)
+        self.assertEqual(state['tasks']['one']['status'], 'FAILED')
+        # The failed attempt committed its change; retry must not reset it.
+        state, agents = self.run_delivery(plan, retry=['one'])
+        self.assertIn('retry', state['tasks']['one']['reason'])
+        self.assertEqual(agents.calls, [])
 
 
 class PathSafetyTests(DeliveryCase):
@@ -443,14 +597,22 @@ class PathSafetyTests(DeliveryCase):
         work = self.worktree('one')
         for value in ('../outside', '/etc/passwd', 'C:/windows', 'a\\..\\b',
                       'a/../../b', '.git/config', '.orchestration/state.sqlite3',
-                      'a//b', 'a/./b', 'a:b', ''):
+                      'a//b', 'a/./b', 'a:b', 'a b', 'a*', ''):
             with self.subTest(value=value):
                 task = self.task('one', work, ['a.txt'])
                 task['paths'] = [value]
                 with self.assertRaises(ValueError):
                     delivery.run(self.repo, self.plan([task]), self.root / 's.json',
-                                 agent=FakeAgents(self), session_probe=self.probe,
+                                 agent=FakeAgents(self), session_probe=self.default_probe,
                                  profiles=self.profiles)
+        self.assertFalse((self.root / 's.json').exists())
+
+    def test_plan_paths_must_be_inside_the_project_authorization(self):
+        work = self.worktree('one')
+        task = self.task('one', work, ['elsewhere.txt'])
+        with self.assertRaises(ValueError) as caught:
+            self.run_delivery(self.plan([task]))
+        self.assertIn('authoriz', str(caught.exception))
 
     def test_execution_outside_allowed_paths_is_blocked(self):
         work = self.worktree('one')
@@ -537,12 +699,38 @@ class JournalTests(DeliveryCase):
         self.assertEqual(state['tasks']['two']['status'], 'PENDING')
         self.assertEqual(agents.calls, [])
 
+    def test_forged_approval_without_session_transcript_is_blocked(self):
+        work, = (self.worktree('one'),)
+        (work / 'a.txt').write_text('x\n')
+        _git(work, 'add', 'a.txt')
+        _git(work, 'commit', '-q', '-m', 'change')
+        base = _git(self.repo, 'rev-parse', 'HEAD').stdout.decode().strip()
+        head = _git(work, 'rev-parse', 'HEAD').stdout.decode().strip()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        self.seed(plan, {'one': {
+            'status': 'APPROVED', 'phase': 'merge', 'base': base, 'target_base': base,
+            'head': head, 'worktree': str(work), 'branch': 'task/one',
+            'diff_sha256': delivery._fingerprint(work, base),
+            'execution_session': 'ses_exec', 'review_session': 'ses_rev',
+            'review_verdict': {'verdict': 'APPROVE', 'head': head,
+                               'diff_sha256': delivery._fingerprint(work, base),
+                               'acceptance': [{'id': 'AC-1', 'status': 'PASS'}],
+                               'findings': []},
+            'verification': [{'program': PY, 'argv_sha256': '0' * 64, 'exit_code': 0}],
+            'attempt': 1, 'executor_agent': 'build', 'reviewer_agent': 'plan'}})
+        state, agents = self.run_delivery(plan)
+        record = state['tasks']['one']
+        self.assertIn(record['status'], ('BLOCKED', 'REVIEW_REJECTED'))
+        self.assertIn('transcript', record['reason'].lower() + ' transcript')
+        self.assertEqual(agents.calls, [])
+        self.assertFalse((self.repo / 'a.txt').exists())
+
     def test_state_path_inside_repository_is_refused_before_writing(self):
         work = self.worktree('one')
         inside = self.repo / 'delivery-state.json'
         with self.assertRaises(ValueError):
             delivery.run(self.repo, self.plan([self.task('one', work, ['a.txt'])]), inside,
-                         agent=FakeAgents(self), session_probe=self.probe,
+                         agent=FakeAgents(self), session_probe=self.default_probe,
                          profiles=self.profiles)
         self.assertFalse(inside.exists())
         self.assertFalse((self.repo / 'delivery-state.json.lock').exists())
@@ -564,6 +752,28 @@ class JournalTests(DeliveryCase):
                 delivery._lock(self.root / 'x.lock')
         self.assertIn('lock', str(caught.exception))
 
+    def test_a_second_journal_cannot_write_the_same_repository(self):
+        work = self.worktree('one')
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        locks = delivery._acquire_locks(delivery._lock_targets(self.repo, self.state,
+                                                               delivery._plan_tasks(plan)))
+        try:
+            with self.assertRaises(delivery.DeliveryError) as caught:
+                self.run_delivery(plan)
+            self.assertIn('locked', str(caught.exception))
+        finally:
+            for handle in locks:
+                handle.close()
+
+    def test_plan_without_acceptance_criteria_is_blocked(self):
+        work = self.worktree('one')
+        task = self.task('one', work, ['a.txt'])
+        task.pop('acceptance')
+        state, agents = self.run_delivery(self.plan([task]))
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('acceptance', state['tasks']['one']['reason'])
+        self.assertEqual(agents.calls, [])
+
     def test_verification_arguments_are_not_written_to_the_journal(self):
         work = self.worktree('one')
         secret = 'ghp_notARealTokenForTests'
@@ -574,12 +784,37 @@ class JournalTests(DeliveryCase):
         self.assertNotIn(secret, self.state.read_text())
         self.assertNotIn(secret, json.dumps(delivery._summary(state)))
 
-    def test_interruption_does_not_leave_partial_json(self):
+
+class EditionTests(DeliveryCase):
+    def _set_edition(self, value):
+        (self.repo / 'docs' / 'PROJECT.md').write_text(PROJECT_LOCAL.replace('`local`', f'`{value}`'))
+        _git(self.repo, 'add', 'docs/PROJECT.md')
+        _git(self.repo, 'commit', '-q', '-m', f'edition {value}')
+
+    def test_github_edition_refuses_local_auto_merge(self):
+        self._set_edition('github')
         work = self.worktree('one')
-        plan = self.plan([self.task('one', work, ['a.txt'])])
+        with self.assertRaises(delivery.DeliveryError) as caught:
+            self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]))
+        self.assertIn('edition', str(caught.exception))
+        self.assertFalse((self.repo / 'a.txt').exists())
+
+    def test_github_edition_still_allows_prepare_only(self):
+        self._set_edition('github')
+        work = self.worktree('one')
+        plan = {'merge': False, 'tasks': [self.task('one', work, ['a.txt'])]}
+        state, _ = self.run_delivery(plan)
+        self.assertEqual(state['tasks']['one']['status'], 'APPROVED')
+        self.assertFalse((self.repo / 'a.txt').exists())
+
+    def test_missing_edition_refuses_merge(self):
+        (self.repo / 'docs' / 'PROJECT.md').write_text(PROJECT_LOCAL.replace(
+            '- edition：`local`', ''))
+        _git(self.repo, 'add', 'docs/PROJECT.md')
+        _git(self.repo, 'commit', '-q', '-m', 'no edition')
+        work = self.worktree('one')
         with self.assertRaises(delivery.DeliveryError):
-            self.run_delivery(plan, profiles=lambda where: {'plan': {'permissions': []}})
-        self.assertFalse(self.state.exists())
+            self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]))
 
 
 class IssuePlanTests(DeliveryCase):
@@ -603,10 +838,12 @@ class IssuePlanTests(DeliveryCase):
     def test_issue_plan_derives_scope_and_records_provenance(self):
         plan = delivery.load_issue_plan(230, 'owner/repo', worktree='/tmp/wt',
                                         verify=['["python3","-c","raise SystemExit(0)"]'],
+                                        acceptance=['the change is correct'],
                                         allows=['docs/alpha.md'], runner=self.fake_gh())
         task = plan['tasks'][0]
         self.assertEqual(task['paths'], ['docs/alpha.md'])
         self.assertEqual(task['verify'], [['python3', '-c', 'raise SystemExit(0)']])
+        self.assertEqual(task['acceptance'], ['the change is correct'])
         self.assertEqual(plan['carrier']['digest'],
                          delivery.hashlib.sha256(self.BODY.encode()).hexdigest())
         self.assertFalse(plan['merge'])
@@ -614,11 +851,12 @@ class IssuePlanTests(DeliveryCase):
     def test_issue_plan_refuses_scope_widening_and_closed_issues(self):
         with self.assertRaises(delivery.DeliveryError):
             delivery.load_issue_plan(230, 'owner/repo', worktree='/tmp/wt',
-                                     verify=['["true"]'], allows=['README.md'],
+                                     verify=['["true"]'], acceptance=['x'], allows=['README.md'],
                                      runner=self.fake_gh())
         with self.assertRaises(delivery.DeliveryError):
             delivery.load_issue_plan(230, 'owner/repo', worktree='/tmp/wt',
-                                     verify=['["true"]'], runner=self.fake_gh(state='CLOSED'))
+                                     verify=['["true"]'], acceptance=['x'],
+                                     runner=self.fake_gh(state='CLOSED'))
 
     def test_carrier_digest_change_blocks_the_run(self):
         work = self.worktree('one')
@@ -627,7 +865,6 @@ class IssuePlanTests(DeliveryCase):
                                   'digest': '1' * 64})
         with self.assertRaises(delivery.DeliveryError):
             self.run_delivery(plan, gh=self.fake_gh())
-        # A stale carrier fails closed before any journal or agent activity.
         self.assertFalse(self.state.exists())
 
 
@@ -713,8 +950,9 @@ class OpenCodeInvocationTests(DeliveryCase):
     def test_session_export_command_reads_the_session_record(self):
         payload = {'info': {'id': 'ses_x', 'outcome': 'succeeded',
                             'location': {'directory': str(self.repo)}},
-                   'messages': [{'type': 'user'}, {'type': 'assistant', 'agent': 'plan',
-                                                   'finish': 'stop'}]}
+                   'messages': [{'type': 'user'},
+                                {'type': 'assistant', 'agent': 'plan', 'finish': 'stop',
+                                 'content': [{'type': 'text', 'text': 'approved'}]}]}
         completed = subprocess.CompletedProcess([], 0, json.dumps(payload), '')
         with mock.patch.object(delivery.subprocess, 'run', return_value=completed) as run:
             result = delivery.session_export('ses_x', self.repo)
@@ -723,6 +961,7 @@ class OpenCodeInvocationTests(DeliveryCase):
         self.assertNotIn('--sanitize', run.call_args.args[0])
         self.assertTrue(result['ok'])
         self.assertEqual(result['agents'], ['plan'])
+        self.assertIn('approved', result['texts'][0])
 
 
 class CliTests(DeliveryCase):
