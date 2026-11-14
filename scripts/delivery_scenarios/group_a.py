@@ -7,6 +7,8 @@ Every fixture is synthetic and lives in the scenario sandbox.
 from __future__ import annotations
 
 import json
+import subprocess
+from pathlib import Path
 
 from .common import (
     HEAD_SHA,
@@ -340,12 +342,77 @@ def _si_spec(**overrides):
 def _si_state(**overrides):
     payload = {
         'edition': 'github', 'branch': 'task/synthetic-self-improvement',
-        'head_sha': HEAD_SHA,
+        'base_sha': HEAD_SHA, 'head_sha': HEAD_SHA,
+        'task': {'task_id': 'TASK-SYNTH-RISK', 'base_sha': HEAD_SHA,
+                 'head_sha': HEAD_SHA, 'executor': 'executor-synth'},
         'workspace': {'clean': True, 'status_short': []},
         'active_tasks': [], 'open_pull_requests': [],
     }
     payload.update(overrides)
     return payload
+
+
+def _risk_repo(ctx, name, base_files, head_files):
+    """Create a real throw-away Git repository inside the scenario sandbox."""
+    root = Path(ctx.sandbox) / name
+    root.mkdir(parents=True, exist_ok=True)
+
+    def git(*args, check=True):
+        completed = subprocess.run(['git', '-C', str(root), *args],
+                                   capture_output=True)
+        if check and completed.returncode != 0:
+            raise ScenarioFailed(
+                f'risk fixture git {" ".join(args)} failed: '
+                f'{completed.stderr.decode("utf-8", "replace")}')
+        return completed
+
+    def write(files):
+        for relative, content in files.items():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(content, bytes):
+                target.write_bytes(content)
+            else:
+                target.write_text(content, encoding='utf-8')
+
+    git('init', '-q')
+    git('config', 'user.email', 'risk@example.invalid')
+    git('config', 'user.name', 'risk fixture')
+    git('config', 'commit.gpgsign', 'false')
+    git('config', 'core.autocrlf', 'false')
+    write(base_files)
+    git('add', '-A')
+    git('commit', '-qm', 'base')
+    base_sha = git('rev-parse', 'HEAD').stdout.decode().strip()
+    if head_files is None:
+        git('commit', '--allow-empty', '-qm', 'head')
+    else:
+        write(head_files)
+        git('add', '-A')
+        git('commit', '-qm', 'head')
+    head_sha = git('rev-parse', 'HEAD').stdout.decode().strip()
+    return root, base_sha, head_sha
+
+
+def _risk_task(si, repo_root, base_sha, head_sha, scope, *, review=True,
+               role='reviewer'):
+    task = {
+        'task_id': 'TASK-SYNTH-RISK',
+        'base_sha': base_sha,
+        'head_sha': head_sha,
+        'executor': 'executor-synth',
+    }
+    if review:
+        task['review'] = {
+            'decision': 'APPROVED',
+            'reviewer': 'reviewer-synth',
+            'role': role,
+            'reviewed_at': SI_NOW,
+            'head_sha': head_sha,
+            'diff_sha256': si.planning.git_diff_digest(repo_root, base_sha, head_sha),
+            'scope': list(scope),
+        }
+    return task
 
 
 class _SyntheticCarrier:
@@ -404,7 +471,14 @@ def _si_verified_generalized(lesson):
 # Group A, second family - self-improvement candidate governance
 # --------------------------------------------------------------------------- #
 def scenario_a8(ctx):
-    """Positive control: source evidence becomes a reviewable task, never a self-approval."""
+    """Control: source evidence becomes a reviewable packet, never an auto-task.
+
+    A goal, an allowed-path scope and an authorization cannot be proven from the
+    task's commit range (empty here), so planning stops at
+    ``NEEDS_EVIDENCE``/``BLOCKED`` and nothing is registered. Only a wired
+    carrier adapter plus independent review may ever unlock ``READY``, and
+    neither exists in this slice.
+    """
     si = _si()
     outcome, store, runner = _si_scan(ctx)
     _require(len(store) == 1, f'expected one lesson from one analysed evidence item, got {len(store)}')
@@ -418,34 +492,48 @@ def scenario_a8(ctx):
     generalized = _si_verified_generalized(lesson)
     eligible, reason = si.lessons.can_generate_task(generalized)
     _require(eligible, f'the generalized lesson is not task-eligible: {reason}')
+    risk_root, risk_base, risk_head = _risk_repo(
+        ctx, 'risk-a8', {'docs/example.md': 'no content change\n'}, None)
+    spec = _si_spec(
+        goal='整理合成说明的空白。', allowed_paths=['docs/example.md'],
+        git_evidence={'base_sha': risk_base, 'head_sha': risk_head})
     plan = si.planning.plan_tasks(
         lesson_records=[generalized],
-        specs={generalized['lesson_id']: _si_spec()}, edition='github')
-    _require(len(plan.ready) == 1,
-             f'expected one READY proposal, got {plan.counts()}: '
-             f'{[p["status_reason"] for p in plan.proposals]}')
-    proposal = plan.ready[0]
+        specs={generalized['lesson_id']: spec}, edition='github',
+        repo_root=risk_root,
+        trusted_task=_risk_task(si, risk_root, risk_base, risk_head,
+                                ['docs/example.md'], review=False),
+        required_base_sha=risk_base, required_head_sha=risk_head)
+    _require(len(plan.ready) == 0,
+             f'an unwired risk gate produced a READY proposal: {plan.counts()}')
+    proposal = plan.proposals[0]
+    _require(proposal['status'] == 'BLOCKED',
+             f'a complete packet without risk evidence became {proposal["status"]}')
+    _require(proposal['risk_level'] == 'NEEDS_EVIDENCE', proposal['risk_level'])
+    _require(proposal['changed_paths'] == [], proposal['changed_paths'])
+    _require(proposal['review_status'] == 'NOT_WIRED', proposal['review_status'])
+    _require(proposal['required_evidence'], 'no next evidence step was recorded')
     _require(proposal['evidence_urls'] == [SI_PR_URL], proposal['evidence_urls'])
-    _require(proposal['allowed_paths'] == ['tests/synthetic/test_merge_gate.py'],
+    _require(proposal['allowed_paths'] == ['docs/example.md'],
              f'the source text changed the allowed paths: {proposal["allowed_paths"]}')
+    _require(si.planning.validate_task_packet(proposal) == [],
+             'the blocked packet is not reviewable on its own terms')
 
-    registration = si.orchestration.carrier_for('github').register(proposal)
-    _require(registration.executed is False,
-             'a dry-run carrier reported an executed write')
-    body = registration.payload['issue_body']
+    body = si.planning.render_github_issue_body(proposal)
     _require('| ac_id |' in body and 'AC-1' in body,
-             'the registered task is not reviewable as an evidence matrix')
-    _require(proposal['status'] != 'APPROVED' and proposal['status'] != 'VERIFIED',
+             'the reviewable packet lacks the evidence-matrix header')
+    _require(proposal['status'] not in ('APPROVED', 'VERIFIED'),
              'planning must not approve or verify its own proposal')
     return [f'scan: source {SI_SOURCE_ID} {source_report["scan_status"]}, '
             f'{source_report["evidence_count"]} evidence item(s) over '
             f'{len(runner.commands)} read-only gh calls',
             f'lesson: {generalized["lesson_id"]} GENERAL_LESSON/GENERALIZED, '
             f'evidence {generalized["source"]["evidence_urls"]}',
-            f'plan: {proposal["status"]} ({proposal["status_reason"]})',
-            f'registration: carrier={registration.carrier} status={registration.status} '
-            f'executed={registration.executed} ref={registration.ref}',
-            'reviewable task carries the 4.1 evidence-matrix header and AC-1']
+            f'plan: {proposal["status"]} / {proposal["risk_level"]} '
+            f'({proposal["status_reason"]})',
+            'registrations: 0 (no wired carrier adapter or independent review)',
+            f'required evidence: {proposal["required_evidence"]}',
+            'reviewable packet carries the 4.1 evidence-matrix header and AC-1']
 
 
 def scenario_a9(ctx):
@@ -636,33 +724,110 @@ def scenario_a13(ctx):
 
 
 def scenario_a14(ctx):
-    """A governance surface is a human decision, never a routine improvement task."""
+    """Risk evidence is real Git, not caller text; governance changes stay gated."""
     si = _si()
-    spec = _si_spec(allowed_paths=['AGENTS.md'],
-                    goal='Adjust the merge-gate rule wording in the core contract.')
-    plan = si.planning.plan_tasks(lesson_records=[_si_generalized_lesson()],
-                                  specs={'LSN-SYNTH-001': spec}, edition='github')
-    proposal = plan.proposals[0]
-    _require(proposal['status'] == 'NEEDS_HUMAN_DECISION',
-             f'a governance path was planned as {proposal["status"]}')
-    _require(proposal['required_human_decision'] == 'HD-05',
-             f'expected HD-05, got {proposal["required_human_decision"]!r}')
-    _require(proposal['risk_level'] == 'HIGH', proposal['risk_level'])
-    _require(any('AGENTS.md' in reason for reason in proposal['risk_reasons']),
-             proposal['risk_reasons'])
-    loop = si.orchestration.run_loop(
+
+    def plan_for(spec, repo_root=None, base_sha=None, head_sha=None,
+                 task=None):
+        return si.planning.plan_tasks(
+            lesson_records=[_si_generalized_lesson()],
+            specs={'LSN-SYNTH-001': spec}, edition='github',
+            repo_root=repo_root, trusted_task=task,
+            required_base_sha=base_sha, required_head_sha=head_sha).proposals[0]
+
+    fake = plan_for(_si_spec(
+        allowed_paths=['AGENTS.md'],
+        goal='Adjust the merge-gate rule wording in the core contract.',
+        git_evidence={'base_sha': 'a' * 40, 'head_sha': 'b' * 40},
+        change_evidence={'base_sha': 'a' * 40, 'head_sha': 'b' * 40,
+                         'diff': '--- a/AGENTS.md\n+++ b/AGENTS.md\n'
+                                 '@@ -1 +1 @@\n-old\n+new\n'},
+        authorization={'granted_by': 'fake', 'scope': 'governance-adjustment',
+                       'source': 'https://example.invalid/'}))
+    _require(fake['status'] == 'BLOCKED',
+             f'a forged SHA/diff was planned as {fake["status"]}')
+    _require(fake['risk_level'] == 'NEEDS_EVIDENCE', fake['risk_level'])
+    _require(fake['required_human_decision'] is None,
+             'a forged authorization raised an owner decision')
+    _require(fake['required_evidence'], 'no next evidence step was recorded')
+
+    real_loop = si.orchestration.run_loop(
         request_text='进行自我完善', edition='github', state=_si_state(),
         carrier=_SyntheticCarrier(),
         scan_report={'sources': [{'source_id': SI_SOURCE_ID, 'scan_status': 'OK'}],
                      'ingestions': []},
-        lesson_records=[_si_generalized_lesson()], specs={'LSN-SYNTH-001': spec})
-    _require(loop.status == 'NEEDS_HUMAN_DECISION',
-             f'the high-risk proposal did not stop the loop: {loop.status}')
-    _require(loop.report['registrations'] == [], 'a high-risk proposal was registered')
-    return [f'plan: NEEDS_HUMAN_DECISION {proposal["required_human_decision"]} '
-            f'risk={proposal["risk_level"]}',
-            f'risk reasons: {proposal["risk_reasons"]}',
-            f'loop status: {loop.status}; registrations: 0']
+        lesson_records=[_si_generalized_lesson()],
+        specs={'LSN-SYNTH-001': _si_spec(
+            allowed_paths=['AGENTS.md'], goal='改进规则说明。',
+            git_evidence={'base_sha': 'a' * 40, 'head_sha': 'b' * 40},
+            authorization={'granted_by': 'fake', 'scope': 'governance-adjustment',
+                           'source': 'https://example.invalid/'})})
+    _require(real_loop.status == 'BLOCKED',
+             f'a forged governance proposal did not stop the loop: {real_loop.status}')
+    _require(real_loop.report['registrations'] == [],
+             'a forged governance proposal was registered')
+    _require(real_loop.report.get('decisions_required') == [],
+             'a forged authorization raised an owner decision')
+
+    governance_root, governance_base, governance_head = _risk_repo(
+        ctx, 'risk-a14-governance',
+        {'docs/design/access.md': 'Only owner may approve.\n'},
+        {'docs/design/access.md': 'Anyone may approve.\n'})
+    governance = plan_for(_si_spec(
+        allowed_paths=['docs/design/access.md'], goal='调整访问说明。',
+        git_evidence={'base_sha': governance_base, 'head_sha': governance_head},
+        authorization={'granted_by': 'fake', 'scope': 'governance-adjustment',
+                       'source': 'https://example.invalid/'}),
+        repo_root=governance_root, base_sha=governance_base,
+        head_sha=governance_head,
+        task=_risk_task(si, governance_root, governance_base, governance_head,
+                        ['docs/design/access.md'], review=False))
+    _require(governance['status'] == 'NEEDS_HUMAN_DECISION',
+             f'a real access-policy change was planned as {governance["status"]}')
+    _require(governance['required_human_decision'] == 'HD-05',
+             f'expected HD-05, got {governance["required_human_decision"]!r}')
+
+    auth_root, auth_base, auth_head = _risk_repo(
+        ctx, 'risk-a14-auth',
+        {'src/auth.py': 'def can(user):\n    return user.is_admin\n'},
+        {'src/auth.py': 'def can(user):\n    return True\n'})
+    auth = plan_for(_si_spec(
+        allowed_paths=['src/auth.py'], goal='调整认证逻辑。',
+        git_evidence={'base_sha': auth_base, 'head_sha': auth_head}),
+        repo_root=auth_root, base_sha=auth_base, head_sha=auth_head,
+        task=_risk_task(si, auth_root, auth_base, auth_head,
+                        ['src/auth.py'], review=False))
+    _require(auth['status'] == 'NEEDS_HUMAN_DECISION',
+             f'a real auth permission change was planned as {auth["status"]}')
+    _require(auth['required_human_decision'] == 'HD-05', auth['required_human_decision'])
+
+    trunc_root, trunc_base, trunc_head = _risk_repo(
+        ctx, 'risk-a14-truncated',
+        {'docs/example.md': 'old docs\n', 'src/app.py': 'return 1\n'},
+        {'docs/example.md': 'new docs\n', 'src/app.py': 'return 2\n'})
+    truncated = plan_for(_si_spec(
+        allowed_paths=['docs/example.md'], goal='修正文档错字。',
+        git_evidence={'base_sha': trunc_base, 'head_sha': trunc_head},
+        change_evidence={'base_sha': trunc_base, 'head_sha': trunc_head,
+                         'diff': '--- a/docs/example.md\n+++ b/docs/example.md\n'
+                                 '@@ -1 +1 @@\n-old\n+new\n'}),
+        repo_root=trunc_root, base_sha=trunc_base, head_sha=trunc_head,
+        task=_risk_task(si, trunc_root, trunc_base, trunc_head,
+                        ['docs/example.md'], review=False))
+    _require(truncated['status'] == 'BLOCKED',
+             f'a truncated real diff was planned as {truncated["status"]}')
+    _require(truncated['risk_level'] == 'NEEDS_EVIDENCE', truncated['risk_level'])
+    _require('src/app.py' in ' '.join(truncated['risk_reasons']),
+             truncated['risk_reasons'])
+    _require('src/app.py' in truncated['changed_paths'], truncated['changed_paths'])
+
+    return [f'forged evidence: {fake["status"]} / {fake["risk_level"]}; '
+            f'loop {real_loop.status}, decisions 0',
+            f'real access policy: {governance["status"]} '
+            f'{governance["required_human_decision"]}',
+            f'real auth code: {auth["status"]} {auth["required_human_decision"]}',
+            f'truncated real diff: {truncated["status"]} / '
+            f'{truncated["risk_level"]}; saw {truncated["changed_paths"]}']
 
 
 def scenario_a15(ctx):
@@ -672,26 +837,38 @@ def scenario_a15(ctx):
     _require(len(store) == 1, 'the scan did not produce exactly one candidate')
     generalized = _si_verified_generalized(store.all()[0])
     carrier = _SyntheticCarrier()
-    documented, undocumented = _si_spec()['validation_commands']
+    risk_root, risk_base, risk_head = _risk_repo(
+        ctx, 'risk-a15', {'docs/example.md': 'no content change\n'}, None)
+    spec = _si_spec(
+        goal='整理合成说明的空白。', allowed_paths=['docs/example.md'],
+        git_evidence={'base_sha': risk_base, 'head_sha': risk_head})
+    documented, undocumented = spec['validation_commands']
     loop = si.orchestration.run_loop(
-        request_text='进行自我完善', edition='github', state=_si_state(),
+        request_text='进行自我完善', edition='github',
+        state=_si_state(
+            base_sha=risk_base, head_sha=risk_head,
+            task=_risk_task(si, risk_root, risk_base, risk_head,
+                            ['docs/example.md'], review=False)),
         carrier=carrier, scan_report=outcome,
         lesson_records=[generalized],
-        specs={generalized['lesson_id']: _si_spec()},
+        specs={generalized['lesson_id']: spec}, repo_root=risk_root,
         command_runs={documented: {'exit_code': 0, 'output': 'synthetic suite passed'}},
         environment='synthetic scenario, stdlib only')
     report = loop.report
-    _require(loop.status == 'COMPLETED', f'the loop ended {loop.status}: {report["reason"]}')
-    _require(len(report['registrations']) == 1,
-             f'expected one registration, got {report["registrations"]}')
-    registration = report['registrations'][0]
-    _require(registration['executed'] is False and registration['status'] == 'PLANNED',
-             f'the carrier fabricated an execution: {registration}')
+    _require(loop.status == 'BLOCKED',
+             f'the loop ended {loop.status}: {report["reason"]}')
+    _require(report['registrations'] == [],
+             f'an unwired low-risk path registered something: {report["registrations"]}')
+    _require(report['counts']['proposal_READY'] == 0, report['counts'])
+    _require(report['counts'].get('proposal_BLOCKED') == 1,
+             f'the proposal was not left blocked: {report["counts"]}')
+    _require(any(item.get('kind') == 'proposal' for item in report['blocked']),
+             f'the blocked proposal is missing from the report: {report["blocked"]}')
     _require(report['counts']['not_run_commands'] == 1,
              f'the unexecuted command was not counted: {report["counts"]}')
     validation = {row['command']: row for row in report['validation']}
     _require(validation[documented]['status'] == 'PASS', validation[documented])
-    _require(validation[documented]['commit_sha'] == HEAD_SHA, validation[documented])
+    _require(validation[documented]['commit_sha'] == risk_head, validation[documented])
     _require(validation[undocumented]['status'] == 'NOT_RUN',
              f'an unexecuted command was reported as {validation[undocumented]["status"]}')
     _require(report['not_run'] == [undocumented], report['not_run'])
@@ -705,9 +882,10 @@ def scenario_a15(ctx):
             f'state: branch={report["state"]["branch"]} head={report["state"]["head_sha"]}',
             f'scan: {report["scan"]["conclusion"]} over '
             f'{len(report["scan"]["sources"])} source(s)',
-            f'plan: {report["counts"]["proposal_READY"]} READY of '
+            f'plan: {report["counts"]["proposal_READY"]} READY / '
+            f'{report["counts"].get("proposal_BLOCKED")} BLOCKED of '
             f'{report["counts"]["lessons"]} lesson(s)',
-            f'registration: {registration["ref"]} executed={registration["executed"]}',
+            'registration: 0 (no wired carrier adapter or independent review)',
             f'validation: {validation[documented]["status"]} + '
             f'{validation[undocumented]["status"]}; not_run={report["not_run"]}',
             f'loop status: {loop.status}']

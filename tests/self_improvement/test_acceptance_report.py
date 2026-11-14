@@ -62,13 +62,20 @@ class RegistryTests(unittest.TestCase):
             for field in ('precondition', 'defect', 'gate', 'evidence', 'cleanup'):
                 self.assertTrue(getattr(scenario, field),
                                 f'{scenario_id} has an empty {field}')
-            self.assertIn(scenario.kind, ('positive', 'negative'))
+            self.assertIn(scenario.kind, ('positive', 'negative', 'safety'))
             self.assertIn(scenario.group, 'ABCD')
 
     def test_each_new_group_keeps_a_positive_control(self):
         by_id = {item.id: item for item in RUNNER.SCENARIOS}
         positives = [item for item in FINAL_SCENARIOS if by_id[item].kind == 'positive']
-        self.assertEqual(positives, ['A8', 'A15', 'B5', 'C19', 'D8'])
+        self.assertEqual(positives, ['B5', 'C19', 'D8'])
+
+    def test_self_improvement_scenarios_are_safety_fallbacks_not_positive(self):
+        by_id = {item.id: item for item in RUNNER.SCENARIOS}
+        for scenario_id in ('A8', 'A15'):
+            self.assertEqual(by_id[scenario_id].kind, 'safety',
+                             f'{scenario_id} must not be counted as a positive control')
+            self.assertIn('TEMPORARY SAFETY FALLBACK', by_id[scenario_id].gate)
 
     @unittest.skipUnless(SCENARIO_DOC.is_file(), 'repository-only document is not shipped')
     def test_scenario_catalogue_lists_every_final_scenario(self):

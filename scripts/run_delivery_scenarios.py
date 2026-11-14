@@ -36,7 +36,12 @@ Two properties are deliberate:
     a non-assertion exception such as TypeError) is recorded as ERROR with its
     traceback and the remaining scenarios still execute;
   * a negative group always comes with a positive control, so "everything fails"
-    is never mistaken for "the gates work".
+    is never mistaken for "the gates work";
+  * ``safety`` scenarios (A8 / A15) are **temporary safety fallbacks**, not
+    positive controls. The self-improvement READY/registration path is not
+    implemented (no authoritative carrier adapter or independent review), so a
+    PASS there proves only that the loop refuses to auto-advance. They are
+    counted separately and never reported as positive capability proofs.
 
 Exit codes: 0 all scenarios passed, 1 at least one scenario failed or errored,
 2 the runner itself could not run (missing module, unknown --only id, unwritable
@@ -408,14 +413,21 @@ SCENARIOS = (
              'the executor claims completion without any evidence item',
              'G1/G6: empty matrix, unbacked AC and direct VERIFIED are all refused',
              'validator findings, refusal message, lock count', 'sandbox removed', scenario_d7),
-    Scenario('A8', 'A', 'positive', 'synthetic source evidence becomes a reviewable task',
-             'one synthetic merged pull request, one synthetic commit and one CI run',
-             'none (positive control)',
-             'self-improvement: the lesson is verified, reclassified and generalized before '
-             'planning; only READY reaches the carrier, which reports executed=False',
-             'scan status / evidence count, lesson id and evidence URLs, proposal status, '
-             'registration payload with the evidence-matrix header',
-             'in-memory source stand-in; scenario sandbox removed', scenario_a8),
+    Scenario('A8', 'A', 'safety',
+             'synthetic source evidence becomes a reviewable packet '
+             '(positive READY path NOT IMPLEMENTED)',
+             'one synthetic merged pull request, one synthetic commit, one CI run, and a '
+             'real throw-away Git repository with a no-content commit range',
+             'none injected: the positive READY/registration path is not implemented',
+             'TEMPORARY SAFETY FALLBACK, not a positive capability proof: the lesson is '
+             'verified, reclassified and generalized before planning; a complete packet '
+             'without risk evidence stays BLOCKED / NEEDS_EVIDENCE and nothing is '
+             'registered because no wired carrier adapter or independent review exists. '
+             'A PASS here proves the refusal only.',
+             'scan status / evidence count, lesson id and evidence URLs, proposal status and '
+             'risk level, required evidence, evidence-matrix header',
+             'in-memory source stand-in plus a sandbox Git repository; sandbox removed',
+             scenario_a8),
     Scenario('A9', 'A', 'negative', 'source unreachable or forbidden',
              'a registered public source whose pulls endpoint fails with a network error '
              'and with 403; one private source with the same 403',
@@ -454,21 +466,31 @@ SCENARIOS = (
              'state machine refuses OBSERVED -> GENERALIZED as skipped verification',
              'eligibility reason, proposal status, state-machine refusal text',
              'in-memory records only; sandbox removed', scenario_a13),
-    Scenario('A14', 'A', 'negative', 'high-risk surface left unresolved',
-             'a generalized lesson whose spec would edit AGENTS.md',
-             'a governance surface is treated as a routine improvement task',
-             'risk gate: HD-05 NEEDS_HUMAN_DECISION, risk_level HIGH with a locatable reason; '
-             'the loop registers nothing',
-             'proposal status / decision id / risk reasons, loop status, registrations',
-             'in-memory records only; sandbox removed', scenario_a14),
-    Scenario('A15', 'A', 'positive', 'self-improvement loop end to end',
-             'a synthetic source scan, one lesson driven to GENERALIZED and a synthetic carrier',
-             'none (positive control)',
-             'loop: trigger routed, state restored, scan classified, plan gated, one task '
-             'registered with executed=False, one executed check recorded PASS and one '
-             'unexecuted command NOT_RUN, closure report written',
-             'trigger / state / scan / plan / registration / validation / not_run fields, '
-             'closure markdown sections', 'in-memory carrier; sandbox removed', scenario_a15),
+    Scenario('A14', 'A', 'negative', 'forged or truncated risk evidence',
+             'fake SHAs plus a caller diff and fake authorization; real Git repositories with '
+             'an access-policy text change, an auth code change, and a real commit range whose '
+             'diff is truncated to one allowed path',
+             'a caller diff / SHA / authorization decides risk, or a real permission change is '
+             'auto-released',
+             'risk gate: forged and truncated evidence is BLOCKED / NEEDS_EVIDENCE with zero '
+             'registrations and no owner decision; real access-policy and auth changes are '
+             'HD-05 NEEDS_HUMAN_DECISION and are not registered',
+             'proposal status / risk level / changed paths / required evidence / decision id, '
+             'loop status, registrations', 'real sandbox Git repositories; sandbox removed',
+             scenario_a14),
+    Scenario('A15', 'A', 'safety', 'self-improvement loop end to end '
+             '(positive registration path NOT IMPLEMENTED)',
+             'a synthetic source scan, one lesson driven to GENERALIZED, a real throw-away Git '
+             'repository with a no-content commit range, and a synthetic carrier',
+             'none injected: the positive READY/registration path is not implemented',
+             'TEMPORARY SAFETY FALLBACK, not a positive capability proof: the loop routes the '
+             'trigger, restores state, classifies the scan, gates the plan with zero '
+             'registrations (no wired low-risk evidence path), records one executed check '
+             'PASS and one unexecuted command NOT_RUN, and writes the closure report. '
+             'A PASS here proves the safe stop only.',
+             'trigger / state / scan / plan / blocked / validation / not_run fields, '
+             'closure markdown sections', 'in-memory carrier plus a sandbox Git repository; '
+             'sandbox removed', scenario_a15),
     Scenario('B5', 'B', 'positive', 'clean older install upgrades end to end',
              'a synthetic v1.5 project with a baseline manifest and a v1.6 release zip',
              'none (positive control)',
@@ -744,15 +766,21 @@ def run_scenarios(scenarios, workdir, vk=None, orch=None, emit=None):
     return results
 
 
+SCENARIO_KINDS = ('positive', 'negative', 'safety')
+
+
 def build_report(results, started_at=None):
     counts = {'scenarios': len(results), 'passed': 0, 'failed': 0, 'errors': 0,
-              'positive': 0, 'negative': 0, 'positive_passed': 0, 'negative_passed': 0}
+              'positive': 0, 'negative': 0, 'safety': 0,
+              'positive_passed': 0, 'negative_passed': 0, 'safety_passed': 0}
     for result in results:
         scenario = result.scenario
-        counts['positive' if scenario.kind == 'positive' else 'negative'] += 1
+        if scenario.kind not in SCENARIO_KINDS:
+            raise ToolError(f'scenario {scenario.id} has unknown kind {scenario.kind!r}')
+        counts[scenario.kind] += 1
         if result.status == 'PASS':
             counts['passed'] += 1
-            counts[f'{"positive" if scenario.kind == "positive" else "negative"}_passed'] += 1
+            counts[f'{scenario.kind}_passed'] += 1
         elif result.status == 'FAIL':
             counts['failed'] += 1
         else:
@@ -791,7 +819,9 @@ def format_human(report):
     totals = report['totals']
     lines = ['Synthetic delivery regression scenarios',
              f'  {totals["scenarios"]} scenarios: {totals["positive"]} positive control(s), '
-             f'{totals["negative"]} injected-defect scenario(s)']
+             f'{totals["negative"]} injected-defect scenario(s), '
+             f'{totals["safety"]} temporary safety fallback(s) '
+             '(positive capability NOT WIRED)']
     for key in GROUPS:
         group = report['groups'][key]
         lines.append(f'  {key} {group["label"]}: {group["passed"]}/{group["scenarios"]} passed')

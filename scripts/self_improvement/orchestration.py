@@ -10,7 +10,7 @@ The loop is an orchestrator, not a new governance layer. It:
    reports ``NO_SOURCES`` / ``NOT_RUN`` / ``INCOMPLETE`` honestly instead of
    calling an unfinished scan "no new evidence";
 4. gates every lesson through :mod:`planning`, which needs an explicit spec and
-   escalates conflicts / high-risk surfaces;
+   escalates conflicts / evidenced high-risk changes and blocks unevidenced leads;
 5. hands only ``READY`` proposals to **one** carrier matching the edition, and
 6. writes a closure report with the current head SHA, the human decisions and
    every command it did not run (``NOT_RUN``).
@@ -59,8 +59,27 @@ LIMITATIONS = (
     'never used to change allowed paths or acceptance criteria.',
     'This loop does not create Issues or tasks, run validation commands, approve, merge, '
     'or close anything; the carriers here are dry-run records.',
-    'High-risk surfaces always end in NEEDS_HUMAN_DECISION here; an owner decision is '
-    're-planned as a normal task, not auto-unlocked by a flag.',
+    'Risk uses the repository’s own Git evidence and only cross-checks the caller-supplied '
+    'base/head locators; that cross-check is not authoritative carrier authentication, and '
+    'caller diffs, SHA strings, review or authorization fields are never evidence. Replace '
+    'refs and diff-hiding config are disabled; repository clean/process filters, config '
+    'includes, executable config in an initialised submodule / nested repository, and '
+    'promisor / ext:: / HTTP-alternate transports make the planner fail closed before any '
+    'Git command (not implemented, every command repeats the preflight), while '
+    'fsmonitor and hooks are disabled through overrides. Hidden index flags / ignored '
+    'allowed paths / stale snapshots block, and no change set is auto-LOW: an empty commit '
+    'range cannot prove the goal, the allowed-path scope or the authorization. The '
+    'authoritative carrier adapter and independent review are not wired in this release, so '
+    'every proposal stops at NEEDS_EVIDENCE with next_action; caller review cannot unlock '
+    'READY. High-risk recognition is a fixed path table plus limited keywords: recognised '
+    'permission/security/destructive leads end in NEEDS_HUMAN_DECISION, an ordinary '
+    'documentation permission mention stays NEEDS_EVIDENCE, and an unrecognised change is '
+    'never treated as safe. A permission/security keyword alone (for example a goal that '
+    'says "adjust user permissions" while the allowed path is an ordinary file) is a '
+    'review lead with no decision id; only destructive wording, or a keyword that '
+    'coincides with a high-risk path or the real diff, escalates. An initialised '
+    'submodule / nested repository with executable config and a promisor, ext:: or '
+    'HTTP-alternate transport are also refused before any Git command.',
 )
 
 
@@ -198,14 +217,22 @@ def restore_state(state, *, edition):
     head_sha = state.get('head_sha')
     if not isinstance(head_sha, str) or not SHA_RE.match(head_sha):
         errors.append('state.head_sha must be the full 40-character commit SHA')
+    base_sha = state.get('base_sha')
+    if not isinstance(base_sha, str) or not SHA_RE.match(base_sha):
+        errors.append('state.base_sha must be the full 40-character task baseline SHA')
     branch = state.get('branch')
     if not isinstance(branch, str) or not branch.strip():
         errors.append('state.branch is missing')
+    task = state.get('task')
+    if task is not None and not isinstance(task, dict):
+        errors.append('state.task must be the trusted task-carrier record')
     workspace = state.get('workspace') or {}
     normalized = {
         'edition': declared,
         'branch': branch,
+        'base_sha': base_sha,
         'head_sha': head_sha,
+        'task': task,
         'workspace_clean': workspace.get('clean'),
         'workspace_status': list(workspace.get('status_short') or []),
         'active_tasks': list(state.get('active_tasks') or []),
@@ -299,7 +326,14 @@ class LoopOutcome:
 def _validation_rows(plan, command_runs, head_sha, environment):
     rows = []
     seen = []
-    for proposal in plan.ready:
+    # Every command declared by a *candidate* proposal is accounted for, not only
+    # the READY ones: with no low-risk evidence path wired, nothing is READY and
+    # dropping the declared commands would silently hide what was never run.
+    # NO_TASK / ALREADY_REGISTERED proposals are not candidates and contribute
+    # nothing.
+    for proposal in plan.proposals:
+        if proposal.get('status') not in ('READY', 'BLOCKED', 'NEEDS_HUMAN_DECISION'):
+            continue
         for command in proposal.get('validation_commands') or []:
             if command not in seen:
                 seen.append(command)
@@ -327,7 +361,8 @@ def _validation_rows(plan, command_runs, head_sha, environment):
 
 def run_loop(*, request_text, edition, state, carrier=None, scan_report=None,
              lesson_records=(), specs=None, coverage=None, dependency_state=None,
-             existing_tasks=None, command_runs=None, environment='', now=None):
+             existing_tasks=None, command_runs=None, environment='', now=None,
+             repo_root=None):
     """Run one self-improvement loop pass and return a closure report."""
     if edition not in CARRIER_KINDS:
         raise LoopError(f'unknown edition {edition!r}; expected one of {CARRIER_KINDS}')
@@ -412,7 +447,10 @@ def run_loop(*, request_text, edition, state, carrier=None, scan_report=None,
     plan = planning.plan_tasks(
         lesson_records=list(lesson_records), specs=specs or {}, edition=edition,
         dependency_state=dependency_state or {}, coverage=coverage or {},
-        existing_tasks=existing_tasks or {})
+        existing_tasks=existing_tasks or {}, repo_root=repo_root,
+        trusted_task=normalized_state.get('task'),
+        required_base_sha=normalized_state['base_sha'],
+        required_head_sha=normalized_state['head_sha'])
     report['plan'] = plan.as_dict()
 
     for proposal in plan.proposals:
@@ -428,6 +466,16 @@ def run_loop(*, request_text, edition, state, carrier=None, scan_report=None,
                 'lesson_id'), 'reason': proposal.get('status_reason')})
 
     for proposal in plan.ready:
+        stable, why = planning.recheck_git_evidence(
+            proposal, repo_root=repo_root,
+            required_base_sha=normalized_state['base_sha'],
+            required_head_sha=normalized_state['head_sha'])
+        if not stable:
+            report['blocked'].append({
+                'kind': 'git_recheck', 'lesson_id': proposal.get('lesson_id'),
+                'reason': 'Git evidence changed or could not be re-verified '
+                          'before registration: ' + '; '.join(why)})
+            continue
         try:
             registration = register(proposal)
         except CarrierError as exc:
