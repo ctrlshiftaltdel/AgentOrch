@@ -164,6 +164,15 @@ class DeliveryCase(unittest.TestCase):
             'version': 4, 'tasks': tasks, 'plan_hash': self.plan_hash(plan),
             'carrier_digest': None, 'mode': delivery.MODE}))
 
+    def bind(self, work, base, task, session='ses_exec'):
+        """Add the runner's own session-to-task/head/diff binding commit."""
+        spec = delivery._plan_tasks(self.plan([task]))[0]
+        packet = delivery._packet_digest(
+            {'executor_agent': 'build', 'reviewer_agent': 'scout'}, spec)
+        digest = delivery._fingerprint(work, base)
+        delivery._bind_session(work, base, session, digest, packet)
+        return _head_of(work), digest
+
     def seed_edit(self, plan, edit):
         state = self.journal()
         for record in state['tasks'].values():
@@ -372,18 +381,20 @@ class ReviewGateTests(DeliveryCase):
 
 
 class ResumeTests(DeliveryCase):
-    def _prepared(self, name='one'):
+    def _prepared(self, name='one', verify=None):
         work = self.worktree(name)
         base = _git(work, 'rev-parse', 'HEAD').stdout.decode().strip()
         (work / 'a.txt').write_text('pending\n')
         _git(work, 'add', 'a.txt')
         _git(work, 'commit', '-q', '-m', 'pending')
-        head = _git(work, 'rev-parse', 'HEAD').stdout.decode().strip()
+        task = self.task('one', work, ['a.txt'], verify=verify)
+        head = self.bind(work, base, task)[0]
         return work, base, head
 
     def _seed_review(self, work, base, head, plan, **extra):
         record = {'status': 'RUNNING', 'phase': 'review', 'base': base, 'head': head,
                   'worktree': str(work), 'diff_sha256': delivery._fingerprint(work, base),
+                  'changed_paths': ['a.txt'],
                   'execution_session': 'ses_exec', 'pid': 999999,
                   'executor_agent': 'build', 'reviewer_agent': 'scout'}
         record.update(extra)
@@ -398,9 +409,9 @@ class ResumeTests(DeliveryCase):
         self.assertEqual(agents.calls, [])
 
     def test_resume_re_runs_verification_before_review(self):
-        work, base, head = self._prepared()
-        plan = self.plan([self.task('one', work, ['a.txt'],
-                                    verify=[[PY, '-c', 'raise SystemExit(73)']])])
+        failing = [[PY, '-c', 'raise SystemExit(73)']]
+        work, base, head = self._prepared(verify=failing)
+        plan = self.plan([self.task('one', work, ['a.txt'], verify=failing)])
         self._seed_review(work, base, head, plan)
         state, agents = self.run_delivery(plan, resume=True)
         self.assertEqual(state['tasks']['one']['status'], 'FAILED')
@@ -408,13 +419,13 @@ class ResumeTests(DeliveryCase):
         self.assertEqual(agents.calls, [])
 
     def test_resume_never_merges_when_verification_fails_even_if_the_target_has_the_head(self):
-        work, base, head = self._prepared()
+        failing = [[PY, '-c', 'raise SystemExit(73)']]
+        work, base, head = self._prepared(verify=failing)
         # The target branch already contains the task head, as in the reported
         # repro. There is no merge code, but the regression check asserts that a
         # failing verification cannot produce an approved/merged outcome.
         _git(self.repo, 'merge', '--no-ff', '--no-edit', 'task/one')
-        plan = self.plan([self.task('one', work, ['a.txt'],
-                                    verify=[[PY, '-c', 'raise SystemExit(73)']])])
+        plan = self.plan([self.task('one', work, ['a.txt'], verify=failing)])
         self._seed_review(work, base, head, plan)
         before = _git(self.repo, 'rev-parse', 'HEAD').stdout
         state, agents = self.run_delivery(plan, resume=True)
@@ -467,6 +478,71 @@ class ResumeTests(DeliveryCase):
         state, agents = self.run_delivery(plan, resume=True, session_probe=probe)
         self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
         self.assertIn('not the declared build', state['tasks']['one']['reason'])
+        self.assertEqual(agents.calls, [])
+
+    def test_resume_refuses_a_manual_commit_the_session_never_produced(self):
+        # The reported repro: a hand-made commit plus a forged UNKNOWN/verify
+        # journal that points at an old, genuinely successful session. Session
+        # metadata alone is not evidence that this session produced this head.
+        work = self.worktree('one')
+        base = _head_of(self.repo)
+        (work / 'a.txt').write_text('pending\n')
+        _git(work, 'add', 'a.txt')
+        _git(work, 'commit', '-q', '-m', 'manual commit without a runner binding')
+        head = _head_of(work)
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        self.seed(plan, {'one': {
+            'status': 'UNKNOWN', 'phase': 'verify', 'base': base, 'head': head,
+            'worktree': str(work), 'branch': 'task/one',
+            'diff_sha256': delivery._fingerprint(work, base),
+            'changed_paths': ['a.txt'], 'execution_session': 'ses_exec',
+            'pid': 999999, 'executor_agent': 'build', 'reviewer_agent': 'scout'}})
+        state, agents = self.run_delivery(plan, resume=True)
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('does not prove', state['tasks']['one']['reason'])
+        self.assertEqual(agents.calls, [])
+
+    def test_resume_refuses_a_binding_for_a_different_diff(self):
+        # A journal writer can keep a real session id and a real head but bind
+        # the session to a different diff digest.
+        work = self.worktree('one')
+        base = _head_of(self.repo)
+        (work / 'a.txt').write_text('pending\n')
+        _git(work, 'add', 'a.txt')
+        _git(work, 'commit', '-q', '-m', 'pending')
+        digest = delivery._fingerprint(work, base)
+        task = self.task('one', work, ['a.txt'])
+        spec = delivery._plan_tasks(self.plan([task]))[0]
+        delivery._bind_session(
+            work, base, 'ses_exec', '0' * 64,
+            delivery._packet_digest({'executor_agent': 'build', 'reviewer_agent': 'scout'},
+                                    spec))
+        head = _head_of(work)
+        plan = self.plan([task])
+        self.seed(plan, {'one': {
+            'status': 'UNKNOWN', 'phase': 'verify', 'base': base, 'head': head,
+            'worktree': str(work), 'branch': 'task/one', 'diff_sha256': digest,
+            'changed_paths': ['a.txt'], 'execution_session': 'ses_exec',
+            'pid': 999999, 'executor_agent': 'build', 'reviewer_agent': 'scout'}})
+        state, agents = self.run_delivery(plan, resume=True)
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('does not prove', state['tasks']['one']['reason'])
+        self.assertEqual(agents.calls, [])
+
+    def test_resume_refuses_an_execution_session_from_another_directory(self):
+        work, base, head = self._prepared()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        self._seed_review(work, base, head, plan)
+
+        def probe(session_id, where):
+            result = self.default_probe(session_id, where)
+            if session_id == 'ses_exec':
+                result['directory'] = str(self.root)
+            return result
+
+        state, agents = self.run_delivery(plan, resume=True, session_probe=probe)
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('not in the task worktree', state['tasks']['one']['reason'])
         self.assertEqual(agents.calls, [])
 
     def test_resume_refuses_an_unproven_reviewer_profile_before_running_checks(self):
@@ -540,6 +616,84 @@ class AuthenticateTests(DeliveryCase):
         state, agents = self.run_delivery(plan)
         self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
         self.assertIn('task packet', state['tasks']['one']['reason'])
+        self.assertEqual(agents.calls, [])
+
+    def test_changing_the_acceptance_text_invalidates_the_old_transcript(self):
+        work = self.worktree('one')
+        task = self.task('one', work, ['a.txt'], acceptance=['the original criterion'])
+        plan = self.plan([task])
+        state, _ = self.run_delivery(plan)
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'PREPARED')
+        transcript = self.transcripts[record['review_session']]
+        # Rewrite the acceptance text and recompute everything a journal writer
+        # can recompute: the journal plan hash and the recorded task digest. The
+        # old transcript still quotes the old AC, so it cannot authorize the task.
+        task['acceptance'] = ['a different criterion']
+        spec = delivery._plan_tasks(plan)[0]
+        state = self.journal()
+        state['plan_hash'] = self.plan_hash(plan)
+        state['tasks']['one']['task_digest'] = delivery._task_digest(
+            mock.Mock(plan={'executor_agent': 'build', 'reviewer_agent': 'scout'}),
+            spec, state['tasks']['one'])
+        self.state.write_text(json.dumps(state))
+        state, agents = self.run_delivery(plan)
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('task packet', state['tasks']['one']['reason'])
+        self.assertEqual(self.transcripts[record['review_session']], transcript)
+        self.assertEqual(agents.calls, [])
+
+    def _forged_journal(self, work):
+        task = self.task('one', work, ['a.txt'])
+        plan = self.plan([task])
+        spec = delivery._plan_tasks(plan)[0]
+        base = _head_of(self.repo)
+        (work / 'a.txt').write_text('x\n')
+        _git(work, 'add', 'a.txt')
+        _git(work, 'commit', '-q', '-m', 'change')
+        digest = delivery._fingerprint(work, base)
+        delivery._bind_session(
+            work, base, 'ses_exec', digest,
+            delivery._packet_digest({'executor_agent': 'build', 'reviewer_agent': 'scout'},
+                                    spec))
+        head = _head_of(work)
+        patch, diff_digest = delivery._review_diff(work, base, head, ['a.txt'])
+        record = {
+            'status': 'PREPARED', 'phase': 'done', 'base': base, 'head': head,
+            'worktree': str(work), 'branch': 'task/one', 'diff_sha256': digest,
+            'diff_digest': diff_digest, 'changed_paths': ['a.txt'],
+            'execution_session': 'ses_exec', 'review_session': 'ses_rev',
+            'reviewer_agent': 'scout', 'executor_agent': 'build', 'attempt': 1,
+            'verification': [{'program': PY, 'argv_sha256': '0' * 64, 'exit_code': 0}]}
+        record['task_digest'] = delivery._task_digest(
+            mock.Mock(plan={'executor_agent': 'build', 'reviewer_agent': 'scout'}),
+            spec, record)
+        verdict = json.loads(re.search(
+            r'```json\n(.*?)\n```', _verdict(delivery._review_prompt(spec, record, patch)),
+            re.S).group(1))
+        record['review_verdict'] = verdict
+        return plan, record, verdict
+
+    def test_a_complete_forged_journal_is_reproved_from_the_transcript(self):
+        work = self.worktree('one')
+        plan, record, verdict = self._forged_journal(work)
+        self.transcripts['ses_rev'] = '```json\n' + json.dumps(verdict) + '\n```\n'
+        self.transcripts['ses_exec'] = 'execution finished'
+        self.seed(plan, {'one': record})
+        state, agents = self.run_delivery(plan)
+        self.assertEqual(state['tasks']['one']['status'], 'PREPARED')
+        self.assertEqual(agents.calls, [])
+
+    def test_a_complete_forged_journal_needs_the_session_transcript(self):
+        work = self.worktree('one')
+        plan, record, _ = self._forged_journal(work)
+        # Everything in the journal is self-consistent and the execution session
+        # is real, but there is no review transcript to prove the verdict.
+        self.transcripts['ses_exec'] = 'execution finished'
+        self.seed(plan, {'one': record})
+        state, agents = self.run_delivery(plan)
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('transcript', state['tasks']['one']['reason'])
         self.assertEqual(agents.calls, [])
 
     def test_verdict_paths_must_match_the_task(self):
@@ -779,6 +933,110 @@ class NoDestructiveTests(DeliveryCase):
         self.assertNotIn('stash', record)
         self.assertEqual(agents.calls, ['review'])
 
+    def _seed_rejected_review(self, work, base, plan, changed, session='ses_exec'):
+        head = self.bind(work, base, plan['tasks'][0], session)[0]
+        self.seed(plan, {'one': {
+            'status': 'REVIEW_REJECTED', 'phase': 'review', 'base': base, 'head': head,
+            'worktree': str(work), 'branch': 'task/one',
+            'diff_sha256': delivery._fingerprint(work, base),
+            'changed_paths': list(changed), 'execution_session': session,
+            'review_session': 'ses_rev', 'attempt': 1,
+            'executor_agent': 'build', 'reviewer_agent': 'scout'}})
+
+    def test_retry_checks_every_actual_changed_path_before_running_checks(self):
+        work = self.worktree('one')
+        base = _head_of(self.repo)
+        (work / 'outside.txt').write_text('out of scope\n')
+        _git(work, 'add', 'outside.txt')
+        _git(work, 'commit', '-q', '-m', 'out of scope')
+        marker = work / 'check-ran'
+        verify = [[PY, '-c',
+                   f'import pathlib; pathlib.Path("{marker}").write_text("x")']]
+        plan = self.plan([self.task('one', work, ['a.txt'], verify=verify)])
+        self._seed_rejected_review(work, base, plan, ['outside.txt'])
+        state, agents = self.run_delivery(plan, retry=['one'])
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('outside the task paths', record['reason'])
+        self.assertFalse(marker.exists())
+        self.assertEqual(agents.calls, [])
+
+    def test_retry_requires_the_full_execution_session_identity(self):
+        work = self.worktree('one')
+        base = _head_of(self.repo)
+        (work / 'a.txt').write_text('attempt\n')
+        _git(work, 'add', 'a.txt')
+        _git(work, 'commit', '-q', '-m', 'attempt')
+        marker = work / 'check-ran'
+        verify = [[PY, '-c',
+                   f'import pathlib; pathlib.Path("{marker}").write_text("x")']]
+        plan = self.plan([self.task('one', work, ['a.txt'], verify=verify)])
+        self._seed_rejected_review(work, base, plan, ['a.txt'])
+
+        def probe(session_id, where):
+            result = self.default_probe(session_id, where)
+            if session_id == 'ses_exec':
+                result['session'] = 'ses_someone_else'
+            return result
+
+        state, agents = self.run_delivery(plan, retry=['one'], session_probe=probe)
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('requested session', record['reason'])
+        self.assertFalse(marker.exists())
+        self.assertEqual(agents.calls, [])
+
+    def test_retry_refuses_a_head_the_session_never_produced(self):
+        work = self.worktree('one')
+        base = _head_of(self.repo)
+        (work / 'a.txt').write_text('manual\n')
+        _git(work, 'add', 'a.txt')
+        _git(work, 'commit', '-q', '-m', 'manual commit without a runner binding')
+        head = _head_of(work)
+        marker = work / 'check-ran'
+        verify = [[PY, '-c',
+                   f'import pathlib; pathlib.Path("{marker}").write_text("x")']]
+        plan = self.plan([self.task('one', work, ['a.txt'], verify=verify)])
+        self.seed(plan, {'one': {
+            'status': 'REVIEW_REJECTED', 'phase': 'review', 'base': base, 'head': head,
+            'worktree': str(work), 'branch': 'task/one',
+            'diff_sha256': delivery._fingerprint(work, base),
+            'changed_paths': ['a.txt'], 'execution_session': 'ses_exec',
+            'review_session': 'ses_rev', 'attempt': 1,
+            'executor_agent': 'build', 'reviewer_agent': 'scout'}})
+        state, agents = self.run_delivery(plan, retry=['one'])
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('does not prove', record['reason'])
+        self.assertFalse(marker.exists())
+        self.assertEqual(agents.calls, [])
+
+    def test_retry_proves_the_reviewer_profile_before_running_checks(self):
+        work = self.worktree('one')
+        base = _head_of(self.repo)
+        (work / 'a.txt').write_text('attempt\n')
+        _git(work, 'add', 'a.txt')
+        _git(work, 'commit', '-q', '-m', 'attempt')
+        marker = work / 'check-ran'
+        verify = [[PY, '-c',
+                   f'import pathlib; pathlib.Path("{marker}").write_text("x")']]
+        plan = self.plan([self.task('one', work, ['a.txt'], verify=verify)])
+        self._seed_rejected_review(work, base, plan, ['a.txt'])
+        queried = []
+
+        def profiles(where):
+            queried.append(str(where))
+            return {'scout': {'permissions': [
+                {'action': '*', 'resource': '*', 'effect': 'allow'}]}}
+
+        state, agents = self.run_delivery(plan, retry=['one'], profiles=profiles)
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('not provably read-only', record['reason'])
+        self.assertTrue(queried)
+        self.assertFalse(marker.exists())
+        self.assertEqual(agents.calls, [])
+
 
 class EditionTests(DeliveryCase):
     def _set(self, text):
@@ -796,6 +1054,31 @@ class EditionTests(DeliveryCase):
                 with self.assertRaises(ValueError):
                     self.run_delivery(plan)
                 self.assertFalse(self.state.exists())
+
+    def test_ambiguous_or_unparseable_edition_values_fail_closed(self):
+        prefix = PROJECT_LOCAL.split('- edition')[0]
+        for index, line in enumerate(('- edition：`github/invalid`\n',
+                                      '- edition：???\n',
+                                      '- edition：\n',
+                                      '- edition：`github` extra\n',
+                                      '- edition：`local`t\n')):
+            with self.subTest(line=line):
+                self.state.unlink(missing_ok=True)
+                self._set(prefix + line)
+                work = self.worktree(f'ambiguous{index}')
+                plan = self.plan([self.task('one', work, ['a.txt'])])
+                with self.assertRaises(ValueError) as caught:
+                    self.run_delivery(plan)
+                self.assertIn('edition', str(caught.exception))
+                self.assertFalse(self.state.exists())
+
+    def test_an_unparseable_duplicate_edition_line_is_counted(self):
+        self._set(PROJECT_LOCAL + '- edition：???\n')
+        work = self.worktree('one')
+        with self.assertRaises(ValueError) as caught:
+            self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]))
+        self.assertIn('exactly one', str(caught.exception))
+        self.assertFalse(self.state.exists())
 
     def test_github_edition_allows_prepare_only(self):
         self._set(PROJECT_GITHUB)

@@ -9,7 +9,7 @@
 能做：
 
 - 读真实载体：GitHub Issue（`--issue`）作为任务来源；Issue 的「可改路径」段落收窄为允许路径，正文摘要（sha256）在运行前重新比对。
-- 读项目自身配置：`docs/PROJECT.md` 的 `edition` 必须是 `local` 或 `github`；任务的允许路径必须落在「允许改动路径」内，且不得与「禁止改动路径」互为祖先/后代。缺失或非法配置在派发前拒绝。
+- 读项目自身配置：`docs/PROJECT.md` 的 `edition` 必须是 `local` 或 `github`；值必须整行精确匹配（`github/invalid`、`???`、空值、带尾随文字都算非法），缺失、非法、重复或无法解析的声明数量不为 1 时在派发前拒绝。任务的允许路径必须落在「允许改动路径」内，且不得与「禁止改动路径」互为祖先/后代。缺失或非法配置在派发前拒绝。
 - 启动真实 OpenCode 会话执行（`opencode run --standalone --format json`），不传 `--auto`，不复用会话。
 - 用计划里的命令验证真实 diff；退出码、head 与 diff 指纹都会记录，head 或 diff 在验证/审查期间变动即失败。
 - 用**另一个**新会话、以声明的 Agent 做审查；runner 把 Git 生成的 base..head 完整 diff（文本、受大小上限约束）交给审查者，结论必须来自该会话自身的 transcript，并绑定 base/head、diff 指纹、任务的完整摘要（描述、AC、路径、验证命令、Agent、载体）、模式与每条验收标准原文。
@@ -84,9 +84,9 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 1. **不可变绑定**：审查结论绑定审查时的 base/head、worktree diff 指纹、runner 展示的完整 diff 指纹、`mode=prepare-only`、允许路径**原文**、每条 AC **原文**，以及任务摘要（描述、验证命令、执行/审查 Agent、载体）。journal/plan 被改写后旧 transcript 不再匹配，任务不能继续被信任。二进制、超过大小上限、或命中项目隐私模式的变更在审查前 `BLOCKED`。
 2. **transcript 为准**：流式输出与 `session export` 得到的 transcript 必须一致；journal 里记录的结论只用于比对，不能单独作为证据。
    - 项目授权在每个写操作前后都重新读取 `docs/PROJECT.md`；即使允许前缀更宽，实际变更路径命中禁改路径（含子文件）也会在提交前被拒绝。
-3. **恢复先重证**：`--resume` 处理 `RUNNING` 与 `UNKNOWN`；在运行任何验证命令前，先核验：同一 Git 仓库身份（common dir）、任务包与项目授权（含每个**实际**变更路径）、执行会话的 Agent/目录/终局、审查 Agent 的工具级门禁、worktree head 与指纹。任一不能证明即 `BLOCKED`，不进入审查。
+3. **恢复先重证**：`--resume` 处理 `RUNNING` 与 `UNKNOWN`；在运行任何验证命令前，先核验：同一 Git 仓库身份（common dir）、任务包与项目授权（含每个**实际**变更路径）、执行会话的 Agent/目录/终局、审查 Agent 的工具级门禁、worktree head 与指纹。执行会话还必须能证明它产出了当前 head/diff/task：runner 在提交后追加一个不含文件变更的绑定提交，trailer 记录 `AgentOrch-Session`、`AgentOrch-Base`、`AgentOrch-Diff`、`AgentOrch-Task`（任务包摘要）。手工提交没有该 trailer、trailer 指向别的 session 或别的任务包时保持 `BLOCKED`，不进入审查。任一不能证明即 `BLOCKED`。
 4. **审查门**：`--reviewer-agent` 的 profile 按规则顺序与 action 通配（如 `s*`）取最终匹配；`edit`、`shell` 必须最终为 `deny`，且不能存在无法证明范围的作用域 `allow`（例如先 `deny shell:*` 后 `allow s*:*`）。未通过时任务 `BLOCKED`，不会启动执行。
-5. **重试不破坏数据**：`--retry` 只在没有未提交改动时开放；执行阶段要求 head 等于基线，验证/审查阶段要求 head 等于失败尝试的 head。它不 stash、不 reset；有提交或未提交内容时要求人工处理。
+5. **重试不破坏数据**：`--retry` 只在没有未提交改动时开放；执行阶段要求 head 等于基线，验证/审查阶段要求 head 等于失败尝试的 head。`--retry`、`--resume`、批准重证与每次 execute/verify/review 共用同一套完整重证（身份、实际变更路径、授权、reviewer profile、执行会话与绑定），任何一项失败都在启动命令或 Agent 之前停止。它不 stash、不 reset；有提交或未提交内容时要求人工处理。
 6. **合并检查点不存在**：journal 中出现 `MERGED`/`VERIFIED` 或 `merge`/`post_verify` 阶段时直接 `BLOCKED`，因为本切片不产生也不信任这类状态。
 7. **并发**：按目标仓库、每个任务 worktree 与 journal 分别取得跨进程锁；仓库/worktree 锁位于仓库 Git common dir 下，journal 锁位于 journal 自身目录且不随 `TMPDIR` 变化，因此同一 journal 指向两个仓库也互斥。它不能阻止其他工具或人直接写仓库。
 8. **命令进程树**：验证命令在独立进程组中运行，超时会杀掉整个进程组；但 `setsid` 逃逸的子进程或 Windows 上的子孙进程无法保证被捕获。超时后任务停在 `BLOCKED`，不允许自动重试，需人工确认主机状态。
@@ -95,7 +95,7 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 
 | 文件 | 覆盖 |
 |---|---|
-| `tests/test_autonomous_delivery.py` | 真实 Git 夹具：prepare-only 批准与目标不变；自动合并被拒绝且不启动 Agent；审查会话/身份/目录/transcript/AC 原文/路径集伪造；恢复前重证（失败验证、跨仓库 worktree、错误 Agent、未证只读 profile）；不执行 `reset`/`stash` 且保留 ignored 数据；禁改子路径与实际变更路径；edition 缺失/非法；跨进程锁（不同 `TMPDIR`）；验证命令超时杀掉整个进程树；journal 伪造与合并状态拒绝；argv 凭据不外泄。 |
+| `tests/test_autonomous_delivery.py` | 真实 Git 夹具：prepare-only 批准与目标不变；自动合并被拒绝且不启动 Agent；审查会话/身份/目录/transcript/AC 原文/路径集伪造；恢复前重证（失败验证、跨仓库 worktree、错误 Agent、未证只读 profile）；重试与恢复共用的实际路径/完整 session 身份/绑定 trailer 重证；不执行 `reset`/`stash` 且保留 ignored 数据；禁改子路径与实际变更路径；edition 缺失/非法/重复/前缀歧义；跨进程锁（不同 `TMPDIR`）；验证命令超时杀掉整个进程树；journal 伪造与合并状态拒绝；argv 凭据不外泄。 |
 | `tests/test_opencode_probe.py` | 单次探针事件流的保守分类，不构成交付成功。 |
 | `scripts/opencode_probe.py` | 探针事件流分类辅助；不被执行器用来判定任务成功。 |
 
@@ -114,6 +114,7 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 ## 7. 已知限制
 
 - **合并未实现**是本切片的核心边界；`PREPARED` 不等于 Master 审批，CLI 退出码 0 只表示计划内任务都已准备完毕，不解锁依赖、不触发合并。
+- 绑定提交是**仓库状态，不是密码学证明**：有仓库写权限的人仍可手工构造 trailer。它只排除“仅改 journal / 手工提交”这一层伪造，不替代签名或可信时间戳。绑定提交不含文件变更，会随任务分支一起出现在审查与合并中。
 - 验证命令是受信输入；AC 只由独立审查逐条判定，命令退出 0 不能单独充当批准。
 - `PREPARED` 重证依赖保留任务 worktree 与会话记录；worktree 或会话被清理后会保持 `BLOCKED`，而不是跳过核验。
 - 任务 worktree 必须是独立 linked worktree：等于仓库自身 worktree、或使用仓库当前分支的 worktree 会被拒绝；该检查在所有执行/恢复/重试/重证路径共用。
