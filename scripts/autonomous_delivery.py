@@ -154,6 +154,37 @@ class DeliveryError(Exception):
         self.status = status
 
 
+class SharedGateError(DeliveryError, ValueError):
+    """A shared gate — the project edition or its path authorization — failed.
+
+    ``docs/PROJECT.md`` is one file every task in the run depends on, so a
+    failure there is not scoped to the task that observed it: a later task would
+    prove its worktree and authorization against the same broken declaration.
+    The run therefore has to stop, not merely mark one record. It is recorded
+    once on the task that saw it and no further Git process, Agent session or
+    journal write starts.
+
+    It is also a ``ValueError`` because the failing input is the project config
+    itself: the helpers that read it have always reported a bad or revoked
+    declaration as a value problem to their direct callers, and those callers
+    keep working unchanged while the runtime boundaries gain the shared-gate
+    type they need to stop the whole run.
+    """
+
+
+def _shared(error, message):
+    """The exception to raise for an edition/authorization failure.
+
+    Callers that already report through ``DeliveryError`` (every runtime
+    boundary) get the shared-gate subclass, so the task loop can tell a
+    run-wide failure from a task-scoped one. Startup callers that raise
+    ``ValueError`` keep their own type.
+    """
+    if isinstance(error, type) and issubclass(error, DeliveryError):
+        return SharedGateError(message)
+    return error(message)
+
+
 # --------------------------------------------------------------------------- git
 
 # Re-proof installed by ``run`` while a task is being processed. Every Git
@@ -276,14 +307,14 @@ def _require_edition(config, error=DeliveryError, expected=None):
     """
     if config.get('edition_count') != 1 or config.get('edition') not in VALID_EDITIONS:
         values = config.get('edition_values') or []
-        raise error('docs/PROJECT.md must declare exactly one `edition` of `local` or '
-                    f'`github` before any dispatch; found {config.get("edition_count")} '
-                    f'declaration(s), values {values!r} (edition parsed as '
-                    f'{config.get("edition")!r})')
+        raise _shared(error, 'docs/PROJECT.md must declare exactly one `edition` of `local` or '
+                     f'`github` before any dispatch; found {config.get("edition_count")} '
+                     f'declaration(s), values {values!r} (edition parsed as '
+                     f'{config.get("edition")!r})')
     if expected is not None and config.get('edition') != expected:
-        raise error('docs/PROJECT.md switched the project edition from '
-                    f'{expected!r} to {config.get("edition")!r} while the run was live; '
-                    'refusing to continue from an edition the run did not begin with')
+        raise _shared(error, 'docs/PROJECT.md switched the project edition from '
+                     f'{expected!r} to {config.get("edition")!r} while the run was live; '
+                     'refusing to continue from an edition the run did not begin with')
 
 
 def _require_live_config(context, spec=None):
@@ -297,8 +328,23 @@ def _require_live_config(context, spec=None):
     fresh = project_config(context.repo)
     _require_edition(fresh, expected=context.config.get('edition'))
     if spec is not None:
-        _authorize_paths(spec['paths'], fresh)
+        _require_authorized(spec['paths'], fresh)
     return fresh
+
+
+def _require_authorized(paths, config, error=DeliveryError):
+    """Prove the task paths against the project's own authorization.
+
+    The authorization list is read from the shared ``docs/PROJECT.md``, so a
+    failure here means the *shared* declaration no longer covers this run's
+    tasks: it is reported as a shared gate failure, not as one task's scope
+    error. A task-scoped scope check (an actual changed path that the unchanged
+    authorization does not cover) is still a plain ``DeliveryError``.
+    """
+    try:
+        _authorize_paths(paths, config)
+    except ValueError as exc:
+        raise _shared(error, str(exc)) from None
 
 
 def _index_text(work, rel):
@@ -347,7 +393,7 @@ def _prove_staged(repo, spec, work, base, expected, *, edition=None):
     """
     fresh = project_config(repo)
     _require_edition(fresh, expected=edition)
-    _authorize_paths(spec['paths'], fresh)
+    _require_authorized(spec['paths'], fresh)
     staged = _staged_config(work)
     if staged is None:
         raise DeliveryError('the staged tree has no docs/PROJECT.md; refusing to commit a '
@@ -367,7 +413,7 @@ def _prove_staged(repo, spec, work, base, expected, *, edition=None):
     # the config again before the last Git fact read starts.
     fresh = project_config(repo)
     _require_edition(fresh, expected=edition)
-    _authorize_paths(spec['paths'], fresh)
+    _require_authorized(spec['paths'], fresh)
     now = _changes(work, base)
     if now != sorted(expected):
         raise DeliveryError('the staged path set changed between staging and commit: '
@@ -381,7 +427,7 @@ def _prove_staged(repo, spec, work, base, expected, *, edition=None):
     # *valid* edition while the index was being proved.
     fresh = project_config(repo)
     _require_edition(fresh, expected=edition)
-    _authorize_paths(spec['paths'], fresh)
+    _require_authorized(spec['paths'], fresh)
     if staged['edition'] != fresh['edition']:
         raise DeliveryError('the staged docs/PROJECT.md would commit edition '
                             f'{staged["edition"]!r}, but the project declares '
@@ -417,18 +463,27 @@ def _configured_clean_filters(work):
     Only the configuration *key* is returned. The value is an arbitrary command
     line, may carry a secret, and is copied into the refusal reason, the journal
     and the CLI summary, so it must never leave this function.
+
+    ``--get-regexp`` prints each value verbatim, and a value may itself contain a
+    newline: a command line continued on a second line is stored and printed as
+    two physical lines, with no key on the second one. Splitting that output into
+    physical lines would therefore read the continuation as another key — and
+    that continuation is exactly the material that must never be reported. Ask
+    Git for the names only, NUL-separated, so no value is read, printed or
+    mistaken for a key.
     """
     result = subprocess.run(
-        ['git', '--no-optional-locks', 'config', '--get-regexp',
-         r'^filter\..*\.(clean|process)$'], cwd=work, stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        ['git', '--no-optional-locks', 'config', '--null', '--name-only',
+         '--get-regexp', r'^filter\..*\.(clean|process)$'], cwd=work,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True)
     if result.returncode not in (0, 1):
         # `git config` stderr can quote configuration material; report neither
-        # it nor the values above.
+        # it nor any value.
         raise DeliveryError('cannot enumerate Git clean filters before commit')
     keys = []
-    for line in result.stdout.splitlines():
-        key = line.split(None, 1)[0].strip() if line.strip() else ''
+    for key in result.stdout.split('\0'):
+        key = key.strip()
         if key and key not in keys:
             keys.append(key)
     return keys
@@ -443,6 +498,12 @@ def _configured_fsmonitor(work):
     it runs that program, which can switch ``docs/PROJECT.md`` after the last
     proof and before history is written. Only the key is reported, never the
     configured value.
+
+    A key with no value at all (``[core]`` followed by ``fsmonitor``) is Git's
+    implicit boolean true, and ``git config --get`` prints an empty line for it —
+    the same empty line an explicitly empty value produces. Git treats both as
+    enabled, so the only spellings that disable the helper are the explicit
+    false ones.
     """
     result = subprocess.run(
         ['git', '--no-optional-locks', 'config', '--get', 'core.fsmonitor'],
@@ -454,8 +515,9 @@ def _configured_fsmonitor(work):
         return []
     value = result.stdout.strip().lower()
     # Every value except an explicit boolean false enables the helper: `true`
-    # means Git's builtin daemon, anything else is the hook program's path.
-    return [] if value in ('', 'false', 'no', 'off', '0') else ['core.fsmonitor']
+    # means Git's builtin daemon, anything else is the hook program's path, and
+    # no value at all is the implicit true.
+    return [] if value in ('false', 'no', 'off', '0') else ['core.fsmonitor']
 
 
 def _prove_commit_is_inert(context, spec, work):
@@ -485,7 +547,7 @@ def _prove_commit_is_inert(context, spec, work):
     # last action before the caller starts `git commit`.
     fresh = project_config(context.repo)
     _require_edition(fresh, expected=context.config.get('edition'))
-    _authorize_paths(spec['paths'], fresh)
+    _require_authorized(spec['paths'], fresh)
     if hooks or filters or fsmonitor:
         parts = []
         if filters:
@@ -519,7 +581,7 @@ def _prove_before_add(context, spec, work, base, expected):
                             f'{actual!r} instead of {sorted(expected)!r}')
     fresh = project_config(context.repo)
     _require_edition(fresh, expected=context.config.get('edition'))
-    _authorize_paths(spec['paths'], fresh)
+    _require_authorized(spec['paths'], fresh)
     for name in actual:
         _check_changed_path(work, name, spec['paths'], fresh)
 
@@ -1579,7 +1641,7 @@ def _execute(context, spec, record):
     # committing: either may have changed while the agent was running.
     fresh = project_config(context.repo)
     _require_edition(fresh, expected=context.config.get('edition'))
-    _authorize_paths(spec['paths'], fresh)
+    _require_authorized(spec['paths'], fresh)
     for name in changed:
         _check_changed_path(work, name, spec['paths'], fresh)
     dirty = bool(_status(work))
@@ -1594,14 +1656,26 @@ def _execute(context, spec, record):
         # the pre-add proof's own Git reads; an invalid or out-of-scope state
         # must not reach `git add`.
         _prove_before_add(context, spec, work, base, changed)
-        subprocess.run(['git', '--no-optional-locks', 'add', '-A', '--', '.'], cwd=work,
-                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, check=True)
+        try:
+            subprocess.run(['git', '--no-optional-locks', 'add', '-A', '--', '.'],
+                           cwd=work, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        except (OSError, subprocess.SubprocessError):
+            # A clean filter runs inside `add` and can switch the shared
+            # edition before the process returns — including when the add
+            # itself fails. Re-prove the config here, on the failure path,
+            # before this exception is treated as a task-scoped problem: a
+            # shared-gate failure has to stop the whole run instead of letting
+            # the next task start its own Git calls.
+            _require_live_config(context, spec)
+            raise
         # `add` and `commit` are separate processes, so the proof above (which
         # ran before `add`) does not describe what `commit` would record. A
         # clean filter can rewrite the staged blob while `add` runs, so the
         # index itself is re-proved here — before the second process starts,
-        # not after history exists.
+        # not after history exists. That proof opens by reading the project
+        # config from the file, so a switch that landed inside a *successful*
+        # `add` starts no Git call before it is seen.
         _prove_staged(context.repo, spec, work, base, changed,
                       edition=context.config.get('edition'))
         # `_prove_staged` reads the index and the worktree through Git and ends
@@ -1627,7 +1701,7 @@ def _execute(context, spec, record):
     committed = _changes(work, base)
     fresh = project_config(context.repo)
     _require_edition(fresh, expected=context.config.get('edition'))
-    _authorize_paths(spec['paths'], fresh)
+    _require_authorized(spec['paths'], fresh)
     for name in committed:
         _check_changed_path(work, name, spec['paths'], fresh)
     digest = _fingerprint(work, base)
@@ -2219,10 +2293,7 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
         for spec in specs:
             if spec['errors']:
                 continue
-            try:
-                _authorize_paths(spec['paths'], fresh)
-            except ValueError as exc:
-                raise error(str(exc)) from None
+            _require_authorized(spec['paths'], fresh, error)
         return fresh
 
     if _status(repo):
@@ -2254,6 +2325,11 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
             continue
         try:
             work = _root(spec['worktree'])
+        except SharedGateError:
+            # The project config is shared state: a re-proof that failed while
+            # this worktree was resolved stops the whole run, and must not be
+            # recorded as this worktree's own problem.
+            raise
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             spec['errors'].append(f'task worktree is not usable: {exc}')
             continue
@@ -2278,6 +2354,11 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
                 raise ValueError('worktree must be on a non-main branch')
             if _status(work):
                 raise ValueError('worktree is not clean')
+        except SharedGateError:
+            # A consecutive re-proof failed inside this block: the edition or the
+            # authorization it proves is shared, so this is not a per-worktree
+            # error and must stop the run before the next task is looked at.
+            raise
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             spec['errors'].append(f'task worktree is not usable: {exc}')
         # `_status` above may have run a clean filter; prove the edition before
@@ -2337,6 +2418,38 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
                            saver, config, state_path)
         for spec in specs:
             state['tasks'].setdefault(spec['id'], {'status': 'PENDING'})
+
+        # A shared-gate failure is not scoped to the task that observed it: the
+        # edition and the path authorization come from the one
+        # ``docs/PROJECT.md`` every task in this run proves itself against, and a
+        # later task would start its own `_root`/`rev-parse` (or Agent, or
+        # journal write) on a declaration the run did not begin with. It is
+        # recorded once, on that task, and then the run stops: nothing else
+        # starts, including the closing approval re-check, which reads Git and
+        # queries the runtime profiles.
+        halt = []
+
+        def halt_on_shared(ident, record, exc):
+            """Persist the reason the run stopped; this is the last write.
+
+            Every approval still live in this process loses its support at the
+            same moment: it was proved against the declaration that just
+            failed, and re-proving it would need the Git reads and profile
+            queries this halt forbids. Closing them here is part of the same
+            single journal write, so the run never reports an approval the
+            shared gate no longer supports.
+            """
+            for other in sorted(context.approved):
+                live = context.record(other)
+                if live.get('status') != TERMINAL_OK:
+                    continue
+                live.update(status='BLOCKED', reason=(
+                    f'the shared project gate failed while task {ident} was being '
+                    f'processed: {exc}; every live approval depends on that gate'))
+            record.update(status=exc.status, reason=str(exc))
+            saver()
+            halt.append(exc)
+
         for spec in specs:
             record = context.record(spec['id'])
             try:
@@ -2356,6 +2469,9 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
             try:
                 _reconcile(context, spec, record)
                 saver()
+            except SharedGateError as exc:
+                halt_on_shared(spec['id'], record, exc)
+                break
             except DeliveryError as exc:
                 record.update(status=exc.status, reason=str(exc))
                 saver()
@@ -2363,29 +2479,40 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
                 record.update(status='BLOCKED', reason=str(exc))
                 saver()
         for ident in retry:
+            if halt:
+                break
             spec = next((spec for spec in specs if spec['id'] == ident), None)
             if spec is None:
                 raise ValueError(f'--retry names an unknown task {ident!r}')
             try:
                 _attempt_retry(context, spec, context.record(ident))
+            except SharedGateError as exc:
+                halt_on_shared(ident, context.record(ident), exc)
+                break
             except DeliveryError as exc:
                 context.record(ident).update(status=exc.status, reason=str(exc))
                 saver()
 
         progress = True
-        while progress:
+        while progress and not halt:
             progress = False
             for spec in specs:
+                if halt:
+                    break
                 record = state['tasks'][spec['id']]
                 try:
                     progress = _process(context, spec, record) or progress
+                except SharedGateError as exc:
+                    halt_on_shared(spec['id'], record, exc)
+                    break
                 except DeliveryError as exc:
                     record.update(status=exc.status, reason=str(exc))
                     saver()
                 except (OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
                     record.update(status='BLOCKED', reason=str(exc))
                     saver()
-        _recheck_approved(context)
+        if not halt:
+            _recheck_approved(context)
         return state
     finally:
         _GIT_GUARD = None
