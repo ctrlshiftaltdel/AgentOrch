@@ -106,7 +106,8 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 
 - 在 AgentOrch 本仓库（`github` edition）对一个文档任务做了 prepare-only 运行：真实执行会话与真实审查会话均为 `succeeded`、目录为该任务 worktree、Agent 不同；验证命令退出 0；审查 transcript 中全部验收标准 `PASS`、结论 `APPROVE` 且绑定该 commit 与 diff 指纹；最终 `APPROVED`，未改动目标分支与 `main`。
 - 在同一计划上请求自动合并时，运行在启动 Agent 之前被拒绝（见 §1）。
-- 真实失败也保留：某次审查只给出散文而未给出机器可读结论时，任务停在 `REVIEW_REJECTED`，没有被当作批准。
+- 真实失败也保留：同一任务的审查前两次只给出散文而未给出机器可读结论，任务停在 `REVIEW_REJECTED`，没有被当作批准；第三次审查在提示中提供了 runner 已从 Git 核验的 head、diff 指纹与变更路径后，逐条 AC 给出 `PASS` 并 `APPROVE`，最终 `APPROVED`、CLI 退出码 0（仅表示可供人工合并）。
+- 另一次自动化尝试被运行前的 edition 检查拒绝，未启动 Agent；依赖任务在上游仅 `APPROVED` 时保持 `PENDING`。
 
 **没有验证、也不宣称的事项**：自动合并、GitHub PR/CI 接线、Issue/PR 状态同步、从 `docs/implementation-plan.md` 自动选任务、MCP/插件通道与 OS 隔离、模型独立、Windows 真机、真实 CI 触发。
 
