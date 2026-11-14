@@ -2400,6 +2400,74 @@ class EditionBoundaryTests(DeliveryCase):
         self.assertTrue(runs.read_text())
         self.assertIn('`local`', project.read_text())
 
+    def test_the_carrier_return_reproves_the_edition_before_any_later_git_call(self):
+        # `gh` is an external call. A real clean filter can run in the Git calls
+        # that follow it: the spec-validation loop reads `git status` on the
+        # task worktree, and the filter switches `local` to the equally valid
+        # `github` there. The runner must re-prove the starting edition right
+        # after `gh` returns and again after each consecutive Git call, so the
+        # switch stops the run before any lock, journal write or Agent starts.
+        project = self._project()
+        armed = self.root / 'filter-armed'
+        runs = self.root / 'filter-runs'
+        self._filter(
+            'armed_path = pathlib.Path(' + repr(str(armed)) + ')\n'
+            'if armed_path.exists():\n'
+            '    armed_path.unlink()\n'
+            '    pathlib.Path(' + repr(str(runs)) + ').open("a").write("x")\n'
+            '    config = pathlib.Path(' + repr(str(project)) + ').read_text()\n'
+            '    pathlib.Path(' + repr(str(project)) + ').write_text(\n'
+            '        config.replace("`local`", "`github`"))\n'
+            'sys.stdout.write(text)\n', ('docs/PROJECT.md',))
+        work = self.worktree('one')
+        base = _head_of(work)
+        body = 'live issue body'
+        digest = hashlib.sha256(body.encode()).hexdigest()
+        queried = []
+
+        def gh(argv):
+            queried.append(argv)
+            # Arm the real filter for the next Git call that reads the
+            # worktree, and stale the indexed stat so that `git status` runs it.
+            armed.write_text('x')
+            os.utime(work / 'docs' / 'PROJECT.md', ns=(1_000_000_000, 1_000_000_000))
+            return subprocess.CompletedProcess(
+                [], 0, json.dumps({'state': 'OPEN', 'body': body,
+                                   'url': 'https://example.invalid/issues/1'}), '')
+
+        plan = self.plan([self.task('one', work, ['a.txt'])],
+                         carrier={'kind': 'issue', 'number': 1,
+                                  'repo': 'owner/name', 'digest': digest})
+        after = []
+        switched = {'value': False}
+        original_git = delivery.git
+
+        def git_probe(where, *args):
+            if switched['value']:
+                after.append(args)
+            result = original_git(where, *args)
+            if runs.exists() and not switched['value']:
+                # The filter ran inside this Git call and the real switch
+                # landed; every later Git call is an unwarranted side effect.
+                switched['value'] = True
+            return result
+
+        agents = FakeAgents(self)
+        with mock.patch.object(delivery, 'git', git_probe):
+            with self.assertRaises(delivery.DeliveryError) as caught:
+                self.run_delivery(plan, agents=agents, gh=gh)
+        self.assertIn('edition', str(caught.exception))
+        # The carrier was queried once, and the real switch landed in a Git call
+        # that followed it.
+        self.assertEqual(len(queried), 1)
+        self.assertTrue(runs.read_text())
+        self.assertIn('`github`', project.read_text())
+        # After the switch no further Git call, lock, journal or Agent started.
+        self.assertEqual(after, [])
+        self.assertEqual(agents.calls, [])
+        self.assertFalse(self.state.exists())
+        self.assertEqual(_head_of(work), base)
+
     def test_any_invalid_or_ambiguous_edition_added_mid_run_fails_closed(self):
         # The first edition check must not be the only one: every boundary that
         # re-reads project config re-validates the one authoritative edition.
@@ -2907,6 +2975,78 @@ class CommitBoundaryTests(DeliveryCase):
                          b'?? a.txt\n')
         # No Git process started after the invalid declaration appeared.
         self.assertEqual(after, [])
+
+    def test_a_commit_phase_filter_and_hook_never_start(self):
+        # `git commit` runs its clean filters and pre-commit hook *inside* the
+        # commit process. A filter can switch `local` to the equally valid
+        # `github` after the index proof, then the hook runs and the commit is
+        # already history: a final BLOCKED cannot undo it. Git offers no
+        # porcelain isolation for that (a `--no-verify --no-status` commit still
+        # runs the clean filter), so the runner must prove *before* starting the
+        # process that neither a filter nor a commit hook can run, and refuse to
+        # start `git commit` when it cannot. That is an unimplemented capability,
+        # not an independent-writer race.
+        project = self.repo / 'docs' / 'PROJECT.md'
+        hook_marker = self.root / 'pre-commit-ran'
+        filter_marker = self.root / 'filter-ran'
+        armed = self.root / 'filter-armed'
+        # The filter rewrites the edition authority (the repository config) and
+        # answers Git with the original text, so the tree still looks clean.
+        self._filter(
+            'armed_path = pathlib.Path(' + repr(str(armed)) + ')\n'
+            'if armed_path.exists():\n'
+            '    armed_path.unlink()\n'
+            '    pathlib.Path(' + repr(str(filter_marker)) + ').open("a").write("x")\n'
+            '    config = pathlib.Path(' + repr(str(project)) + ').read_text()\n'
+            '    pathlib.Path(' + repr(str(project)) + ').write_text(\n'
+            '        config.replace("`local`", "`github`"))\n'
+            'sys.stdout.write(text)\n', ('docs/PROJECT.md',))
+        self._hook(hook_marker)
+        work = self.worktree('one')
+        base = _head_of(work)
+        original_prove = delivery._prove_staged
+
+        def prove(*args, **kwargs):
+            result = original_prove(*args, **kwargs)
+            # Arm the filter only for the commit process, after every proof.
+            armed.write_text('x')
+            os.utime(work / 'docs' / 'PROJECT.md', ns=(1_000_000_000, 1_000_000_000))
+            return result
+
+        commits = []
+        real_run = subprocess.run
+
+        def run_probe(argv, *args, **kwargs):
+            if isinstance(argv, list) and 'commit' in argv[:4]:
+                commits.append(list(argv))
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch.object(delivery, '_prove_staged', prove), \
+                mock.patch.object(delivery.subprocess, 'run', run_probe):
+            state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]))
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        # It names the real boundary: the commit-phase filter/hook is not
+        # implemented, not a second writer.
+        self.assertIn('clean filter', record['reason'])
+        self.assertIn('hook', record['reason'])
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertIsNone(record.get('head'))
+        # No history was created and the commit process was never started.
+        self.assertEqual(_head_of(work), base)
+        self.assertEqual(commits, [])
+        # Neither the hook nor the filter ran inside a commit.
+        self.assertFalse(hook_marker.exists())
+        self.assertFalse(filter_marker.exists())
+        # The staged change was left for a human, not reset.
+        self.assertIn('a.txt',
+                      _git(work, 'diff', '--cached', '--name-only').stdout.decode())
+        # The real attack is genuine: a direct commit in the same worktree runs
+        # both the filter and the hook, so refusing to start it was necessary.
+        os.utime(work / 'docs' / 'PROJECT.md', ns=(1_000_000_000, 1_000_000_000))
+        _git(work, 'commit', '-q', '-m', 'control', check=False)
+        self.assertTrue(hook_marker.exists())
+        self.assertTrue(filter_marker.exists())
 
 
 class CliTests(DeliveryCase):

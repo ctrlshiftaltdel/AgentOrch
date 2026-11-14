@@ -32,8 +32,11 @@ fail-closed:
   Git runs *inside* ``status``/``diff``: the shared side-effect proof re-reads
   the config after those calls and before the agent or command it gates, the
   repository status read before dispatch is followed by another config and
-  authorization proof before the carrier query or any Agent, and the status
-  read just before ``git add`` is followed by one before the index is touched.
+  authorization proof before the carrier query or any Agent, the carrier
+  return is followed by one before any later Git call, lock, journal or Agent,
+  every consecutive Git call in the dispatch validation is followed by one
+  before the next, and the status read just before ``git add`` is followed by
+  one before the index is touched.
   The runtime profile is part of that gate, so it is re-queried *after* an
   export and *before* the reviewer session starts, and again before every
   verification command, not only once per phase;
@@ -43,10 +46,17 @@ fail-closed:
   its own, so configuration, authorization and the actual scope are re-proved
   after it returns and before ``git add``; a stale proof never reaches the
   index. The index proof then reads through Git itself, so it re-reads the
-  project config after those calls and the caller proves it once more
-  immediately before ``commit``. A hook that changes the tree is outside that
-  proof (it runs inside ``commit``); it is only caught afterwards, and the
-  commit it ran in already exists;
+  project config after those calls;
+* ``git commit`` is a porcelain process that runs clean filters while it
+  refreshes the index and then its commit hooks, *inside* the process and after
+  the index proof. Git exposes no switch that keeps those from running
+  (``--no-verify --no-status`` still runs the clean filter), so a filter can
+  switch ``docs/PROJECT.md`` to another valid edition and a hook can run before
+  the runner sees it; a later ``BLOCKED`` cannot undo that history. This is not
+  a second-writer race. The runner therefore proves before starting the process
+  that no clean filter or commit hook can run, and refuses to start
+  ``git commit`` when it cannot: creating a commit under a filter or hook is an
+  unimplemented capability, and the staged change is left for a human;
 * the final summary re-proves the project config after its Git fact checks, and
   re-queries the reviewer profile, once more over every live approval before the
   journal is saved. The config and profile are shared: if that final pass sees
@@ -295,14 +305,14 @@ def _staged_config(work):
 def _prove_staged(repo, spec, work, base, expected, *, edition=None):
     """Re-prove configuration, authorization and scope on what will be committed.
 
-    ``git add`` and ``git commit`` are separate processes, and both can run
-    code the runner does not control: a clean filter can rewrite the content
-    that gets staged, and a pre-commit hook can change the tree a commit
-    records. The pre-add proof therefore does not describe the commit that is
-    about to happen. This one reads the *index* — the exact blob and path set
-    the commit would record — plus the project authorization again, and it runs
-    while nothing has been committed yet, so a failure leaves staged changes
-    for a human instead of history.
+    ``git add`` and ``git commit`` are separate processes, and ``git add`` can
+    run code the runner does not control: a clean filter can rewrite the content
+    that gets staged. The pre-add proof therefore does not describe the commit
+    that is about to happen. This one reads the *index* — the exact blob and
+    path set the commit would record — plus the project authorization again, and
+    it runs while nothing has been committed yet, so a failure leaves staged
+    changes for a human instead of history. The commit process itself is gated
+    separately by ``_prove_commit_is_inert``.
 
     Every call in the body is a Git process (``ls-files``, ``show :path``,
     ``diff``), and a clean filter runs inside them. A filter that rewrites the
@@ -355,6 +365,76 @@ def _prove_staged(repo, spec, work, base, expected, *, edition=None):
         raise DeliveryError('the staged docs/PROJECT.md would commit edition '
                             f'{staged["edition"]!r}, but the project declares '
                             f'{fresh["edition"]!r} after the index proof')
+
+
+COMMIT_HOOKS = ('pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit')
+
+
+def _commit_hooks(work):
+    """Every hook ``git commit`` could run for this worktree.
+
+    ``git rev-parse --git-path hooks`` resolves ``core.hooksPath`` (absolute or
+    worktree-relative) and the linked-worktree common dir, so this is the same
+    directory Git itself would execute from. Only existing hooks are listed; any
+    of them can run code before the commit is recorded.
+    """
+    path = Path(os.fsdecode(git(work, 'rev-parse', '--git-path', 'hooks')).strip())
+    if not path.is_absolute():
+        path = Path(work) / path
+    return [name for name in COMMIT_HOOKS if (path / name).is_file()]
+
+
+def _configured_clean_filters(work):
+    """Every configured clean/process filter that could rewrite a staged blob.
+
+    ``git commit`` refreshes the index, which reads worktree content through a
+    clean filter (a process filter included). ``git commit --no-verify
+    --no-status`` still runs it, so porcelain cannot isolate the commit from
+    this. The check is deliberately conservative: any configured driver is
+    enough to refuse.
+    """
+    result = subprocess.run(
+        ['git', '--no-optional-locks', 'config', '--get-regexp',
+         r'^filter\..*\.(clean|process)$'], cwd=work, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode not in (0, 1):
+        raise DeliveryError('cannot enumerate Git clean filters before commit: '
+                            + result.stderr.strip())
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def _prove_commit_is_inert(context, spec, work):
+    """Refuse to start ``git commit`` unless it cannot run code of its own.
+
+    ``git commit`` is a porcelain process that runs clean filters while it
+    refreshes the index and then runs its commit hooks. Both run *inside* the
+    process, after the index proof, so a filter can switch ``docs/PROJECT.md``
+    to another valid edition and a hook can run before the runner sees the
+    change; by then the commit is already history. Git exposes no switch that
+    keeps the clean filter from running (``--no-verify --no-status`` still runs
+    it), so this is not a second-writer race and another file read cannot close
+    it. The runner therefore proves *before* starting the process that no
+    filter or commit hook can run, and refuses otherwise. That refusal is an
+    unimplemented capability: the staged change is left for a human to commit.
+    """
+    hooks = _commit_hooks(work)
+    filters = _configured_clean_filters(work)
+    # The two probes are Git processes; re-prove the config afterwards as the
+    # last action before the caller starts `git commit`.
+    fresh = project_config(context.repo)
+    _require_edition(fresh, expected=context.config.get('edition'))
+    _authorize_paths(spec['paths'], fresh)
+    if hooks or filters:
+        parts = []
+        if filters:
+            parts.append('configured clean filter(s): ' + ', '.join(filters))
+        if hooks:
+            parts.append('commit hook(s): ' + ', '.join(hooks))
+        raise DeliveryError(
+            'creating a commit is not implemented while a Git '
+            + ' and '.join(parts) + ' can run inside it: that code runs after the '
+            'last proof and can change docs/PROJECT.md before history is written. '
+            'The staged change is left for a human to commit')
 
 
 def _prove_before_add(context, spec, work, base, expected):
@@ -1396,6 +1476,10 @@ def _execute(context, spec, record):
     if _status(work):
         raise DeliveryError('task worktree is not clean')
     base = _head(work)
+    # `_resolve_task` and `_status` are Git processes of their own; a clean
+    # filter runs inside `status`. Prove the starting edition and authorization
+    # before the journal is written or the execution agent is started.
+    _require_live_config(context, spec)
     record.update(base=base, branch=_branch(work), worktree=str(work), pid=os.getpid(),
                   phase='execute', execution_session=None, head=None, diff_sha256=None,
                   changed_paths=[])
@@ -1451,18 +1535,18 @@ def _execute(context, spec, record):
                        stderr=subprocess.DEVNULL, check=True)
         # `add` and `commit` are separate processes, so the proof above (which
         # ran before `add`) does not describe what `commit` would record. A
-        # clean filter can rewrite the staged blob and a hook can change the
-        # tree while `commit` runs, so the index itself is re-proved here —
-        # before the second process starts, not after history exists.
+        # clean filter can rewrite the staged blob while `add` runs, so the
+        # index itself is re-proved here — before the second process starts,
+        # not after history exists.
         _prove_staged(context.repo, spec, work, base, changed,
                       edition=context.config.get('edition'))
-        # `_prove_staged` reads the index and the worktree through Git, and a
-        # clean filter runs inside those calls; it ends with a config proof, and
-        # this one is immediately before the commit process starts. The only
-        # window left is a second *writer* changing the config between this read
-        # and `commit`: that is the retained non-atomic window, not a call the
-        # runner makes or waits for.
-        _require_live_config(context, spec)
+        # `_prove_staged` reads the index and the worktree through Git and ends
+        # with a config proof. The commit process itself then runs its clean
+        # filters and commit hooks, after that proof and inside the process, so
+        # prove *before* starting `git commit` that it cannot run code of its
+        # own. When it can, this refuses and leaves the staged change for a
+        # human instead of creating history after an unobservable switch.
+        _prove_commit_is_inert(context, spec, work)
         message = spec['raw'].get('message') or f'{spec["id"]}: autonomous delivery'
         subprocess.run(['git', '--no-optional-locks', 'commit', '--no-gpg-sign',
                         '-m', str(message)], cwd=work, stdin=subprocess.DEVNULL,
@@ -2052,20 +2136,40 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
     # query; a switch while that external call ran must be refused here.
     _require_edition(config, ValueError, expected=expected_edition)
     edition = config['edition']
+
+    def reprove(error=ValueError):
+        """Re-proof the starting edition and task authorization, fail closed.
+
+        ``gh`` and every Git fact read are external processes a clean filter can
+        run inside, so the config is read again after each of them before the
+        next Git, lock, journal or Agent. Each call is the *last* action before
+        the caller's next step; a switch to another valid edition fails exactly
+        like an invalid one.
+        """
+        fresh = project_config(repo)
+        _require_edition(fresh, error, expected=edition)
+        for spec in specs:
+            if spec['errors']:
+                continue
+            try:
+                _authorize_paths(spec['paths'], fresh)
+            except ValueError as exc:
+                raise error(str(exc)) from None
+        return fresh
+
     if _status(repo):
         raise ValueError('repository worktree is not clean')
     # `_status` is a Git process of its own and a clean filter runs inside it,
     # so the config read above may already be stale. Prove the edition and the
     # task authorization again after it returns, before the carrier query or
     # any Agent starts; an invalid declaration must not reach either.
-    config = project_config(repo)
-    _require_edition(config, ValueError, expected=edition)
-    for spec in specs:
-        if spec['errors']:
-            continue
-        _authorize_paths(spec['paths'], config)
+    config = reprove(ValueError)
 
     carrier_url = verify_carrier(plan['carrier'], gh) if plan.get('carrier') else None
+    # `gh` is an external process and a clean filter can run in the Git calls
+    # that follow it. Prove the starting edition and authorization again before
+    # the journal read, any Git call, lock or Agent starts.
+    reprove(DeliveryError)
     peek = {}
     if state_path.exists():
         try:
@@ -2085,20 +2189,32 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             spec['errors'].append(f'task worktree is not usable: {exc}')
             continue
+        # `_root` is a Git process of its own; re-prove before the next one.
+        reprove(DeliveryError)
         if state_path.resolve().is_relative_to(work):
             raise ValueError('state must be outside every task worktree')
         try:
             if work == repo:
                 raise ValueError('task worktree is the repository worktree itself')
-            if _common(work) != _common(repo):
+            common_work = _common(work)
+            # Each consecutive Git call is a synchronous return boundary: prove
+            # the edition before the next one starts.
+            reprove(DeliveryError)
+            common_repo = _common(repo)
+            reprove(DeliveryError)
+            if common_work != common_repo:
                 raise ValueError('worktree does not belong to the repository')
             branch = _branch(work)
+            reprove(DeliveryError)
             if not branch or branch in ('main', 'master'):
                 raise ValueError('worktree must be on a non-main branch')
             if _status(work):
                 raise ValueError('worktree is not clean')
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             spec['errors'].append(f'task worktree is not usable: {exc}')
+        # `_status` above may have run a clean filter; prove the edition before
+        # the journal or the next worktree is touched.
+        reprove(DeliveryError)
 
     plan = dict(plan, executor_agent=executor_agent, reviewer_agent=reviewer_agent)
     plan_hash = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
@@ -2106,6 +2222,9 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
 
     locks = acquire_locks(repo, state_path, specs)
     try:
+        # Lock acquisition ran a Git call of its own; prove the edition and the
+        # task authorization before the journal is read or written.
+        reprove(DeliveryError)
         if state_path.exists():
             state = json.loads(state_path.read_text(encoding='utf-8'))
             if (not isinstance(state, dict) or state.get('version') != STATE_VERSION
@@ -2260,13 +2379,17 @@ def main(argv=None):
                 parser.error('--issue needs --issue-repo and --worktree')
             # The project edition is the authority for the base and it must be
             # proved before the carrier query starts: `gh issue view` is the
-            # first external call of this mode.
-            config = project_config(_root(args.repo))
+            # first external call of this mode. `load_issue_plan` is that query,
+            # so re-prove the starting edition from the file (no Git call)
+            # before `run` makes its first Git call.
+            root = _root(args.repo)
+            config = project_config(root)
             _require_edition(config, ValueError)
             edition = config['edition']
             plan = load_issue_plan(args.issue, args.issue_repo, worktree=args.worktree,
                                    verify=args.verify, acceptance=args.acceptance,
                                    allows=args.allow, instruction=args.instruction)
+            _require_edition(project_config(root), ValueError, expected=edition)
         else:
             plan = _load_plan_file(args.plan)
         state = run(args.repo, plan, args.state, resume=args.resume, retry=args.retry,
