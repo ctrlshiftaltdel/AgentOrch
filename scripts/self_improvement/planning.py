@@ -289,8 +289,17 @@ _SAFE_GIT_CONFIG = (
 )
 # Repository-local config sections that can execute a command or pull in another
 # config file that does. Only a raw file read is used: no Git command is run.
-_CONFIG_SECTION_RE = re.compile(
-    r'^\[\s*([A-Za-z0-9.-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]')
+# Escapes Git's value grammar accepts. Anything else (including an unknown
+# escape or a quote left open at end of line) is a fatal config error in Git, so
+# the reader must fail closed instead of guessing.
+_CONFIG_VALUE_ESCAPES = {
+    't': '\t',
+    'b': '\b',
+    'n': '\n',
+    '\\': '\\',
+    '"': '"',
+}
+_CONFIG_SPACE = ' \t\r\n\v\f'
 _FILTER_ISOLATION_MESSAGE = (
     'the repository configures a Git clean/process filter or a filter attribute; '
     'this read-only planner cannot isolate it without executing repository commands, '
@@ -554,43 +563,184 @@ def _attributes_declare_filter(path):
     return False
 
 
+def _config_section_parts(base, subsection):
+    """Split Git's full header name into ``(section, subsection)``.
+
+    Git splits at the first dot of ``base + "." + subsection``, so
+    ``[filter.x "probe"]`` names section ``filter`` with subsection
+    ``x.probe``. The old reader kept the dotted text as the section and could
+    miss a ``filter`` section entirely.
+    """
+    full = base if not subsection else base + '.' + subsection
+    if '.' in full:
+        return tuple(full.split('.', 1))
+    return full, ''
+
+
+def _config_section_header(text, index):
+    """Parse ``[section "subsection"]`` starting just after ``[``.
+
+    Mirrors Git's base/extended header grammar: a base name of ASCII letters,
+    digits, ``-`` and ``.``, an optional quoted subsection where a backslash
+    escapes the next character, and a required closing ``]``. Returns
+    ``(section, subsection, next_index)`` or ``None`` when Git would reject the
+    header. A backslash-newline inside a subsection is a Git error, not a value
+    continuation, so it is refused rather than unfolded.
+    """
+    length = len(text)
+    base = []
+    while index < length:
+        char = text[index]
+        if char == ']':
+            if not base:
+                return None
+            section, subsection = _config_section_parts(''.join(base), '')
+            return section, subsection, index + 1
+        if char in ' \t':
+            break
+        if not (char.isascii() and (char.isalnum() or char in '.-')):
+            return None
+        base.append(char.lower())
+        index += 1
+    else:
+        return None
+    if not base:
+        return None
+    while index < length and text[index] in ' \t':
+        index += 1
+    if index >= length or text[index] != '"':
+        return None
+    index += 1
+    subsection = []
+    while index < length:
+        char = text[index]
+        index += 1
+        if char == '\n':
+            return None
+        if char == '"':
+            break
+        if char == '\\':
+            if index >= length:
+                return None
+            char = text[index]
+            index += 1
+            if char == '\n':
+                return None
+        subsection.append(char)
+    else:
+        return None
+    if index >= length or text[index] != ']':
+        return None
+    section, subsection = _config_section_parts(
+        ''.join(base), ''.join(subsection))
+    return section, subsection, index + 1
+
+
+def _config_value(text, index):
+    """Read one Git config value and return ``(value, next_index)``.
+
+    Follows Git's value grammar instead of physical lines: a backslash-newline
+    continues the value with no inserted whitespace, quotes delimit literal
+    spans, an unquoted ``#`` / ``;`` starts a comment, and the escapes in
+    :data:`_CONFIG_VALUE_ESCAPES` are the only accepted ones. ``None`` means Git
+    would reject the file (unknown escape or a quote still open at end of line),
+    so the caller refuses before starting Git. A trailing backslash at end of
+    file is tolerated because Git accepts it.
+    """
+    length = len(text)
+    value = []
+    quoted = False
+    while True:
+        if index >= length:
+            return (None if quoted
+                    else (''.join(value).strip(), index))
+        char = text[index]
+        index += 1
+        if char == '\n':
+            if quoted:
+                return None
+            return ''.join(value).strip(), index
+        if not quoted and char in '#;':
+            newline = text.find('\n', index)
+            if newline == -1:
+                return ''.join(value).strip(), length
+            return ''.join(value).strip(), newline + 1
+        if char == '\\':
+            if index >= length:
+                return ''.join(value).strip(), index
+            escaped = text[index]
+            index += 1
+            if escaped == '\n':
+                continue
+            mapped = _CONFIG_VALUE_ESCAPES.get(escaped)
+            if mapped is None:
+                return None
+            value.append(mapped)
+            continue
+        if char == '"':
+            quoted = not quoted
+            continue
+        value.append(char)
+
+
 def _config_entries(text):
     """Parse section/key/value triples from a Git config file without running Git.
 
-    Git config syntax is intentionally read only far enough to name executable
-    sections and keys. A section header this parser cannot read returns ``None``
-    so the caller fails closed instead of assuming the file is harmless.
+    Git config is not line-oriented. Section headers and keys are separated by
+    arbitrary whitespace (two headers may share one line), a value can be
+    continued across physical lines with a backslash, and quotes or escapes
+    change where a comment starts. Reading physical lines let a continued
+    ``ext::`` remote URL or a same-line ``[filter ...]`` header stay invisible,
+    so this follows Git's character grammar. Anything this reader cannot parse
+    exactly returns ``None`` and the caller fails closed before running Git.
     """
     entries = []
     section = None
     subsection = ''
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith(('#', ';')):
+    text = text.replace('\r\n', '\n')
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        index += 1
+        if char in _CONFIG_SPACE:
             continue
-        if line.startswith('['):
-            match = _CONFIG_SECTION_RE.match(line)
-            if match is None:
+        if char in '#;':
+            newline = text.find('\n', index)
+            index = length if newline == -1 else newline + 1
+            continue
+        if char == '[':
+            parsed = _config_section_header(text, index)
+            if parsed is None:
                 return None
-            name = match.group(1).lower()
-            subsection = (match.group(2) or '').replace('\\"', '"').replace('\\\\', '\\')
-            if subsection:
-                section = name
-            elif '.' in name:
-                # Legacy ``[section.subsection]`` header: Git treats the part
-                # before the first dot as the section and lowercases the rest.
-                section, subsection = name.split('.', 1)
-            else:
-                section = name
+            section, subsection, index = parsed
             continue
+        if not (char.isascii() and char.isalpha()):
+            return None
+        name = [char]
+        while index < length:
+            next_char = text[index]
+            if next_char.isascii() and (next_char.isalnum()
+                                        or next_char == '-'):
+                name.append(next_char)
+                index += 1
+                continue
+            break
+        while index < length and text[index] in ' \t':
+            index += 1
+        value = 'true'
+        if index < length and text[index] == '=':
+            parsed = _config_value(text, index + 1)
+            if parsed is None:
+                return None
+            value, index = parsed
+        elif index < length and text[index] != '\n':
+            # Git rejects a key followed by anything but '=' or end of line.
+            return None
         if section is None:
             return None
-        if '=' in line:
-            key, value = line.split('=', 1)
-        else:
-            key, value = line, 'true'
-        entries.append((section, subsection.lower(), key.strip().lower(),
-                        value.strip().strip('"')))
+        entries.append((section, subsection.lower(),
+                        ''.join(name).lower(), value))
     return entries
 
 

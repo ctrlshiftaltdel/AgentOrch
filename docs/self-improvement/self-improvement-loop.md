@@ -111,7 +111,7 @@
 
 - 屏蔽 Git replace refs，并覆盖 `diff.ignoreSubmodules`、`core.fileMode`、`core.symlinks`、`core.ignoreCase`、external diff / textconv / 系统与全局配置等可隐藏 changed paths 的配置与环境；
 - 把 changed path 作为**字面 pathspec**（`:(literal)` 前缀）传给 `git diff`，并从 Git 子进程环境中丢弃 `GIT_LITERAL_PATHSPECS` / `GIT_GLOB_PATHSPECS` / `GIT_NOGLOB_PATHSPECS` / `GIT_ICASE_PATHSPECS`：`--` 只阻止选项注入，不阻止 pathspec 魔法，文件名本身以 `:(glob)`、`:(exclude)`、`:!` 等开头时不能被误读为模式、排除或大小写开关；
-- **在任何 Git 命令之前**用纯文件读取检查仓库本地配置与 attributes：若定义了 `filter.<driver>.clean` / `.process`、`include` / `includeIf`，或 attributes 声明了 `filter=`，则无法在不执行仓库命令的情况下隔离，直接失败关闭并标明未实现；同样的检查覆盖工作树内的**子模块 / 嵌套仓库**（父仓库的 `git status` 会进入已初始化子模块并运行它自己的 clean filter），以及会让只读命令发起 fetch / remote helper 的 **promisor / partial-clone remote、`ext::` transport、`objects/info/http-alternates`**。`core.fsmonitor` 与 hooks 通过 `-c core.fsmonitor=false` / `-c core.hooksPath=<空>` 显式禁用，lazy fetch 通过 `GIT_NO_LAZY_FETCH=1` 关闭；每条 Git 命令（包括公开的 diff 摘要函数）启动前都重复该预检；
+- **在任何 Git 命令之前**用纯文件读取检查仓库本地配置与 attributes：若定义了 `filter.<driver>.clean` / `.process`、`include` / `includeIf`，或 attributes 声明了 `filter=`，则无法在不执行仓库命令的情况下隔离，直接失败关闭并标明未实现；同样的检查覆盖工作树内的**子模块 / 嵌套仓库**（父仓库的 `git status` 会进入已初始化子模块并运行它自己的 clean filter），以及会让只读命令发起 fetch / remote helper 的 **promisor / partial-clone remote、`ext::` transport、`objects/info/http-alternates`**。配置按 Git 自身的语法读取而不是按物理行猜测：值可用反斜杠续行（`url = e\` + 下一行 `xt::...` 是 `ext::...`），同一行允许出现多个 section 头且最后一个拥有后续键；无法精确解析的续行（例如把 section 头或键拆到两行）在任何 Git 命令前失败关闭。`core.fsmonitor` 与 hooks 通过 `-c core.fsmonitor=false` / `-c core.hooksPath=<空>` 显式禁用，lazy fetch 通过 `GIT_NO_LAZY_FETCH=1` 关闭；每条 Git 命令（包括公开的 diff 摘要函数）启动前都重复该预检；
 - 拒绝带 assume-unchanged / skip-worktree 的索引、未提交 / 未跟踪工作树、以及落在 `allowed_paths` 内的 ignored 文件；
 - 记录 Git 快照，并在登记 / 交付前复查；快照变化即阻塞。
 
@@ -129,7 +129,7 @@
 | authority surface 上命中权限 / 安全 / 不可逆关键词 | `HIGH` → `HD-05` |
 | 非空代码 / 文档 / 治理面变化，未命中高风险线索 | `NEEDS_EVIDENCE` → `BLOCKED`，等待真实独立审查 |
 | Git 证据缺失、伪造、不可验证、HEAD 不符、dirty / untracked / hidden-index、binary / rename / symlink / submodule / deletion | `NEEDS_EVIDENCE` → `BLOCKED`，写出 `required_evidence` |
-| 仓库（含子模块 / 嵌套仓库）本地配置定义 clean / process filter 或 include / includeIf，或声明 promisor / partial-clone remote、`ext::` transport、HTTP alternate | 任何 Git 命令前失败关闭：`NEEDS_EVIDENCE` / `BLOCKED`，明确标注未实现（不执行仓库命令、零 Git 进程） |
+| 仓库（含子模块 / 嵌套仓库）本地配置定义 clean / process filter 或 include / includeIf，或声明 promisor / partial-clone remote、`ext::` transport、HTTP alternate（包括用反斜杠续行或同一行多个 section 头隐藏的写法），或配置无法按 Git 语法解析 | 任何 Git 命令前失败关闭：`NEEDS_EVIDENCE` / `BLOCKED`，明确标注未实现（不执行仓库命令、零 Git 进程） |
 
 **当前切片没有接入权威任务载体适配器或真实独立审查**：`state.task` 的 task id 与调用者传入的 `base_sha` / `head_sha` 都只是定位符和一致性交叉校验，不是认证；spec / `state.task` / 调用者提供的 review、authorization 或自算摘要都不会触发 READY。`review_status` 明确为 `NOT_WIRED`。未来路径必须由独立适配器从 local SQLite / GitHub 认证 PR Review / Owner 权限取证，并绑定 task id、目标与 allowed-path hash、base/head、完整 diff、reviewer 身份/角色/独立性与有效期/撤销；在这条链路实现前，普通错字也只能停在 `NEEDS_EVIDENCE`，不能声称已自动推进。被识别的治理面及权限 / 安全 / 锁 / 状态机 / 数据 / 外部 / 不可逆变化升级 `NEEDS_HUMAN_DECISION`；未被识别的同类变化不会被放行，只会停在 `NEEDS_EVIDENCE` / `BLOCKED`。二进制、rename / copy / type change、symlink、submodule、删除、dirty / untracked / hidden-index 工作树、缺失或不可验证的提交都显式阻塞。两种任务载体 payload 记录 Git base/head、diff SHA-256、changed paths、review status 与 next_action，但记录的是待取证状态，不是授权。
 

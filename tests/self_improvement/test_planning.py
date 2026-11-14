@@ -1201,6 +1201,126 @@ class GitIsolationTests(unittest.TestCase):
                 self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
                 self.assertTrue(details['reasons'], f'{name}: no refusal reason')
 
+    def _append_config(self, repo, text):
+        config = repo.root / '.git' / 'config'
+        config.write_text(config.read_text(encoding='utf-8') + text,
+                          encoding='utf-8')
+
+    def test_config_value_continuation_cannot_hide_ext_transport(self):
+        """Git joins a backslash-newline value; the preflight must read it too.
+
+        A physical-line parser saw ``url = e\\`` and a separate key, so the real
+        ``ext::`` URL stayed invisible and the planner started Git on a
+        repository it promises to refuse before running any Git command.
+        """
+        base, head = self._commit_range()
+        self._append_config(
+            self.repo,
+            '[remote "origin"]\n'
+            '\turl = e\\\n'
+            'xt::echo danger\n')
+        resolved = self.repo._git('config', '--get', 'remote.origin.url')
+        self.assertEqual(resolved.stdout.decode().strip(), 'ext::echo danger',
+                         'fixture is not a real Git value continuation')
+        self._reset_marker()
+        details, process_marker = self._assess_with_git_probe(
+            self.repo.root, base, head, ['docs/evil.md'])
+        self.assertFalse(
+            process_marker.exists(),
+            'risk assessment started Git on a continued ext:: remote')
+        self.assertFalse(
+            self.marker.exists(),
+            'risk assessment executed the continued ext:: transport')
+        self.assertNotEqual(details['evidence_status'], 'PRESENT')
+        self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+        self.assertTrue(
+            any('promisor' in reason or 'ext::' in reason
+                or 'remote helper' in reason for reason in details['reasons']),
+            details['reasons'])
+
+    def test_config_continuation_in_section_or_key_fails_closed(self):
+        """A continuation that splits a header or key cannot be parsed as Git.
+
+        Git rejects these files outright, but the preflight must decide that
+        without running Git. Otherwise it starts Git on a repository whose
+        configuration (for example a split promisor or ssh key) it cannot see.
+        """
+        cases = (
+            ('filter-section', '[fil\\\nter "probe"]\n\tclean = true\n'),
+            ('legacy-filter-section', '[filter.pr\\\nobe]\n\tclean = true\n'),
+            ('promisor-key', '[remote "origin"]\n'
+                             '\turl = https://example.invalid/\n'
+                             '\tpromiso\\\nr = true\n'),
+            ('ssh-command-key', '[core]\n\tssh\\\nCommand = sh -c true\n'),
+            ('include-key', '[include]\n\tpat\\\nh = /tmp/example\n'),
+            ('credential-section',
+             '[credential "https://example.invalid"]\n'
+             '\thel\\\nper = sh -c true\n'),
+            ('remote-subsection',
+             '[remote "ori\\\ngin"]\n\turl = ext::echo danger\n'),
+        )
+        for label, fragment in cases:
+            with self.subTest(case=label):
+                repo = loop_support.GitRepo(f'agentorch-risk-cont-{label}-')
+                self.addCleanup(repo.close)
+                base = repo.commit({'docs/note.md': 'note\n'}, message='base')
+                head = repo.empty_commit('head')
+                self._append_config(repo, fragment)
+                rejected = repo._git('config', '--list', '--local', check=False)
+                self.assertNotEqual(
+                    rejected.returncode, 0,
+                    f'{label}: fixture is not a Git-rejected config')
+                self._reset_marker()
+                details, process_marker = self._assess_with_git_probe(
+                    repo.root, base, head, ['docs/note.md'])
+                self.assertFalse(
+                    process_marker.exists(),
+                    f'{label}: started Git on an unparseable config')
+                self.assertFalse(
+                    self.marker.exists(),
+                    f'{label}: executed a command from an unparseable config')
+                self.assertNotEqual(details['evidence_status'], 'PRESENT')
+                self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+                self.assertTrue(details['reasons'], f'{label}: no refusal reason')
+
+    def test_section_header_sharing_a_line_cannot_hide_executable_config(self):
+        """Git accepts two section headers on one line; the last one owns the key.
+
+        ``[safe] [filter "probe"]`` defines ``filter.probe.clean``, so a
+        physical-line parser that keeps only ``safe`` starts Git on an
+        executable surface. Same for ``[safe][credential]``.
+        """
+        command = f'"{sys.executable}" "{self._script()}"'
+        cases = (
+            ('filter', '[safe] [filter "probe"]\n\tclean = ' + command + '\n',
+             'filter.probe.clean'),
+            ('credential', '[safe][credential]\n\thelper = ' + command + '\n',
+             'credential.helper'),
+        )
+        for label, fragment, expected in cases:
+            with self.subTest(case=label):
+                repo = loop_support.GitRepo(f'agentorch-risk-line-{label}-')
+                self.addCleanup(repo.close)
+                base = repo.commit({'docs/note.md': 'note\n'}, message='base')
+                head = repo.empty_commit('head')
+                self._append_config(repo, fragment)
+                listing = repo._git(
+                    'config', '--list', '--local').stdout.decode()
+                self.assertIn(expected, listing,
+                              f'{label}: fixture is not a real Git config')
+                self._reset_marker()
+                details, process_marker = self._assess_with_git_probe(
+                    repo.root, base, head, ['docs/note.md'])
+                self.assertFalse(
+                    process_marker.exists(),
+                    f'{label}: started Git before seeing the executable section')
+                self.assertFalse(
+                    self.marker.exists(),
+                    f'{label}: executed a same-line executable section')
+                self.assertNotEqual(details['evidence_status'], 'PRESENT')
+                self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+                self.assertTrue(details['reasons'], f'{label}: no refusal reason')
+
     def test_git_diff_digest_refuses_executable_repository_config(self):
         """The public digest helper must preflight too, not just the planner."""
         base, head = self._commit_range(
