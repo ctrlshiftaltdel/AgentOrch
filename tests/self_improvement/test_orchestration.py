@@ -22,6 +22,7 @@ def run_loop(**overrides):
         'scan_report': loop_support.scan_report(),
         'lesson_records': (),
         'specs': {},
+        'repo_root': loop_support.DEFAULT_REPO_ROOT,
     }
     payload.update(overrides)
     return orchestration.run_loop(**payload)
@@ -101,17 +102,26 @@ class NoNewEvidenceTests(unittest.TestCase):
 
 
 class GateTests(unittest.TestCase):
+    def _orchestrator_repo(self):
+        repo = loop_support.GitRepo()
+        self.addCleanup(repo.close)
+        base = repo.commit({'scripts/orchestrator.py': 'return deny()\n'},
+                           message='base')
+        head = repo.commit({'scripts/orchestrator.py': 'return allow()\n'},
+                           message='head')
+        return repo, base, head
+
     def test_high_risk_candidate_needs_a_human_and_is_not_registered(self):
         record = loop_support.general_lesson()
+        repo, base, head = self._orchestrator_repo()
         spec = loop_support.spec(
             allowed_paths=['scripts/orchestrator.py'],
-            change_evidence=loop_support.change_evidence(
-                'scripts/orchestrator.py',
-                old='return deny()', new='return allow()'))
+            git_evidence=loop_support.git_evidence(base, head))
         carrier = loop_support.RecordingCarrier()
         outcome = run_loop(
             carrier=carrier, lesson_records=[record],
-            specs={record['lesson_id']: spec},
+            specs={record['lesson_id']: spec}, repo_root=repo.root,
+            state=loop_support.state(head_sha=repo.head()),
             scan_report=loop_support.scan_report(
                 ingestions=[loop_support.created(record['lesson_id'])]))
         self.assertEqual(outcome.status, 'NEEDS_HUMAN_DECISION')
@@ -189,15 +199,19 @@ class CarrierParityTests(unittest.TestCase):
         for edition in ('local', 'github'):
             with self.subTest(edition=edition):
                 record = loop_support.general_lesson()
+                repo = loop_support.GitRepo()
+                self.addCleanup(repo.close)
+                base = repo.commit(
+                    {'scripts/orchestrator.py': 'return deny()\n'}, message='base')
+                head = repo.commit(
+                    {'scripts/orchestrator.py': 'return allow()\n'}, message='head')
                 spec = loop_support.spec(
                     allowed_paths=['scripts/orchestrator.py'],
-                    change_evidence=loop_support.change_evidence(
-                        'scripts/orchestrator.py',
-                        old='return deny()', new='return allow()'))
+                    git_evidence=loop_support.git_evidence(base, head))
                 carrier = orchestration.carrier_for(edition)
                 outcome = run_loop(
-                    edition=edition, carrier=carrier,
-                    state=loop_support.state(edition),
+                    edition=edition, carrier=carrier, repo_root=repo.root,
+                    state=loop_support.state(edition, head_sha=repo.head()),
                     lesson_records=[record], specs={record['lesson_id']: spec},
                     scan_report=loop_support.scan_report(
                         ingestions=[loop_support.created(record['lesson_id'])]))
@@ -262,7 +276,8 @@ class EndToEndTests(unittest.TestCase):
             specs={record['lesson_id']: loop_support.spec(
                 validation_commands=[passed, unrun])},
             command_runs={passed: {'exit_code': 0, 'output': 'tests passed'}},
-            environment='Linux; Python 3; synthetic fixture; local edition')
+            environment='Linux; Python 3; synthetic fixture; local edition',
+            repo_root=loop_support.DEFAULT_REPO_ROOT)
 
         report = outcome.report
         self.assertEqual(report['status'], 'COMPLETED')
@@ -298,7 +313,8 @@ class EndToEndTests(unittest.TestCase):
             state=loop_support.state(), carrier=carrier, scan_report=scan,
             lesson_records=[record],
             specs={record['lesson_id']: loop_support.spec()},
-            existing_tasks={record['lesson_id']: 'TASK-0003'})
+            existing_tasks={record['lesson_id']: 'TASK-0003'},
+            repo_root=loop_support.DEFAULT_REPO_ROOT)
         self.assertEqual(outcome.status, 'NO_ACTIONABLE_CANDIDATES')
         self.assertEqual(outcome.report['registrations'], [])
         self.assertEqual(outcome.report['plan']['proposals'][0]['status'],

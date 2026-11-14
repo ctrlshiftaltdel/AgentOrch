@@ -59,9 +59,11 @@ LIMITATIONS = (
     'never used to change allowed paths or acceptance criteria.',
     'This loop does not create Issues or tasks, run validation commands, approve, merge, '
     'or close anything; the carriers here are dry-run records.',
-    'Evidenced high-risk changes always end in NEEDS_HUMAN_DECISION here; a path or keyword '
-    'lead without a trustworthy diff stays BLOCKED with required evidence. An owner decision '
-    'is re-planned as a normal task, not auto-unlocked by a flag.',
+    'Risk uses the repository’s own Git evidence, not caller-supplied diffs, SHA strings or '
+    'authorization fields; the evidence head must also match the task carrier head. Evidenced '
+    'permission/security changes end in NEEDS_HUMAN_DECISION; missing, forged or incomplete '
+    'evidence stays BLOCKED with required evidence. An owner decision is re-planned as a '
+    'normal task, not auto-unlocked by a flag.',
 )
 
 
@@ -328,7 +330,8 @@ def _validation_rows(plan, command_runs, head_sha, environment):
 
 def run_loop(*, request_text, edition, state, carrier=None, scan_report=None,
              lesson_records=(), specs=None, coverage=None, dependency_state=None,
-             existing_tasks=None, command_runs=None, environment='', now=None):
+             existing_tasks=None, command_runs=None, environment='', now=None,
+             repo_root=None):
     """Run one self-improvement loop pass and return a closure report."""
     if edition not in CARRIER_KINDS:
         raise LoopError(f'unknown edition {edition!r}; expected one of {CARRIER_KINDS}')
@@ -413,7 +416,8 @@ def run_loop(*, request_text, edition, state, carrier=None, scan_report=None,
     plan = planning.plan_tasks(
         lesson_records=list(lesson_records), specs=specs or {}, edition=edition,
         dependency_state=dependency_state or {}, coverage=coverage or {},
-        existing_tasks=existing_tasks or {})
+        existing_tasks=existing_tasks or {}, repo_root=repo_root,
+        required_head_sha=normalized_state['head_sha'])
     report['plan'] = plan.as_dict()
 
     for proposal in plan.proposals:

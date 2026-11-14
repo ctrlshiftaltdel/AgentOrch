@@ -128,9 +128,19 @@ start it.
 
 4. Planning and the loop report live in `scripts/self_improvement/planning.py` and
    `scripts/self_improvement/orchestration.py`. A proposal is `READY` only for an
-   eligible lesson, a complete task packet, verified dependencies and no high-risk
-   surface. Registering a task is always a Master action on the current edition's
-   carrier.
+   eligible lesson, a complete task packet, verified dependencies and real Git
+   evidence: the repository must prove that the two commits exist, that base is an
+   ancestor of head, that `HEAD` matches head, that head matches the task carrier,
+   that the worktree is clean and that the complete diff stays inside
+   `allowed_paths`. Only a whitespace-only change in
+   non-authority Markdown / text is mechanically low risk. All other content
+   changes stay `BLOCKED` / `NEEDS_EVIDENCE` for Agent / Master review, and an
+   evidenced permission / security change goes to `NEEDS_HUMAN_DECISION`.
+   Caller-supplied diffs, `changed_paths`, SHA strings, boolean flags and
+   `authorization` fields are not evidence; literal `granted_by` / URL values are
+   not authorization. Binary, rename / copy / type, symlink, submodule, deletion or
+   a dirty / untracked worktree blocks instead of being treated as text. Registering
+   a task is always a Master action on the current edition's carrier.
 
 Templates: [`proposal.md`](proposal.md), [`task-packet.md`](task-packet.md),
 [`closure-report.md`](closure-report.md). Field meanings and the G1–G6 gates are

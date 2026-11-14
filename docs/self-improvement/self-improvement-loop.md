@@ -92,14 +92,16 @@
 
 ## 4. 高风险与人工决策门
 
-以下任一情况在真实 Diff / 可核验证据支持时进入 `NEEDS_HUMAN_DECISION`，决策 ID 只引用 [`entrypoints-and-decisions.md`](entrypoints-and-decisions.md) §5：
+以下任一情况在真实 Git 证据支持时进入 `NEEDS_HUMAN_DECISION`，决策 ID 只引用 [`entrypoints-and-decisions.md`](entrypoints-and-decisions.md) §5：
 
 - 实际改变权限 / 安全边界、锁 / 状态机、数据迁移、外部依赖、隐私、破坏兼容或不可逆动作 → `HD-05`（契约 / schema 级改为 `HD-13`）。
 - Lesson 冲突无法靠证据解除 → `HD-04`。
 - 把 Lesson 提升为通用规则且影响上述边界 → `HD-03`。
 - 来源访问授权问题 → `HD-01` / `HD-02`。
 
-`planning.py` 的 `assess_risk()` 把允许路径与 Lesson / goal 中的关键词只当作**调查线索**，不当作判决。没有绑定 base/head SHA 的真实 Diff 时，命中线索的提案进入 `BLOCKED`（`risk_level: NEEDS_EVIDENCE`）并写出 `required_evidence`，由机器 / Agent 继续取证后重新规划；这既不是 `READY`，也不是自动询问 Owner。只有 Diff 证明实际改动了上述语义，或改动了受保护的执行 / 发布面，才升级 `NEEDS_HUMAN_DECISION`。治理文本变更须带 `authorization`（`granted_by`、`scope: governance-adjustment`、可定位 `source`），由 Master 审查。调用方的 `low_risk` / `approved` 布尔值不被采信；`change_evidence.changed_paths` 必须与 Diff 一致，Diff 中超出 `allowed_paths` 的路径不会被静默忽略。Diff 由调用方提供，规划器能拒绝不一致或越界的 Diff，但不能证明它覆盖工作树的全部实际变更；该限制写入提案的 `risk_limitations`，复核时仍必须对照真实工作树。决策后重新规划仍是普通任务，不是闭环自动解锁。
+`planning.py` 的 `assess_risk()` 只接受仓库自己解析的 Git 证据：`git_evidence` 提供 base/head SHA，规划器在受控仓库中验证两个提交存在、base 是 head 的祖先、`HEAD` 与 head 一致、`git_evidence.head_sha` 与任务载体 head 一致、工作树干净且不是浅克隆，然后用 Git 生成完整 raw / numstat diff。调用者提供的 Diff、`changed_paths`、40 位 SHA 字符串、`low_risk` / `approved` 布尔值或 `authorization` 字段都不是证据；伪造或截断的 Diff 不能缩小真实 changed paths。
+
+`allowed_paths` 中的绝对路径、反斜杠、通配符和任何 `..` 段在任何证据之前直接拒绝，不能被其他合法路径或 Diff 冲掉。只有所有 changed paths 都在 `allowed_paths` 内、且变更是非权威 Markdown / 文本的纯空白变化时，才自动 `LOW` / `READY`；其他内容变更保持 `NEEDS_EVIDENCE` / `BLOCKED`。真实权限 / 安全 / 锁 / 状态机 / 数据 / 外部 / 不可逆变更或受保护执行面变化升级 `NEEDS_HUMAN_DECISION`。治理面变化即使带字面 `granted_by` / `source` 也不自动放行，必须由权威任务载体 / Owner 决定。二进制、rename / copy / type change、symlink、submodule、删除、未提交或未跟踪工作树、缺失或不可验证的提交都显式阻塞并写出 `required_evidence`。决策后重新规划仍是普通任务，不是闭环自动解锁。
 
 **常规低风险工作也不得绕过 Master 审查、证据矩阵或合并门。**
 

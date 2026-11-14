@@ -1,20 +1,96 @@
-"""Synthetic fixtures for the #50 self-improvement loop tests.
+"""Fixtures for the #50 self-improvement loop tests.
 
-Everything is invented: lesson records, scan reports and state snapshots. No
-Issue / PR is created, no command is run and no network is touched. The lesson
-shapes come from the #49 builders so the planner sees records the pipeline could
-really produce.
+Lesson records, scans and state are invented. Risk evidence is not: the
+fixtures create throw-away Git repositories with real commits so the planner can
+be tested against the same Git checks production uses. No network is touched and
+no real task carrier is written.
 """
+import atexit
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
 from . import support
 from agentorch_self_improvement import lessons, orchestration
 
-HEAD = 'd' * 40
-BASE_SHA = 'a' * 40
-CHANGE_HEAD_SHA = 'b' * 40
 NOW = support.T2
 PR_URL = 'https://github.com/ctrlshiftaltdel/TalkDND/pull/12'
-AUTHORIZATION_URL = ('https://github.com/ctrlshiftaltdel/AgentOrch/issues/230'
-                     '#issuecomment-0000000000')
+
+
+class GitRepo:
+    """A real, throw-away Git repository for risk-evidence tests."""
+
+    def __init__(self, prefix='agentorch-risk-'):
+        base = os.environ.get('TMPDIR') or None
+        self.root = Path(tempfile.mkdtemp(prefix=prefix, dir=base))
+        self._git('init', '-q')
+        self._git('config', 'user.email', 'risk@example.invalid')
+        self._git('config', 'user.name', 'risk fixture')
+        self._git('config', 'commit.gpgsign', 'false')
+        self._git('config', 'core.autocrlf', 'false')
+
+    def _git(self, *args, check=True, input_bytes=None):
+        completed = subprocess.run(
+            ['git', '-C', str(self.root), *args], capture_output=True,
+            input=input_bytes)
+        if check and completed.returncode != 0:
+            raise RuntimeError(
+                f'git {" ".join(args)} failed: '
+                f'{completed.stderr.decode("utf-8", "replace")}')
+        return completed
+
+    def write(self, path, content):
+        target = self.root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            target.write_bytes(content)
+        else:
+            target.write_text(content, encoding='utf-8')
+
+    def symlink(self, path, target):
+        link = self.root / path
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(target)
+
+    def mv(self, old, new):
+        self._git('mv', old, new)
+
+    def gitlink(self, path, sha):
+        self._git('update-index', '--add', '--cacheinfo',
+                  f'160000,{sha},{path}')
+
+    def commit(self, files, *, message='fixture commit', stage=False):
+        for path, content in files.items():
+            if content is None:
+                target = self.root / path
+                if target.is_symlink() or target.exists():
+                    target.unlink()
+            else:
+                self.write(path, content)
+        if not stage:
+            self._git('add', '-A')
+        self._git('commit', '-qm', message)
+        return self.head()
+
+    def head(self):
+        return self._git('rev-parse', 'HEAD').stdout.decode().strip()
+
+    def close(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+_DEFAULT_REPO = GitRepo('agentorch-risk-default-')
+DEFAULT_REPO_ROOT = _DEFAULT_REPO.root
+DEFAULT_BASE_SHA = _DEFAULT_REPO.commit({'docs/example.md': 'old line\n'},
+                                        message='base')
+DEFAULT_HEAD_SHA = _DEFAULT_REPO.commit({'docs/example.md': 'old line  \n'},
+                                        message='whitespace-only docs change')
+HEAD = DEFAULT_HEAD_SHA
+atexit.register(_DEFAULT_REPO.close)
 
 
 def general_lesson(**overrides):
@@ -39,7 +115,8 @@ def spec(**overrides):
         'title': '在规划模块拒绝缺少验证命令的提案',
         'goal': '让规划模块在生成任务时拒绝缺少验证命令的提案。',
         'context': '当前提案只做字段搬运，缺少可执行验证时会静默通过。',
-        'allowed_paths': ['scripts/self_improvement/planning.py'],
+        'allowed_paths': ['docs/example.md'],
+        'git_evidence': git_evidence(DEFAULT_BASE_SHA, DEFAULT_HEAD_SHA),
         'forbidden_paths': ['every other path'],
         'dependencies': [],
         'acceptance_criteria': [
@@ -66,36 +143,18 @@ def spec(**overrides):
     return payload
 
 
-def change_evidence(path='docs/example.md', old='旧说明', new='新说明', *,
-                    new_path=None, diff=None, **overrides):
-    """A synthetic, commit-bound unified diff for risk routing tests.
-
-    The content is invented; the shape mirrors ``git diff --no-ext-diff`` so the
-    planner can parse changed paths and added / removed lines without a repo.
-    """
-    target = new_path or path
-    if diff is None:
-        diff = (f'diff --git a/{path} b/{target}\n'
-                f'--- a/{path}\n'
-                f'+++ b/{target}\n'
-                '@@ -1 +1 @@\n'
-                f'-{old}\n'
-                f'+{new}\n')
-    payload = {
-        'base_sha': BASE_SHA,
-        'head_sha': CHANGE_HEAD_SHA,
-        'diff': diff,
-    }
+def git_evidence(base_sha, head_sha, **overrides):
+    payload = {'base_sha': base_sha, 'head_sha': head_sha}
     payload.update(overrides)
     return payload
 
 
-def authorization(*, granted_by='project-owner', scope='governance-adjustment',
-                  source=AUTHORIZATION_URL, **overrides):
+def authorization(**overrides):
+    """A caller-asserted authorization that the planner must ignore."""
     payload = {
-        'granted_by': granted_by,
-        'scope': scope,
-        'source': source,
+        'granted_by': 'fake',
+        'scope': 'governance-adjustment',
+        'source': 'https://example.invalid/',
     }
     payload.update(overrides)
     return payload
