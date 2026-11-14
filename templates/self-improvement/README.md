@@ -127,32 +127,42 @@ start it.
    rely on the later incremental scans once an `OK` watermark exists.
 
 4. Planning and the loop report live in `scripts/self_improvement/planning.py` and
-   `scripts/self_improvement/orchestration.py`. `READY` would require an eligible
-   lesson, a complete task packet, verified dependencies and real low-risk
-   evidence whose base/head come from the task carrier, not the proposal. The
+   `scripts/self_improvement/orchestration.py`. A future `READY` would require an
+   eligible lesson, a complete task packet, verified dependencies and real
+   low-risk evidence. The `base_sha` / `head_sha` arguments are only locators that
+   are cross-checked against `git_evidence`; they are **not** authoritative
+   task-carrier authentication, because the carrier adapter is not wired. The
    repository must prove that both commits exist, that base is an ancestor of head,
-   that `HEAD` and the carrier head match, that the worktree is clean and that the
+   that `HEAD` matches the supplied head, that the worktree is clean and that the
    complete diff stays inside `allowed_paths`. Replace refs and diff-hiding config
    / environment are disabled; assume-unchanged / skip-worktree, ignored files
    under allowed paths, binary, rename / copy / type, symlink, submodule, deletion,
-   dirty or untracked worktree all block. There is no automatic low-risk verdict
-   at all in this slice: an empty diff or empty tree cannot prove the intended
-   goal, the allowed-path scope or the authorization, and non-empty content still
-   needs a trusted review. A destructive or irreversible goal (for example
-   "delete all user data") escalates to `NEEDS_HUMAN_DECISION` / `HD-05` even when
-   the diff is empty.
+   dirty or untracked worktree all block. Before the first Git command, a
+   repository-local `filter.<driver>.clean` / `.process`, `include` / `includeIf`
+   or a `filter=` attribute makes the planner fail closed and state that the
+   isolation is not implemented; `core.fsmonitor` and hooks are disabled through
+   config overrides. There is no automatic low-risk verdict at all in this slice:
+   an empty diff or empty tree cannot prove the intended goal, the allowed-path
+   scope or the authorization, and non-empty content still needs a trusted review.
+   A destructive or irreversible goal (for example "delete all user data")
+   escalates to `NEEDS_HUMAN_DECISION` / `HD-05` even when the diff is empty.
 
    Every proposal therefore currently stays `BLOCKED` / `NEEDS_EVIDENCE` (or goes
-   to `NEEDS_HUMAN_DECISION` when high risk is declared or evidenced).
-   This release has no authoritative task-carrier adapter and no wired
+   to `NEEDS_HUMAN_DECISION` when a recognised high-risk lead is declared or
+   evidenced). This release has no authoritative task-carrier adapter and no wired
    independent review: `state.task` is only a locator, and caller-supplied
    review, authorization or self-computed digests never unlock READY. The
    proposal records `required_evidence` and `next_action` for a future
-   Master/Agent evidence pass; `review_status` is `NOT_WIRED`. Evidenced
-   permission / security changes still go to `NEEDS_HUMAN_DECISION`. Both
-   carrier shapes record the Git base/head, diff SHA-256, changed paths, review
-   status and next action so a later session can see what evidence is still
-   missing. Registering a task is always a Master action on the current
+   Master/Agent evidence pass; `review_status` is `NOT_WIRED`. High-risk
+   recognition uses a fixed path table and a limited keyword / filename regex,
+   not full semantic analysis: recognised authority-surface permission / security
+   changes, protected execution surfaces, schema, executable-mode and
+   irreversible changes go to `NEEDS_HUMAN_DECISION` / `HD-05` (schema:
+   `HD-13`); ordinary documentation text that merely mentions permissions stays
+   `NEEDS_EVIDENCE` / `BLOCKED`, and an unrecognised change is never treated as
+   safe. Both carrier shapes record the Git base/head, diff SHA-256, changed
+   paths, review status and next action so a later session can see what evidence
+   is still missing. Registering a task is always a Master action on the current
    edition's carrier.
 
 Templates: [`proposal.md`](proposal.md), [`task-packet.md`](task-packet.md),

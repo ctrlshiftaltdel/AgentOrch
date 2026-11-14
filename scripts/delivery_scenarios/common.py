@@ -49,7 +49,10 @@ class Context:
 class Scenario:
     id: str
     group: str
-    kind: str            # 'positive' control or 'negative' injected defect
+    kind: str            # 'positive' control, 'negative' injected defect, or
+    # 'safety' temporary fallback: the positive capability is NOT wired, so a
+    # PASS here proves the safe refusal only and is never counted as a positive
+    # capability proof.
     title: str
     precondition: str
     defect: str

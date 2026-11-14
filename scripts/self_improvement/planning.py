@@ -15,19 +15,25 @@ This module answers two questions and nothing else:
     proposal stays below ``READY`` in this slice: an empty change set proves
     nothing about the intended goal, the allowed-path scope or the authorization,
     and a non-empty change set always needs a trusted review. A missing, forged or
-    incomplete Git claim stays ``BLOCKED`` (``risk_level: NEEDS_EVIDENCE``); an
-    evidenced or declared permission/security/destructive change reaches
-    ``NEEDS_HUMAN_DECISION``. Everything else is ``NO_TASK`` / ``BLOCKED``;
-    nothing is invented from source text.
+    incomplete Git claim stays ``BLOCKED`` (``risk_level: NEEDS_EVIDENCE``); a
+    **recognised** permission/security/destructive lead reaches
+    ``NEEDS_HUMAN_DECISION``. Recognition is a fixed path table plus limited
+    keyword / filename checks, not semantic analysis: an unrecognised change is
+    never treated as safe and still stops at ``NEEDS_EVIDENCE``. Everything else
+    is ``NO_TASK`` / ``BLOCKED``; nothing is invented from source text.
 
 What the module does **not** do: adopt a lesson, invent a root cause or an
 acceptance criterion, create an Issue / task, run a command, or approve a
 high-risk change. Field meanings (``negative_cases`` ... ) and the G1–G6 gates
 live only in ``kit/orchestration.md`` 4.1 and are referenced, never restated.
 
-Standard library only; no network, no carrier. Git is read through the local
-``git`` executable so risk evidence is the repository's own diff, never a
-caller-supplied summary.
+Standard library only; no network, no carrier. Before running Git, a pure
+filesystem preflight refuses a repository whose own config can execute commands
+(``filter.<driver>.clean`` / ``.process``, ``include`` / ``includeIf``, or a
+``filter=`` attribute): those cannot be isolated without executing them, so the
+planner fails closed and says so. ``core.fsmonitor`` and hooks are disabled through
+config overrides. Git is then read through the local ``git`` executable so risk
+evidence is the repository's own diff, never a caller-supplied summary.
 """
 from __future__ import annotations
 
@@ -260,7 +266,30 @@ _SAFE_GIT_CONFIG = (
     'core.symlinks=true',
     'core.ignoreCase=false',
     'core.excludesFile=' + os.devnull,
+    # These three are executable surfaces too. Disable them explicitly so a
+    # repository-local fsmonitor hook or hook path is never invoked by a
+    # supposedly read-only probe. Clean/process filters cannot be overridden by a
+    # single switch, so :func:`_repository_isolation_error` refuses those before
+    # any Git command runs.
+    'core.fsmonitor=false',
+    'core.hooksPath=' + os.devnull,
+    'core.attributesFile=' + os.devnull,
 )
+# Repository-local config sections that can execute a command or pull in another
+# config file that does. Only a raw file read is used: no Git command is run.
+_CONFIG_EXECUTABLE_RE = re.compile(r'(?im)^\s*\[\s*filter\b')
+_CONFIG_INCLUDE_RE = re.compile(r'(?im)^\s*\[\s*include(?:if)?\b')
+_FILTER_ISOLATION_MESSAGE = (
+    'the repository configures a Git clean/process filter or a filter attribute; '
+    'this read-only planner cannot isolate it without executing repository commands, '
+    'so it refuses before running any Git command (not implemented)')
+_INCLUDE_ISOLATION_MESSAGE = (
+    'the repository config uses include/includeIf, so this planner cannot prove that '
+    'no executable Git filter is configured; it refuses before running any Git '
+    'command (not implemented)')
+_LAYOUT_ISOLATION_MESSAGE = (
+    'cannot locate a non-bare Git worktree without running Git; this planner will not '
+    'execute repository configuration before that check (not implemented)')
 _UNSAFE_GIT_ENV = (
     'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
     'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_COMMON_DIR',
@@ -395,6 +424,138 @@ def _is_security_path(path):
 def _is_schema_path(path):
     lower = path.lower()
     return 'schema' in posixpath.basename(lower) or lower.endswith('.schema.json')
+
+
+def _resolve_path(value):
+    try:
+        return Path(value).resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+def _git_layout(repo_root):
+    """Locate ``(worktree, git_dir, common_dir)`` by reading the filesystem only.
+
+    No Git command is executed: ``.git`` is either a directory or a ``gitdir:``
+    file, and a linked worktree names its common directory in ``commondir``.
+    ``None`` means the layout cannot be proven (missing, unreadable, or bare).
+    """
+    current = _resolve_path(Path(repo_root or os.getcwd()).expanduser())
+    if current is None or not current.is_dir():
+        return None
+    while True:
+        dot_git = current / '.git'
+        if dot_git.is_dir():
+            git_dir = dot_git
+            break
+        if dot_git.is_file():
+            try:
+                line = dot_git.read_text(encoding='utf-8', errors='replace').strip()
+            except OSError:
+                return None
+            if not line.lower().startswith('gitdir:'):
+                return None
+            target = line.split(':', 1)[1].strip()
+            if not target:
+                return None
+            git_dir = Path(target)
+            if not git_dir.is_absolute():
+                git_dir = current / git_dir
+            break
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+    git_dir = _resolve_path(git_dir)
+    if git_dir is None or not git_dir.is_dir():
+        return None
+    common_dir = git_dir
+    commondir = git_dir / 'commondir'
+    if commondir.is_file():
+        try:
+            value = commondir.read_text(encoding='utf-8', errors='replace').strip()
+        except OSError:
+            return None
+        if value:
+            common_dir = _resolve_path(git_dir / value)
+            if common_dir is None or not common_dir.is_dir():
+                return None
+    return current, git_dir, common_dir
+
+
+def _attributes_declare_filter(path):
+    """True when an attributes file assigns a ``filter`` attribute.
+
+    A line such as ``*.bin filter=lfs`` makes Git execute the driver's clean /
+    process command. ``-filter`` and ``!filter`` are unset forms and do not make
+    Git run anything. Unreadable content is treated as "may declare a filter".
+    """
+    try:
+        text = path.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return True
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        tokens = line.split()
+        for token in tokens[1:]:
+            if token.startswith(('-', '!')):
+                continue
+            name = token[1:] if token.startswith('+') else token
+            if name == 'filter' or name.startswith('filter='):
+                return True
+    return False
+
+
+def _config_statements(text):
+    """Drop whole-line comments so a commented-out section is not a false hit."""
+    return '\n'.join(line for line in text.splitlines()
+                     if not line.lstrip().startswith(('#', ';')))
+
+
+def _repository_isolation_error(repo_root):
+    """Refuse to touch a repository whose own config can execute commands.
+
+    Clean/process filters cannot be disabled through a single Git config override,
+    and ``git status`` executes them while refreshing the index. Reading the
+    local config and attribute files is enough to know that isolation is not
+    possible, so the planner fails closed here *before* the first Git command
+    instead of running a repository-defined command and reporting the side effect
+    afterwards.
+    """
+    layout = _git_layout(repo_root)
+    if layout is None:
+        return _LAYOUT_ISOLATION_MESSAGE
+    worktree, git_dir, common_dir = layout
+    config_paths = [common_dir / 'config', git_dir / 'config.worktree']
+    for path in config_paths:
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            return _LAYOUT_ISOLATION_MESSAGE
+        statements = _config_statements(text)
+        if _CONFIG_EXECUTABLE_RE.search(statements):
+            return _FILTER_ISOLATION_MESSAGE
+        if _CONFIG_INCLUDE_RE.search(statements):
+            return _INCLUDE_ISOLATION_MESSAGE
+    info_attributes = [git_dir / 'info' / 'attributes',
+                       common_dir / 'info' / 'attributes']
+    for path in info_attributes:
+        if path.is_file() and _attributes_declare_filter(path):
+            return _FILTER_ISOLATION_MESSAGE
+    for dirpath, dirnames, filenames in os.walk(worktree):
+        # A nested worktree / submodule has its own attributes; they do not apply
+        # to this worktree, and walking them could be unbounded.
+        dirnames[:] = [name for name in dirnames
+                       if name != '.git'
+                       and not (Path(dirpath) / name / '.git').exists()]
+        if '.gitattributes' in filenames:
+            if _attributes_declare_filter(Path(dirpath) / '.gitattributes'):
+                return _FILTER_ISOLATION_MESSAGE
+    return None
 
 
 def _git_environment():
@@ -611,6 +772,9 @@ def _git_evidence_state(proposal, repo_root, required_base_sha=None,
             return _untrusted_evidence(
                 'git_evidence.head_sha does not match the task carrier head_sha')
     root = Path(repo_root or os.getcwd()).expanduser()
+    isolation_error = _repository_isolation_error(root)
+    if isolation_error:
+        return _untrusted_evidence(isolation_error)
     try:
         top = _run_git(root, ['rev-parse', '--show-toplevel'])
         if top.returncode != 0:
@@ -907,9 +1071,12 @@ def assess_risk_details(proposal, lesson, trusted_task=None, repo_root=None,
     An empty change set is never ``LOW``: it cannot prove the intended goal, the
     allowed-path scope or that the authorization is safe, so it stays
     ``NEEDS_EVIDENCE`` (or ``HIGH`` when the declared goal/scope is destructive,
-    permission/security or otherwise high risk). Every non-empty content change is
+    permission/security or otherwise high risk as far as the fixed path table and
+    limited keyword checks can tell). Every non-empty content change is
     ``NEEDS_EVIDENCE`` or ``HIGH``, and a missing, forged or incomplete Git claim
-    stays ``NEEDS_EVIDENCE``. ``LOW`` is reserved for the not-yet-wired
+    stays ``NEEDS_EVIDENCE``. A repository whose local config defines clean /
+    process filters or config includes is refused before any Git command with an
+    explicit "not implemented" reason. ``LOW`` is reserved for the not-yet-wired
     authoritative carrier adapter plus independent review and is not returned by
     this slice. No caller-supplied review or authorization is accepted.
     """

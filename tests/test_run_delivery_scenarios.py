@@ -55,9 +55,18 @@ class RegistryTests(unittest.TestCase):
 
     def test_positive_controls_and_negative_groups_both_exist(self):
         kinds = {item.kind for item in runner.SCENARIOS}
-        self.assertEqual(kinds, {'positive', 'negative'})
+        self.assertEqual(kinds, {'positive', 'negative', 'safety'})
         positives = [item for item in runner.SCENARIOS if item.kind == 'positive']
         self.assertGreaterEqual(len(positives), 4)
+
+    def test_self_improvement_fallbacks_are_not_counted_as_positive_controls(self):
+        by_id = {item.id: item for item in runner.SCENARIOS}
+        for scenario_id in ('A8', 'A15'):
+            self.assertEqual(by_id[scenario_id].kind, 'safety')
+            self.assertIn('NOT IMPLEMENTED', by_id[scenario_id].title)
+        positives = {item.id for item in runner.SCENARIOS if item.kind == 'positive'}
+        self.assertNotIn('A8', positives)
+        self.assertNotIn('A15', positives)
 
     def test_agent_selection_group_keeps_its_positive_control(self):
         group = [item for item in runner.SCENARIOS if item.group == 'E']
@@ -71,7 +80,7 @@ class RegistryTests(unittest.TestCase):
             for field in ('id', 'group', 'kind', 'title', 'precondition', 'defect',
                           'gate', 'evidence', 'cleanup'):
                 self.assertTrue(getattr(item, field), f'{item.id} has an empty {field}')
-            self.assertIn(item.kind, ('positive', 'negative'))
+            self.assertIn(item.kind, ('positive', 'negative', 'safety'))
             self.assertIn(item.group, 'ABCDE')
 
     def test_select_rejects_unknown_ids(self):
@@ -122,7 +131,10 @@ class FullRunTests(unittest.TestCase):
         self.assertEqual(totals['passed'], len(self.results))
         self.assertEqual(totals['failed'], 0)
         self.assertEqual(totals['errors'], 0)
-        self.assertEqual(totals['positive'] + totals['negative'], totals['scenarios'])
+        self.assertEqual(totals['positive'] + totals['negative'] + totals['safety'],
+                         totals['scenarios'])
+        self.assertEqual(totals['safety'], 2, 'A8/A15 must stay temporary safety fallbacks')
+        self.assertEqual(totals['safety_passed'], totals['safety'])
         self.assertEqual(sum(g['scenarios'] for g in report['groups'].values()),
                          totals['scenarios'])
         for item in report['scenarios']:

@@ -7,6 +7,7 @@ repository's own commit range and clean worktree can decide.
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -167,6 +168,25 @@ class GitRiskTests(unittest.TestCase):
         self.assertEqual(proposal['required_human_decision'], 'HD-05')
         self.assertEqual(proposal['risk_level'], 'HIGH')
 
+    def test_ordinary_docs_permission_text_is_blocked_not_hd05(self):
+        """Documentation wording is a lead, not proof: ordinary docs stay blocked.
+
+        Only authority surfaces escalate a permission-looking text change. This
+        pins the actual behaviour so the docs cannot claim that *every* permission
+        mention becomes HD-05.
+        """
+        base, head = self.commit_range(
+            {'docs/help.md': 'Only owner may approve.\n'},
+            {'docs/help.md': 'Anyone may approve.\n'})
+        proposal = self.plan(self.spec(['docs/help.md'], base, head,
+                                       goal='调整文档措辞。'), review=False)
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertIsNone(proposal['required_human_decision'])
+        self.assertTrue(any('documentation' in reason
+                            for reason in proposal['risk_reasons']),
+                        proposal['risk_reasons'])
+
     def test_real_docs_design_access_change_is_not_low(self):
         base, head = self.commit_range(
             {'docs/design/access.md': 'Only owner may approve.\n'},
@@ -213,14 +233,21 @@ class GitRiskTests(unittest.TestCase):
         self.assertIn('src/app.py', proposal['changed_paths'])
 
     def test_real_repository_range_cannot_be_truncated_by_the_caller(self):
-        """The exact reviewer case: real base/head, caller only names one path."""
-        root = Path(support.ROOT)
-        base = '7e74fd0aa59285fa4970606e9ebe231eee82a07a'
-        head = 'c88b33db728ddfe9fa9ca24cb3f3ad6c84becbfe'
-        for sha in (base, head):
-            if subprocess.run(['git', '-C', str(root), 'cat-file', '-e',
-                               f'{sha}^{{commit}}'], capture_output=True).returncode != 0:
-                self.skipTest(f'repository history lacks {sha}')
+        """A real base/head range, caller only names one path.
+
+        The range is created inside this test instead of borrowed from the
+        enclosing repository's history, so the property is still proven in a
+        release package or a shallow clone: no skip can hide a regression.
+        """
+        source = loop_support.GitRepo('agentorch-risk-real-range-')
+        self.addCleanup(source.close)
+        base = source.commit({
+            'docs/note.md': 'old docs\n',
+            'scripts/self_improvement/planning.py': 'return 1\n'}, message='base')
+        head = source.commit({
+            'docs/note.md': 'new docs\n',
+            'scripts/self_improvement/planning.py': 'return 2\n'}, message='head')
+        root = source.root
         tmp = Path(tempfile.mkdtemp(prefix='agentorch-risk-worktree-',
                                     dir=os.environ.get('TMPDIR') or None))
         self.addCleanup(shutil.rmtree, tmp, True)
@@ -232,14 +259,14 @@ class GitRiskTests(unittest.TestCase):
                         capture_output=True)
         spec = loop_support.spec(
             goal='修正文档错字。',
-            allowed_paths=['docs/self-improvement/entrypoints-and-decisions.md'],
+            allowed_paths=['docs/note.md'],
             git_evidence=loop_support.git_evidence(base, head),
             change_evidence={'base_sha': base, 'head_sha': head,
-                             'diff': '--- a/docs/self-improvement/entrypoints-and-decisions.md\n'
-                                     '+++ b/docs/self-improvement/entrypoints-and-decisions.md\n'
+                             'diff': '--- a/docs/note.md\n'
+                                     '+++ b/docs/note.md\n'
                                      '@@ -1 +1 @@\n-old\n+new\n'})
         details = planning.assess_risk_details(
-            {'allowed_paths': ['docs/self-improvement/entrypoints-and-decisions.md'],
+            {'allowed_paths': ['docs/note.md'],
              'git_evidence': loop_support.git_evidence(base, head)},
             {}, repo_root=tmp)
         self.assertNotEqual(details['level'], 'LOW')
@@ -779,6 +806,123 @@ class GitRiskTests(unittest.TestCase):
             with self.subTest(path=path):
                 with self.assertRaises(ValueError):
                     planning._canonical_allowed_path(path)
+
+
+class GitIsolationTests(unittest.TestCase):
+    """Risk assessment must not execute the repository's own Git configuration.
+
+    A repository can define ``filter.<driver>.clean`` / ``.process`` and
+    ``core.fsmonitor`` commands in its local config. ``git status`` runs the clean
+    filter (and fsmonitor) while refreshing the index, so a "read-only" probe can
+    execute arbitrary commands and a filter can even map a dirty file back to its
+    indexed content so the worktree looks clean. These tests use real Git
+    repositories and a marker file outside the repository: the marker must stay
+    absent, and a filter-masked worktree must never be reported as PRESENT.
+    """
+
+    def setUp(self):
+        self.repo = loop_support.GitRepo('agentorch-risk-isolation-')
+        self.addCleanup(self.repo.close)
+        self.marker_dir = Path(tempfile.mkdtemp(
+            prefix='agentorch-risk-marker-', dir=os.environ.get('TMPDIR') or None))
+        self.addCleanup(shutil.rmtree, self.marker_dir, True)
+        self.marker = self.marker_dir / 'executed.txt'
+
+    def _script(self, transform=False, name='probe.py'):
+        script = self.marker_dir / name
+        lines = [
+            'import pathlib, sys',
+            f"pathlib.Path({str(self.marker)!r}).open('a').write('ran\\n')",
+        ]
+        if transform:
+            lines.append('data = sys.stdin.buffer.read()')
+            lines.append("sys.stdout.buffer.write(data.replace(b'EVIL', b'SAFE'))")
+        script.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        script.chmod(0o755)
+        return script
+
+    def _commit_range(self, *, attributes=False, driver='probe',
+                      config_key=None, command=None):
+        self.repo.write('docs/evil.md', 'SAFE\n')
+        if attributes:
+            self.repo.write('.gitattributes', f'docs/evil.md filter={driver}\n')
+        if config_key is not None:
+            self.repo._git('config', config_key, command)
+        self.repo._git('add', '-A')
+        self.repo._git('commit', '-qm', 'base')
+        base = self.repo.head()
+        self.repo._git('commit', '--allow-empty', '-qm', 'head')
+        return base, self.repo.head()
+
+    def _assess(self, base, head):
+        return planning.assess_risk_details(
+            {'allowed_paths': ['docs/evil.md'],
+             'git_evidence': loop_support.git_evidence(base, head)},
+            {}, repo_root=self.repo.root)
+
+    def _reset_marker(self):
+        if self.marker.exists():
+            self.marker.unlink()
+
+    def test_clean_filter_is_not_executed_and_cannot_mask_a_dirty_file(self):
+        command = f'"{sys.executable}" "{self._script(transform=True)}"'
+        base, head = self._commit_range(
+            attributes=True, driver='probe',
+            config_key='filter.probe.clean', command=command)
+        # Commit-time Git already ran the filter once; start from a clean slate.
+        self.repo.write('docs/evil.md', 'EVIL\n')
+        os.utime(self.repo.root / 'docs/evil.md', None)
+        self._reset_marker()
+        details = self._assess(base, head)
+        self.assertFalse(
+            self.marker.exists(),
+            'risk assessment executed the repository clean filter')
+        self.assertNotEqual(details['evidence_status'], 'PRESENT',
+                            'a filter-masked dirty worktree was reported as evidence')
+        self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+        self.assertEqual(details['changed_paths'], [])
+        self.assertTrue(
+            any('filter' in reason or 'not implemented' in reason
+                for reason in details['reasons']), details['reasons'])
+        self.assertEqual((self.repo.root / 'docs/evil.md').read_text(encoding='utf-8'),
+                         'EVIL\n')
+
+    def test_process_filter_defined_in_the_repository_is_refused(self):
+        base, head = self._commit_range()
+        # Configure after the commit so fixture setup never runs it.
+        self.repo._git('config', 'filter.probe.process',
+                       f'"{sys.executable}" "{self._script()}"')
+        self._reset_marker()
+        details = self._assess(base, head)
+        self.assertFalse(self.marker.exists(),
+                         'risk assessment executed the repository process filter')
+        self.assertNotEqual(details['evidence_status'], 'PRESENT')
+        self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+
+    def test_filter_without_applicable_attribute_is_still_refused(self):
+        command = f'"{sys.executable}" "{self._script(transform=True)}"'
+        base, head = self._commit_range(
+            attributes=False, config_key='filter.probe.clean', command=command)
+        self._reset_marker()
+        details = self._assess(base, head)
+        self.assertFalse(self.marker.exists(),
+                         'risk assessment executed a configured clean filter')
+        self.assertNotEqual(details['evidence_status'], 'PRESENT')
+        self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+
+    def test_repository_fsmonitor_command_is_disabled_not_executed(self):
+        base, head = self._commit_range()
+        self.repo._git('config', 'core.fsmonitor',
+                       f'"{sys.executable}" "{self._script()}"')
+        self.repo._git('update-index', '--fsmonitor')
+        self._reset_marker()
+        details = self._assess(base, head)
+        self.assertFalse(self.marker.exists(),
+                         'risk assessment executed the repository fsmonitor hook')
+        # fsmonitor can be disabled reliably, so the assessment proceeds; the
+        # empty change set still cannot prove a low-risk task.
+        self.assertEqual(details['evidence_status'], 'PRESENT')
+        self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
 
 
 class PacketCompletenessTests(unittest.TestCase):

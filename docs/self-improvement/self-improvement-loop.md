@@ -94,23 +94,40 @@
 
 以下任一情况在真实 Git 证据支持时进入 `NEEDS_HUMAN_DECISION`，决策 ID 只引用 [`entrypoints-and-decisions.md`](entrypoints-and-decisions.md) §5：
 
-- 实际改变权限 / 安全边界、锁 / 状态机、数据迁移、外部依赖、隐私、破坏兼容或不可逆动作 → `HD-05`（契约 / schema 级改为 `HD-13`）。
+- 规划器**识别为**改变权限 / 安全边界、锁 / 状态机、数据迁移、外部依赖、隐私、破坏兼容或不可逆动作的变更 → `HD-05`（契约 / schema 级改为 `HD-13`）。
 - 任务目标 / 允许范围本身声明破坏性或不可逆动作（例如「删除全部用户数据」），而当前 diff 无法证明它时同样 `HD-05`；空 diff 不能作为「无风险」的反证。
 - Lesson 冲突无法靠证据解除 → `HD-04`。
 - 把 Lesson 提升为通用规则且影响上述边界 → `HD-03`。
 - 来源访问授权问题 → `HD-01` / `HD-02`。
 
-`planning.py` 的 `assess_risk()` 只接受仓库自己解析的 Git 证据，并从任务载体的 `state.base_sha` / `state.head_sha` 取得基线，而不是从 proposal 的 spec 自选 SHA。规划器验证两个提交存在、base 是 head 的祖先、`HEAD` 与 head 一致、`git_evidence`（若提供）与任务载体 base/head 一致、工作树干净且不是浅克隆，然后用 Git 生成完整 raw / numstat diff。它还会：
+**识别能力有限，未命中不等于安全**：`planning.py` 使用固定的路径前缀表和有限关键词 / 文件名正则，不是完整的语义分析。只有命中这些线索时才升级 `HD-05` / `HD-13`；未命中的变更仍然停在 `NEEDS_EVIDENCE` / `BLOCKED`，绝不自动放行。因此「所有权限变化都会 `HD-05`」是错误描述。具体边界：
 
-- 屏蔽 Git replace refs，并覆盖 `diff.ignoreSubmodules`、`core.fileMode`、`core.symlinks`、`core.ignoreCase`、external diff / textconv / 系统配置等可隐藏 changed paths 的配置与环境；
+- 只有 `AGENTS.md`、`docs/orchestration.md`、`kit/orchestration.md`、`editions/`、`docs/contracts/`、`docs/design/` 这类 authority surface 上的权限 / 安全措辞变化才映射到 `HD-05`；
+- 普通文档（例如 `docs/help.md`）里出现「permission」等词不自动判为 `HD-05`，而是作为内容变化进入 `NEEDS_EVIDENCE` / `BLOCKED`，等待审查；
+- 命中受保护执行面（`scripts/orchestrator.py`、`.orchestration/`、`.github/workflows/`、`release/`）、schema、可执行位变化、不可逆操作的变更进入 `HD-05` / `HD-13`。
+
+`planning.py` 的 `assess_risk()` 只用仓库自己解析的 Git 证据，并把调用者提供的 `base_sha` / `head_sha` 参数与 `git_evidence` 交叉校验。**这些参数只是定位符和一致性检查，不是权威任务载体认证**：真实适配器未接入，任何调用者都可以传相同的字符串。规划器验证两个提交存在、base 是 head 的祖先、`HEAD` 与 head 一致、工作树干净且不是浅克隆，然后用 Git 生成完整 raw / numstat diff。它还会：
+
+- 屏蔽 Git replace refs，并覆盖 `diff.ignoreSubmodules`、`core.fileMode`、`core.symlinks`、`core.ignoreCase`、external diff / textconv / 系统与全局配置等可隐藏 changed paths 的配置与环境；
+- **在任何 Git 命令之前**用纯文件读取检查仓库本地配置与 attributes：若定义了 `filter.<driver>.clean` / `.process`、`include` / `includeIf`，或 attributes 声明了 `filter=`，则无法在不执行仓库命令的情况下隔离，直接失败关闭并标明未实现；`core.fsmonitor` 与 hooks 通过 `-c core.fsmonitor=false` / `-c core.hooksPath=<空>` 显式禁用，不执行仓库配置；
 - 拒绝带 assume-unchanged / skip-worktree 的索引、未提交 / 未跟踪工作树、以及落在 `allowed_paths` 内的 ignored 文件；
 - 记录 Git 快照，并在登记 / 交付前复查；快照变化即阻塞。
 
 调用者提供的 Diff、`changed_paths`、40 位 SHA 字符串、`low_risk` / `approved` 布尔值、spec 内 `review` 或 `authorization` 字段都不是证据；伪造或截断的 Diff 不能缩小真实 changed paths。`allowed_paths` 中的绝对路径、反斜杠、通配符和任何 `..` 段在任何证据之前直接拒绝，不能被其他合法路径或 Diff 冲掉。
 
-空 diff 不能证明拟实施目标、允许范围或授权安全，因此**没有自动 `LOW`**：空 diff / 空 tree 与纯空白等价、Markdown 代码块 / 命令、普通文档、代码和治理面一样，都不凭后缀或空白自动放行。任何非空内容变化都保持 `NEEDS_EVIDENCE` / `BLOCKED`，并写出结构化 `required_evidence` 与 `next_action`。因此本切片的规划阶段不会产出 `READY`（`LOW` 保留给接入后的取证路径）：任务包完整性、依赖与 `required_evidence` 照常记录，登记必须等权威载体适配器与独立审查接入。
+空 diff 不能证明拟实施目标、允许范围或授权安全，因此**没有自动 `LOW`**：空 diff / 空 tree、纯空白、Markdown 代码块 / 命令、普通文档、代码和治理面一样，都不凭后缀或空白自动放行。任何非空内容变化都保持 `NEEDS_EVIDENCE` / `BLOCKED`，并写出结构化 `required_evidence` 与 `next_action`。因此本切片的规划阶段不会产出 `READY`（`LOW` 保留给接入后的取证路径）：任务包完整性、依赖与 `required_evidence` 照常记录，登记必须等权威载体适配器与独立审查接入。实际行为与文档逐项对齐：
 
-**当前切片没有接入权威任务载体适配器或真实独立审查**：`state.task` 只能作为任务定位符；spec / `state.task` / 调用者提供的 review、authorization 或自算摘要都不会触发 READY。`review_status` 明确为 `NOT_WIRED`。未来路径必须由独立适配器从 local SQLite / GitHub 认证 PR Review / Owner 权限取证，并绑定 task id、目标与 allowed-path hash、base/head、完整 diff、reviewer 身份/角色/独立性与有效期/撤销；在这条链路实现前，普通错字也只能停在 `NEEDS_EVIDENCE`，不能声称已自动推进。治理面及真实权限 / 安全 / 锁 / 状态机 / 数据 / 外部 / 不可逆变化仍升级 `NEEDS_HUMAN_DECISION`。二进制、rename / copy / type change、symlink、submodule、删除、dirty / untracked / hidden-index 工作树、缺失或不可验证的提交都显式阻塞。两种任务载体 payload 记录 Git base/head、diff SHA-256、changed paths、review status 与 next_action，但记录的是待取证状态，不是授权。
+| 输入 | 实际结果 |
+|---|---|
+| 空 diff / 空 tree，且目标与范围无可识别高风险线索 | `NEEDS_EVIDENCE` → `BLOCKED`（不产出 `READY`） |
+| 空 diff / 空 tree，但目标或允许范围声明破坏性 / 权限 / 安全 / 迁移 / 不可逆动作 | `HIGH` → `NEEDS_HUMAN_DECISION` / `HD-05`（契约 / schema 级 `HD-13`） |
+| 普通文档（非 authority surface）文本变化，即使含 permission / auth 等词 | `NEEDS_EVIDENCE` → `BLOCKED`；不自动升级 `HD-05` |
+| authority surface 上命中权限 / 安全 / 不可逆关键词 | `HIGH` → `HD-05`（契约 / schema 级 `HD-13`） |
+| 非空代码 / 文档 / 治理面变化，未命中高风险线索 | `NEEDS_EVIDENCE` → `BLOCKED`，等待真实独立审查 |
+| Git 证据缺失、伪造、不可验证、HEAD 不符、dirty / untracked / hidden-index、binary / rename / symlink / submodule / deletion | `NEEDS_EVIDENCE` → `BLOCKED`，写出 `required_evidence` |
+| 仓库本地配置定义 clean / process filter 或 include / includeIf | 任何 Git 命令前失败关闭：`NEEDS_EVIDENCE` / `BLOCKED`，明确标注未实现（不执行仓库命令） |
+
+**当前切片没有接入权威任务载体适配器或真实独立审查**：`state.task` 的 task id 与调用者传入的 `base_sha` / `head_sha` 都只是定位符和一致性交叉校验，不是认证；spec / `state.task` / 调用者提供的 review、authorization 或自算摘要都不会触发 READY。`review_status` 明确为 `NOT_WIRED`。未来路径必须由独立适配器从 local SQLite / GitHub 认证 PR Review / Owner 权限取证，并绑定 task id、目标与 allowed-path hash、base/head、完整 diff、reviewer 身份/角色/独立性与有效期/撤销；在这条链路实现前，普通错字也只能停在 `NEEDS_EVIDENCE`，不能声称已自动推进。被识别的治理面及权限 / 安全 / 锁 / 状态机 / 数据 / 外部 / 不可逆变化升级 `NEEDS_HUMAN_DECISION`；未被识别的同类变化不会被放行，只会停在 `NEEDS_EVIDENCE` / `BLOCKED`。二进制、rename / copy / type change、symlink、submodule、删除、dirty / untracked / hidden-index 工作树、缺失或不可验证的提交都显式阻塞。两种任务载体 payload 记录 Git base/head、diff SHA-256、changed paths、review status 与 next_action，但记录的是待取证状态，不是授权。
 
 **常规低风险工作也不得绕过 Master 审查、证据矩阵或合并门。**
 

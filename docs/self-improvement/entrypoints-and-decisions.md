@@ -59,9 +59,11 @@
 
 触发语**不等于**无条件授权。默认不自动合并、不绕过审查门、不推送破坏性更改。
 
-路径或关键词命中只是调查线索。风险判断必须来自受控仓库的真实 Git 证据，并从任务载体取得 base/head 基线（提交存在、祖先关系、`HEAD` 与 head 一致、与任务载体 base/head 一致、工作树干净且非浅克隆、屏蔽 replace refs 与隐藏 diff 的配置/环境、完整 diff 与 changed paths）。调用者提供的 Diff、`changed_paths`、SHA 字符串、`low_risk` / `approved` 布尔值、spec 内 `review` 或 `authorization` 字段都不是证据，字面 `granted_by` 与 URL 也不等于授权。无法证明完整性时保持待调查 / 阻塞，不自动询问 Owner，也不判为低风险。
+上表的“是否需要人工决策”是**策略要求**，不依赖规划器是否识别出关键词。规划器只有固定的路径前缀表与有限关键词 / 文件名正则：命中时升级 `HD-05` / `HD-13`；未命中时**不会**自动判为低风险，而是停在 `NEEDS_EVIDENCE` / `BLOCKED` 等待审查。因此不得把“所有权限变化都由规划器判成 `HD-05`”写成已实现事实，也不得因为未命中关键词就跳过人工决策。
 
-空 diff 不能证明拟实施目标、允许范围或授权安全，因此没有自动低风险：纯空白、Markdown 代码块 / 命令、普通文档、代码和治理面都不再凭后缀或空白自动放行。**当前未接入权威任务载体适配器或真实独立审查**；`state.task` 只是定位符，spec / state / 调用者提供的 review、authorization 或自算摘要都不构成授权。需要继续时返回结构化的 `required_evidence` / `next_action`，由 Agent/Master 取证；在适配器与独立审查接入前，普通错字也只能 `NEEDS_EVIDENCE`。真实权限 / 安全 / 锁 / 状态机 / 数据 / 外部 / 不可逆变化进入 `HD-05` / `HD-13`。非法、绝对、反斜杠、通配符或含 `..` 的 `allowed_paths` 必须先拒绝，不能被其他证据冲掉；外部项目须单独批准。
+路径或关键词命中只是调查线索。风险判断只用受控仓库的真实 Git 证据：规划器接收的 `base_sha` / `head_sha` 参数只是与 `git_evidence` 交叉校验的定位符，**不是权威任务载体认证**（适配器未接入，调用者可以传任意相同字符串）。它验证提交存在、祖先关系、`HEAD` 与 head 一致、工作树干净且非浅克隆，并屏蔽 replace refs 与隐藏 diff 的配置 / 环境，用 Git 生成完整 diff 与 changed paths。调用者提供的 Diff、`changed_paths`、SHA 字符串、`low_risk` / `approved` 布尔值、spec 内 `review` 或 `authorization` 字段都不是证据，字面 `granted_by` 与 URL 也不等于授权。仓库本地配置若定义 `filter.<driver>.clean` / `.process` 或 `include` / `includeIf`，规划器无法在不执行仓库命令的情况下隔离，会在**任何 Git 命令前**失败关闭并标明未实现；`core.fsmonitor` 与 hooks 则通过配置覆盖禁用。无法证明完整性时保持待调查 / 阻塞，不自动询问 Owner，也不判为低风险。
+
+空 diff 不能证明拟实施目标、允许范围或授权安全，因此没有自动低风险：纯空白、Markdown 代码块 / 命令、普通文档、代码和治理面都不再凭后缀或空白自动放行。空 diff / 空 tree 的实际结果是 `NEEDS_EVIDENCE` → `BLOCKED`；若目标或允许范围声明破坏性 / 权限 / 安全 / 迁移 / 不可逆动作，则升级 `HIGH` / `HD-05`。普通文档（非 authority surface）里出现 permission / auth 等词仍只是内容变化，停在 `NEEDS_EVIDENCE`，不会自动变成 `HD-05`。**当前未接入权威任务载体适配器或真实独立审查**；`state.task` 与调用者传入的 SHA 只是定位符，spec / state / 调用者提供的 review、authorization 或自算摘要都不构成授权。需要继续时返回结构化的 `required_evidence` / `next_action`，由 Agent/Master 取证；在适配器与独立审查接入前，普通错字也只能 `NEEDS_EVIDENCE`。真实权限 / 安全 / 锁 / 状态机 / 数据 / 外部 / 不可逆变化在**被识别时**进入 `HD-05` / `HD-13`，未识别时仍阻塞等待审查。非法、绝对、反斜杠、通配符或含 `..` 的 `allowed_paths` 必须先拒绝，不能被其他证据冲掉；外部项目须单独批准。
 
 ## 4. 停止条件
 

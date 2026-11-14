@@ -59,14 +59,20 @@ LIMITATIONS = (
     'never used to change allowed paths or acceptance criteria.',
     'This loop does not create Issues or tasks, run validation commands, approve, merge, '
     'or close anything; the carriers here are dry-run records.',
-    'Risk uses the repository’s own Git evidence and the task carrier base/head, not '
-    'caller-supplied diffs, SHA strings, review or authorization fields. Replace refs and '
-    'diff-hiding config are disabled, hidden index flags / ignored allowed paths / stale '
-    'snapshots block, and no change set is auto-LOW: an empty commit range cannot prove '
-    'the goal, the allowed-path scope or the authorization. The authoritative carrier '
-    'adapter and independent review are not wired in this release, so every proposal '
-    'stops at NEEDS_EVIDENCE with next_action; caller review cannot unlock READY. '
-    'Declared permission/security/destructive changes still end in NEEDS_HUMAN_DECISION.',
+    'Risk uses the repository’s own Git evidence and only cross-checks the caller-supplied '
+    'base/head locators; that cross-check is not authoritative carrier authentication, and '
+    'caller diffs, SHA strings, review or authorization fields are never evidence. Replace '
+    'refs and diff-hiding config are disabled; repository clean/process filters or config '
+    'includes make the planner fail closed before any Git command (not implemented), while '
+    'fsmonitor and hooks are disabled through overrides. Hidden index flags / ignored '
+    'allowed paths / stale snapshots block, and no change set is auto-LOW: an empty commit '
+    'range cannot prove the goal, the allowed-path scope or the authorization. The '
+    'authoritative carrier adapter and independent review are not wired in this release, so '
+    'every proposal stops at NEEDS_EVIDENCE with next_action; caller review cannot unlock '
+    'READY. High-risk recognition is a fixed path table plus limited keywords: recognised '
+    'permission/security/destructive leads end in NEEDS_HUMAN_DECISION, an ordinary '
+    'documentation permission mention stays NEEDS_EVIDENCE, and an unrecognised change is '
+    'never treated as safe.',
 )
 
 
