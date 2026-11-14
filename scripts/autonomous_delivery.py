@@ -22,7 +22,12 @@ fail-closed:
   re-running that command;
 * the edition is re-read from the project config at every side-effect boundary,
   and an invalid, duplicate, empty or ambiguous declaration blocks immediately
-  instead of reusing the first check;
+  instead of reusing the first check. Every external call — the profile query,
+  each Agent/session invocation, each session export and each verification
+  command — is bracketed by that proof on both sides, so a declaration that goes
+  bad while one of them is in flight stops the run at that call: no further
+  query, export, session or command starts, and an invalid config never yields a
+  ``PREPARED`` record;
 * lock identity is the canonical real path, so a symlinked journal directory
   cannot create a second lock identity for the same journal;
 * resume/retry re-prove the repository identity, the task packet, project
@@ -201,6 +206,21 @@ def _require_edition(config, error=DeliveryError):
                     f'`github` before any dispatch; found {config.get("edition_count")} '
                     f'declaration(s), values {values!r} (edition parsed as '
                     f'{config.get("edition")!r})')
+
+
+def _require_live_config(context, spec=None):
+    """Re-read the project config and fail closed unless the edition is valid.
+
+    Every external operation — profile query, Agent session, session export and
+    each verification command — is bracketed by this call, so a declaration
+    invalidated by any other writer at any point stops the run *at* that call.
+    Nothing external may start or continue after it fails.
+    """
+    fresh = project_config(context.repo)
+    _require_edition(fresh)
+    if spec is not None:
+        _authorize_paths(spec['paths'], fresh)
+    return fresh
 
 
 def _policy_paths(text, needle):
@@ -1050,35 +1070,34 @@ def _check_probe(probe, work, expected_agent, role, status='BLOCKED', require_te
         fail(f'{role} session transcript has no assistant text')
 
 
-def _run_checks(commands, work, timeout):
-    """Run checks in their own process group; a timeout kills the whole tree."""
-    checks = []
-    for command in commands:
-        entry = {'program': command[0], 'argv_sha256':
-                 hashlib.sha256(json.dumps(command).encode()).hexdigest()}
+def _run_check(command, work, timeout):
+    """Run one check in its own process group; a timeout kills the whole tree."""
+    entry = {'program': command[0], 'argv_sha256':
+             hashlib.sha256(json.dumps(command).encode()).hexdigest()}
+    try:
+        process = _popen(command, cwd=work, stdin=subprocess.DEVNULL,
+                         env=dict(os.environ, PWD=str(work)),
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                         start_new_session=(os.name == 'posix'))
+    except OSError as exc:
+        entry.update(exit_code=None, output_tail=f'not run: {exc}')
+        return entry
+    try:
+        output, _ = process.communicate(timeout=timeout)
+        entry.update(exit_code=process.returncode, output_tail=(output or '')[-1000:])
+    except subprocess.TimeoutExpired:
+        _kill_group(process)
         try:
-            process = _popen(command, cwd=work, stdin=subprocess.DEVNULL,
-                             env=dict(os.environ, PWD=str(work)),
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                             start_new_session=(os.name == 'posix'))
-        except OSError as exc:
-            entry.update(exit_code=None, output_tail=f'not run: {exc}')
-            checks.append(entry)
-            continue
-        try:
-            output, _ = process.communicate(timeout=timeout)
-            entry.update(exit_code=process.returncode,
-                         output_tail=(output or '')[-1000:])
+            process.communicate(timeout=30)
         except subprocess.TimeoutExpired:
-            _kill_group(process)
-            try:
-                process.communicate(timeout=30)
-            except subprocess.TimeoutExpired:
-                pass
-            entry.update(exit_code=None, timeout=True,
-                         output_tail='timed out; process group killed')
-        checks.append(entry)
-    return checks
+            pass
+        entry.update(exit_code=None, timeout=True,
+                     output_tail='timed out; process group killed')
+    return entry
+
+
+def _run_checks(commands, work, timeout):
+    return [_run_check(command, work, timeout) for command in commands]
 
 
 def _timed_out(record):
@@ -1116,7 +1135,18 @@ def _resolve_task(context, spec):
 
 
 def _reviewer_gate(context, spec, work, record):
+    """Bracket the runtime profile query with an edition re-proof.
+
+    The profiles are runtime state and may change while a task runs, so a
+    cached gate could authorize a later command or session with a profile the
+    caller never saw. The project config is re-read *before* the query so an
+    already invalid declaration starts no external call, and again *after* it so
+    a change made while the runtime answered blocks before the answer is used or
+    another call is made.
+    """
+    _require_live_config(context, spec)
     gate = context.reviewer_gate(work)
+    fresh = _require_live_config(context, spec)
     record['reviewer_profile'] = {'agent': context.plan['reviewer_agent'],
                                   'effective': gate['effective'],
                                   'missing_denies': gate['missing'],
@@ -1126,27 +1156,40 @@ def _reviewer_gate(context, spec, work, record):
     if not gate['ready']:
         raise DeliveryError('reviewer agent profile is not provably read-only: '
                             + '; '.join(gate['reasons']))
+    return fresh
+
+
+def _prove_session(context, spec, session, work):
+    """Export a session only while the project config still authorizes it.
+
+    The export is an external call of its own, so it is bracketed the same way
+    as a profile query: nothing is read back, and no later action starts, once
+    the declaration has gone bad.
+    """
+    _require_live_config(context, spec)
+    probe = context.session_probe(session, work)
+    _require_live_config(context, spec)
+    return probe
 
 
 def _prove_before_side_effect(context, spec, record, work, require_evidence):
     """The one re-proof shared by execute, verify, review, resume, retry and auth.
 
     It runs before any command or agent starts, so a failure stops the task with
-    no verification or session side effect: the reviewer profile is re-queried,
-    then the edition and task authorization are re-read and re-validated, and —
-    once an attempt has produced a head — every *actual* changed path and the
-    execution session's own Agent/directory/terminal state are re-proven. The
-    session metadata is an
-    identity check, not proof that the session produced the recorded commit:
-    there is no independently verifiable execution artifact, so cross-process
-    trust of a recorded head is refused separately.
+    no verification or session side effect: the edition and task authorization
+    are re-read, the reviewer profile is re-queried (itself bracketed by another
+    config proof), and — once an attempt has produced a head — every *actual*
+    changed path and the execution session's own Agent/directory/terminal state
+    are re-proven. Each external call is guarded on both sides, so a config that
+    goes bad while the runtime answers cannot be followed by one more call. The
+    session metadata is an identity check, not proof that the session produced
+    the recorded commit: there is no independently verifiable execution
+    artifact, so cross-process trust of a recorded head is refused separately.
     """
-    # Query the profile first: a config change made while the runtime answers
-    # the query must be seen by the config read below, not after the agent.
-    _reviewer_gate(context, spec, work, record)
-    fresh = project_config(context.repo)
-    _require_edition(fresh)
-    _authorize_paths(spec['paths'], fresh)
+    # Config first, then the external profile query, then config again: a
+    # change made while the runtime answers the query is seen before its answer
+    # is used and before the agent or command it would gate can start.
+    fresh = _reviewer_gate(context, spec, work, record)
     if _status(work):
         raise DeliveryError('worktree is not clean; refusing to continue')
     changed = []
@@ -1163,7 +1206,7 @@ def _prove_before_side_effect(context, spec, record, work, require_evidence):
         session = record.get('execution_session')
         if not session:
             raise DeliveryError('recorded state has no execution session')
-        probe = context.session_probe(session, work)
+        probe = _prove_session(context, spec, session, work)
         _check_probe(probe, work, context.plan['executor_agent'], 'execution',
                      session=session)
     return changed
@@ -1186,12 +1229,16 @@ def _execute(context, spec, record):
               'Acceptance criteria:\n' + _criteria_prompt(spec)
               + '\n\n' + spec['prompt'])
     execution = context.agent(work, packet, 'execution')
+    # The agent session is an external call and the export below is another
+    # one: re-prove the declaration before reading anything back, so a config
+    # invalidated while the agent ran stops the run here.
+    _require_live_config(context, spec)
     record['execution_session'] = execution.get('session_id')
     record['execution_detail'] = execution.get('detail')
     if execution.get('exit_code') != 0 or not execution.get('session_id'):
         raise DeliveryError('execution failed or its terminal state is unknown: '
                             + str(execution.get('detail') or 'no detail'), 'FAILED')
-    probe = context.session_probe(execution['session_id'], work)
+    probe = _prove_session(context, spec, execution['session_id'], work)
     _check_probe(probe, work, context.plan['executor_agent'], 'execution', 'FAILED',
                  session=execution['session_id'])
     record['execution_evidence'] = {
@@ -1238,9 +1285,18 @@ def _verify(context, spec, record):
     if _head(work) != record['head'] or _fingerprint(work, record['base']) != record['diff_sha256']:
         raise DeliveryError('head or diff changed before verification')
     _prove_before_side_effect(context, spec, record, work, require_evidence=True)
-    checks = _run_checks(spec['verify'], work, spec['raw'].get('timeout', 1800))
-    record['verification'] = checks
-    context.save()
+    checks = []
+    for command in spec['verify']:
+        # Each check is its own external side effect. The declaration is
+        # re-proved immediately before it starts and again as soon as it
+        # returns, so a check that invalidates the config cannot be followed by
+        # the next check. The finished entries are journalled first, so the
+        # evidence that did run is never lost to the block that follows.
+        _require_live_config(context, spec)
+        checks.append(_run_check(command, work, spec['raw'].get('timeout', 1800)))
+        record['verification'] = list(checks)
+        context.save()
+        _require_live_config(context, spec)
     if any(check.get('timeout') for check in checks):
         raise DeliveryError('a verification process tree may still be running; refusing to '
                             'continue or retry automatically')
@@ -1332,6 +1388,9 @@ def _review(context, spec, record):
     record['task_digest'] = _task_digest(context, spec, record)
     context.save()
     review = context.agent(work, _review_prompt(spec, record, patch), 'review')
+    # The review session is an external call and the export below is another:
+    # re-prove the declaration before reading the verdict back.
+    _require_live_config(context, spec)
     session = review.get('session_id')
     record['review_detail'] = review.get('detail')
     if review.get('exit_code') != 0 or not session:
@@ -1340,7 +1399,7 @@ def _review(context, spec, record):
     if session == record.get('execution_session'):
         raise DeliveryError('review session equals execution session; independence is not '
                             'established', 'REVIEW_REJECTED')
-    probe = context.session_probe(session, work)
+    probe = _prove_session(context, spec, session, work)
     _check_probe(probe, work, context.plan['reviewer_agent'], 'review', 'REVIEW_REJECTED',
                  require_text=True, session=session)
     record['review_session'] = session
@@ -1364,10 +1423,17 @@ def _review(context, spec, record):
     problem = _verdict_matches(verdict, record, spec, context)
     if problem:
         raise DeliveryError(problem, 'REVIEW_REJECTED')
+    # Accepting the review is a trust decision taken after two external calls
+    # (the review session and its export), so the project config is re-proved
+    # before the verdict is accepted rather than reused from before them.
+    _require_live_config(context, spec)
     if _status(work) or _head(work) != record['head'] \
             or _fingerprint(work, record['base']) != record['diff_sha256']:
         raise DeliveryError('review session changed the worktree or its head/diff',
                             'REVIEW_REJECTED')
+    # ... and once more immediately before the record is called PREPARED, so a
+    # declaration invalidated in between never yields a prepared approval.
+    _require_live_config(context, spec)
     record['review_verdict'] = verdict
     record['status'] = 'PREPARED'
     record['phase'] = 'done'
@@ -1391,15 +1457,18 @@ def _recheck_approved(context):
     A trusted verification command from a later task, or any other writable
     channel, can change an earlier task's worktree after it reached
     ``PREPARED``. Nothing re-reads that record on the normal path, so the
-    summary would otherwise report stale approvals. This check only reads Git
-    state: it never re-runs a verification command, starts an agent or writes
-    to a worktree.
+    summary would otherwise report stale approvals. This check re-reads the
+    project config (edition, authorization) as well as Git state: it never
+    re-runs a verification command, starts an agent or writes to a worktree.
+    An invalid project config therefore blocks every approval instead of being
+    reported as prepared.
     """
     for ident in sorted(context.approved):
         record = context.record(ident)
         if record.get('status') != 'PREPARED':
             continue
         try:
+            _require_live_config(context, context.spec(ident))
             work = _resolve_task(context, context.spec(ident))
             ok, why = _facts_match(record, work)
             if not ok:
@@ -1441,7 +1510,7 @@ def _prove_common(context, spec, record, work):
     review = record.get('review_session')
     if not review or review == session:
         raise DeliveryError('recorded state has no independent review session')
-    review_probe = context.session_probe(review, work)
+    review_probe = _prove_session(context, spec, review, work)
     _check_probe(review_probe, work, context.plan['reviewer_agent'], 'review',
                  require_text=True, session=review)
     verdict = _verdict(''.join(review_probe.get('texts') or []))
