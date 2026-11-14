@@ -96,7 +96,7 @@
 
 - 规划器**识别为**改变权限 / 安全边界、锁 / 状态机、数据迁移、外部依赖、隐私、破坏兼容或不可逆动作的变更 → `HD-05`（契约 / schema 级改为 `HD-13`）。
 - 任务目标 / 允许范围本身声明破坏性或不可逆动作（例如「删除全部用户数据」），而当前 diff 无法证明它时同样 `HD-05`；这条只看破坏性措辞，空 diff 不能作为「无风险」的反证。
-- 权限 / 安全 / 迁移等一般关键词只是线索，不单独升级：只有当**允许范围本身命中高风险路径**（authority surface、受保护执行面、安全命名的文件名、schema）并同时出现对应关键词时，空 diff 才升级 `HD-05` / `HD-13`。目标写「调整用户权限」、允许 `a.md` 的空提交仍是 `NEEDS_EVIDENCE`，且**没有** decision ID。
+- 权限 / 安全 / 迁移等一般关键词只是线索，不单独升级：只有当**允许范围本身命中高风险路径**（authority surface、受保护执行面、安全命名的文件名、schema）并同时出现对应关键词时，空 diff 才升级 `HD-05`。目标写「调整用户权限」、允许 `a.md` 的空提交仍是 `NEEDS_EVIDENCE`，且**没有** decision ID；同一目标把允许范围改成 `AGENTS.md` 或 `docs/design/guide.md` 才升级 `HD-05`。空 diff 的 scope 线索一律是 `HD-05`：`HD-13` 只用于真实 diff 改动 schema / 契约路径的破坏性版本升级，不凭文件名或空 diff 升级。
 - Lesson 冲突无法靠证据解除 → `HD-04`。
 - 把 Lesson 提升为通用规则且影响上述边界 → `HD-03`。
 - 来源访问授权问题 → `HD-01` / `HD-02`。
@@ -123,9 +123,9 @@
 | 空 diff / 空 tree，且目标与允许范围无可识别高风险线索 | `NEEDS_EVIDENCE` → `BLOCKED`（不产出 `READY`） |
 | 空 diff / 空 tree，目标声明破坏性或不可逆动作（例如「删除全部用户数据」） | `HIGH` → `NEEDS_HUMAN_DECISION` / `HD-05` |
 | 空 diff / 空 tree，目标只提到权限 / 安全 / 迁移等一般关键词，允许范围未命中高风险路径（例如「调整用户权限」+ `a.md`） | `NEEDS_EVIDENCE` → `BLOCKED`，内容线索待审，**无 decision ID** |
-| 空 diff / 空 tree，允许范围命中高风险路径并伴随对应关键词 | `HIGH` → `HD-05`（契约 / schema 级 `HD-13`） |
+| 空 diff / 空 tree，允许范围命中高风险路径并伴随对应关键词 | `HIGH` → `HD-05`（`HD-13` 只用于真实 schema 变更） |
 | 普通文档（非 authority surface）文本变化，即使含 permission / auth 等词 | `NEEDS_EVIDENCE` → `BLOCKED`；不自动升级 `HD-05` |
-| authority surface 上命中权限 / 安全 / 不可逆关键词 | `HIGH` → `HD-05`（契约 / schema 级 `HD-13`） |
+| authority surface 上命中权限 / 安全 / 不可逆关键词 | `HIGH` → `HD-05` |
 | 非空代码 / 文档 / 治理面变化，未命中高风险线索 | `NEEDS_EVIDENCE` → `BLOCKED`，等待真实独立审查 |
 | Git 证据缺失、伪造、不可验证、HEAD 不符、dirty / untracked / hidden-index、binary / rename / symlink / submodule / deletion | `NEEDS_EVIDENCE` → `BLOCKED`，写出 `required_evidence` |
 | 仓库（含子模块 / 嵌套仓库）本地配置定义 clean / process filter 或 include / includeIf，或声明 promisor / partial-clone remote、`ext::` transport、HTTP alternate | 任何 Git 命令前失败关闭：`NEEDS_EVIDENCE` / `BLOCKED`，明确标注未实现（不执行仓库命令、零 Git 进程） |

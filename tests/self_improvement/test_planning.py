@@ -1172,6 +1172,61 @@ class GitIsolationTests(unittest.TestCase):
         self.assertFalse(self.marker.exists(),
                          'git_diff_digest executed the repository filter')
 
+    def _assert_digest_refused_before_git(self, repo_root, base, head):
+        process_marker, bin_dir = self._git_process_probe()
+        path = str(bin_dir) + os.pathsep + os.environ['PATH']
+        with mock.patch.dict(os.environ, {'PATH': path}):
+            with self.assertRaises(planning.GitEvidenceError):
+                planning.git_diff_digest(repo_root, base, head)
+        self.assertFalse(process_marker.exists(),
+                         'git_diff_digest started Git before validating its arguments')
+        return process_marker
+
+    def test_git_diff_digest_rejects_injected_diff_options(self):
+        """A caller-supplied "SHA" must never become a Git option.
+
+        ``git diff ... --no-ext-diff <base> <head>`` puts the caller value after
+        the protective switch, so base='--ext-diff' re-enables the repository's
+        external diff and base='--textconv' runs its textconv driver. Both used
+        to execute a repository-configured command and still return a digest.
+        """
+        for option in ('--ext-diff', '--textconv'):
+            with self.subTest(option=option):
+                repo = loop_support.GitRepo('agentorch-risk-inject-')
+                self.addCleanup(repo.close)
+                repo.write('docs/evil.md', 'SAFE\n')
+                repo.write('.gitattributes', 'docs/evil.md diff=probe\n')
+                command = f'"{sys.executable}" "{self._script()}"'
+                repo._git('config', 'diff.probe.textconv', command)
+                repo._git('config', 'diff.external', command)
+                repo._git('add', '-A')
+                repo._git('commit', '-qm', 'base')
+                head = repo.head()
+                repo.write('docs/evil.md', 'EVIL\n')
+                self._reset_marker()
+                self._assert_digest_refused_before_git(repo.root, option, head)
+                self.assertFalse(
+                    self.marker.exists(),
+                    f'{option}: git_diff_digest executed the repository diff surface')
+                self.assertEqual(
+                    (repo.root / 'docs/evil.md').read_text(encoding='utf-8'),
+                    'EVIL\n')
+
+    def test_git_diff_digest_rejects_output_option_injection(self):
+        """``--output=<path>`` used to overwrite the named file during a digest."""
+        repo = loop_support.GitRepo('agentorch-risk-output-')
+        self.addCleanup(repo.close)
+        base = repo.commit({'docs/evil.md': 'SAFE\n'}, message='base')
+        head = repo.empty_commit('no change')
+        target = self.marker_dir / 'overwritten.txt'
+        target.write_text('original\n', encoding='utf-8')
+        self._assert_digest_refused_before_git(
+            repo.root, f'--output={target}', head)
+        self.assertEqual(target.read_text(encoding='utf-8'), 'original\n',
+                         'git_diff_digest overwrote the caller-named output file')
+        # The valid range still produces a digest.
+        self.assertTrue(planning.git_diff_digest(repo.root, base, head))
+
 
 class EmptyDiffPermissionWordingTests(unittest.TestCase):
     def test_permission_goal_without_high_risk_path_is_not_hd05(self):
@@ -1195,6 +1250,49 @@ class EmptyDiffPermissionWordingTests(unittest.TestCase):
         self.assertIsNone(details['decision_id'])
         self.assertTrue(any('permission' in reason or '权限' in reason
                             for reason in details['reasons']), details['reasons'])
+
+    def test_permission_goal_on_an_authority_surface_is_hd05(self):
+        """The documented high-risk path table includes authority surfaces.
+
+        With an empty commit range, '调整用户权限' scoped to AGENTS.md or
+        docs/design/guide.md is an unproven high-risk scope and must escalate to
+        HIGH / HD-05, exactly as the docs state. Ordinary paths stay at
+        NEEDS_EVIDENCE (pinned by the test above).
+        """
+        for path in ('AGENTS.md', 'docs/design/guide.md'):
+            with self.subTest(path=path):
+                repo = loop_support.GitRepo('agentorch-risk-authority-empty-')
+                self.addCleanup(repo.close)
+                base = repo.commit({path: 'old text\n'}, message='base')
+                head = repo.empty_commit('no change')
+                details = planning.assess_risk_details(
+                    {'goal': '调整用户权限。', 'allowed_paths': [path],
+                     'git_evidence': loop_support.git_evidence(base, head)},
+                    {}, repo_root=repo.root)
+                self.assertEqual(details['changed_paths'], [])
+                self.assertEqual(details['level'], 'HIGH')
+                self.assertEqual(details['decision_id'], 'HD-05')
+
+    def test_schema_scope_lead_is_hd05_not_hd13(self):
+        """HD-13 is a destructive schema/contract upgrade, not a filename match.
+
+        An empty diff whose allowed scope names a schema file and a schema
+        keyword is an unproven high-risk scope: HD-05. Only a real diff that
+        changes a schema path maps to HD-13.
+        """
+        repo = loop_support.GitRepo('agentorch-risk-schema-empty-')
+        self.addCleanup(repo.close)
+        path = 'docs/contracts/lesson.schema.json'
+        base = repo.commit({path: '{"enum":["A"]}\n'}, message='base')
+        head = repo.empty_commit('no change')
+        details = planning.assess_risk_details(
+            {'goal': '调整 lesson.schema.json 的枚举取值。',
+             'allowed_paths': [path],
+             'git_evidence': loop_support.git_evidence(base, head)},
+            {}, repo_root=repo.root)
+        self.assertEqual(details['changed_paths'], [])
+        self.assertEqual(details['level'], 'HIGH')
+        self.assertEqual(details['decision_id'], 'HD-05')
 
 
 class PacketCompletenessTests(unittest.TestCase):

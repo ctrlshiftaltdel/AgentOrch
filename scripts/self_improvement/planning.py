@@ -797,7 +797,29 @@ def _snapshot_digest(head_sha, base_sha, status, index, raw, numstat, ignored):
     return digest.hexdigest()
 
 
+def _require_diff_sha(label, value):
+    """Return a validated commit SHA or refuse before any Git process.
+
+    Repository revisions are appended to a ``git diff`` command line. An
+    unvalidated value such as ``--ext-diff``, ``--textconv`` or
+    ``--output=/path`` lands *after* the protective switches and overrides them:
+    the first two run repository-configured helpers, the last overwrites a file.
+    Only a full 40-character hex SHA may reach Git, so option injection is
+    rejected here, before ``_run_git`` starts anything.
+    """
+    if not isinstance(value, str):
+        raise GitEvidenceError(
+            f'{label} must be a full 40-character hex Git SHA')
+    sha = value.strip().lower()
+    if not _SHA_RE.match(sha):
+        raise GitEvidenceError(
+            f'{label} must be a full 40-character hex Git SHA')
+    return sha
+
+
 def _diff_digest(repo_root, base_sha, head_sha):
+    base_sha = _require_diff_sha('base_sha', base_sha)
+    head_sha = _require_diff_sha('head_sha', head_sha)
     completed = _run_git(repo_root, [
         'diff', '--binary', '--full-index', '--no-ext-diff', '--no-textconv',
         base_sha, head_sha])
@@ -869,7 +891,11 @@ def _parse_numstat_binary(data):
 
 def _blob_is_unproven(repo_root, sha):
     """True when a blob cannot be treated as text by this planner."""
-    if not sha or set(sha) <= {'0'}:
+    # Only a full hex object id may reach ``git cat-file``. Raw-diff headers come
+    # from Git, but never let a malformed token become a command-line option.
+    if not isinstance(sha, str) or not _SHA_RE.match(sha):
+        return True
+    if set(sha) <= {'0'}:
         return False
     size = _run_git(repo_root, ['cat-file', '-s', sha])
     if size.returncode != 0:
@@ -984,8 +1010,11 @@ def _git_evidence_state(proposal, repo_root, required_base_sha=None,
             raise GitEvidenceError(
                 'index has assume-unchanged or skip-worktree entries: '
                 + ', '.join(flagged[:5]))
-        raw = git(['diff', '--raw', '-z', '--find-renames', '--find-copies',
-                   '--no-ext-diff', '--no-textconv', base_sha, head_sha])
+        # ``--abbrev=40`` keeps raw-diff object ids at 40 hex characters so
+        # every later ``cat-file`` argument is a full SHA, never an option.
+        raw = git(['diff', '--raw', '-z', '--abbrev=40', '--find-renames',
+                   '--find-copies', '--no-ext-diff', '--no-textconv',
+                   base_sha, head_sha])
         if raw.returncode != 0:
             raise GitEvidenceError('cannot read the raw diff')
         numstat = git(['diff', '--numstat', '-z', '--find-renames', '--find-copies',
@@ -1062,12 +1091,18 @@ def _scope_leads(proposal, lesson):
     keyword_hits = [keyword for keyword in SCOPE_KEYWORDS
                     if keyword.casefold() in text]
     high_paths = []
+    authority_paths = []
     for path in proposal.get('allowed_paths') or []:
         normalized = _canonical_allowed_path(path)
+        if _is_authority_path(normalized):
+            # An authority surface escalates only together with a keyword (see
+            # the high-risk escalation below), so it is tracked separately from
+            # the always-suspicious protected / security / schema paths.
+            authority_paths.append(normalized)
         if (_is_protected_path(normalized) or _is_security_path(normalized)
                 or _is_schema_path(normalized)):
             high_paths.append(normalized)
-    return keyword_hits, high_paths
+    return keyword_hits, high_paths, authority_paths
 
 
 def _destructive_intent_hits(proposal, lesson):
@@ -1175,7 +1210,7 @@ def _classify_git_evidence(proposal, lesson, evidence):
                 result['content'],
                 f'code change needs review: {path}')
 
-    keyword_hits, high_paths = _scope_leads(proposal, lesson)
+    keyword_hits, high_paths, authority_paths = _scope_leads(proposal, lesson)
     intent_hits = _destructive_intent_hits(proposal, lesson)
     empty_change = not evidence['entries']
     if intent_hits:
@@ -1186,8 +1221,10 @@ def _classify_git_evidence(proposal, lesson, evidence):
              'task goal/scope requests a change not proven by the current diff: ')
             + detail)
         result['decision_id'] = result['decision_id'] or DECISION_HIGH_RISK
-    if high_paths and keyword_hits:
-        detail = ', '.join(sorted(set(keyword_hits + high_paths)))
+    if (high_paths or authority_paths) and keyword_hits:
+        # A scope lead is always HD-05: the diff does not prove a contract
+        # change. HD-13 is reserved for a real diff on a schema/contract path.
+        detail = ', '.join(sorted(set(keyword_hits + high_paths + authority_paths)))
         _append_unique(
             result['high'],
             ('an empty change set cannot prove a high-risk task scope: '
