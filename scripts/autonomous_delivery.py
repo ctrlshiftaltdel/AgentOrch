@@ -15,6 +15,8 @@ fail-closed:
 * resume/retry re-prove the repository identity, the task packet, project
   authorization (including every *actual* changed path), the execution session,
   the reviewer profile and the full verification set before any side effect;
+  the runner also appends a binding trailer commit that ties the session to the
+  task packet, base, head and diff, so a hand-made commit cannot be resumed;
 * no ``reset``, ``stash`` or delete is ever performed; a worktree that is not
   exactly at the target baseline, or that has uncommitted/committed leftovers,
   is refused and left untouched;
@@ -56,6 +58,10 @@ MODE = 'prepare-only'
 # The runtime's write-capable tool actions we can name. MCP/plugin channels are
 # not enumerable here, so this gate is never presented as an OS read-only proof.
 MUTATING_ACTIONS = ('edit', 'shell')
+VALID_EDITIONS = ('local', 'github')
+EDITION_RE = re.compile(r'^\s*[-*]\s*`?edition`?\s*[:：]\s*(.*?)\s*$', re.M)
+BINDING_KEYS = ('AgentOrch-Session', 'AgentOrch-Base', 'AgentOrch-Diff',
+                'AgentOrch-Task')
 MERGE_REFUSAL = ('automatic merge is not implemented in this slice: it has no authoritative '
                  'task lock, atomic recovery or independent authorization binding. Run with '
                  'merge disabled and let the Master review the PREPARED head')
@@ -119,16 +125,28 @@ def project_config(repo):
     """Read edition and path authorization from the project's own config."""
     path = Path(repo) / 'docs' / 'PROJECT.md'
     if not path.is_file():
-        return {'edition': None, 'edition_count': 0, 'allowed': None, 'forbidden': [],
-                'secrets': []}
+        return {'edition': None, 'edition_count': 0, 'edition_values': [],
+                'allowed': None, 'forbidden': [], 'secrets': []}
     text = path.read_text(encoding='utf-8', errors='replace')
-    match = re.search(r'^\s*[-*]\s*`?edition`?\s*[:：]\s*`?([A-Za-z0-9_-]+)`?', text, re.M)
-    editions = re.findall(r'^\s*[-*]\s*`?edition`?\s*[:：]\s*`?([A-Za-z0-9_-]+)`?', text, re.M)
-    return {'edition': editions[0] if len(editions) == 1 else None,
-            'edition_count': len(editions),
+    values = [_edition_value(match) for match in EDITION_RE.findall(text)]
+    return {'edition': values[0] if len(values) == 1 else None,
+            'edition_count': len(values), 'edition_values': values,
             'allowed': _policy_paths(text, '允许改动路径'),
             'forbidden': _policy_paths(text, '禁止改动路径'),
             'secrets': _secret_patterns(text)}
+
+
+def _edition_value(raw):
+    """Take the *whole* declared value; a prefix or trailing text is invalid.
+
+    Only a value wrapped in a matching pair of backticks is unwrapped. Anything
+    else (``github/invalid``, ``???``, an empty value, a closed backtick followed
+    by prose) stays as-is and is rejected by the callers' exact-value check.
+    """
+    value = raw.strip()
+    if len(value) >= 2 and value.startswith('`') and value.endswith('`'):
+        value = value[1:-1]
+    return value
 
 
 def _policy_paths(text, needle):
@@ -323,6 +341,50 @@ def _fingerprint(path, base):
         else:
             digest.update(b'X' + oct(info.st_mode).encode())
     return digest.hexdigest()
+
+
+def _bind_session(work, base, session, digest, packet):
+    """Record the execution session on the branch as durable repository state.
+
+    The journal is copyable and its hashes are recomputable, so a journal field
+    alone cannot show that this session produced this head for this task packet.
+    The runner writes an empty trailer commit *after* the work is committed;
+    resume, retry and approval re-proof read it from Git. A hand-made commit, or
+    a session bound to another packet, cannot carry it.
+    """
+    body = (f'AgentOrch-Session: {session}\nAgentOrch-Base: {base}\n'
+            f'AgentOrch-Diff: {digest}\nAgentOrch-Task: {packet}\n')
+    subprocess.run(['git', '--no-optional-locks', 'commit', '--allow-empty',
+                    '--no-gpg-sign', '-m', 'AgentOrch: bind the execution session',
+                    '-m', body], cwd=work, stdin=subprocess.DEVNULL,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+
+
+def _session_binding(work, base, head, session, digest, packet):
+    """Name the trailer field that does not match, or ``None`` when all match."""
+    if not isinstance(session, str) or not session:
+        return 'session'
+    if not isinstance(base, str) or not base or not isinstance(head, str) or not head:
+        return 'base/head'
+    if not isinstance(digest, str) or not digest:
+        return 'diff'
+    if not isinstance(packet, str) or not packet:
+        return 'task packet'
+    try:
+        body = os.fsdecode(git(work, 'log', '-1', '--format=%B', head))
+    except subprocess.SubprocessError:
+        return 'head'
+    wanted = {'AgentOrch-Session': session, 'AgentOrch-Base': base,
+              'AgentOrch-Diff': digest, 'AgentOrch-Task': packet}
+    found = {}
+    for line in body.splitlines():
+        for key in BINDING_KEYS:
+            if line.startswith(key + ':'):
+                found[key] = line.split(':', 1)[1].strip()
+    for key in BINDING_KEYS:
+        if found.get(key) != wanted[key]:
+            return 'task packet' if key == 'AgentOrch-Task' else key.rsplit('-', 1)[1].lower()
+    return None
 
 
 # ------------------------------------------------------------------- plan input
@@ -1046,6 +1108,47 @@ def _reviewer_gate(context, spec, work, record):
                             + '; '.join(gate['reasons']))
 
 
+def _prove_before_side_effect(context, spec, record, work, require_evidence):
+    """The one re-proof shared by execute, verify, review, resume, retry and auth.
+
+    It runs before any command or agent starts, so a failure stops the task with
+    no verification or session side effect: the task identity and authorization
+    are re-read, the reviewer profile is re-queried, and — once an attempt has
+    produced a head — every *actual* changed path, the declared execution
+    session's own Agent/directory/terminal state, and the session-to-head/diff
+    binding are re-proven. Session metadata alone is not evidence that the
+    session produced the recorded commit.
+    """
+    fresh = project_config(context.repo)
+    _authorize_paths(spec['paths'], fresh)
+    if _status(work):
+        raise DeliveryError('worktree is not clean; refusing to continue')
+    changed = []
+    if require_evidence:
+        base, head = record.get('base'), record.get('head')
+        if not isinstance(base, str) or not base or not isinstance(head, str) or not head:
+            raise DeliveryError('recorded state has no proven base/head')
+        changed = _changes(work, base)
+        if changed != sorted(record.get('changed_paths') or []):
+            raise DeliveryError('actual changed paths do not match the recorded set')
+        for name in changed:
+            _check_changed_path(work, name, spec['paths'], fresh)
+    _reviewer_gate(context, spec, work, record)
+    if require_evidence:
+        session = record.get('execution_session')
+        if not session:
+            raise DeliveryError('recorded state has no execution session')
+        probe = context.session_probe(session, work)
+        _check_probe(probe, work, context.plan['executor_agent'], 'execution',
+                     session=session)
+        problem = _session_binding(work, base, head, session, record.get('diff_sha256'),
+                                   _packet_digest(context.plan, spec))
+        if problem:
+            raise DeliveryError(f'the execution session does not prove the recorded '
+                                f'{problem}; refusing to trust this attempt')
+    return changed
+
+
 def _execute(context, spec, record):
     work = _resolve_task(context, spec)
     if _status(work):
@@ -1055,6 +1158,7 @@ def _execute(context, spec, record):
                   phase='execute', execution_session=None, head=None, diff_sha256=None,
                   changed_paths=[])
     context.save()
+    _prove_before_side_effect(context, spec, record, work, require_evidence=False)
     packet = ('You are an execution agent. Work only inside this task worktree and only '
               'within these repository-relative paths: ' + json.dumps(spec['paths'])
               + '. Do not push, merge, approve, change permissions, or modify any other '
@@ -1101,8 +1205,12 @@ def _execute(context, spec, record):
     _authorize_paths(spec['paths'], fresh)
     for name in committed:
         _check_changed_path(work, name, spec['paths'], fresh)
+    digest = _fingerprint(work, base)
+    _bind_session(work, base, execution['session_id'], digest,
+                  _packet_digest(context.plan, spec))
+    head = _head(work)
     record.update(head=head, changed_paths=committed, phase='verify')
-    record['diff_sha256'] = _fingerprint(work, base)
+    record['diff_sha256'] = digest
     context.save()
 
 
@@ -1110,6 +1218,7 @@ def _verify(context, spec, record):
     work = _resolve_task(context, spec)
     if _head(work) != record['head'] or _fingerprint(work, record['base']) != record['diff_sha256']:
         raise DeliveryError('head or diff changed before verification')
+    _prove_before_side_effect(context, spec, record, work, require_evidence=True)
     checks = _run_checks(spec['verify'], work, spec['raw'].get('timeout', 1800))
     record['verification'] = checks
     context.save()
@@ -1122,6 +1231,20 @@ def _verify(context, spec, record):
         raise DeliveryError('head or diff changed during verification')
     record['phase'] = 'review'
     context.save()
+
+
+def _packet_digest(plan, spec):
+    """Digest of the task packet, independent of the attempt's head/diff state."""
+    payload = {
+        'id': spec['id'], 'prompt': spec['prompt'], 'paths': list(spec['paths']),
+        'acceptance': list(spec['acceptance']),
+        'verify': [hashlib.sha256(json.dumps(command).encode()).hexdigest()
+                   for command in spec['verify']],
+        'executor_agent': plan.get('executor_agent'),
+        'reviewer_agent': plan.get('reviewer_agent'),
+        'carrier_digest': (plan.get('carrier') or {}).get('digest'),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
 def _task_digest(context, spec, record):
@@ -1194,6 +1317,7 @@ def _review_prompt(spec, record, patch):
 
 def _review(context, spec, record):
     work = _resolve_task(context, spec)
+    _prove_before_side_effect(context, spec, record, work, require_evidence=True)
     changed = _changes(work, record['base'])
     if changed != sorted(record.get('changed_paths') or []):
         raise DeliveryError('changed paths moved before review; refusing to review')
@@ -1265,27 +1389,17 @@ def _require_supported_state(record):
 def _prove_common(context, spec, record, work):
     """Everything that must hold before any side effect on a recorded approval."""
     work = _resolve_task(context, spec)
-    fresh = project_config(context.repo)
-    _authorize_paths(spec['paths'], fresh)
     ok, why = _facts_match(record, work)
     if not ok:
         raise DeliveryError(f'recorded state cannot be proven: {why}')
-    changed = _changes(work, record['base'])
-    if changed != sorted(record.get('changed_paths') or []):
-        raise DeliveryError('recorded path set does not match the worktree')
-    for name in changed:
-        _check_changed_path(work, name, spec['paths'], fresh)
+    changed = _prove_before_side_effect(context, spec, record, work,
+                                        require_evidence=True)
     patch, diff_digest = _review_diff(work, record['base'], record['head'], changed)
     if diff_digest != record.get('diff_digest'):
         raise DeliveryError('the reviewed diff no longer matches the worktree')
     if _task_digest(context, spec, record) != record.get('task_digest'):
         raise DeliveryError('the current task packet no longer matches the reviewed one')
-    _reviewer_gate(context, spec, work, record)
     session = record.get('execution_session')
-    if not session:
-        raise DeliveryError('recorded state has no execution session')
-    probe = context.session_probe(session, work)
-    _check_probe(probe, work, context.plan['executor_agent'], 'execution', session=session)
     review = record.get('review_session')
     if not review or review == session:
         raise DeliveryError('recorded state has no independent review session')
@@ -1339,8 +1453,6 @@ def _reconcile(context, spec, record):
         raise DeliveryError('previous runner process may still be alive; refusing to resume')
     _require_supported_state(record)
     work = _resolve_task(context, spec)
-    fresh = project_config(context.repo)
-    _authorize_paths(spec['paths'], fresh)
     phase = record.get('phase')
     if phase in (None, 'execute'):
         if _status(work):
@@ -1349,6 +1461,7 @@ def _reconcile(context, spec, record):
         if record.get('base') and _head(work) != record['base']:
             raise DeliveryError('interrupted execution left commits behind; inspect them '
                                 'manually (this runner will not reset or stash)')
+        _prove_before_side_effect(context, spec, record, work, require_evidence=False)
         record.update(status='PENDING', phase='execute', reason=None,
                       attempt=(record.get('attempt') or 1) + 1)
         return
@@ -1360,15 +1473,8 @@ def _reconcile(context, spec, record):
     ok, why = _facts_match(record, work)
     if not ok:
         raise DeliveryError(f'interrupted state cannot be proven: {why}')
-    changed = _changes(work, record['base'])
-    for name in changed:
-        _check_changed_path(work, name, spec['paths'], fresh)
-    session = record.get('execution_session')
-    if not session:
-        raise DeliveryError('interrupted execution has no verifiable session')
-    probe = context.session_probe(session, work)
-    _check_probe(probe, work, context.plan['executor_agent'], 'execution', session=session)
-    _reviewer_gate(context, spec, work, record)
+    changed = _prove_before_side_effect(context, spec, record, work,
+                                        require_evidence=True)
     # Re-run the full verification before handing the task to review again.
     checks = _run_checks(spec['verify'], work, spec['raw'].get('timeout', 1800))
     record['verification'] = checks
@@ -1467,7 +1573,6 @@ def _attempt_retry(context, spec, record):
         raise DeliveryError('retry refused: a verification check timed out and its process '
                             'tree may still be running; inspect the host manually')
     work = _resolve_task(context, spec)
-    _authorize_paths(spec['paths'], project_config(context.repo))
     if _status(work):
         raise DeliveryError('retry refused: the worktree has uncommitted changes. Inspect them '
                             'and clean up manually; this runner never stashes or resets')
@@ -1478,12 +1583,11 @@ def _attempt_retry(context, spec, record):
     elif record.get('base') and _head(work) != record['base']:
         raise DeliveryError('retry refused: the worktree has commits from the failed attempt. '
                             'Inspect them and reset manually; this runner never resets')
-    session = record.get('execution_session')
-    if session:
-        probe = context.session_probe(session, spec['worktree'])
-        if not probe.get('ok') or probe.get('outcome') not in ('succeeded', 'failed'):
-            raise DeliveryError('retry refused: the previous agent session has no verifiable '
-                                'terminal outcome')
+    # Every retry re-proves identity, scope, every actual changed path, the
+    # reviewer profile, authorization and the session-to-head/diff binding
+    # before it can run a check or start a session.
+    _prove_before_side_effect(context, spec, record, work,
+                              require_evidence=phase in ('verify', 'review'))
     attempt = int(record.get('attempt') or 1)
     history = record.get('history') or []
     history.append({'attempt': attempt, 'status': record.get('status'),
@@ -1520,10 +1624,12 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
         raise ValueError('reviewer agent must differ from the executor agent')
 
     config = project_config(repo)
-    if config.get('edition_count') != 1 or config.get('edition') not in ('local', 'github'):
+    if config.get('edition_count') != 1 or config.get('edition') not in VALID_EDITIONS:
+        values = config.get('edition_values') or []
         raise ValueError('docs/PROJECT.md must declare exactly one `edition` of `local` or '
                          f'`github` before any dispatch; found {config.get("edition_count")} '
-                         f'declaration(s), value {config.get("edition")!r}')
+                         f'declaration(s), values {values!r} (edition parsed as '
+                         f'{config.get("edition")!r})')
     if _status(repo):
         raise ValueError('repository worktree is not clean')
     for spec in specs:
