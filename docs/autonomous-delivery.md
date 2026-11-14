@@ -83,6 +83,7 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 
 1. **不可变绑定**：审查结论绑定审查时的 commit SHA、diff 指纹、`mode=prepare-only`、允许路径**原文**与每条 AC **原文**；journal/plan 被改写后旧 transcript 不再匹配，任务不能继续被信任。
 2. **transcript 为准**：流式输出与 `session export` 得到的 transcript 必须一致；journal 里记录的结论只用于比对，不能单独作为证据。
+   - 项目授权在每个写操作前后都重新读取 `docs/PROJECT.md`；即使允许前缀更宽，实际变更路径命中禁改路径（含子文件）也会在提交前被拒绝。
 3. **恢复先重证**：`--resume` 处理 `RUNNING` 与 `UNKNOWN`；在运行任何验证命令前，先核验：同一 Git 仓库身份（common dir）、任务包与项目授权（含每个**实际**变更路径）、执行会话的 Agent/目录/终局、审查 Agent 的工具级门禁、worktree head 与指纹。任一不能证明即 `BLOCKED`，不进入审查。
 4. **审查门**：`--reviewer-agent` 的 profile 按规则顺序取最终通配规则；`edit`、`shell` 必须最终为 `deny`，且不能存在无法证明范围的作用域 `allow`（例如先 `deny shell:*` 后 `allow shell:rm *`）。未通过时任务 `BLOCKED`，不会启动执行。
 5. **重试不破坏数据**：`--retry` 只在没有未提交改动时开放；执行阶段要求 head 等于基线，验证/审查阶段要求 head 等于失败尝试的 head。它不 stash、不 reset；有提交或未提交内容时要求人工处理。

@@ -591,6 +591,59 @@ class ScopeTests(DeliveryCase):
         self.assertIn('overlaps the forbidden path', str(caught.exception))
         self.assertFalse(self.state.exists())
 
+    def test_runtime_writes_into_a_forbidden_subpath_are_blocked_end_to_end(self):
+        (self.repo / 'docs' / 'secret.txt').write_text('secret')
+        text = (self.repo / 'docs' / 'PROJECT.md').read_text().replace(
+            '- 永远禁止改动路径 / 文件：`LICENSE.md`',
+            '- 永远禁止改动路径 / 文件：`LICENSE.md`、`docs/secret.txt`')
+        (self.repo / 'docs' / 'PROJECT.md').write_text(text)
+        _git(self.repo, 'add', '-A')
+        _git(self.repo, 'commit', '-q', '-m', 'forbid a nested path')
+        work = self.worktree('one')
+
+        def write_secret(where, prompt):
+            (where / 'public.txt').write_text('allowed\n')
+            (where / 'docs').mkdir(exist_ok=True)
+            (where / 'docs' / 'secret.txt').write_text('leaked\n')
+
+        # The declared path does not overlap the forbidden file, so the plan is
+        # accepted; the actual out-of-policy write must still fail closed.
+        task = self.task('one', work, ['docs/public.txt'],
+                         acceptance=['only allowed files change'])
+        state, _ = self.run_delivery(self.plan([task]),
+                                     FakeAgents(self, execution=write_secret))
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('forbidden', record['reason'])
+        self.assertNotIn('review_session', record)
+        # Nothing reached the target repository.
+        self.assertFalse((self.repo / 'public.txt').exists())
+        self.assertEqual((self.repo / 'docs' / 'secret.txt').read_text(), 'secret')
+
+    def test_project_policy_is_re_read_before_the_commit(self):
+        work = self.worktree('one')
+
+        def write_and_tighten(where, prompt):
+            (where / 'docs').mkdir(exist_ok=True)
+            (where / 'docs' / 'public.txt').write_text('allowed\n')
+            (where / 'docs' / 'secret.txt').write_text('leaked\n')
+            project = self.repo / 'docs' / 'PROJECT.md'
+            project.write_text(project.read_text().replace(
+                '- 永远禁止改动路径 / 文件：`LICENSE.md`',
+                '- 永远禁止改动路径 / 文件：`LICENSE.md`、`docs/secret.txt`'))
+            _git(self.repo, 'add', 'docs/PROJECT.md')
+            _git(self.repo, 'commit', '-q', '-m', 'tighten policy mid-run')
+
+        task = self.task('one', work, ['docs/public.txt'])
+        state, _ = self.run_delivery(self.plan([task]),
+                                     FakeAgents(self, execution=write_and_tighten))
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('forbidden', record['reason'])
+        self.assertNotIn('review_session', record)
+        # The blocked files stay in the task worktree (nothing is reset).
+        self.assertEqual((work / 'docs' / 'secret.txt').read_text(), 'leaked\n')
+
     def test_every_actual_changed_path_is_checked_against_project_forbidden(self):
         work = self.worktree('one')
         (work / 'docs').mkdir(exist_ok=True)
