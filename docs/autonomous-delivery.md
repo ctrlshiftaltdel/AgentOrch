@@ -119,3 +119,29 @@ journal 是私有 JSON（原子替换写入，`flock` / `msvcrt` 跨进程锁；
 - **验证命令是受信输入**：不按 AC 自动生成检查，也不限制 argv 的程序；AC 只能经独立审查逐条判定，不能由「命令退出 0」单独充当批准。
 - **同一 journal 之外的并发写者**：仓库/worktree/journal 锁覆盖本工具的运行；不阻止其他工具或人直接写仓库。
 - **Windows**：进程存活检查为避免 `os.kill` 终止进程而直接 fail closed；锁使用 `msvcrt`，未在 Windows 真机实测。
+
+## 8. 实测记录（2026-11-13/14，本机 OpenCode v2.2.7）
+
+以下都是真实调用后的结果；journal 与日志在本机临时目录，不入库。两次运行使用的都是本文件所述门禁（合并按不可变 head SHA、逐条 AC、transcript 结论、工具级只读检查）。
+
+**A. AgentOrch 本仓库（`github` edition，只能 `merge: false`）**
+
+- 任务：按 Owner 2026-11-13 方向修正 `docs/charter.md` 中与交付执行器冲突的「非目标」表述；允许路径仅 `docs/charter.md`；4 条验收标准；验证 `python3 scripts/validate_kit.py`；计划附带 Issue #230 body 摘要并在运行前重新核对。
+- 结果：分支 `task/230-charter-gated`，基线 `e0e2e96d74c6a5d7171483fd4774b0d593b26c60`，head `4a5aa6cf918dfa2d7c6c6b01e90422e06341ff53`；执行会话 `ses_e288cdc2fffeurLa5zifUL5gVk`（agent `build`）、审查会话 `ses_e288c0b66ffeGzMeRHMguaxDyM`（agent `scout`，profile 拒绝 `edit` 与 `shell`）；两个会话 `outcome: succeeded` 且目录都是该任务 worktree；验证退出码 0；审查 transcript 中 4 条 AC 全部 `PASS` 且结论 `APPROVE` 绑定该 head 与 diff 指纹。最终状态 `APPROVED`，CLI 退出码 1（未合并、未 `VERIFIED`，符合 `github` edition 的预期）。
+- 运行时也确认：同一计划在 `github` edition 上请求 `merge: true` 会在执行前被拒绝并给出 edition 说明；本仓库没有发生任何目标分支或 `main` 变更。
+
+**B. 本地 `local` edition 克隆上的完整合并闭环（`merge: true`）**
+
+- 环境：对本仓库的本地克隆，基线为 `e0e2e96`；为演练合并，克隆里用一次提交 `b35be4b` 把 `docs/PROJECT.md` 的 `edition` 改为 `local`（这只是演练配置，不是对 AgentOrch 仓库的授权变更）。目标分支 `delivery/base`（不是 `main`，也不在 AgentOrch 仓库内）。
+- 任务：`smoke-doc`（新建 `docs/testing/delivery-executor-smoke.md` 并在 repository-map 注册）与依赖它的 `cross-ref`（在 `docs/autonomous-delivery.md` 加交叉引用）；验证均为 `python3 scripts/validate_kit.py`；reviewer 为 `scout`（`edit` 与 `shell` 都被拒绝，`merge` 门要求两者）。
+- 结果：两个任务都 `VERIFIED`；合并提交 `03153de2469e5abb01a3c24c90057fcaf1c712a1` 与 `222d747203f3e9a10974c2477fd037c6c790b1a9`，各自第二父提交就是审查过的 head；合并后验证退出码 0；`delivery/base` 上 `validate_kit` 通过；两个合并各自相对于基线只包含审查过的文件集。
+- 真实失败与重试：`cross-ref` 第一次审查（`ses_e2882c421ffeT3LYy4WIBJB1WR`）没有给出机器可读结论，任务停在 `REVIEW_REJECTED`；`--retry` 在没有 stash/reset、head 与提交原样保留的前提下重跑验证并换了新的审查会话 `ses_e287ef204ffekte6xg6TDYROr2`，逐条 AC `PASS` 后才合并。这个失败与恢复都是真实发生的，不是构造场景。
+- 幂等重跑：同一计划与 journal 再运行，退出码 0，journal 字节不变，没有新增合并提交。
+
+**没有验证、也不宣称的事项**
+
+- 没有对 GitHub 执行任何合并或状态写入：不建 PR、不写 Issue 评论/label、不调用 `gh pr merge`；`github` 底座的最终合并仍由 Master 按 PR + 当前 head CI 完成。
+- 没有实现「从 `docs/implementation-plan.md` 自动挑任务」：该文件是 Markdown 状态表，本工具只读显式计划或真实 Issue。
+- 审查与执行使用同一底层模型（本机默认 `gemini-4-hydrogen`）；「独立」只按会话、Agent 身份、工具级写权限与证据绑定判定，不是模型独立，也不是 OS 隔离。
+- 验证命令仍是受信输入；AC 只由独立审查逐条判定，命令退出 0 不能单独充当批准。
+- Windows、非 Git Bash shell、真实 GitHub CI 触发均未在本轮实测。

@@ -998,8 +998,9 @@ def _review_prompt(spec, record):
             'HEAD_SHA=' + record['head'] + '\nDIFF_SHA256=' + record['diff_sha256']
             + '\nAllowed paths: ' + json.dumps(spec['paths'])
             + '\nAcceptance criteria:\n' + _criteria_prompt(spec)
-            + '\n\nThe verdict must bind this exact head and digest; list a finding for every '
-            'defect and use REJECT when any criterion is not PASS. Task:\n' + spec['prompt'])
+            + '\n\nThe verdict must bind this exact head and digest; use REJECT when any '
+            'criterion is not PASS. findings must be an empty list for APPROVE: put any '
+            'non-defect note inside the acceptance evidence instead. Task:\n' + spec['prompt'])
 
 
 def _review(context, spec, record):
@@ -1397,13 +1398,19 @@ def _attempt_retry(context, spec, record):
         raise DeliveryError(f'task {spec["id"]} cannot be retried from phase '
                             f'{record.get("phase")!r}')
     work = _task_root(spec)
+    phase = record.get('phase')
     if _status(work):
         raise DeliveryError('retry refused: the worktree has uncommitted changes. Inspect them '
                             'and clean up manually; this runner will not stash or reset data')
-    if record.get('base') and _head(work) != record['base']:
+    if phase in ('verify', 'review'):
+        # The attempt is committed and untouched: re-running the checks and a
+        # fresh review session discards nothing.
+        if _head(work) != record.get('head'):
+            raise DeliveryError('retry refused: the worktree head is not the failed attempt')
+    elif record.get('base') and _head(work) != record['base']:
         raise DeliveryError('retry refused: the worktree has commits from the failed attempt. '
                             'Inspect them and reset manually; this runner will not discard them')
-    if _pid_alive(record.get('pid')) is not False:
+    if record.get('status') == 'UNKNOWN' and _pid_alive(record.get('pid')) is not False:
         raise DeliveryError('retry refused: the previous runner process may still be alive')
     session = record.get('execution_session')
     if session:
@@ -1416,10 +1423,16 @@ def _attempt_retry(context, spec, record):
     history.append({'attempt': attempt, 'status': record.get('status'),
                     'phase': record.get('phase'), 'reason': record.get('reason'),
                     'head': record.get('head')})
-    record.update(history=history, status='PENDING', phase='execute', attempt=attempt + 1,
-                  reason=None, head=None, diff_sha256=None, changed_paths=[],
-                  verification=None, review_verdict=None, review_session=None,
-                  execution_session=None, merge_commit=None, post_verification=None)
+    if phase == 'execute':
+        record.update(history=history, status='PENDING', phase='execute', attempt=attempt + 1,
+                      reason=None, head=None, diff_sha256=None, changed_paths=[],
+                      verification=None, review_verdict=None, review_session=None,
+                      execution_session=None, merge_commit=None, post_verification=None)
+    else:
+        record.update(history=history, status='RUNNING', phase='verify', attempt=attempt + 1,
+                      reason=None, verification=None, review_verdict=None,
+                      review_session=None, review_evidence=None, review_detail=None,
+                      execution_detail=None)
     context.save()
 
 
