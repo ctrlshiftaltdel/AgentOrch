@@ -101,7 +101,13 @@ fail-closed:
   timeout already saved in the journal stops the run before ``_root``,
   ``_status``, the carrier query or any lock can start a Git/``gh`` process, and
   its halt write blocks every approval saved on disk, not only the ones this
-  process remembers.
+  process remembers. That halt only happens after the journal is proved to be
+  outside the repository and every task worktree by filesystem calls alone --
+  a repository path given as a subdirectory cannot hide the root -- so a journal
+  inside a worktree is never rewritten or locked to record a stop; a boundary
+  that cannot be proved stops the run instead. An existing journal that cannot
+  be read or parsed is not treated as a missing one: whether it records a
+  timeout cannot be proved, so it fails closed before any Git or ``gh`` call.
 
 Nothing here is a sandbox. Worktrees, prompts, path checks and ``--standalone``
 do not restrict OpenCode's configured permissions: V2 can reach the host
@@ -941,6 +947,22 @@ def _load_plan_file(path):
     return json.loads(Path(path).read_text(encoding='utf-8'))
 
 
+def _plan_worktrees(path):
+    """The task worktrees a plan file names, read as data with no Git process.
+
+    The halt boundary has to include every task worktree before the run loads
+    the plan, and the CLI may not query the carrier to learn them. A plan that
+    cannot be read is not treated as naming no worktrees: the caller stops
+    instead of halting on a boundary it cannot prove.
+    """
+    plan = _load_plan_file(path)
+    tasks = plan.get('tasks') if isinstance(plan, dict) else None
+    if not isinstance(tasks, list):
+        raise ValueError('plan needs a nonempty tasks list')
+    return [task.get('worktree') for task in tasks
+            if isinstance(task, dict) and isinstance(task.get('worktree'), str)]
+
+
 def gh_run(argv):
     """Default GitHub CLI runner: capture output, never a shell."""
     return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -1095,6 +1117,55 @@ def _journal_path(state_path):
     return path.resolve()
 
 
+def _enclosing_worktree(path):
+    """The nearest enclosing Git worktree root of ``path``, without Git.
+
+    A worktree root carries a ``.git`` entry -- a directory in a main worktree,
+    a file in a linked one -- so walking up from ``path`` to the nearest
+    ancestor that holds one locates the root with filesystem calls only. That
+    matters here: this proof gates a halt write and the journal lock, and the
+    very reason it exists is that a timed-out check's surviving tree, or a
+    helper run inside a Git process, must not influence it. A path given as a
+    subdirectory of the worktree therefore still resolves to the root.
+    ``None`` means no ancestor carries a ``.git`` entry.
+    """
+    current = Path(path).resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / '.git').exists():
+            return candidate
+    return None
+
+
+def _prove_journal_outside(state_path, repo, worktrees=()):
+    """Refuse a journal inside the repository or a task worktree, without Git.
+
+    ``run`` is given a repository path that may be a subdirectory of the
+    worktree, and the task-worktree boundary used to be checked only after a
+    halt write. Each boundary is therefore the resolved path itself *and* its
+    enclosing worktree, found from the filesystem so no Git process (and no
+    ``core.fsmonitor`` helper inside it) starts. This runs before the halt
+    write and before the journal lock is created: a journal that is inside a
+    worktree is never rewritten to record a stop, and a repository path that
+    cannot be resolved is reported instead of being written around.
+    """
+    journal = Path(state_path).resolve()
+    boundary = [Path(repo).resolve(strict=True)]
+    enclosing = _enclosing_worktree(boundary[0])
+    if enclosing is not None:
+        boundary.append(enclosing)
+    if any(journal.is_relative_to(path) for path in boundary):
+        raise ValueError('state must be outside the repository')
+    for worktree in worktrees:
+        if not worktree:
+            continue
+        boundary = [Path(worktree).resolve()]
+        enclosing = _enclosing_worktree(boundary[0])
+        if enclosing is not None:
+            boundary.append(enclosing)
+        if any(journal.is_relative_to(path) for path in boundary):
+            raise ValueError('state must be outside every task worktree')
+
+
 def _journal_timeout(state):
     """The first saved record whose verification recorded a timeout, or ``None``.
 
@@ -1153,25 +1224,36 @@ def _halt_shared_records(state, ident, record, exc):
     record.update(status=exc.status, reason=message)
 
 
-def _halt_saved_timeout(state_path, task_ids=()):
+def _halt_saved_timeout(state_path, task_ids=(), *, repo, worktrees=()):
     """Stop before anything external when the journal already records a timeout.
 
     The check has to precede ``_root``, ``_status``, the carrier query, every
     worktree probe and lock acquisition: each of them is a Git or ``gh`` process
     that can run a configured ``core.fsmonitor`` helper, and a process tree left
     behind by the timed-out check may still write any worktree. Only the journal
-    file and its own lock are touched. The journal is re-read under that lock so
-    a concurrent writer's state is what gets halted, and the halted state is
-    saved before returning. ``None`` means no record carries a timeout, so the
-    caller may continue.
+    file and its own lock are touched, and the boundary is proved before either:
+    the journal is never rewritten or locked while it sits inside the repository
+    or a task worktree, and a boundary that cannot be proved stops the run
+    instead of being written around. An existing journal that cannot be read or
+    parsed is not the same as a missing one -- whether it records a timeout
+    cannot be proved -- so it fails closed before any Git or ``gh`` call. The
+    journal is re-read under the lock so a concurrent writer's state is what
+    gets halted, and the halted state is saved before returning. ``None`` means
+    no record carries a timeout, so the caller may continue.
     """
     path = Path(state_path)
     try:
         peek = json.loads(path.read_text(encoding='utf-8'))
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return None
+    except (OSError, ValueError) as exc:
+        raise RunHaltError(
+            f'the state journal at {path} exists but cannot be read as state '
+            f'({exc}); whether it records a timed-out check cannot be proved, so '
+            'nothing may start until it is inspected manually') from None
     if _journal_timeout(peek) is None:
         return None
+    _prove_journal_outside(path, repo, worktrees)
     try:
         handle = _lock(_journal_lock_path(path))
     except DeliveryError as exc:
@@ -2612,11 +2694,14 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
     # filter or a `core.fsmonitor` helper could run inside.
     specs = _plan_tasks(plan)
     state_path = _journal_path(state_path)
-    # The repository root is resolved without Git so the journal is proved to
-    # be outside it before this run writes anything to that journal.
-    if state_path.is_relative_to(Path(repo).resolve(strict=True)):
-        raise ValueError('state must be outside the repository')
-    halted = _halt_saved_timeout(state_path, [spec['id'] for spec in specs])
+    # The enclosing repository and every task worktree are located without Git,
+    # so the journal is proved outside them before this run writes to it. The
+    # repository path may be a subdirectory, which the old comparison against
+    # that path alone mistook for "outside".
+    worktrees = [spec['worktree'] for spec in specs if spec['worktree']]
+    _prove_journal_outside(state_path, repo, worktrees)
+    halted = _halt_saved_timeout(state_path, [spec['id'] for spec in specs],
+                                 repo=repo, worktrees=worktrees)
     if halted is not None:
         # Nothing external started, and the halt write already blocked every
         # approval saved in the journal.
@@ -2990,8 +3075,14 @@ def main(argv=None):
         # `--issue` queries the carrier with `gh issue view`, and `run` makes
         # Git calls of its own. A timeout already recorded in the journal is
         # run-wide: it stops the run before either can start, and the halt
-        # write blocks every saved approval on the way out.
-        halted = _halt_saved_timeout(state_path)
+        # write blocks every saved approval on the way out. The task worktrees
+        # are known without Git -- `--issue` has the single `--worktree`, and a
+        # plan file is read as data -- so the halt write and the journal lock
+        # are proved outside them first.
+        worktrees = [args.worktree] if args.worktree else []
+        if args.plan:
+            worktrees += _plan_worktrees(args.plan)
+        halted = _halt_saved_timeout(state_path, repo=args.repo, worktrees=worktrees)
         if halted is not None:
             ident, _ = _journal_timeout(halted)
             raise RunHaltError(_timeout_halt_reason(ident))
