@@ -97,7 +97,11 @@ fail-closed:
   because ``taskkill``'s zero exit only reports that the command succeeded. A
   timeout stops the whole run at that check — no later task, closing approval
   re-check, verification command, profile query, Agent or Git write starts — and
-  a kill that cannot be proven is recorded as unproven, never as killed.
+  a kill that cannot be proven is recorded as unproven, never as killed. A
+  timeout already saved in the journal stops the run before ``_root``,
+  ``_status``, the carrier query or any lock can start a Git/``gh`` process, and
+  its halt write blocks every approval saved on disk, not only the ones this
+  process remembers.
 
 Nothing here is a sandbox. Worktrees, prompts, path checks and ``--standalone``
 do not restrict OpenCode's configured permissions: V2 can reach the host
@@ -190,8 +194,9 @@ class RunHaltError(DeliveryError):
     A timed-out verification check is the producer: the process tree may still
     be running on the host and can write to any worktree, so no later task, no
     closing approval re-check and no profile query or Agent may start. The task
-    that observed the timeout is recorded ``BLOCKED``, and every approval still
-    live in this process loses its support in the same journal write.
+    that observed the timeout is recorded ``BLOCKED``, and every approval saved
+    in the journal — including one an earlier process saved before it died —
+    loses its support in the same journal write.
     """
 
 
@@ -1074,6 +1079,135 @@ def _lock(path):
     return handle
 
 
+def _journal_lock_path(state_path):
+    """The journal's own lock file, derived from its path; no Git process."""
+    journal = _canonical(state_path)
+    return journal.parent / (
+        '.agentorch-delivery-' + hashlib.sha256(str(journal).encode()).hexdigest()[:24]
+        + '.lock')
+
+
+def _journal_path(state_path):
+    """The validated absolute journal path; starts no Git or carrier process."""
+    path = Path(state_path).absolute()
+    if path.is_symlink() or not path.parent.is_dir():
+        raise ValueError('state must be a regular file path in an existing directory')
+    return path.resolve()
+
+
+def _journal_timeout(state):
+    """The first saved record whose verification recorded a timeout, or ``None``.
+
+    This reads the journal as data. It starts no Git process, no Agent, no
+    profile query and no carrier query, so it can run before any of them.
+    """
+    tasks = state.get('tasks') if isinstance(state, dict) else None
+    if not isinstance(tasks, dict):
+        return None
+    for ident in sorted(tasks):
+        record = tasks[ident]
+        if isinstance(record, dict) and _timed_out(record):
+            return ident, record
+    return None
+
+
+def _timeout_halt_reason(ident):
+    return (f'the journal records that a verification check for task {ident} timed '
+            'out; its process tree may still be running, so the run cannot resume or '
+            'continue')
+
+
+def _halt_saved_approvals(state, reason):
+    """Block every approval saved in the journal, not only this process's.
+
+    A journal-level stop can be the first thing a new process sees: the runner
+    that recorded the timeout may have died before writing the halted-run
+    state, so an approval saved by that process is on disk but absent from this
+    one's ``approved`` set. The same write invalidates both, because the failure
+    that stopped the run makes re-proving any of them impossible without the
+    Git reads, profile queries and Agents the stop forbids.
+    """
+    for ident in sorted(state['tasks']):
+        record = state['tasks'][ident]
+        if not isinstance(record, dict) or record.get('status') != TERMINAL_OK:
+            continue
+        record.update(status='BLOCKED', reason=reason(ident))
+
+
+def _halt_timeout_records(state, ident, record, exc):
+    message = str(exc)
+    _halt_saved_approvals(
+        state,
+        lambda other: (f'the run stopped when task {ident} timed out: {message}; a '
+                       'surviving process tree may have changed any worktree, so the '
+                       'approval is no longer supportable'))
+    record.update(status=exc.status, reason=message)
+
+
+def _halt_shared_records(state, ident, record, exc):
+    message = str(exc)
+    _halt_saved_approvals(
+        state,
+        lambda other: (f'the shared project gate failed while task {ident} was being '
+                       f'processed: {message}; every live approval depends on that gate'))
+    record.update(status=exc.status, reason=message)
+
+
+def _halt_saved_timeout(state_path, task_ids=()):
+    """Stop before anything external when the journal already records a timeout.
+
+    The check has to precede ``_root``, ``_status``, the carrier query, every
+    worktree probe and lock acquisition: each of them is a Git or ``gh`` process
+    that can run a configured ``core.fsmonitor`` helper, and a process tree left
+    behind by the timed-out check may still write any worktree. Only the journal
+    file and its own lock are touched. The journal is re-read under that lock so
+    a concurrent writer's state is what gets halted, and the halted state is
+    saved before returning. ``None`` means no record carries a timeout, so the
+    caller may continue.
+    """
+    path = Path(state_path)
+    try:
+        peek = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    if _journal_timeout(peek) is None:
+        return None
+    try:
+        handle = _lock(_journal_lock_path(path))
+    except DeliveryError as exc:
+        raise RunHaltError(
+            'the journal may record a timed-out verification check and is locked by '
+            f'another runner ({exc}); nothing may start until the host is inspected '
+            'manually') from None
+    try:
+        try:
+            state = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            state = None
+        found = _journal_timeout(state) if state is not None else None
+        if found is None:
+            # The journal changed between the two reads, so there is no record
+            # left to halt. The timeout may still have a live tree, so fail
+            # closed instead of continuing on a journal that moved.
+            raise RunHaltError(
+                'the journal changed while its recorded timeout was being halted; '
+                'inspect the host manually before running again')
+        ident, record = found
+        for task in task_ids:
+            state['tasks'].setdefault(task, {'status': 'PENDING'})
+        exc = RunHaltError(_timeout_halt_reason(ident))
+        _halt_timeout_records(state, ident, record, exc)
+        try:
+            _save(path, state)
+        except OSError as write_error:
+            raise RunHaltError(
+                f'{exc}; the journal could not be written ({write_error}), so it is '
+                'not reliably persisted and the run is stopped') from None
+        return state
+    finally:
+        handle.close()
+
+
 def _lock_dir(repo):
     """Stable per-repository lock directory, independent of TMPDIR."""
     directory = _common(repo) / 'agentorch-delivery-locks'
@@ -1098,10 +1232,7 @@ def lock_targets(repo, state_path, specs):
 
 def acquire_locks(repo, state_path, specs):
     directory, targets = lock_targets(repo, state_path, specs)
-    journal = _canonical(state_path)
-    journal_lock = journal.parent / (
-        '.agentorch-delivery-' + hashlib.sha256(str(journal).encode()).hexdigest()[:24]
-        + '.lock')
+    journal_lock = _journal_lock_path(state_path)
     keys = [('repo', str(_common(repo)))]
     for value in targets:
         if value not in ('repo', 'journal'):
@@ -2472,16 +2603,25 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
         profiles=agent_profiles, gh=gh_run, resume=False, retry=(),
         executor_agent=None, reviewer_agent=None, timeout=1800,
         expected_edition=None):
-    repo = _root(repo)
     if plan.get('merge') or plan.get('merge_into'):
         raise DeliveryError(MERGE_REFUSAL)
+    # Everything up to the timeout check is local: validating the plan and the
+    # journal path starts no Git, Agent, profile or carrier query. A journal
+    # that already records a timeout therefore stops the run before `_root`,
+    # `_status`, `gh` or a lock can start a process a surviving tree, a clean
+    # filter or a `core.fsmonitor` helper could run inside.
     specs = _plan_tasks(plan)
-    state_path = Path(state_path).absolute()
-    if state_path.is_symlink() or not state_path.parent.is_dir():
-        raise ValueError('state must be a regular file path in an existing directory')
-    state_path = state_path.resolve()
-    if state_path.is_relative_to(repo):
+    state_path = _journal_path(state_path)
+    # The repository root is resolved without Git so the journal is proved to
+    # be outside it before this run writes anything to that journal.
+    if state_path.is_relative_to(Path(repo).resolve(strict=True)):
         raise ValueError('state must be outside the repository')
+    halted = _halt_saved_timeout(state_path, [spec['id'] for spec in specs])
+    if halted is not None:
+        # Nothing external started, and the halt write already blocked every
+        # approval saved in the journal.
+        return halted
+    repo = _root(repo)
 
     executor_agent = executor_agent or plan.get('executor_agent') or 'build'
     reviewer_agent = reviewer_agent or plan.get('reviewer_agent') or 'scout'
@@ -2648,21 +2788,15 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
         def halt_on_shared(ident, record, exc):
             """Persist the reason the run stopped; this is the last write.
 
-            Every approval still live in this process loses its support at the
-            same moment: it was proved against the declaration that just
-            failed, and re-proving it would need the Git reads and profile
-            queries this halt forbids. Closing them here is part of the same
-            single journal write, so the run never reports an approval the
-            shared gate no longer supports.
+            Every approval saved in the journal loses its support at the same
+            moment: it was proved against the declaration that just failed (or
+            was saved by an earlier process whose memory is gone), and
+            re-proving it would need the Git reads and profile queries this
+            halt forbids. Closing them here is part of the same single journal
+            write, so the run never reports an approval the shared gate no
+            longer supports.
             """
-            for other in sorted(context.approved):
-                live = context.record(other)
-                if live.get('status') != TERMINAL_OK:
-                    continue
-                live.update(status='BLOCKED', reason=(
-                    f'the shared project gate failed while task {ident} was being '
-                    f'processed: {exc}; every live approval depends on that gate'))
-            record.update(status=exc.status, reason=str(exc))
+            _halt_shared_records(state, ident, record, exc)
             try:
                 saver()
             except OSError as write_error:
@@ -2681,18 +2815,12 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
             A timed-out check is the only producer: its process tree may still
             be running and can write to any worktree. No later task, closing
             approval re-check, profile query or Agent starts. Every approval
-            still live loses its support in this same write because its
-            worktree can no longer be shown to match what was reviewed.
+            saved on disk loses its support in this same write because its
+            worktree can no longer be shown to match what was reviewed; the
+            set read here is the journal, not just this process's memory, so a
+            previous process's approval cannot survive the stop.
             """
-            for other in sorted(context.approved):
-                live = context.record(other)
-                if live.get('status') != TERMINAL_OK:
-                    continue
-                live.update(status='BLOCKED', reason=(
-                    f'the run stopped when task {ident} timed out: {exc}; a surviving '
-                    'process tree may have changed any worktree, so the approval is no '
-                    'longer supportable'))
-            record.update(status=exc.status, reason=str(exc))
+            _halt_timeout_records(state, ident, record, exc)
             try:
                 saver()
             except OSError as write_error:
@@ -2702,19 +2830,18 @@ def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
             halt.append(exc)
 
         # A recorded timeout is run-wide, not task-scoped: its process tree may
-        # still be alive and can write to any worktree. The whole journal is
-        # therefore checked before any task is processed, so a task-scoped
+        # still be alive and can write to any worktree. The journal read under
+        # these locks is checked before any task is processed, so a task-scoped
         # refusal on another record -- an already-BLOCKED timeout, a still-live
         # recorded PID, a worktree that is not retryable -- cannot mask it and
-        # let the next task start in this process.
+        # let the next task start in this process. `_halt_saved_timeout` made
+        # the same check before any Git, `gh` or lock call started; this read
+        # catches a timeout another runner saved in between.
         for ident in sorted(state['tasks']):
             record = state['tasks'][ident]
             if not isinstance(record, dict) or not _timed_out(record):
                 continue
-            halt_run(ident, record, RunHaltError(
-                f'the journal records that a verification check for task {ident} timed '
-                'out; its process tree may still be running, so the run cannot resume or '
-                'continue'))
+            halt_run(ident, record, RunHaltError(_timeout_halt_reason(ident)))
             break
 
         for spec in specs:
@@ -2859,6 +2986,15 @@ def main(argv=None):
     if args.merge_into:
         parser.exit(2, MERGE_REFUSAL + '\n')
     try:
+        state_path = _journal_path(args.state)
+        # `--issue` queries the carrier with `gh issue view`, and `run` makes
+        # Git calls of its own. A timeout already recorded in the journal is
+        # run-wide: it stops the run before either can start, and the halt
+        # write blocks every saved approval on the way out.
+        halted = _halt_saved_timeout(state_path)
+        if halted is not None:
+            ident, _ = _journal_timeout(halted)
+            raise RunHaltError(_timeout_halt_reason(ident))
         edition = None
         if args.issue is not None:
             if not args.issue_repo or not args.worktree:

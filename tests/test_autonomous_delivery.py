@@ -2447,6 +2447,180 @@ class TimeoutTests(DeliveryCase):
         self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
         self.assertIn('timed out', state['tasks']['one']['reason'])
 
+    def test_a_recorded_timeout_stops_a_resume_before_any_git_or_hook(self):
+        # The journal-level timeout scan used to run after `_root`, `_status`,
+        # the carrier query, every worktree probe and lock acquisition. On a
+        # journal that already recorded a timeout, a resume therefore ran real
+        # Git processes -- and a configured `core.fsmonitor` helper inside them
+        # -- twice before stopping. The check must run first: no Git call, no
+        # hook, no profile query and no Agent.
+        one, two = self.worktree('one'), self.worktree('two')
+        plan = self.plan([self.task('one', one, ['a.txt']),
+                          self.task('two', two, ['b.txt'])],
+                         carrier={'kind': 'issue', 'repo': 'owner/repo', 'number': 1,
+                                  'digest': 'a' * 64})
+        self.seed(plan, {'one': {
+            'status': 'UNKNOWN', 'phase': 'verify', 'pid': 999999,
+            'verification': [{'program': 'x', 'argv_sha256': '0' * 64,
+                              'exit_code': None, 'timeout': True}]}})
+        runs = self.root / 'fsmonitor-runs'
+        script = self._fsmonitor(
+            'pathlib.Path(' + repr(str(runs)) + ').open("a").write("x")\n')
+        self._use_fsmonitor(script)
+        queried, carrier = [], []
+        original_git = delivery.git
+        calls = []
+
+        def profiles(where):
+            queried.append(str(where))
+            return self.profiles(where)
+
+        def gh_probe(argv):
+            carrier.append(argv)
+            raise AssertionError('the carrier query started')
+
+        def git_probe(where, *args):
+            calls.append(args)
+            return original_git(where, *args)
+
+        with mock.patch.object(delivery, 'git', git_probe):
+            state, agents = self.run_delivery(plan, resume=True, profiles=profiles,
+                                              gh=gh_probe)
+        self.assertEqual(calls, [])
+        self.assertEqual(carrier, [])
+        self.assertFalse(runs.exists())
+        self.assertEqual(queried, [])
+        self.assertEqual(agents.calls, [])
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('process tree', state['tasks']['one']['reason'])
+        self.assertEqual(state['tasks']['two']['status'], 'PENDING')
+        # Control: the configured helper really does run inside an ordinary
+        # Git call, so the missing marker above is the resumed run's doing.
+        _git(self.repo, 'status', '--porcelain')
+        self.assertTrue(runs.exists())
+
+    def test_a_recorded_timeout_stops_a_retry_before_any_git(self):
+        # `--retry` must not reach the live-PID refusal (a task-scoped error in
+        # the old loop) before the journal-level timeout: a retry of a journal
+        # that records one starts no Git process at all.
+        one, two = self.worktree('one'), self.worktree('two')
+        plan = self.plan([self.task('one', one, ['a.txt']),
+                          self.task('two', two, ['b.txt'])])
+        self.seed(plan, {'one': {
+            'status': 'UNKNOWN', 'phase': 'verify', 'pid': os.getpid(),
+            'verification': [{'program': 'x', 'argv_sha256': '0' * 64,
+                              'exit_code': None, 'timeout': True}]}})
+        original_git = delivery.git
+        calls = []
+
+        def git_probe(where, *args):
+            calls.append(args)
+            return original_git(where, *args)
+
+        with mock.patch.object(delivery, 'git', git_probe):
+            state, agents = self.run_delivery(plan, retry=['one'])
+        self.assertEqual(calls, [])
+        self.assertEqual(agents.calls, [])
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('timed out', state['tasks']['one']['reason'])
+        self.assertEqual(state['tasks']['two']['status'], 'PENDING')
+
+    def test_a_journal_level_stop_blocks_every_saved_prepared_record(self):
+        # A runner can save the timed-out result and die before the halted-run
+        # write. The journal then holds one=PREPARED and two=RUNNING+timeout.
+        # This process's `approved` set is empty, so sweeping only that set
+        # would leave `one` PREPARED after a run-wide stop. The halt write must
+        # block every approval saved on disk.
+        one, two = self.worktree('one'), self.worktree('two')
+        plan = self.plan([self.task('one', one, ['a.txt']),
+                          self.task('two', two, ['b.txt'])])
+        self.seed(plan, {
+            'one': {'status': 'PREPARED', 'phase': 'done'},
+            'two': {'status': 'RUNNING', 'phase': 'verify',
+                    'verification': [{'program': 'x', 'argv_sha256': '0' * 64,
+                                      'exit_code': None, 'timeout': True}]}})
+        state, agents = self.run_delivery(plan, resume=True)
+        self.assertEqual(agents.calls, [])
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('timed out', state['tasks']['one']['reason'])
+        self.assertEqual(state['tasks']['two']['status'], 'BLOCKED')
+        self.assertIn('process tree', state['tasks']['two']['reason'])
+        journal = self.journal()
+        self.assertEqual(journal['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('timed out', journal['tasks']['one']['reason'])
+        self.assertEqual(journal['tasks']['two']['status'], 'BLOCKED')
+
+    def test_a_timeout_saved_while_locks_are_acquired_still_stops_the_run(self):
+        # The pre-check can read a journal with no timeout, and another runner
+        # can save one before this runner holds the locks. The journal must be
+        # re-read after lock acquisition, so the run-wide stop is applied to
+        # that state, including every approval saved on disk.
+        one, two = self.worktree('one'), self.worktree('two')
+        plan = self.plan([self.task('one', one, ['a.txt']),
+                          self.task('two', two, ['b.txt'])])
+        original = delivery.acquire_locks
+
+        def acquire(repo, state, specs):
+            Path(state).write_text(json.dumps({
+                'version': 4, 'plan_hash': self.plan_hash(plan),
+                'carrier_digest': None, 'mode': delivery.MODE,
+                'tasks': {
+                    'one': {'status': 'PREPARED', 'phase': 'done'},
+                    'two': {'status': 'RUNNING', 'phase': 'verify',
+                            'verification': [{'program': 'x', 'argv_sha256': '0' * 64,
+                                              'exit_code': None, 'timeout': True}]}}}))
+            return original(repo, state, specs)
+
+        queried = []
+
+        def profiles(where):
+            queried.append(str(where))
+            return self.profiles(where)
+
+        with mock.patch.object(delivery, 'acquire_locks', acquire):
+            state, agents = self.run_delivery(plan, profiles=profiles)
+        self.assertEqual(agents.calls, [])
+        self.assertEqual(queried, [])
+        self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('timed out', state['tasks']['one']['reason'])
+        self.assertEqual(state['tasks']['two']['status'], 'BLOCKED')
+        journal = self.journal()
+        self.assertEqual(journal['tasks']['one']['status'], 'BLOCKED')
+        self.assertEqual(journal['tasks']['two']['status'], 'BLOCKED')
+
+    def test_the_cli_stops_a_recorded_timeout_before_the_issue_query(self):
+        # `--issue` starts `gh issue view` inside `load_issue_plan`. A timeout
+        # already recorded in the journal is run-wide and has to stop the CLI
+        # before that query starts, and the halt write blocks every approval
+        # saved on disk even though the CLI never loaded a plan.
+        work = self.worktree('one')
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        self.seed(plan, {
+            'one': {'status': 'PREPARED', 'phase': 'done'},
+            'two': {'status': 'RUNNING', 'phase': 'verify',
+                    'verification': [{'program': 'x', 'argv_sha256': '0' * 64,
+                                      'exit_code': None, 'timeout': True}]}})
+        loader = mock.Mock(side_effect=AssertionError('gh issue view started'))
+        args = ['delivery', '--repo', str(self.repo), '--issue', '230',
+                '--issue-repo', 'owner/repo', '--worktree', str(work),
+                '--verify', '["true"]', '--acceptance', 'x',
+                '--state', str(self.state), '--execute']
+        errors = io.StringIO()
+        with mock.patch('sys.argv', args), \
+                mock.patch.object(delivery, 'load_issue_plan', loader), \
+                mock.patch.object(delivery, 'gh_run') as gh, \
+                contextlib.redirect_stderr(errors), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                delivery.main()
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn('timed out', errors.getvalue())
+        loader.assert_not_called()
+        gh.assert_not_called()
+        journal = self.journal()
+        self.assertEqual(journal['tasks']['one']['status'], 'BLOCKED')
+        self.assertEqual(journal['tasks']['two']['status'], 'BLOCKED')
+
     def test_a_timed_out_check_that_cannot_be_journalled_stops_the_run(self):
         # The reviewer's third reproduction: `_verify` saved the timed-out
         # result before consulting it. When that first write failed once, the
