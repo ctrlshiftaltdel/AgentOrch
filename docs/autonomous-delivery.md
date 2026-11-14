@@ -2,7 +2,7 @@
 
 > 状态：`ACTIVE`，**仅仓库**，不在 `scripts/validate_kit.py` 的 `REQUIRED` 清单中，不随发行包发布。它不替代 `kit/orchestration.md` 的状态机、G1–G6 合并门、Issue 登记块、路径锁或资源锁。
 >
-> 入口：`scripts/autonomous_delivery.py`。当前交付的是**证据采集与人工接管切片**：对已授权的任务 worktree 真实执行、验证、独立审查，最后停在 `APPROVED` 等人工/Master 合并。**自动合并未实现，写路径被禁用**。
+> 入口：`scripts/autonomous_delivery.py`。当前交付的是**证据采集与人工接管切片**：对已授权的任务 worktree 真实执行、验证、独立审查，最后停在 `PREPARED` 等人工/Master 审阅与合并。**runner 自身不提供合并写路径**；这不等同于整机安全隔离，见 §1 与 §7。
 
 ## 1. 能做什么、不能做什么
 
@@ -12,15 +12,15 @@
 - 读项目自身配置：`docs/PROJECT.md` 的 `edition` 必须是 `local` 或 `github`；任务的允许路径必须落在「允许改动路径」内，且不得与「禁止改动路径」互为祖先/后代。缺失或非法配置在派发前拒绝。
 - 启动真实 OpenCode 会话执行（`opencode run --standalone --format json`），不传 `--auto`，不复用会话。
 - 用计划里的命令验证真实 diff；退出码、head 与 diff 指纹都会记录，head 或 diff 在验证/审查期间变动即失败。
-- 用**另一个**新会话、以声明的 Agent 做审查；结论必须来自该会话自身的 transcript，并绑定当前 head、diff 指纹、模式、允许路径原文与每条验收标准原文。
+- 用**另一个**新会话、以声明的 Agent 做审查；runner 把 Git 生成的 base..head 完整 diff（文本、受大小上限约束）交给审查者，结论必须来自该会话自身的 transcript，并绑定 base/head、diff 指纹、任务的完整摘要（描述、AC、路径、验证命令、Agent、载体）、模式与每条验收标准原文。
 - 失败、`--retry`、`--resume` 与局部阻塞：某个任务失败不阻止无依赖、无路径冲突的任务继续。
 
 不能做 / 不宣称：
 
 - **不能自动合并。** 计划中含 `merge`/`merge_into` 或 CLI 带 `--merge-into` 时，在启动任何 Agent 之前就拒绝运行。原因是本切片没有权威任务锁、原子恢复与可核验的独立授权绑定，无法安全地完成合并与合并后验证。合并仍由 Master 按 PR + 当前 head CI 执行。
 - **不写权威载体。** journal 是本地私有记录，不是 GitHub Issue、本地任务库、`ORCH-TASK-REGISTRY`、锁或证据矩阵的替代；它可被复制或重算，因此每次使用都会从 Git 与会话 transcript 重新取证。
-- **不是沙箱。** OpenCode V2 可能允许 shell、外部目录、网络与凭据访问；worktree、路径检查与 `--standalone` 都不改变这一点。
-- **不证明 OS 隔离或模型独立。** 审查门只检查已知工具动作（`edit`、`shell`）的最终规则与作用域 allow；MCP/插件通道、未知工具与底层模型都没有被证明。
+- **不是沙箱，也不作绝对保证。** OpenCode V2 可能允许 shell、外部目录、网络与凭据访问；`verify` 的 argv 是受信输入，它可以主动对目标仓库执行 `git merge`、`reset` 或任何外部写操作；Agent/MCP/插件也可以写出 worktree。runner 只约束自己发起的写操作，不能阻止这些通道。
+- **不证明 OS 隔离或模型独立。** 审查门按 OpenCode V2 的“最后匹配”语义检查 `edit`/`shell` 的动作通配与作用域 allow；MCP/插件、未知工具与操作系统权限没有枚举，因此只记录为“工具门通过、未知通道未证”，不声称只读或独立。
 - **看不到 worktree 之外的副作用。** 路径检查只覆盖 Git 能观察到的变更；被忽略文件、外部写入与执行过程中披露的数据无法回滚。
 - **依赖任务不会执行。** 依赖只有达到集成状态（`VERIFIED`）才算满足；本切片不产生该状态，所以依赖任务保持 `PENDING`，不会在缺少依赖变更的基线上开工。
 
@@ -61,7 +61,7 @@ Issue 模式（`--issue`）等价于自动生成单任务计划：`id` 为 `issu
 ## 3. 运行
 
 ```bash
-# 计划文件（prepare-only；退出码 0 表示全部任务已 APPROVED）
+# 计划文件（prepare-only；退出码 0 表示全部任务已 PREPARED）
 python3 scripts/autonomous_delivery.py --repo <仓库worktree> --plan plan.json \
   --state ~/.cache/agentorch/delivery-state.json --execute
 
@@ -77,19 +77,19 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 ... --execute --retry one
 ```
 
-退出码：`0` 仅当计划内所有任务都达到 `APPROVED`（可供人工合并；不代表已合并或已验收）；`1` 表示运行结束但存在未批准/阻塞任务；`2` 表示输入、权限或前置检查失败（未开始执行）。
+退出码：`0` 仅当计划内所有任务都达到 `PREPARED`（可供人工合并；不代表已合并或已验收）；`1` 表示运行结束但存在未批准/阻塞任务；`2` 表示输入、权限或前置检查失败（未开始执行）。
 
 ## 4. 审查与恢复门禁
 
-1. **不可变绑定**：审查结论绑定审查时的 commit SHA、diff 指纹、`mode=prepare-only`、允许路径**原文**与每条 AC **原文**；journal/plan 被改写后旧 transcript 不再匹配，任务不能继续被信任。
+1. **不可变绑定**：审查结论绑定审查时的 base/head、worktree diff 指纹、runner 展示的完整 diff 指纹、`mode=prepare-only`、允许路径**原文**、每条 AC **原文**，以及任务摘要（描述、验证命令、执行/审查 Agent、载体）。journal/plan 被改写后旧 transcript 不再匹配，任务不能继续被信任。二进制、超过大小上限、或命中项目隐私模式的变更在审查前 `BLOCKED`。
 2. **transcript 为准**：流式输出与 `session export` 得到的 transcript 必须一致；journal 里记录的结论只用于比对，不能单独作为证据。
    - 项目授权在每个写操作前后都重新读取 `docs/PROJECT.md`；即使允许前缀更宽，实际变更路径命中禁改路径（含子文件）也会在提交前被拒绝。
 3. **恢复先重证**：`--resume` 处理 `RUNNING` 与 `UNKNOWN`；在运行任何验证命令前，先核验：同一 Git 仓库身份（common dir）、任务包与项目授权（含每个**实际**变更路径）、执行会话的 Agent/目录/终局、审查 Agent 的工具级门禁、worktree head 与指纹。任一不能证明即 `BLOCKED`，不进入审查。
-4. **审查门**：`--reviewer-agent` 的 profile 按规则顺序取最终通配规则；`edit`、`shell` 必须最终为 `deny`，且不能存在无法证明范围的作用域 `allow`（例如先 `deny shell:*` 后 `allow shell:rm *`）。未通过时任务 `BLOCKED`，不会启动执行。
+4. **审查门**：`--reviewer-agent` 的 profile 按规则顺序与 action 通配（如 `s*`）取最终匹配；`edit`、`shell` 必须最终为 `deny`，且不能存在无法证明范围的作用域 `allow`（例如先 `deny shell:*` 后 `allow s*:*`）。未通过时任务 `BLOCKED`，不会启动执行。
 5. **重试不破坏数据**：`--retry` 只在没有未提交改动时开放；执行阶段要求 head 等于基线，验证/审查阶段要求 head 等于失败尝试的 head。它不 stash、不 reset；有提交或未提交内容时要求人工处理。
 6. **合并检查点不存在**：journal 中出现 `MERGED`/`VERIFIED` 或 `merge`/`post_verify` 阶段时直接 `BLOCKED`，因为本切片不产生也不信任这类状态。
-7. **并发**：按目标仓库、每个任务 worktree 与 journal 分别取得跨进程锁；锁位于仓库 Git common dir 下的 `agentorch-delivery-locks/`，不随 `TMPDIR` 变化。任一被占用即拒绝运行。
-8. **命令进程树**：验证命令在独立进程组中运行，超时会杀掉整个进程组，避免遗留子进程继续写文件。
+7. **并发**：按目标仓库、每个任务 worktree 与 journal 分别取得跨进程锁；仓库/worktree 锁位于仓库 Git common dir 下，journal 锁位于 journal 自身目录且不随 `TMPDIR` 变化，因此同一 journal 指向两个仓库也互斥。它不能阻止其他工具或人直接写仓库。
+8. **命令进程树**：验证命令在独立进程组中运行，超时会杀掉整个进程组；但 `setsid` 逃逸的子进程或 Windows 上的子孙进程无法保证被捕获。超时后任务停在 `BLOCKED`，不允许自动重试，需人工确认主机状态。
 
 ## 5. 测试套件清单
 
@@ -105,17 +105,18 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 
 真实调用后的摘要，未包含会话标识或个人路径；原始 journal 只在本机受保护目录，不入库。
 
-- 在 AgentOrch 本仓库（`github` edition）对一个文档任务做了 prepare-only 运行：真实执行会话与真实审查会话均为 `succeeded`、目录为该任务 worktree、Agent 不同；验证命令退出 0；审查 transcript 中全部验收标准 `PASS`、结论 `APPROVE` 且绑定该 commit 与 diff 指纹；最终 `APPROVED`，未改动目标分支与 `main`。
+- 在 AgentOrch 本仓库（`github` edition）对一个文档任务做了 prepare-only 运行：真实执行会话与真实审查会话均为 `succeeded`、目录为该任务 worktree、Agent 不同；验证命令退出 0；审查 transcript 中全部验收标准 `PASS`、结论 `APPROVE` 且绑定该 commit 与 diff 指纹；最终 `PREPARED`，未改动目标分支与 `main`。
 - 在同一计划上请求自动合并时，运行在启动 Agent 之前被拒绝（见 §1）。
-- 真实失败也保留：同一任务的审查前两次只给出散文而未给出机器可读结论，任务停在 `REVIEW_REJECTED`，没有被当作批准；第三次审查在提示中提供了 runner 已从 Git 核验的 head、diff 指纹与变更路径后，逐条 AC 给出 `PASS` 并 `APPROVE`，最终 `APPROVED`、CLI 退出码 0（仅表示可供人工合并）。
-- 另一次自动化尝试被运行前的 edition 检查拒绝，未启动 Agent；依赖任务在上游仅 `APPROVED` 时保持 `PENDING`。
+- 真实失败也保留：同一任务的审查前两次只给出散文而未给出机器可读结论，任务停在 `REVIEW_REJECTED`，没有被当作批准；第三次审查在提示中提供了 runner 已从 Git 核验的 head、diff 指纹与变更路径后，逐条 AC 给出 `PASS` 并 `APPROVE`，最终 `PREPARED`、CLI 退出码 0（仅表示可供人工合并）。
+- 另一次自动化尝试被运行前的 edition 检查拒绝，未启动 Agent；依赖任务在上游仅 `PREPARED` 时保持 `PENDING`。
 
 **没有验证、也不宣称的事项**：自动合并、GitHub PR/CI 接线、Issue/PR 状态同步、从 `docs/implementation-plan.md` 自动选任务、MCP/插件通道与 OS 隔离、模型独立、Windows 真机、真实 CI 触发。
 
 ## 7. 已知限制
 
-- **合并未实现**是本切片的核心边界；需要合并时由人工/Master 按仓库既有门禁执行。
+- **合并未实现**是本切片的核心边界；`PREPARED` 不等于 Master 审批，CLI 退出码 0 只表示计划内任务都已准备完毕，不解锁依赖、不触发合并。
 - 验证命令是受信输入；AC 只由独立审查逐条判定，命令退出 0 不能单独充当批准。
-- `APPROVED` 重证依赖保留任务 worktree 与会话记录；worktree 或会话被清理后会保持 `BLOCKED`，而不是跳过核验。
+- `PREPARED` 重证依赖保留任务 worktree 与会话记录；worktree 或会话被清理后会保持 `BLOCKED`，而不是跳过核验。
+- 任务 worktree 必须是独立 linked worktree：等于仓库自身 worktree、或使用仓库当前分支的 worktree 会被拒绝；该检查在所有执行/恢复/重试/重证路径共用。
 - 审查 Agent 的只读性只覆盖 `edit`/`shell` 两个工具动作的通配规则与作用域 allow；未知工具、MCP/插件与操作系统权限未证实。
 - Windows 上进程存活检查直接 fail closed；锁使用 `msvcrt`，未在 Windows 真机实测。
