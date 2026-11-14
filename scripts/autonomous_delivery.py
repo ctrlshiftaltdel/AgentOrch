@@ -9,9 +9,14 @@ fail-closed:
 * a plan may not ask for a merge; ``merge``/``--merge-into`` is refused before
   any agent runs, because automatic merge, its authoritative task lock, atomic
   recovery and independent-authorization binding are not implemented here;
-* pending approvals are re-proved from Git and from the reviewer's own session
-  transcript before they are trusted; the private journal and its plan hash are
-  not authority (they are copyable and recomputable);
+* an approval is only trusted while it is live in this process. A task that
+  completes execution, verification and an independent review here is left
+  ``PREPARED`` for a human; a ``PREPARED`` record read from a previous process is
+  re-checked for worktree identity and scope and then refused, because Git
+  history, the journal, the execution session's metadata and the reviewer
+  transcript are all writable and their mutual consistency is not evidence that
+  this execution session produced the recorded head or that an independent
+  reviewer approved it;
 * resume/retry re-prove the repository identity, the task packet, project
   authorization (including every *actual* changed path), the execution session's
   metadata, the reviewer profile and the full verification set before any side
@@ -62,13 +67,14 @@ MODE = 'prepare-only'
 # not enumerable here, so this gate is never presented as an OS read-only proof.
 MUTATING_ACTIONS = ('edit', 'shell')
 VALID_EDITIONS = ('local', 'github')
-# A declaration is a bullet whose first token is `edition`, with optional
-# backticks or Markdown emphasis around it. Value parsing is line-exact: [ \t]
-# rather than \s, so a newline cannot carry the value to the next line, and a
-# non-colon or emphasized form still counts as a declaration so a malformed
-# duplicate is rejected instead of silently ignored.
+# A declaration is a bullet whose first token is `edition`, with any mix of
+# backticks or Markdown emphasis around it (including nested forms such as
+# **`edition`**). Value parsing is line-exact: [ \t] rather than \s, so a
+# newline cannot carry the value to the next line, and an emphasized, nested or
+# non-colon form still counts as a declaration so a malformed duplicate is
+# rejected instead of silently ignored.
 EDITION_RE = re.compile(
-    r'^[ \t]*[-*][ \t]+(?P<form>(?:\*\*?|__?|`)?edition(?:\*\*?|__?|`)?)'
+    r'^[ \t]*[-*+][ \t]+(?P<form>[*_`]*edition[*_`]*)'
     r'(?=[ \t:：]|$)(?P<rest>[^\n]*)$', re.M)
 # There is no OpenCode artifact that can independently bind a session to the
 # commit it produced. Git history and the journal are writable by the same user,
@@ -961,7 +967,7 @@ class _Context:
         self.profiles = profiles
         self.save = state_saver
         self.config = config
-        self.auth = {}
+        self.approved = set()
         self.order = {spec['id']: index for index, spec in enumerate(specs)}
 
     def record(self, ident):
@@ -1331,6 +1337,7 @@ def _review(context, spec, record):
     record['review_verdict'] = verdict
     record['status'] = 'PREPARED'
     record['phase'] = 'done'
+    context.approved.add(spec['id'])
     context.save()
 
 
@@ -1385,12 +1392,21 @@ def _prove_common(context, spec, record, work):
 
 
 def _authenticate(record, context, spec):
-    """Re-prove an approval from Git and the transcripts before trusting it."""
+    """Refuse an approval that was not produced live by this process.
+
+    A ``PREPARED`` record read from a journal in a later process is only a set
+    of writable fields. Git history, the journal, the execution session's
+    metadata and the reviewer transcript can be made mutually consistent by the
+    same user, but none of them proves that a live execution session produced
+    the recorded head or that a live, independent reviewer approved it. The
+    non-executing identity and scope checks still run so a wrong worktree,
+    session or profile reports its own reason, but the approval is then refused.
+    No verification command, Agent or target write happens here.
+    """
     _require_supported_state(record)
     if record.get('status') != 'PREPARED':
         return
-    key = spec['id']
-    if context.auth.get(key) == 'ok':
+    if spec['id'] in context.approved:
         return
     head, digest = record.get('head'), record.get('diff_sha256')
     if not isinstance(head, str) or not SHA_RE.match(head):
@@ -1400,16 +1416,9 @@ def _authenticate(record, context, spec):
     work = _resolve_task(context, spec)
     # Non-executing proof first: identity, scope, sessions and transcript.
     _prove_common(context, spec, record, work)
-    # Only then run the verification commands (the only side effect here).
-    checks = _run_checks(spec['verify'], work, spec['raw'].get('timeout', 1800))
-    if any(check.get('timeout') for check in checks):
-        raise DeliveryError('a verification process tree may still be running; refusing to '
-                            'continue')
-    if not _all_zero(checks):
-        raise DeliveryError('recorded preparation does not pass verification when re-run')
-    if _head(work) != head or _fingerprint(work, record['base']) != digest:
-        raise DeliveryError('worktree moved while re-proving the approval')
-    context.auth[key] = 'ok'
+    # Mutually consistent writable fields are still not execution provenance or
+    # independent review, so a cross-process approval is never trusted.
+    raise DeliveryError(UNPROVABLE_EXECUTION)
 
 
 def _reconcile(context, spec, record):
