@@ -2715,6 +2715,122 @@ class EditionBoundaryTests(DeliveryCase):
         self.assertIn('not authorized', record['reason'])
         self.assertEqual(_head_of(work), record['head'])
 
+    def test_a_shared_edition_failure_stops_the_whole_run_before_the_next_task(self):
+        # Two independent tasks. The first task's execution leaves the worktree
+        # dirty, so the first Git call after the Agent is the `diff` inside
+        # `_changes`; a real `core.fsmonitor` helper runs inside it and switches
+        # `local` to the equally valid `github`. The edition is *shared* state:
+        # the failure is not scoped to the task that observed it, so the run must
+        # stop before task two's `_root`/`rev-parse`, before any Agent, and
+        # before any journal write other than the record of the halted run.
+        project = self._project()
+        runs = self.root / 'fsmonitor-runs'
+        armed = self.root / 'fsmonitor-armed'
+        script = self._fsmonitor(
+            'armed_path = pathlib.Path(' + repr(str(armed)) + ')\n'
+            'if armed_path.exists():\n'
+            '    armed_path.unlink()\n'
+            '    pathlib.Path(' + repr(str(runs)) + ').open("a").write("x")\n'
+            '    config = pathlib.Path(' + repr(str(project)) + ').read_text()\n'
+            '    pathlib.Path(' + repr(str(project)) + ').write_text(\n'
+            '        config.replace("`local`", "`github`"))\n')
+        one, two = self.worktree('one'), self.worktree('two')
+        base_one, base_two = _head_of(one), _head_of(two)
+        after, writes = [], []
+        original_git = delivery.git
+        original_save = delivery._save
+
+        def git_probe(where, *args):
+            if runs.exists():
+                after.append(args)
+            return original_git(where, *args)
+
+        def save_probe(path, state):
+            if runs.exists():
+                writes.append(json.dumps(state, sort_keys=True))
+            return original_save(path, state)
+
+        def execution(where, prompt):
+            self.write_default(where, prompt)
+            # The first Git call after the execution session is the `diff`
+            # inside `_changes`; configure and arm the real hook for it only.
+            self._use_fsmonitor(script)
+            armed.write_text('x')
+
+        agents = FakeAgents(self, execution=execution)
+        plan = self.plan([self.task('one', one, ['a.txt']),
+                          self.task('two', two, ['b.txt'])])
+        with mock.patch.object(delivery, 'git', git_probe), \
+                mock.patch.object(delivery, '_save', save_probe):
+            state, _ = self.run_delivery(plan, agents)
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        # The hook really ran inside Git, and the real switch landed.
+        self.assertTrue(runs.read_text())
+        self.assertIn('`github`', project.read_text())
+        # Task two never started: no Git call at all (in particular no
+        # `rev-parse` from `_root`), no Agent, no history in its worktree.
+        self.assertEqual(after, [])
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertEqual(state['tasks']['two']['status'], 'PENDING')
+        self.assertEqual(_head_of(two), base_two)
+        self.assertEqual(_head_of(one), base_one)
+        # The only write after the switch is the halted run's own record, and
+        # the persisted journal reports the same state.
+        self.assertEqual(len(writes), 1)
+        journal = json.loads(self.state.read_text())
+        self.assertEqual(journal['tasks']['one']['status'], 'BLOCKED')
+        self.assertIn('edition', journal['tasks']['one']['reason'])
+        self.assertEqual(journal['tasks']['two']['status'], 'PENDING')
+
+    def test_a_git_add_failure_that_switches_the_edition_stops_the_whole_run(self):
+        # `git add` is a synchronous Git process of its own and a real clean
+        # filter runs inside it. Here the filter switches `local` to the equally
+        # valid `github` and then fails, so the add itself raises. That failure
+        # is not a licence to continue: the edition is shared state, so the run
+        # must re-prove it before the failure can reach task two's
+        # `_root`/`rev-parse`, and stop the whole run when it changed.
+        project = self._project()
+        self._filter(
+            'config = pathlib.Path(' + repr(str(project)) + ').read_text()\n'
+            'pathlib.Path(' + repr(str(project)) + ').write_text(\n'
+            '    config.replace("`local`", "`github`"))\n'
+            'raise SystemExit(1)\n', ('a.txt',))
+        # A required clean filter makes the failure fatal for `git add` itself,
+        # so the runner's add process really raises instead of quietly staging
+        # the worktree content.
+        _git(self.repo, 'config', 'filter.poison.required', 'true')
+        one, two = self.worktree('one'), self.worktree('two')
+        base_one, base_two = _head_of(one), _head_of(two)
+        after = []
+        original_git = delivery.git
+
+        def git_probe(where, *args):
+            if '`github`' in project.read_text():
+                after.append(args)
+            return original_git(where, *args)
+
+        agents = FakeAgents(self)
+        plan = self.plan([self.task('one', one, ['a.txt']),
+                          self.task('two', two, ['b.txt'])])
+        with mock.patch.object(delivery, 'git', git_probe):
+            state, _ = self.run_delivery(plan, agents)
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        # The filter really ran inside `git add`, and the real switch landed.
+        self.assertIn('`github`', project.read_text())
+        # The failed add staged nothing and no history was created.
+        self.assertEqual(_git(one, 'diff', '--cached', '--name-only').stdout, b'')
+        self.assertEqual(_head_of(one), base_one)
+        self.assertIsNone(record.get('head'))
+        # Task two never started and no Git call followed the switch.
+        self.assertEqual(after, [])
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertEqual(state['tasks']['two']['status'], 'PENDING')
+        self.assertEqual(_head_of(two), base_two)
+
 
 class CommitBoundaryTests(DeliveryCase):
     """`git add` and `git commit` are separate processes and separate risks."""
@@ -3192,6 +3308,63 @@ class CommitBoundaryTests(DeliveryCase):
         self.assertTrue(marker.exists())
         self.assertIn('`github`', project.read_text())
 
+    def test_an_implicit_true_fsmonitor_in_a_linked_worktree_never_starts_the_commit(self):
+        # `[core] fsmonitor` with no value at all is Git's implicit boolean
+        # true: Git starts its builtin daemon, which is executable code inside
+        # `git commit` exactly like a configured helper path. `git config --get`
+        # prints an empty line for it, so the proof must treat "no value" as
+        # enabled and only an explicit false spelling as disabled. The key is
+        # written in the *linked worktree's* own config scope, which is where
+        # Git reads it and where a path-based proof of the common config misses
+        # it.
+        work = self.worktree('one')
+        base = _head_of(work)
+        _git(self.repo, 'config', 'extensions.worktreeConfig', 'true')
+        config_path = Path(_git(work, 'rev-parse', '--git-path', 'config.worktree')
+                           .stdout.decode().strip())
+        if not config_path.is_absolute():
+            config_path = work / config_path
+        original_prove = delivery._prove_staged
+
+        def prove(*args, **kwargs):
+            result = original_prove(*args, **kwargs)
+            # Add the valueless key only for the commit phase, after every proof
+            # that came before it.
+            config_path.write_text('[core]\n\tfsmonitor\n')
+            return result
+
+        commits = []
+        real_run = subprocess.run
+
+        def run_probe(argv, *args, **kwargs):
+            if isinstance(argv, list) and 'commit' in argv[:4]:
+                commits.append(list(argv))
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch.object(delivery, '_prove_staged', prove), \
+                mock.patch.object(delivery.subprocess, 'run', run_probe):
+            state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]))
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('fsmonitor', record['reason'])
+        self.assertIn('core.fsmonitor', record['reason'])
+        self.assertIn('not implemented', record['reason'])
+        # The key really is the implicit true Git itself acts on, and it is read
+        # from this linked worktree's own scope only.
+        self.assertEqual(_git(work, 'config', '--get', '--type=bool', 'core.fsmonitor')
+                         .stdout.strip(), b'true')
+        self.assertEqual(delivery._configured_fsmonitor(work), ['core.fsmonitor'])
+        self.assertEqual(_git(self.repo, 'config', '--get', 'core.fsmonitor',
+                              check=False).returncode, 1)
+        # No commit process started and no history was created.
+        self.assertEqual(commits, [])
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertEqual(_head_of(work), base)
+        self.assertIsNone(record.get('head'))
+        # The staged change was left for a human, not reset.
+        self.assertIn('a.txt',
+                      _git(work, 'diff', '--cached', '--name-only').stdout.decode())
+
     def test_a_configured_filter_value_is_not_written_to_the_journal_or_summary(self):
         # A clean-filter refusal must name the configuration key, never its
         # value: a filter value is an arbitrary command line and may carry a
@@ -3211,6 +3384,49 @@ class CommitBoundaryTests(DeliveryCase):
         self.assertNotIn(token, record['reason'])
         self.assertNotIn(token, self.state.read_text())
         self.assertNotIn(token, json.dumps(delivery._summary(state)))
+
+    def test_a_multi_line_filter_value_is_not_written_to_the_journal_or_summary(self):
+        # A filter value is an arbitrary command line and may carry a secret on
+        # a second line. `git config --get-regexp` prints every value verbatim,
+        # so splitting its output into physical lines turns that second line
+        # into a phantom configuration key — which the refusal then copies into
+        # the reason, the journal and the CLI summary. The proof may name real
+        # configuration keys only and must never echo a value or a continuation
+        # of one.
+        token = 'DEMO_FAKE_TOKEN_456'
+        work = self.worktree('one')
+        base = _head_of(work)
+        _git(self.repo, 'config', 'filter.unused.clean', f'cat\n{token}')
+        # The helper itself reports exactly one real key, not the value's
+        # second line; `git` stores the newline as a real multi-line value.
+        self.assertEqual(delivery._configured_clean_filters(work), ['filter.unused.clean'])
+        commits = []
+        real_run = subprocess.run
+
+        def run_probe(argv, *args, **kwargs):
+            if isinstance(argv, list) and 'commit' in argv[:4]:
+                commits.append(list(argv))
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch.object(delivery.subprocess, 'run', run_probe):
+            state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]))
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        # The real key is named; the value and its continuation never are.
+        self.assertIn('filter.unused.clean', record['reason'])
+        self.assertIn('clean filter', record['reason'])
+        self.assertNotIn(token, record['reason'])
+        self.assertNotIn('DEMO_FAKE_TOKEN', record['reason'])
+        self.assertNotIn(token, self.state.read_text())
+        self.assertNotIn(token, json.dumps(delivery._summary(state)))
+        # No commit was started and no history was created.
+        self.assertEqual(commits, [])
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertEqual(_head_of(work), base)
+        self.assertIsNone(record.get('head'))
+        # The persisted journal carries the same refusal without the value.
+        self.assertEqual(json.loads(self.state.read_text())['tasks']['one']['status'],
+                         'BLOCKED')
 
 
 class CliTests(DeliveryCase):
