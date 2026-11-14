@@ -1742,6 +1742,61 @@ class GitPathspecLiteralTests(unittest.TestCase):
         self.assertIn('return True', lines)
         self.assertIn('return user.is_admin', lines)
 
+    def _capture_diff_argv(self, state, name):
+        """Return ``(diff lines, git argv)`` for one real diff read.
+
+        The real ``subprocess.run`` still executes, so the returned lines are the
+        repository's own diff. Only the argv is recorded, which is what a mocked
+        ``_literal_pathspec`` would change while leaving the diff of an ordinary
+        path untouched.
+        """
+        real_run = subprocess.run
+        commands = []
+
+        def recording_run(command, *args, **kwargs):
+            commands.append(list(command))
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch.object(planning.subprocess, 'run', recording_run):
+            lines = planning._diff_lines_for_path(state, name)
+        diffs = [command for command in commands if 'diff' in command]
+        self.assertEqual(len(diffs), 1, commands)
+        return lines, diffs[0]
+
+    def _assert_diff_argv_reads_literally(self, name):
+        repo, base, head = self._magic_range(name)
+        state = {'repo_root': str(repo.root), 'base_sha': base,
+                 'head_sha': head}
+        lines, argv = self._capture_diff_argv(state, name)
+        # The prefix must be the pathspec Git actually receives, not merely a
+        # constant the implementation could stop using. This is the assertion
+        # that fails if ``_literal_pathspec`` is mocked to return *name* as is.
+        self.assertIn(':(literal)' + name, argv)
+        self.assertEqual(argv[argv.index('--') + 1:], [':(literal)' + name])
+        self.assertNotIn(name, argv)
+        # And Git must accept it: the real diff still comes back.
+        self.assertIn('return True', lines)
+        self.assertIn('return user.is_admin', lines)
+
+    def test_diff_argv_reads_a_portable_path_as_a_literal_pathspec(self):
+        """Git is actually told to read the path literally, on every platform.
+
+        ``docs/plain.py`` carries no pathspec magic, so its diff is the same
+        whether or not ``:(literal)`` was passed, and the earlier portable case
+        passed unchanged with ``_literal_pathspec`` mocked to return the path
+        as is — it could not tell the two readings apart. The claim is therefore
+        asserted on the argv Git receives, while the real diff lines keep
+        proving the prefix is accepted rather than merely printed.
+        """
+        self._assert_diff_argv_reads_literally(self.PORTABLE_NAME)
+
+    def test_diff_argv_reads_a_magic_name_as_a_literal_pathspec(self):
+        """The same argv assertion for a name that *is* pathspec magic."""
+        name = ':(glob)foo.py'
+        if not self._name_is_creatable(name):
+            self.skipTest(self.PLATFORM_LIMIT.format(name=name))
+        self._assert_diff_argv_reads_literally(name)
+
     def test_literal_diff_reading_ignores_pathspec_environment(self):
         """A caller's pathspec environment cannot change the literal reading."""
         names = (':(glob)foo.py', self.PORTABLE_NAME)
