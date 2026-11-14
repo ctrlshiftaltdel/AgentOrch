@@ -81,11 +81,17 @@ fail-closed:
   execution session to the commit it is supposed to have produced, and both Git
   history and the journal are writable, so a recorded head is never trusted
   across processes: an interrupted verify/review attempt is ``BLOCKED`` instead
-  of resumed or retried. Only an attempt that left no commit can start again;
+  of resumed or retried. Only an attempt that left no commit can start again,
+  and its recorded previous PID must be provably dead first: POSIX probes it
+  with signal 0, while Windows reads the process object because the same call
+  would terminate it;
 * no ``reset``, ``stash`` or delete is ever performed; a worktree that is not
   exactly at the target baseline, or that has uncommitted/committed leftovers,
   is refused and left untouched;
 * verification runs in its own process group so a timeout kills the whole tree.
+  Windows has no process group a plain ``Popen`` can signal, so the check's PID
+  tree is stopped with ``taskkill /T`` instead; a descendant that detaches from
+  that tree is still not guaranteed to be caught.
 
 Nothing here is a sandbox. Worktrees, prompts, path checks and ``--standalone``
 do not restrict OpenCode's configured permissions: V2 can reach the host
@@ -1098,11 +1104,58 @@ def acquire_locks(repo, state_path, specs):
     return handles
 
 
+def _pid_alive_windows(pid):
+    """Ask Windows whether the recorded process object is still running.
+
+    ``os.kill(pid, 0)`` is not a liveness probe on Windows: any signal other
+    than a console event calls ``TerminateProcess``, so it would kill the very
+    process the resume gate is asking about. Read the process object instead.
+    A handle that Windows cannot open is reported dead only for the exact
+    "no such process" error; access denied (the process exists but belongs to
+    someone else) and every unexpected result stay ``None`` so the caller keeps
+    refusing to resume. A process object that is still open but already exited
+    is signalled, and one whose PID was reused by an unrelated live process is
+    reported alive — refusing the resume is the safe reading of both.
+    """
+    import ctypes
+
+    ERROR_INVALID_PARAMETER = 87
+    SYNCHRONIZE = 0x00100000
+    WAIT_OBJECT_0 = 0
+    WAIT_TIMEOUT = 258
+    try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.OpenProcess(SYNCHRONIZE, 0, pid)
+        if not handle:
+            # A PID that names no process object is the only answer that may let
+            # a later process resume; everything else is "possibly alive".
+            return False if ctypes.get_last_error() == ERROR_INVALID_PARAMETER else None
+        try:
+            state = kernel32.WaitForSingleObject(handle, 0)
+        finally:
+            kernel32.CloseHandle(handle)
+    except (AttributeError, OSError, ValueError):
+        # A ctypes binding that does not work here proves nothing about the
+        # process, so it must not authorize a resume.
+        return None
+    if state == WAIT_TIMEOUT:
+        return True
+    if state == WAIT_OBJECT_0:
+        return False
+    return None
+
+
 def _pid_alive(pid):
     if not isinstance(pid, int) or pid <= 0:
         return None
     if os.name == 'nt':  # os.kill would terminate the process on Windows
-        return None
+        return _pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1185,11 +1238,25 @@ def _classify_stream(returncode, output):
 
 
 def _kill_group(process):
-    try:
-        if os.name == 'posix':
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        else:
+    if os.name == 'nt':
+        # Windows has no process group a plain ``Popen`` can signal: killing the
+        # direct child leaves the children it started running. ``taskkill /T``
+        # walks the live tree of that PID, which is how the whole check is
+        # stopped without a job object. Killing the direct child afterwards is a
+        # no-op when the tree kill already took it.
+        try:
+            subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=False)
+        except OSError:
+            pass
+        try:
             process.kill()
+        except OSError:
+            pass
+        return
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
     except (OSError, AttributeError):
         pass
 
@@ -2121,7 +2188,8 @@ def _authenticate(record, context, spec):
     same user, but none of them proves that a live execution session produced
     the recorded head or that a live, independent reviewer approved it. The
     non-executing identity and scope checks still run so a wrong worktree,
-    session or profile reports its own reason, but the approval is then refused.
+    session or profile reports its own reason alongside the refusal — an
+    unavailable runtime cannot mask it — but the approval is then refused.
     No verification command, Agent or target write happens here.
     """
     _require_supported_state(record)
@@ -2136,7 +2204,20 @@ def _authenticate(record, context, spec):
         raise DeliveryError('recorded approval has no diff digest')
     work = _resolve_task(context, spec)
     # Non-executing proof first: identity, scope, sessions and transcript.
-    _prove_common(context, spec, record, work)
+    # Its diagnostics are worth reporting — a wrong worktree, session or
+    # transcript names its own cause — but the verdict below does not depend on
+    # them. A runtime the proof cannot query (no usable ``opencode``, a profile
+    # query that fails) must not replace the unconditional refusal with its own
+    # availability error, so the proof's message is reported *alongside* the
+    # refusal instead of in place of it. A shared gate still stops the whole
+    # run, exactly as it does on every other path.
+    try:
+        _prove_common(context, spec, record, work)
+    except SharedGateError:
+        raise
+    except DeliveryError as exc:
+        raise DeliveryError(f'{UNPROVABLE_EXECUTION}. Its non-executing proof also '
+                            f'failed: {exc}') from None
     # Mutually consistent writable fields are still not execution provenance or
     # independent review, so a cross-process approval is never trusted.
     raise DeliveryError(UNPROVABLE_EXECUTION)

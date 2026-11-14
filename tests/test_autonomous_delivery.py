@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -70,6 +71,22 @@ def _git(where, *args, check=True):
     return subprocess.run(['git', '--no-optional-locks', *args], cwd=where, check=check,
                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE)
+
+
+def _shell_command(*parts):
+    """A Git filter/hook command line that survives the shell Git runs it with.
+
+    ``filter.<driver>.clean`` and ``core.fsmonitor`` values are command lines
+    Git hands to a POSIX shell, and Git for Windows ships that shell too. There
+    a Windows path's backslashes are escape characters, so an unquoted
+    ``C:\\...\\python.exe C:\\...\\script.py`` collapses to ``C:...python.exe``
+    and the helper never starts; the run then looks like a platform that cannot
+    execute the fixture at all. Normalize separators and quote each part with
+    POSIX quoting, which changes nothing on POSIX.
+    """
+    if os.name == 'nt':
+        parts = tuple(part.replace('\\', '/') for part in parts)
+    return ' '.join(shlex.quote(part) for part in parts)
 
 
 def _verdict(prompt, verdict='APPROVE', findings=None, criteria=None, paths=None,
@@ -287,7 +304,7 @@ class DeliveryCase(unittest.TestCase):
             ''.join(f'{path} filter=poison\n' for path in paths))
         _git(self.repo, 'add', '.gitattributes')
         _git(self.repo, 'commit', '-q', '-m', 'attributes')
-        _git(self.repo, 'config', 'filter.poison.clean', f'{PY} {script}')
+        _git(self.repo, 'config', 'filter.poison.clean', _shell_command(PY, str(script)))
         _git(self.repo, 'config', 'filter.poison.smudge', 'cat')
         return script
 
@@ -336,8 +353,29 @@ class DeliveryCase(unittest.TestCase):
         return script
 
     def _use_fsmonitor(self, script):
-        _git(self.repo, 'config', 'core.fsmonitor', str(script))
+        # The value is a command line Git runs through its shell; the same
+        # portable form keeps Git for Windows from mangling the backslashes.
+        _git(self.repo, 'config', 'core.fsmonitor', _shell_command(PY, str(script)))
         _git(self.repo, 'config', 'core.fsmonitorHookVersion', '2')
+
+    def _helper_ran(self, marker, what):
+        """Whether this host actually executed the fixture helper.
+
+        A helper Git resolves through ``PATH`` as a bare name (a program
+        literally named ``False``) is an extensionless script. Git for Windows
+        runs it through its POSIX shell, which cannot execute a file without an
+        executable extension, so the helper's body may never run. That is a
+        platform limit, not a property of the runner: the run still refuses to
+        start the commit because the *configuration* is visible. On POSIX the
+        helper is expected to run, so a missing marker is a broken fixture and
+        fails here instead of silently weakening the assertion.
+        """
+        ran = Path(marker).exists()
+        if not ran:
+            self.assertEqual(
+                os.name, 'nt',
+                f'{what} never executed on this POSIX host; the fixture is broken')
+        return ran
 
 
 class PrepareOnlyTests(DeliveryCase):
@@ -544,7 +582,7 @@ class ReviewGateTests(DeliveryCase):
         # read-only when the task started must not be reused after execution.
         work = self.worktree('one')
         marker = self.root / 'check-ran'
-        verify = [[PY, '-c', f'import pathlib; pathlib.Path("{marker}").write_text("x")']]
+        verify = [[PY, '-c', f'import pathlib; pathlib.Path({str(marker)!r}).write_text("x")']]
         plan = self.plan([self.task('one', work, ['a.txt'], verify=verify)])
         safe = self.profiles
         queried = []
@@ -581,7 +619,7 @@ class ReviewGateTests(DeliveryCase):
         # boundary still has to query it again instead of reusing a cache.
         work = self.worktree('one')
         marker = self.root / 'check-ran'
-        verify = [[PY, '-c', f'import pathlib; pathlib.Path("{marker}").write_text("x")']]
+        verify = [[PY, '-c', f'import pathlib; pathlib.Path({str(marker)!r}).write_text("x")']]
         plan = self.plan([self.task('one', work, ['a.txt'], verify=verify)])
         safe = self.profiles
         queried = []
@@ -710,7 +748,7 @@ class ResumeTests(DeliveryCase):
     def test_resume_refuses_unprovable_execution_before_running_checks(self):
         work, base, head = self._prepared()
         marker = work / 'check-ran'
-        verify = [[PY, '-c', f'import pathlib; pathlib.Path("{marker}").write_text("x")']]
+        verify = [[PY, '-c', f'import pathlib; pathlib.Path({str(marker)!r}).write_text("x")']]
         plan = self.plan([self.task('one', work, ['a.txt'], verify=verify)])
         self._seed_review(work, base, head, plan)
         state, agents = self.run_delivery(plan, resume=True)
@@ -872,7 +910,7 @@ class ResumeTests(DeliveryCase):
     def test_resume_refuses_an_unproven_reviewer_profile_before_running_checks(self):
         work, base, head = self._prepared()
         marker = work / 'check-ran'
-        verify = [[PY, '-c', f'import pathlib; pathlib.Path("{marker}").write_text("x")']]
+        verify = [[PY, '-c', f'import pathlib; pathlib.Path({str(marker)!r}).write_text("x")']]
         plan = self.plan([self.task('one', work, ['a.txt'], verify=verify)])
         self._seed_review(work, base, head, plan)
         weak = lambda where: {'scout': {'permissions': [
@@ -928,7 +966,7 @@ class AuthenticateTests(DeliveryCase):
         _git(work, 'commit', '-q', '-m', 'change')
         base = _git(self.repo, 'rev-parse', 'HEAD').stdout.decode().strip()
         head = _git(work, 'rev-parse', 'HEAD').stdout.decode().strip()
-        verify = [[PY, '-c', f'import pathlib; pathlib.Path("{marker}").write_text("x")']]
+        verify = [[PY, '-c', f'import pathlib; pathlib.Path({str(marker)!r}).write_text("x")']]
         plan = self.plan([self.task('one', work, ['a.txt'], verify=verify)])
         self.seed(plan, {'one': {
             'status': 'PREPARED', 'phase': 'done', 'base': base, 'head': head,
@@ -1022,7 +1060,7 @@ class AuthenticateTests(DeliveryCase):
         # must fail closed before a verification command or Agent can run.
         work = self.worktree('one')
         marker = work / 'check-ran'
-        verify = [[PY, '-c', f'import pathlib; pathlib.Path("{marker}").write_text("x")']]
+        verify = [[PY, '-c', f'import pathlib; pathlib.Path({str(marker)!r}).write_text("x")']]
         plan, record, verdict = self._forged_journal(work, verify=verify)
         self.transcripts['ses_rev'] = '```json\n' + json.dumps(verdict) + '\n```\n'
         self.transcripts['ses_exec'] = 'execution finished'
@@ -1477,7 +1515,7 @@ class NoDestructiveTests(DeliveryCase):
         _git(work, 'commit', '-q', '-m', 'out of scope')
         marker = work / 'check-ran'
         verify = [[PY, '-c',
-                   f'import pathlib; pathlib.Path("{marker}").write_text("x")']]
+                   f'import pathlib; pathlib.Path({str(marker)!r}).write_text("x")']]
         plan = self.plan([self.task('one', work, ['a.txt'], verify=verify)])
         self._seed_rejected_review(work, base, plan, ['outside.txt'])
         state, agents = self.run_delivery(plan, retry=['one'])
@@ -1495,7 +1533,7 @@ class NoDestructiveTests(DeliveryCase):
         _git(work, 'commit', '-q', '-m', 'attempt')
         marker = work / 'check-ran'
         verify = [[PY, '-c',
-                   f'import pathlib; pathlib.Path("{marker}").write_text("x")']]
+                   f'import pathlib; pathlib.Path({str(marker)!r}).write_text("x")']]
         plan = self.plan([self.task('one', work, ['a.txt'], verify=verify)])
         self._seed_rejected_review(work, base, plan, ['a.txt'])
 
@@ -1521,7 +1559,7 @@ class NoDestructiveTests(DeliveryCase):
         head = _head_of(work)
         marker = work / 'check-ran'
         verify = [[PY, '-c',
-                   f'import pathlib; pathlib.Path("{marker}").write_text("x")']]
+                   f'import pathlib; pathlib.Path({str(marker)!r}).write_text("x")']]
         plan = self.plan([self.task('one', work, ['a.txt'], verify=verify)])
         self.seed(plan, {'one': {
             'status': 'REVIEW_REJECTED', 'phase': 'review', 'base': base, 'head': head,
@@ -1545,7 +1583,7 @@ class NoDestructiveTests(DeliveryCase):
         _git(work, 'commit', '-q', '-m', 'attempt')
         marker = work / 'check-ran'
         verify = [[PY, '-c',
-                   f'import pathlib; pathlib.Path("{marker}").write_text("x")']]
+                   f'import pathlib; pathlib.Path({str(marker)!r}).write_text("x")']]
         plan = self.plan([self.task('one', work, ['a.txt'], verify=verify)])
         self._seed_rejected_review(work, base, plan, ['a.txt'])
         queried = []
@@ -1671,6 +1709,22 @@ class CheckRunnerTests(DeliveryCase):
         self.assertIsNone(checks[0]['exit_code'])
         time.sleep(3)
         self.assertFalse((work / 'child-marker').exists())
+
+    def test_a_recorded_pid_is_provably_dead_before_a_resume_continues(self):
+        # The resume gate asks whether the previous runner can still write.
+        # A live PID (this process) must never answer "dead", and a process the
+        # OS has already reaped must answer "dead" on every platform. Windows
+        # reads the process object because `os.kill(pid, 0)` would terminate it.
+        self.assertIs(delivery._pid_alive(os.getpid()), True)
+        child = subprocess.Popen([PY, '-c', 'pass'])
+        child.wait(timeout=60)
+        self.assertIs(delivery._pid_alive(child.pid), False)
+        finished = subprocess.run([PY, '-c', 'import os; print(os.getpid())'],
+                                  stdout=subprocess.PIPE, text=True, check=True)
+        self.assertIs(delivery._pid_alive(int(finished.stdout)), False)
+        # A value that cannot name a process object is not "dead enough".
+        self.assertIsNone(delivery._pid_alive(None))
+        self.assertIsNone(delivery._pid_alive(0))
 
     def test_checks_receive_pwd_and_cwd(self):
         # Route the worktree through a directory symlink the way macOS exposes
@@ -3538,8 +3592,14 @@ class CommitBoundaryTests(DeliveryCase):
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE)
         self.assertEqual(direct.returncode, 0)
-        self.assertTrue(marker.exists())
-        self.assertIn('`github`', project.read_text())
+        if self._helper_ran(marker, 'the PATH program named False'):
+            self.assertIn('`github`', project.read_text())
+        else:
+            # This host's shell could not execute the extensionless helper, so
+            # the switch it would perform is not proven here. What is proven is
+            # that the run refused to start the commit while the value was not
+            # a value Git's boolean parser reads as false.
+            self.assertIn('`local`', project.read_text())
         self.assertNotEqual(_head_of(work), base)
 
     def test_an_explicitly_empty_fsmonitor_is_gits_boolean_false(self):
@@ -3769,7 +3829,7 @@ class CliTests(DeliveryCase):
         # re-running verification and reporting success.
         work = self.worktree('one')
         marker = work / 'check-ran'
-        verify = [[PY, '-c', f'import pathlib; pathlib.Path("{marker}").write_text("x")']]
+        verify = [[PY, '-c', f'import pathlib; pathlib.Path({str(marker)!r}).write_text("x")']]
         plan, record, verdict = self._forged_journal(work, verify=verify)
         transcript = '```json\n' + json.dumps(verdict) + '\n```\n'
         exports = {
