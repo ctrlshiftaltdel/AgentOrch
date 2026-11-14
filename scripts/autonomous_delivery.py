@@ -1704,11 +1704,11 @@ def _void_stale_approvals(context):
     for one approval can be the call that widens the profile another approval
     was already checked against. A pass that only blocked the failing approval
     would therefore keep an earlier ``PREPARED`` that no later query supports.
-    The gate is evaluated for every live approval first, and if any of those
-    shared queries fails, every approval that is still live — including the
-    ones whose own query returned the safe profile — is blocked and the journal
-    is saved. An approval whose worktree cannot be resolved is task-specific
-    and blocks only itself.
+    The gate is evaluated for the live approvals in turn, and the first shared
+    failure stops the pass: no further query starts, and every approval that is
+    still live — including the ones whose own query returned the safe profile —
+    is blocked and the journal is saved. An approval whose worktree cannot be
+    resolved is task-specific and blocks only itself.
 
     It is **not atomic**: the project config is a file another process can
     write between this read and the save or console output that follows, and
@@ -1737,8 +1737,9 @@ def _void_stale_approvals(context):
         try:
             _reviewer_gate(context, spec, work, record)
         except (DeliveryError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
-            shared_failure = shared_failure or (ident, exc)
+            shared_failure = (ident, exc)
             record.update(status='BLOCKED', reason=str(exc))
+            break
     if shared_failure is not None:
         source, cause = shared_failure
         for ident, _spec, _work in live:
