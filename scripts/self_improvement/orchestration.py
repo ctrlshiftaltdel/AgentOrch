@@ -62,8 +62,10 @@ LIMITATIONS = (
     'Risk uses the repository’s own Git evidence and only cross-checks the caller-supplied '
     'base/head locators; that cross-check is not authoritative carrier authentication, and '
     'caller diffs, SHA strings, review or authorization fields are never evidence. Replace '
-    'refs and diff-hiding config are disabled; repository clean/process filters or config '
-    'includes make the planner fail closed before any Git command (not implemented), while '
+    'refs and diff-hiding config are disabled; repository clean/process filters, config '
+    'includes, executable config in an initialised submodule / nested repository, and '
+    'promisor / ext:: / HTTP-alternate transports make the planner fail closed before any '
+    'Git command (not implemented, every command repeats the preflight), while '
     'fsmonitor and hooks are disabled through overrides. Hidden index flags / ignored '
     'allowed paths / stale snapshots block, and no change set is auto-LOW: an empty commit '
     'range cannot prove the goal, the allowed-path scope or the authorization. The '
@@ -72,7 +74,12 @@ LIMITATIONS = (
     'READY. High-risk recognition is a fixed path table plus limited keywords: recognised '
     'permission/security/destructive leads end in NEEDS_HUMAN_DECISION, an ordinary '
     'documentation permission mention stays NEEDS_EVIDENCE, and an unrecognised change is '
-    'never treated as safe.',
+    'never treated as safe. A permission/security keyword alone (for example a goal that '
+    'says "adjust user permissions" while the allowed path is an ordinary file) is a '
+    'review lead with no decision id; only destructive wording, or a keyword that '
+    'coincides with a high-risk path or the real diff, escalates. An initialised '
+    'submodule / nested repository with executable config and a promisor, ext:: or '
+    'HTTP-alternate transport are also refused before any Git command.',
 )
 
 

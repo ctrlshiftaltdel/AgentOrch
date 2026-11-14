@@ -140,8 +140,14 @@ start it.
    dirty or untracked worktree all block. Before the first Git command, a
    repository-local `filter.<driver>.clean` / `.process`, `include` / `includeIf`
    or a `filter=` attribute makes the planner fail closed and state that the
-   isolation is not implemented; `core.fsmonitor` and hooks are disabled through
-   config overrides. There is no automatic low-risk verdict at all in this slice:
+   isolation is not implemented. The same preflight covers initialised
+   submodules / nested repositories, which carry their own config and
+   attributes (a parent `git status` runs their clean filter), and promisor /
+   partial-clone remotes, `ext::` transports and HTTP alternates, which could
+   make a read-only command fetch or run a remote helper; every Git command,
+   including the public diff-digest helper, repeats it. `core.fsmonitor` and
+   hooks are disabled through config overrides and lazy fetch through
+   `GIT_NO_LAZY_FETCH=1`. There is no automatic low-risk verdict at all in this slice:
    an empty diff or empty tree cannot prove the intended goal, the allowed-path
    scope or the authorization, and non-empty content still needs a trusted review.
    A destructive or irreversible goal (for example "delete all user data")

@@ -29,11 +29,15 @@ live only in ``kit/orchestration.md`` 4.1 and are referenced, never restated.
 
 Standard library only; no network, no carrier. Before running Git, a pure
 filesystem preflight refuses a repository whose own config can execute commands
-(``filter.<driver>.clean`` / ``.process``, ``include`` / ``includeIf``, or a
-``filter=`` attribute): those cannot be isolated without executing them, so the
-planner fails closed and says so. ``core.fsmonitor`` and hooks are disabled through
-config overrides. Git is then read through the local ``git`` executable so risk
-evidence is the repository's own diff, never a caller-supplied summary.
+(``filter.<driver>.clean`` / ``.process``, ``include`` / ``includeIf``, a
+``filter=`` attribute, an initialised submodule / nested repository carrying
+such config or attributes, a promisor / partial-clone remote, an ``ext::``
+transport or an HTTP alternate): those cannot be isolated without executing
+them, so the planner fails closed and says so. ``core.fsmonitor``, hooks and
+lazy fetch are disabled through config overrides / environment. Git is then read
+through the local ``git`` executable so risk evidence is the repository's own
+diff, never a caller-supplied summary; every Git command repeats the preflight,
+including the public diff-digest helper.
 """
 from __future__ import annotations
 
@@ -277,8 +281,8 @@ _SAFE_GIT_CONFIG = (
 )
 # Repository-local config sections that can execute a command or pull in another
 # config file that does. Only a raw file read is used: no Git command is run.
-_CONFIG_EXECUTABLE_RE = re.compile(r'(?im)^\s*\[\s*filter\b')
-_CONFIG_INCLUDE_RE = re.compile(r'(?im)^\s*\[\s*include(?:if)?\b')
+_CONFIG_SECTION_RE = re.compile(
+    r'^\[\s*([A-Za-z0-9.-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]')
 _FILTER_ISOLATION_MESSAGE = (
     'the repository configures a Git clean/process filter or a filter attribute; '
     'this read-only planner cannot isolate it without executing repository commands, '
@@ -290,6 +294,19 @@ _INCLUDE_ISOLATION_MESSAGE = (
 _LAYOUT_ISOLATION_MESSAGE = (
     'cannot locate a non-bare Git worktree without running Git; this planner will not '
     'execute repository configuration before that check (not implemented)')
+_PROMISOR_ISOLATION_MESSAGE = (
+    'the repository config declares a promisor / partial-clone remote, an ext:: '
+    'transport or an HTTP alternate, so a read-only Git command could fetch objects '
+    'or run a remote helper; this planner cannot prove no external command would run '
+    'and refuses before starting Git (not implemented)')
+_EXECUTABLE_CONFIG_MESSAGE = (
+    'the repository config declares a command-executable Git surface (credential '
+    'helper, ssh command, proxy command or alternate-refs command); this planner '
+    'cannot prove it will not run and refuses before starting Git (not implemented)')
+_UNREADABLE_CONFIG_MESSAGE = (
+    'a repository config, info/attributes or alternates file cannot be read, so this '
+    'planner cannot prove the repository is non-executable; it refuses before '
+    'starting Git (not implemented)')
 _UNSAFE_GIT_ENV = (
     'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
     'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_COMMON_DIR',
@@ -508,53 +525,183 @@ def _attributes_declare_filter(path):
     return False
 
 
-def _config_statements(text):
-    """Drop whole-line comments so a commented-out section is not a false hit."""
-    return '\n'.join(line for line in text.splitlines()
-                     if not line.lstrip().startswith(('#', ';')))
+def _config_entries(text):
+    """Parse section/key/value triples from a Git config file without running Git.
 
-
-def _repository_isolation_error(repo_root):
-    """Refuse to touch a repository whose own config can execute commands.
-
-    Clean/process filters cannot be disabled through a single Git config override,
-    and ``git status`` executes them while refreshing the index. Reading the
-    local config and attribute files is enough to know that isolation is not
-    possible, so the planner fails closed here *before* the first Git command
-    instead of running a repository-defined command and reporting the side effect
-    afterwards.
+    Git config syntax is intentionally read only far enough to name executable
+    sections and keys. A section header this parser cannot read returns ``None``
+    so the caller fails closed instead of assuming the file is harmless.
     """
-    layout = _git_layout(repo_root)
-    if layout is None:
-        return _LAYOUT_ISOLATION_MESSAGE
+    entries = []
+    section = None
+    subsection = ''
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(('#', ';')):
+            continue
+        if line.startswith('['):
+            match = _CONFIG_SECTION_RE.match(line)
+            if match is None:
+                return None
+            name = match.group(1).lower()
+            subsection = (match.group(2) or '').replace('\\"', '"').replace('\\\\', '\\')
+            if subsection:
+                section = name
+            elif '.' in name:
+                # Legacy ``[section.subsection]`` header: Git treats the part
+                # before the first dot as the section and lowercases the rest.
+                section, subsection = name.split('.', 1)
+            else:
+                section = name
+            continue
+        if section is None:
+            return None
+        if '=' in line:
+            key, value = line.split('=', 1)
+        else:
+            key, value = line, 'true'
+        entries.append((section, subsection.lower(), key.strip().lower(),
+                        value.strip().strip('"')))
+    return entries
+
+
+def _config_isolation_reason(entries):
+    """Return why a parsed config can execute a command or reach the network."""
+    if entries is None:
+        return _UNREADABLE_CONFIG_MESSAGE
+    for section, subsection, key, value in entries:
+        if section == 'filter':
+            return _FILTER_ISOLATION_MESSAGE
+        if section in ('include', 'includeif'):
+            return _INCLUDE_ISOLATION_MESSAGE
+        if section == 'credential':
+            return _EXECUTABLE_CONFIG_MESSAGE
+        if section == 'extensions' and 'partialclone' in key:
+            return _PROMISOR_ISOLATION_MESSAGE
+        if section == 'remote':
+            # A promisor remote makes ``cat-file`` / ``diff`` fetch missing
+            # objects; ``vcs`` selects an external SCM helper.
+            if key in ('promisor', 'partialclonefilter', 'vcs'):
+                return _PROMISOR_ISOLATION_MESSAGE
+            if key == 'url' and 'ext::' in value:
+                return _PROMISOR_ISOLATION_MESSAGE
+        if section == 'url' and 'ext::' in (subsection + ' ' + value):
+            return _PROMISOR_ISOLATION_MESSAGE
+        if section == 'core' and key in ('alternaterefscommand', 'sshcommand',
+                                         'gitproxy'):
+            return _EXECUTABLE_CONFIG_MESSAGE
+    return None
+
+
+def _attribute_files(worktree):
+    """Every ``.gitattributes`` in the worktree, including nested repositories.
+
+    Git reads attributes from nested directories too, and a submodule's
+    attributes apply inside its own worktree, so they cannot be skipped.
+    """
+    paths = []
+    for dirpath, dirnames, filenames in os.walk(worktree):
+        dirnames[:] = [name for name in dirnames if name != '.git']
+        if '.gitattributes' in filenames:
+            paths.append(Path(dirpath) / '.gitattributes')
+    return paths
+
+
+def _nested_repository_roots(worktree):
+    """Directories below *worktree* that have their own ``.git`` entry.
+
+    Submodules store a ``.git`` *file*, standalone nested repositories a ``.git``
+    directory; both are enumerated from the filesystem because ``git status`` in
+    the parent enters an initialised submodule and runs its clean filter.
+    """
+    roots = []
+    for dirpath, dirnames, filenames in os.walk(worktree):
+        path = Path(dirpath)
+        nested = path != worktree and ('.git' in dirnames or '.git' in filenames)
+        dirnames[:] = [name for name in dirnames if name != '.git']
+        if nested:
+            roots.append(path)
+    return roots
+
+
+def _layout_isolation_reason(layout):
+    """Why this one repository layout can execute commands or fetch objects."""
     worktree, git_dir, common_dir = layout
-    config_paths = [common_dir / 'config', git_dir / 'config.worktree']
+    config_paths = []
+    seen = set()
+    for path in (common_dir / 'config', git_dir / 'config.worktree'):
+        key = os.path.abspath(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        config_paths.append(path)
     for path in config_paths:
         if not path.is_file():
             continue
         try:
             text = path.read_text(encoding='utf-8', errors='replace')
         except OSError:
-            return _LAYOUT_ISOLATION_MESSAGE
-        statements = _config_statements(text)
-        if _CONFIG_EXECUTABLE_RE.search(statements):
-            return _FILTER_ISOLATION_MESSAGE
-        if _CONFIG_INCLUDE_RE.search(statements):
-            return _INCLUDE_ISOLATION_MESSAGE
-    info_attributes = [git_dir / 'info' / 'attributes',
-                       common_dir / 'info' / 'attributes']
-    for path in info_attributes:
+            return _UNREADABLE_CONFIG_MESSAGE
+        reason = _config_isolation_reason(_config_entries(text))
+        if reason:
+            return reason
+    for path in (git_dir / 'info' / 'attributes',
+                 common_dir / 'info' / 'attributes'):
         if path.is_file() and _attributes_declare_filter(path):
             return _FILTER_ISOLATION_MESSAGE
-    for dirpath, dirnames, filenames in os.walk(worktree):
-        # A nested worktree / submodule has its own attributes; they do not apply
-        # to this worktree, and walking them could be unbounded.
-        dirnames[:] = [name for name in dirnames
-                       if name != '.git'
-                       and not (Path(dirpath) / name / '.git').exists()]
-        if '.gitattributes' in filenames:
-            if _attributes_declare_filter(Path(dirpath) / '.gitattributes'):
-                return _FILTER_ISOLATION_MESSAGE
+    for name in ('alternates', 'http-alternates'):
+        path = common_dir / 'objects' / 'info' / name
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            return _UNREADABLE_CONFIG_MESSAGE
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            # Local object stores are plain reads; a URL alternate makes Git
+            # fetch, and an ext:: alternate runs a command.
+            if '://' in line or line.startswith('ext::'):
+                return _PROMISOR_ISOLATION_MESSAGE
+    return None
+
+
+def _repository_isolation_error(repo_root):
+    """Refuse to touch a repository whose own configuration can execute commands.
+
+    Clean/process filters cannot be disabled through a single Git config override,
+    and ``git status`` executes them while refreshing the index. The same is true
+    for an initialised submodule: the parent's ``git status`` enters it and runs
+    the submodule's own clean filter. Promisor remotes and ext:: transports can
+    make object reads fetch or run a helper. Reading config, attributes and
+    alternates files is enough to know that isolation is not possible, so the
+    planner fails closed here *before* the first Git command instead of running a
+    repository-defined command and reporting the side effect afterwards.
+    """
+    layout = _git_layout(repo_root)
+    if layout is None:
+        return _LAYOUT_ISOLATION_MESSAGE
+    worktree = layout[0]
+    reason = _layout_isolation_reason(layout)
+    if reason:
+        return reason
+    for path in _attribute_files(worktree):
+        if _attributes_declare_filter(path):
+            return _FILTER_ISOLATION_MESSAGE
+    for root in _nested_repository_roots(worktree):
+        try:
+            label = str(root.relative_to(worktree))
+        except ValueError:
+            label = root.name
+        nested_layout = _git_layout(root)
+        if nested_layout is None:
+            return (f'nested Git repository (submodule) at {label}: '
+                    + _LAYOUT_ISOLATION_MESSAGE)
+        reason = _layout_isolation_reason(nested_layout)
+        if reason:
+            return f'nested Git repository (submodule) at {label}: ' + reason
     return None
 
 
@@ -569,10 +716,18 @@ def _git_environment():
     env['GIT_ATTR_NOSYSTEM'] = '1'
     env['GIT_TERMINAL_PROMPT'] = '0'
     env['GIT_OPTIONAL_LOCKS'] = '0'
+    # Belt and braces: a partial clone must never lazily fetch during an
+    # evidence probe. The preflight already refuses promisor remotes.
+    env['GIT_NO_LAZY_FETCH'] = '1'
     return env
 
 
 def _run_git(repo_root, args):
+    # Every Git command, including the public diff-digest helper, re-proves that
+    # the repository cannot execute its own configuration first.
+    isolation_error = _repository_isolation_error(repo_root)
+    if isolation_error:
+        raise GitEvidenceError(isolation_error)
     command = ['git', '--no-replace-objects']
     for setting in _SAFE_GIT_CONFIG:
         command.extend(['-c', setting])
@@ -1075,8 +1230,10 @@ def assess_risk_details(proposal, lesson, trusted_task=None, repo_root=None,
     limited keyword checks can tell). Every non-empty content change is
     ``NEEDS_EVIDENCE`` or ``HIGH``, and a missing, forged or incomplete Git claim
     stays ``NEEDS_EVIDENCE``. A repository whose local config defines clean /
-    process filters or config includes is refused before any Git command with an
-    explicit "not implemented" reason. ``LOW`` is reserved for the not-yet-wired
+    process filters or config includes, whose submodule / nested repository
+    defines them, or which declares a promisor remote, ``ext::`` transport or
+    HTTP alternate is refused before any Git command with an explicit "not
+    implemented" reason. ``LOW`` is reserved for the not-yet-wired
     authoritative carrier adapter plus independent review and is not returned by
     this slice. No caller-supplied review or authorization is accepted.
     """

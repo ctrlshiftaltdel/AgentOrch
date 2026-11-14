@@ -5,12 +5,14 @@ SHA, `changed_paths` list or authorization is never evidence: only the
 repository's own commit range and clean worktree can decide.
 """
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from . import loop_support, support
 from agentorch_self_improvement import planning  # noqa: E402
@@ -923,6 +925,276 @@ class GitIsolationTests(unittest.TestCase):
         # empty change set still cannot prove a low-risk task.
         self.assertEqual(details['evidence_status'], 'PRESENT')
         self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+
+    def _git_process_probe(self):
+        """Return ``(marker, bin_dir)``; any ``git`` started writes *marker*.
+
+        Putting this ``git`` first on ``PATH`` proves a refusal happened *before*
+        the first Git process, not after a side effect.
+        """
+        real_git = shutil.which('git')
+        bin_dir = Path(tempfile.mkdtemp(prefix='git-bin-', dir=self.marker_dir))
+        marker = bin_dir.parent / (bin_dir.name + '-process.txt')
+        stub = bin_dir / 'git'
+        stub.write_text(
+            '#!/bin/sh\n'
+            f'printf ran >> {shlex.quote(str(marker))}\n'
+            f'exec {shlex.quote(real_git)} "$@"\n',
+            encoding='utf-8')
+        stub.chmod(0o755)
+        return marker, bin_dir
+
+    def _assess_with_git_probe(self, repo_root, base, head, allowed_paths):
+        process_marker, bin_dir = self._git_process_probe()
+        path = str(bin_dir) + os.pathsep + os.environ['PATH']
+        with mock.patch.dict(os.environ, {'PATH': path}):
+            details = planning.assess_risk_details(
+                {'allowed_paths': allowed_paths,
+                 'git_evidence': loop_support.git_evidence(base, head)},
+                {}, repo_root=repo_root)
+        return details, process_marker
+
+    def _parent_with_submodule_filter(self):
+        """A parent commit range whose submodule runs a clean filter on status."""
+        parent = loop_support.GitRepo('agentorch-risk-parent-')
+        self.addCleanup(parent.close)
+        sub_source = loop_support.GitRepo('agentorch-risk-sub-source-')
+        self.addCleanup(sub_source.close)
+        sub_source.write('.gitattributes', 'data filter=probe\n')
+        sub_source.write('data', 'SAFE\n')
+        sub_source._git('add', '-A')
+        sub_source._git('commit', '-qm', 'sub base')
+        parent.write('docs/note.md', 'note\n')
+        parent._git('add', '-A')
+        parent._git('commit', '-qm', 'base')
+        base = parent.head()
+        parent._git('-c', 'protocol.file.allow=always', 'submodule', 'add',
+                    str(sub_source.root), 'sub')
+        parent._git('commit', '-qm', 'add submodule')
+        head = parent.head()
+        # Configure the filter only after the fixture commits, so setup never runs it.
+        parent._git('-C', 'sub', 'config', 'filter.probe.clean',
+                    f'"{sys.executable}" "{self._script(transform=True)}"')
+        data = parent.root / 'sub' / 'data'
+        data.write_text('EVIL\n', encoding='utf-8')
+        os.utime(data, None)
+        return parent, base, head
+
+    def test_submodule_clean_filter_is_not_executed(self):
+        """The parent status must not enter a submodule and run its clean filter.
+
+        Hiding the submodule config inside ``.git/modules/<name>`` and its
+        attributes inside the submodule worktree used to be enough to slip past
+        the preflight: ``git status`` then ran the filter, wrote the marker and
+        still reported PRESENT. The refusal must now happen before *any* Git
+        process starts.
+        """
+        parent, base, head = self._parent_with_submodule_filter()
+        self._reset_marker()
+        details, process_marker = self._assess_with_git_probe(
+            parent.root, base, head, ['docs/note.md', 'sub'])
+        self.assertFalse(process_marker.exists(),
+                         'risk assessment started Git before proving isolation')
+        self.assertFalse(self.marker.exists(),
+                         'risk assessment executed the submodule clean filter')
+        self.assertNotEqual(details['evidence_status'], 'PRESENT')
+        self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+        self.assertEqual(details['changed_paths'], [])
+        self.assertTrue(
+            any('nested' in reason or 'submodule' in reason or 'filter' in reason
+                for reason in details['reasons']), details['reasons'])
+
+    def test_nested_repository_filter_config_is_refused(self):
+        """A nested repository that is not a registered submodule still counts."""
+        self.repo.write('docs/note.md', 'note\n')
+        self.repo._git('add', '-A')
+        self.repo._git('commit', '-qm', 'base')
+        base = self.repo.head()
+        nested = self.repo.root / 'vendor' / 'nested'
+        nested.mkdir(parents=True)
+        subprocess.run(['git', 'init', '-q', str(nested)], check=True)
+        subprocess.run(['git', '-C', str(nested), 'config', 'filter.probe.clean',
+                        f'"{sys.executable}" "{self._script()}"'], check=True)
+        self.repo.write('vendor/nested/data', 'one\n')
+        self.repo._git('commit', '--allow-empty', '-qm', 'head')
+        head = self.repo.head()
+        self._reset_marker()
+        details, process_marker = self._assess_with_git_probe(
+            self.repo.root, base, head, ['docs/note.md'])
+        self.assertFalse(process_marker.exists(),
+                         'risk assessment started Git before proving isolation')
+        self.assertFalse(self.marker.exists(),
+                         'risk assessment executed a nested repository filter')
+        self.assertNotEqual(details['evidence_status'], 'PRESENT')
+        self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+        self.assertTrue(
+            any('nested' in reason or 'filter' in reason
+                for reason in details['reasons']), details['reasons'])
+
+    def test_promisor_remote_with_ext_transport_is_refused_before_git(self):
+        """A partial-clone remote must not be able to run a fetch/helper command.
+
+        ``git cat-file -e`` on a missing object makes Git fetch from the promisor
+        remote; an ``ext::`` URL turns that into an arbitrary command. The
+        planner must refuse on the config alone, with zero Git processes.
+        """
+        base, head = self._commit_range()
+        helper = self.marker_dir / 'ext-helper.sh'
+        helper.write_text(
+            '#!/bin/sh\n'
+            f'printf ran >> {shlex.quote(str(self.marker))}\n'
+            'exit 1\n', encoding='utf-8')
+        helper.chmod(0o755)
+        self.repo._git('config', 'protocol.ext.allow', 'always')
+        self.repo._git('config', 'remote.origin.url', f'ext::sh {helper}')
+        self.repo._git('config', 'remote.origin.promisor', 'true')
+        self.repo._git('config', 'remote.origin.partialclonefilter', 'blob:none')
+        self.repo._git('config', 'core.repositoryformatversion', '1')
+        self.repo._git('config', 'extensions.partialClone', 'origin')
+        # Remove the base commit so the first object read needs the promisor.
+        loose = self.repo.root / '.git' / 'objects' / base[:2] / base[2:]
+        self.assertTrue(loose.is_file(), 'expected a loose base commit object')
+        loose.unlink()
+        self._reset_marker()
+        details, process_marker = self._assess_with_git_probe(
+            self.repo.root, base, head, ['docs/evil.md'])
+        self.assertFalse(process_marker.exists(),
+                         'risk assessment started Git on a promisor repository')
+        self.assertFalse(self.marker.exists(),
+                         'risk assessment made Git run the ext:: remote helper')
+        self.assertNotEqual(details['evidence_status'], 'PRESENT')
+        self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+        self.assertTrue(
+            any('promisor' in reason or 'partial' in reason
+                or 'remote helper' in reason or 'ext::' in reason
+                for reason in details['reasons']), details['reasons'])
+
+    def test_real_partial_clone_is_refused_before_git(self):
+        """A genuine ``--filter=blob:none`` clone is refused from its config."""
+        source = loop_support.GitRepo('agentorch-risk-partial-source-')
+        self.addCleanup(source.close)
+        base = source.commit({'docs/a.md': 'one\n'}, message='base')
+        head = source.commit({'docs/a.md': 'two\n'}, message='head')
+        source._git('config', 'uploadpack.allowfilter', 'true')
+        clone_root = Path(tempfile.mkdtemp(
+            prefix='agentorch-risk-partial-', dir=os.environ.get('TMPDIR') or None))
+        self.addCleanup(shutil.rmtree, clone_root, True)
+        clone = clone_root / 'clone'
+        subprocess.run(
+            ['git', 'clone', '--filter=blob:none', '--no-local',
+             f'file://{source.root}', str(clone)],
+            check=True, capture_output=True)
+        promisor = subprocess.run(
+            ['git', '-C', str(clone), 'config', 'remote.origin.promisor'],
+            capture_output=True)
+        self.assertEqual(promisor.stdout.decode().strip(), 'true')
+        details, process_marker = self._assess_with_git_probe(
+            clone, base, head, ['docs/a.md'])
+        self.assertFalse(process_marker.exists(),
+                         'risk assessment started Git on a partial clone')
+        self.assertNotEqual(details['evidence_status'], 'PRESENT')
+        self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+        self.assertTrue(
+            any('promisor' in reason or 'partial' in reason
+                for reason in details['reasons']), details['reasons'])
+
+    def test_other_executable_surfaces_are_refused_before_git(self):
+        """Every config surface that can run a command or reach the network refuses."""
+        cases = [
+            ('include', None),
+            ('url-insteadof', None),
+            ('legacy-filter', None),
+            ('credential', 'credential.helper'),
+            ('ssh-command', 'core.sshCommand'),
+            ('http-alternates', None),
+        ]
+        for name, config_key in cases:
+            with self.subTest(surface=name):
+                repo = loop_support.GitRepo(f'agentorch-risk-{name}-')
+                self.addCleanup(repo.close)
+                repo.write('docs/note.md', 'note\n')
+                repo._git('add', '-A')
+                repo._git('commit', '-qm', 'base')
+                base = repo.head()
+                repo._git('commit', '--allow-empty', '-qm', 'head')
+                head = repo.head()
+                if name == 'include':
+                    included = self.marker_dir / 'included.config'
+                    included.write_text('[filter "probe"]\n', encoding='utf-8')
+                    repo._git('config', 'include.path', str(included))
+                elif name == 'url-insteadof':
+                    config = repo.root / '.git' / 'config'
+                    config.write_text(
+                        config.read_text(encoding='utf-8')
+                        + '[url "ext::sh /bin/false"]\n'
+                          '\tinsteadOf = https://example.invalid/\n',
+                        encoding='utf-8')
+                elif name == 'legacy-filter':
+                    # ``[section.subsection]`` is a valid legacy header form.
+                    config = repo.root / '.git' / 'config'
+                    config.write_text(
+                        config.read_text(encoding='utf-8')
+                        + '[filter.probe]\n'
+                          f'\tclean = "sh -c {shlex.quote(str(self.marker))}"\n',
+                        encoding='utf-8')
+                elif name == 'http-alternates':
+                    info = repo.root / '.git' / 'objects' / 'info'
+                    info.mkdir(parents=True, exist_ok=True)
+                    (info / 'http-alternates').write_text(
+                        'https://example.invalid/objects\n', encoding='utf-8')
+                else:
+                    repo._git('config', config_key,
+                              f'"sh -c {shlex.quote(str(self.marker))}"')
+                self._reset_marker()
+                details, process_marker = self._assess_with_git_probe(
+                    repo.root, base, head, ['docs/note.md'])
+                self.assertFalse(process_marker.exists(),
+                                 f'{name}: risk assessment started Git first')
+                self.assertFalse(self.marker.exists(),
+                                 f'{name}: risk assessment executed the surface')
+                self.assertNotEqual(details['evidence_status'], 'PRESENT')
+                self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+                self.assertTrue(details['reasons'], f'{name}: no refusal reason')
+
+    def test_git_diff_digest_refuses_executable_repository_config(self):
+        """The public digest helper must preflight too, not just the planner."""
+        base, head = self._commit_range(
+            config_key='filter.probe.clean',
+            command=f'"{sys.executable}" "{self._script()}"')
+        self._reset_marker()
+        process_marker, bin_dir = self._git_process_probe()
+        path = str(bin_dir) + os.pathsep + os.environ['PATH']
+        with mock.patch.dict(os.environ, {'PATH': path}):
+            with self.assertRaises(planning.GitEvidenceError):
+                planning.git_diff_digest(self.repo.root, base, head)
+        self.assertFalse(process_marker.exists(),
+                         'git_diff_digest started Git before proving isolation')
+        self.assertFalse(self.marker.exists(),
+                         'git_diff_digest executed the repository filter')
+
+
+class EmptyDiffPermissionWordingTests(unittest.TestCase):
+    def test_permission_goal_without_high_risk_path_is_not_hd05(self):
+        """Pin the limited recogniser before the docs describe it.
+
+        A permission keyword alone is a review lead: with an empty commit range
+        and an ordinary allowed path it stays ``NEEDS_EVIDENCE`` and carries no
+        decision id. Only destructive/irreversible wording, or a keyword that
+        coincides with a high-risk path or real diff, escalates.
+        """
+        repo = loop_support.GitRepo('agentorch-risk-perm-empty-')
+        self.addCleanup(repo.close)
+        base = repo.commit({'a.md': 'old\n'}, message='base')
+        head = repo.empty_commit('no change')
+        details = planning.assess_risk_details(
+            {'goal': '调整用户权限。', 'allowed_paths': ['a.md'],
+             'git_evidence': loop_support.git_evidence(base, head)},
+            {}, repo_root=repo.root)
+        self.assertEqual(details['changed_paths'], [])
+        self.assertEqual(details['level'], 'NEEDS_EVIDENCE')
+        self.assertIsNone(details['decision_id'])
+        self.assertTrue(any('permission' in reason or '权限' in reason
+                            for reason in details['reasons']), details['reasons'])
 
 
 class PacketCompletenessTests(unittest.TestCase):
