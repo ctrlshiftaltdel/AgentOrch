@@ -233,7 +233,18 @@ def _check_changed_path_lexical(name, allowed):
 
 
 def _check_changed_path(work, name, allowed, config=None):
-    """Reject a changed path that is not an allowed regular file or deletion."""
+    """Reject a changed path that is not an allowed regular file or deletion.
+
+    The project-forbidden rule is evaluated first and for the *actual* path, so
+    a forbidden nested file is reported as forbidden even when a broader task
+    prefix would otherwise allow it.
+    """
+    _safe_rel(name)
+    if config is not None:
+        for forbidden in config['forbidden']:
+            if _overlaps(name, forbidden):
+                raise DeliveryError(f'forbidden path: {name} overlaps the project-forbidden '
+                                    f'path {forbidden}')
     _check_changed_path_lexical(name, allowed)
     import stat as _stat
     current = work
@@ -993,8 +1004,12 @@ def _execute(context, spec, record):
     changed = _changes(work, base)
     if not changed:
         raise DeliveryError('execution produced no changes', 'FAILED')
+    # Re-read the project's authorization immediately before committing: the
+    # policy may have changed while the agent was running.
+    fresh = project_config(context.repo)
+    _authorize_paths(spec['paths'], fresh)
     for name in changed:
-        _check_changed_path(work, name, spec['paths'], context.config)
+        _check_changed_path(work, name, spec['paths'], fresh)
     if _status(work):
         subprocess.run(['git', '--no-optional-locks', 'add', '-A', '--', '.'], cwd=work,
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -1009,8 +1024,10 @@ def _execute(context, spec, record):
     if head == base:
         raise DeliveryError('execution committed nothing', 'FAILED')
     committed = _changes(work, base)
+    fresh = project_config(context.repo)
+    _authorize_paths(spec['paths'], fresh)
     for name in committed:
-        _check_changed_path(work, name, spec['paths'], context.config)
+        _check_changed_path(work, name, spec['paths'], fresh)
     record.update(head=head, changed_paths=committed, phase='verify')
     record['diff_sha256'] = _fingerprint(work, base)
     context.save()
@@ -1117,7 +1134,8 @@ def _require_supported_state(record):
 def _prove_common(context, spec, record, work):
     """Everything that must hold before any side effect on a recorded approval."""
     _repo_identity(context, work)
-    _authorize_paths(spec['paths'], context.config)
+    fresh = project_config(context.repo)
+    _authorize_paths(spec['paths'], fresh)
     ok, why = _facts_match(record, work)
     if not ok:
         raise DeliveryError(f'recorded state cannot be proven: {why}')
@@ -1125,7 +1143,7 @@ def _prove_common(context, spec, record, work):
     if changed != sorted(record.get('changed_paths') or []):
         raise DeliveryError('recorded path set does not match the worktree')
     for name in changed:
-        _check_changed_path(work, name, spec['paths'], context.config)
+        _check_changed_path(work, name, spec['paths'], fresh)
     _reviewer_gate(context, spec, work, record)
     session = record.get('execution_session')
     if not session:
@@ -1183,7 +1201,8 @@ def _reconcile(context, spec, record):
     _require_supported_state(record)
     work = _task_root(spec)
     _repo_identity(context, work)
-    _authorize_paths(spec['paths'], context.config)
+    fresh = project_config(context.repo)
+    _authorize_paths(spec['paths'], fresh)
     phase = record.get('phase')
     if phase in (None, 'execute'):
         if _status(work):
@@ -1205,7 +1224,7 @@ def _reconcile(context, spec, record):
         raise DeliveryError(f'interrupted state cannot be proven: {why}')
     changed = _changes(work, record['base'])
     for name in changed:
-        _check_changed_path(work, name, spec['paths'], context.config)
+        _check_changed_path(work, name, spec['paths'], fresh)
     session = record.get('execution_session')
     if not session:
         raise DeliveryError('interrupted execution has no verifiable session')
@@ -1304,7 +1323,7 @@ def _attempt_retry(context, spec, record):
         raise DeliveryError('retry refused: the previous runner process may still be alive')
     work = _task_root(spec)
     _repo_identity(context, work)
-    _authorize_paths(spec['paths'], context.config)
+    _authorize_paths(spec['paths'], project_config(context.repo))
     if _status(work):
         raise DeliveryError('retry refused: the worktree has uncommitted changes. Inspect them '
                             'and clean up manually; this runner never stashes or resets')
