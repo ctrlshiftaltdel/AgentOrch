@@ -900,8 +900,11 @@ def _plan_tasks(plan):
 
     for node in graph:
         visit(node)
-    absolute = [Path(spec['worktree']).absolute() for spec in specs if spec['worktree']]
-    if len(set(absolute)) != len(absolute):
+    # A worktree may be named through a symlinked parent, as /var is on macOS.
+    # Two strings that name one directory are one worktree: compare canonical
+    # identities so an alias cannot hide two tasks running in the same place.
+    identities = [_canonical(spec['worktree']) for spec in specs if spec['worktree']]
+    if len(set(identities)) != len(identities):
         raise ValueError('two tasks share one worktree')
     return specs
 
