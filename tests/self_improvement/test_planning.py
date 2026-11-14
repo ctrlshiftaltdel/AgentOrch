@@ -7,6 +7,7 @@ repository's own commit range and clean worktree can decide.
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1145,7 +1146,16 @@ class GitIsolationTests(unittest.TestCase):
         # Remove the base commit so the first object read needs the promisor.
         loose = self.repo.root / '.git' / 'objects' / base[:2] / base[2:]
         self.assertTrue(loose.is_file(), 'expected a loose base commit object')
+        # Git for Windows leaves repository objects read-only, so a bare
+        # ``unlink()`` raises PermissionError (WinError 5) there. Clear the
+        # attribute first; POSIX ignores it because deletion is governed by the
+        # directory. The object must genuinely be gone: if it survived, Git
+        # would never consult the promisor and the refusal below would pass
+        # without the fixture exercising anything.
+        loose.chmod(stat.S_IWRITE | stat.S_IREAD)
         loose.unlink()
+        self.assertFalse(
+            loose.exists(), 'promisor fixture still holds the base object')
         self._reset_marker()
         details, process_marker = self._assess_with_git_probe(
             self.repo.root, base, head, ['docs/evil.md'])
@@ -1330,11 +1340,20 @@ class GitIsolationTests(unittest.TestCase):
                 self.assertTrue(details['reasons'], f'{label}: no refusal reason')
 
     def test_section_header_sharing_a_line_cannot_hide_executable_config(self):
-        """Git accepts two section headers on one line; the last one owns the key.
+        """A same-line section header cannot hide executable config.
 
-        ``[safe] [filter "probe"]`` defines ``filter.probe.clean``, so a
-        physical-line parser that keeps only ``safe`` starts Git on an
-        executable surface. Same for ``[safe][credential]``.
+        POSIX Git accepts two section headers on one physical line and the last
+        one owns the following key: ``[safe] [filter "probe"]`` defines
+        ``filter.probe.clean``, so a physical-line parser that keeps only
+        ``safe`` starts Git on an executable surface. Same for
+        ``[safe][credential]``.
+
+        Git for Windows rejects such a line outright (``fatal: bad config
+        line``), so that fixture cannot exist there. The required property is
+        split: where Git accepts the line the planner must see the executable
+        section; where Git rejects it the planner must still fail closed on the
+        unreadable config, with no Git side effect. Neither branch is evidence
+        that the other platform behaves the same.
         """
         command = f'"{sys.executable}" "{self._script()}"'
         cases = (
@@ -1350,10 +1369,17 @@ class GitIsolationTests(unittest.TestCase):
                 base = repo.commit({'docs/note.md': 'note\n'}, message='base')
                 head = repo.empty_commit('head')
                 self._append_config(repo, fragment)
-                listing = repo._git(
-                    'config', '--list', '--local').stdout.decode()
-                self.assertIn(expected, listing,
-                              f'{label}: fixture is not a real Git config')
+                listing = repo._git('config', '--list', '--local', check=False)
+                if listing.returncode == 0:
+                    # This Git reads the line, so the fixture must define the
+                    # executable key before the refusal means anything.
+                    self.assertIn(expected, listing.stdout.decode(),
+                                  f'{label}: fixture is not a real Git config')
+                # A rejecting Git is not a weaker case for the planner: the
+                # config is then unparseable for Git itself and the preflight
+                # must still refuse without starting a process. What the
+                # rejection means is that this platform cannot demonstrate
+                # same-line header parsing, which the POSIX run covers.
                 self._reset_marker()
                 details, process_marker = self._assess_with_git_probe(
                     repo.root, base, head, ['docs/note.md'])
@@ -1607,10 +1633,21 @@ class GitPathspecLiteralTests(unittest.TestCase):
     so a ``return user.is_admin`` -> ``return True`` permission change was
     reported as NEEDS_EVIDENCE with no decision id instead of HIGH / HD-05.
     This uses real repositories because the defect only exists in Git itself.
+
+    Platform limits: ``:`` is not a legal Windows file name (``OSError 22``),
+    so the ``:(...)`` / ``:!`` fixtures only exist on POSIX. No portable file
+    name reproduces the re-reading itself, because Git matches a pathspec
+    against a file of the same spelling exactly before it applies wildcards
+    (``[``, legal on Windows, is not enough). So the colon-name cases skip on
+    Windows with that limitation spelled out, which is *not* a claim that they
+    are safe there, while the reading mechanism the fix depends on
+    (``:(literal)`` honoured, pathspec environment ignored) is still exercised
+    on every platform with an ordinary legal path.
     """
 
     # Real, creatable single-component names whose first characters are Git
     # pathspec magic (``:!`` or ``:(...)``) when read without a literal prefix.
+    # POSIX only: ``:`` is illegal in a Windows file name.
     MAGIC_NAMES = (
         ':(glob)foo.py',
         ':(exclude)foo.py',
@@ -1619,6 +1656,35 @@ class GitPathspecLiteralTests(unittest.TestCase):
         ':(attr:probe)foo.py',
         ':!foo.py',
     )
+    # Legal on every platform: proves the literal prefix is accepted and that
+    # no caller pathspec switch changes the reading, even where no magic-named
+    # fixture can be created.
+    PORTABLE_NAME = 'docs/plain.py'
+    PLATFORM_LIMIT = (
+        'this platform cannot host a file named {name!r}, so that pathspec '
+        'spelling is not exercised here (Windows rejects ":" in file names). '
+        'This skip is not evidence that the spelling is read correctly on '
+        'this platform.')
+
+    def _name_is_creatable(self, name):
+        """Can this platform create a file with exactly *name*?
+
+        Ask the filesystem the fixture will actually use instead of guessing
+        from ``sys.platform``; the answer is what decides whether the fixture
+        can exist here.
+        """
+        base = os.environ.get('TMPDIR') or None
+        probe = Path(tempfile.mkdtemp(prefix='agentorch-risk-name-', dir=base))
+        try:
+            target = probe / name
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text('probe\n', encoding='utf-8')
+            except OSError:
+                return False
+            return True
+        finally:
+            shutil.rmtree(probe, True)
 
     def _magic_range(self, name):
         repo = loop_support.GitRepo('agentorch-risk-pathspec-')
@@ -1635,6 +1701,8 @@ class GitPathspecLiteralTests(unittest.TestCase):
         """The public assessment sees the real diff of a magic named file."""
         for name in self.MAGIC_NAMES:
             with self.subTest(path=name):
+                if not self._name_is_creatable(name):
+                    self.skipTest(self.PLATFORM_LIMIT.format(name=name))
                 repo, base, head = self._magic_range(name)
                 details = planning.assess_risk_details(
                     {'allowed_paths': [name],
@@ -1649,9 +1717,8 @@ class GitPathspecLiteralTests(unittest.TestCase):
                     any('permission' in reason or 'security' in reason
                         for reason in details['reasons']), details['reasons'])
 
-    def test_literal_diff_reading_ignores_pathspec_environment(self):
-        """A caller's pathspec environment cannot change the literal reading."""
-        repo, base, head = self._magic_range(':(glob)foo.py')
+    def _assert_literal_reading_is_environment_proof(self, name):
+        repo, base, head = self._magic_range(name)
         state = {'repo_root': str(repo.root), 'base_sha': base,
                  'head_sha': head}
         values = (
@@ -1664,17 +1731,25 @@ class GitPathspecLiteralTests(unittest.TestCase):
         for variable, value in values:
             with self.subTest(variable=variable, value=value):
                 with mock.patch.dict(os.environ, {variable: value}):
-                    lines = planning._diff_lines_for_path(
-                        state, ':(glob)foo.py')
+                    lines = planning._diff_lines_for_path(state, name)
                 self.assertIn('return True', lines)
                 self.assertIn('return user.is_admin', lines)
         overlay = {variable: value for variable, value in values
                    if variable != 'GIT_LITERAL_PATHSPECS'}
         overlay['GIT_LITERAL_PATHSPECS'] = '1'
         with mock.patch.dict(os.environ, overlay):
-            lines = planning._diff_lines_for_path(state, ':(glob)foo.py')
+            lines = planning._diff_lines_for_path(state, name)
         self.assertIn('return True', lines)
         self.assertIn('return user.is_admin', lines)
+
+    def test_literal_diff_reading_ignores_pathspec_environment(self):
+        """A caller's pathspec environment cannot change the literal reading."""
+        names = (':(glob)foo.py', self.PORTABLE_NAME)
+        for name in names:
+            with self.subTest(path=name):
+                if not self._name_is_creatable(name):
+                    self.skipTest(self.PLATFORM_LIMIT.format(name=name))
+                self._assert_literal_reading_is_environment_proof(name)
 
     def test_git_environment_drops_pathspec_variables(self):
         """The Git child environment never inherits a caller pathspec switch."""
