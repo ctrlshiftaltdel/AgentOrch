@@ -322,6 +322,14 @@ _UNSAFE_GIT_ENV = (
     'GIT_REPLACE_REF_BASE', 'GIT_SHALLOW_FILE', 'GIT_QUARANTINE_PATH',
     'GIT_PREFIX', 'GIT_EXTERNAL_DIFF', 'GIT_DIFF_OPTS',
 )
+# Pathspec matching switches a caller can set in the environment. They change
+# how a path argument is read (literal/glob/case), and GIT_LITERAL_PATHSPECS=1
+# would even disable the explicit ``:(literal)`` prefix. Every Git child
+# environment drops all four so the planner always controls the reading.
+_UNSAFE_PATHSPEC_ENV = (
+    'GIT_LITERAL_PATHSPECS', 'GIT_GLOB_PATHSPECS',
+    'GIT_NOGLOB_PATHSPECS', 'GIT_ICASE_PATHSPECS',
+)
 _SECURITY_CHANGE_RE = re.compile(
     r'(?i)(?:\bonly\s+owner\b|\banyone\b|\bmay\s+approve\b|'
     r'\bis_admin\b|\bpermission(?:s)?\b|\bauthoriz(?:e|ed|ation)\b|'
@@ -729,6 +737,7 @@ def _repository_isolation_error(repo_root):
 def _git_environment():
     env = {key: value for key, value in os.environ.items()
            if key not in _UNSAFE_GIT_ENV
+           and key not in _UNSAFE_PATHSPEC_ENV
            and not key.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_'))}
     env['GIT_NO_REPLACE_OBJECTS'] = '1'
     env['GIT_CONFIG_NOSYSTEM'] = '1'
@@ -1069,15 +1078,31 @@ def _git_evidence_state(proposal, repo_root, required_base_sha=None,
         return _untrusted_evidence(str(exc))
 
 
+def _literal_pathspec(path):
+    """Return *path* as a literal Git pathspec, disabling every magic prefix.
+
+    Git reads the remainder of a ``:(literal)`` pathspec verbatim, so names
+    beginning with ``:`` or ``:(glob)`` cannot be reinterpreted as patterns,
+    exclusions or option-like magic.
+    """
+    return ':(literal)' + path
+
+
 def _diff_lines_for_path(state, path):
     # This internal entry point validates its own state SHAs. The normal planning
     # chain already checked them, but a handcrafted state must not turn
     # ``--ext-diff`` / ``--output=<file>`` into a Git option and a side effect.
     base_sha = _require_diff_sha('base_sha', state['base_sha'])
     head_sha = _require_diff_sha('head_sha', state['head_sha'])
+    # ``--`` stops option parsing but not pathspec magic: a changed path named
+    # ``:(glob)foo.py`` would be read as the pathspec ``glob:foo.py`` and the
+    # diff would silently come back empty. ``:(literal)`` makes Git read the
+    # remainder verbatim. The Git child environment drops the pathspec switches
+    # (see ``_UNSAFE_PATHSPEC_ENV``) so a caller cannot re-enable magic or turn
+    # the literal prefix itself into a literal file name.
     completed = _run_git(state['repo_root'], [
         'diff', '-U0', '--no-color', '--no-ext-diff', '--no-textconv',
-        base_sha, head_sha, '--', path])
+        base_sha, head_sha, '--', _literal_pathspec(path)])
     if completed.returncode not in (0, 1):
         raise GitEvidenceError('cannot read file diff')
     lines = []

@@ -1432,6 +1432,98 @@ class GitIsolationTests(unittest.TestCase):
         return process_marker
 
 
+class GitPathspecLiteralTests(unittest.TestCase):
+    """Changed pathnames are read as literal pathspecs, never as Git magic.
+
+    ``--`` stops option parsing but not pathspec magic. A committed file whose
+    name is literally ``:(glob)foo.py`` was handed to ``git diff`` after ``--``
+    and parsed as the pathspec ``glob:foo.py``; the file diff came back empty,
+    so a ``return user.is_admin`` -> ``return True`` permission change was
+    reported as NEEDS_EVIDENCE with no decision id instead of HIGH / HD-05.
+    This uses real repositories because the defect only exists in Git itself.
+    """
+
+    # Real, creatable single-component names whose first characters are Git
+    # pathspec magic (``:!`` or ``:(...)``) when read without a literal prefix.
+    MAGIC_NAMES = (
+        ':(glob)foo.py',
+        ':(exclude)foo.py',
+        ':(icase)foo.py',
+        ':(top)foo.py',
+        ':(attr:probe)foo.py',
+        ':!foo.py',
+    )
+
+    def _magic_range(self, name):
+        repo = loop_support.GitRepo('agentorch-risk-pathspec-')
+        self.addCleanup(repo.close)
+        repo.write(name, 'def f(user):\n    return user.is_admin\n')
+        repo._git('add', '-A')
+        repo._git('commit', '-qm', 'base')
+        base = repo.head()
+        repo.write(name, 'def f(user):\n    return True\n')
+        repo._git('commit', '-qam', 'head')
+        return repo, base, repo.head()
+
+    def test_magic_named_path_is_classified_from_its_real_diff(self):
+        """The public assessment sees the real diff of a magic named file."""
+        for name in self.MAGIC_NAMES:
+            with self.subTest(path=name):
+                repo, base, head = self._magic_range(name)
+                details = planning.assess_risk_details(
+                    {'allowed_paths': [name],
+                     'git_evidence': loop_support.git_evidence(base, head)},
+                    {}, repo_root=repo.root)
+                self.assertEqual(details['evidence_status'], 'PRESENT',
+                                 details['reasons'])
+                self.assertIn(name, details['changed_paths'])
+                self.assertEqual(details['level'], 'HIGH', details['reasons'])
+                self.assertEqual(details['decision_id'], 'HD-05')
+                self.assertTrue(
+                    any('permission' in reason or 'security' in reason
+                        for reason in details['reasons']), details['reasons'])
+
+    def test_literal_diff_reading_ignores_pathspec_environment(self):
+        """A caller's pathspec environment cannot change the literal reading."""
+        repo, base, head = self._magic_range(':(glob)foo.py')
+        state = {'repo_root': str(repo.root), 'base_sha': base,
+                 'head_sha': head}
+        values = (
+            ('GIT_LITERAL_PATHSPECS', '1'),
+            ('GIT_LITERAL_PATHSPECS', '0'),
+            ('GIT_GLOB_PATHSPECS', '1'),
+            ('GIT_NOGLOB_PATHSPECS', '1'),
+            ('GIT_ICASE_PATHSPECS', '1'),
+        )
+        for variable, value in values:
+            with self.subTest(variable=variable, value=value):
+                with mock.patch.dict(os.environ, {variable: value}):
+                    lines = planning._diff_lines_for_path(
+                        state, ':(glob)foo.py')
+                self.assertIn('return True', lines)
+                self.assertIn('return user.is_admin', lines)
+        overlay = {variable: value for variable, value in values
+                   if variable != 'GIT_LITERAL_PATHSPECS'}
+        overlay['GIT_LITERAL_PATHSPECS'] = '1'
+        with mock.patch.dict(os.environ, overlay):
+            lines = planning._diff_lines_for_path(state, ':(glob)foo.py')
+        self.assertIn('return True', lines)
+        self.assertIn('return user.is_admin', lines)
+
+    def test_git_environment_drops_pathspec_variables(self):
+        """The Git child environment never inherits a caller pathspec switch."""
+        overlay = {name: '1' for name in (
+            'GIT_LITERAL_PATHSPECS', 'GIT_GLOB_PATHSPECS',
+            'GIT_NOGLOB_PATHSPECS', 'GIT_ICASE_PATHSPECS')}
+        with mock.patch.dict(os.environ, overlay):
+            env = planning._git_environment()
+        for name in overlay:
+            # Assert on a bool: an ``assertNotIn`` failure would echo the whole
+            # copied environment, including unrelated secrets, into the report.
+            self.assertFalse(
+                name in env, f'{name} leaked into the Git child environment')
+
+
 class EmptyDiffPermissionWordingTests(unittest.TestCase):
     def test_permission_goal_without_high_risk_path_is_not_hd05(self):
         """Pin the limited recogniser before the docs describe it.

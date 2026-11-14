@@ -110,6 +110,7 @@
 `planning.py` 的 `assess_risk()` 只用仓库自己解析的 Git 证据，并把调用者提供的 `base_sha` / `head_sha` 参数与 `git_evidence` 交叉校验。**这些参数只是定位符和一致性检查，不是权威任务载体认证**：真实适配器未接入，任何调用者都可以传相同的字符串。规划器验证两个提交存在、base 是 head 的祖先、`HEAD` 与 head 一致、工作树干净且不是浅克隆，然后用 Git 生成完整 raw / numstat diff。它还会：
 
 - 屏蔽 Git replace refs，并覆盖 `diff.ignoreSubmodules`、`core.fileMode`、`core.symlinks`、`core.ignoreCase`、external diff / textconv / 系统与全局配置等可隐藏 changed paths 的配置与环境；
+- 把 changed path 作为**字面 pathspec**（`:(literal)` 前缀）传给 `git diff`，并从 Git 子进程环境中丢弃 `GIT_LITERAL_PATHSPECS` / `GIT_GLOB_PATHSPECS` / `GIT_NOGLOB_PATHSPECS` / `GIT_ICASE_PATHSPECS`：`--` 只阻止选项注入，不阻止 pathspec 魔法，文件名本身以 `:(glob)`、`:(exclude)`、`:!` 等开头时不能被误读为模式、排除或大小写开关；
 - **在任何 Git 命令之前**用纯文件读取检查仓库本地配置与 attributes：若定义了 `filter.<driver>.clean` / `.process`、`include` / `includeIf`，或 attributes 声明了 `filter=`，则无法在不执行仓库命令的情况下隔离，直接失败关闭并标明未实现；同样的检查覆盖工作树内的**子模块 / 嵌套仓库**（父仓库的 `git status` 会进入已初始化子模块并运行它自己的 clean filter），以及会让只读命令发起 fetch / remote helper 的 **promisor / partial-clone remote、`ext::` transport、`objects/info/http-alternates`**。`core.fsmonitor` 与 hooks 通过 `-c core.fsmonitor=false` / `-c core.hooksPath=<空>` 显式禁用，lazy fetch 通过 `GIT_NO_LAZY_FETCH=1` 关闭；每条 Git 命令（包括公开的 diff 摘要函数）启动前都重复该预检；
 - 拒绝带 assume-unchanged / skip-worktree 的索引、未提交 / 未跟踪工作树、以及落在 `allowed_paths` 内的 ignored 文件；
 - 记录 Git 快照，并在登记 / 交付前复查；快照变化即阻塞。
