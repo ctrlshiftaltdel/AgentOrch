@@ -91,7 +91,9 @@ fail-closed:
 * verification runs in its own process group so a timeout kills the whole tree.
   Windows has no process group a plain ``Popen`` can signal, so the check's PID
   tree is stopped with ``taskkill /T`` instead; a descendant that detaches from
-  that tree is still not guaranteed to be caught.
+  that tree is still not guaranteed to be caught. A timeout stops the run at
+  that check — no later verification command, Agent or Git write starts — and a
+  kill that cannot be proven is recorded as unproven, never as killed.
 
 Nothing here is a sandbox. Worktrees, prompts, path checks and ``--standalone``
 do not restrict OpenCode's configured permissions: V2 can reach the host
@@ -1238,27 +1240,38 @@ def _classify_stream(returncode, output):
 
 
 def _kill_group(process):
+    """Stop the check's process group; return True only when that is proven.
+
+    A ``False`` answer means the surviving tree cannot be ruled out, and every
+    caller must report the timeout without claiming a kill.
+    """
     if os.name == 'nt':
         # Windows has no process group a plain ``Popen`` can signal: killing the
         # direct child leaves the children it started running. ``taskkill /T``
         # walks the live tree of that PID, which is how the whole check is
         # stopped without a job object. Killing the direct child afterwards is a
-        # no-op when the tree kill already took it.
+        # no-op when the tree kill already took it. Only a zero exit proves that
+        # the tree is gone; a failed or missing ``taskkill`` (access denied, PID
+        # reused, no such command) leaves descendants unaccounted for, so it is
+        # reported as unproven rather than assumed.
+        killed = False
         try:
-            subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)],
-                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, check=False)
+            result = subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, check=False)
+            killed = result.returncode == 0
         except OSError:
             pass
         try:
             process.kill()
         except OSError:
             pass
-        return
+        return killed
     try:
         os.killpg(os.getpgid(process.pid), signal.SIGKILL)
     except (OSError, AttributeError):
-        pass
+        return False
+    return True
 
 
 def _popen(argv, **kwargs):
@@ -1281,13 +1294,15 @@ def opencode(worktree, prompt, role, *, agent_name=None, timeout=1800):
     try:
         output, _ = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        _kill_group(process)
+        killed = _kill_group(process)
         try:
             process.communicate(timeout=30)
         except subprocess.TimeoutExpired:
             pass
+        detail = ('timed out; process group killed' if killed else
+                  'timed out; could not prove the process group was terminated')
         return {'exit_code': None, 'session_id': None, 'text': '', 'timeout': True,
-                'detail': 'timed out; the process group was killed'}
+                'detail': detail}
     return _classify_stream(process.returncode, output or '')
 
 
@@ -1557,13 +1572,15 @@ def _run_check(command, work, timeout):
         output, _ = process.communicate(timeout=timeout)
         entry.update(exit_code=process.returncode, output_tail=(output or '')[-1000:])
     except subprocess.TimeoutExpired:
-        _kill_group(process)
+        killed = _kill_group(process)
         try:
             process.communicate(timeout=30)
         except subprocess.TimeoutExpired:
             pass
         entry.update(exit_code=None, timeout=True,
-                     output_tail='timed out; process group killed')
+                     output_tail=('timed out; process group killed' if killed else
+                                  'timed out; could not prove the process group was '
+                                  'terminated'))
     return entry
 
 
@@ -1831,13 +1848,18 @@ def _verify(context, spec, record):
         # check starts, so a profile that the previous check widened cannot
         # authorize the next one.
         _reviewer_gate(context, spec, work, record)
-        checks.append(_run_check(command, work, spec['raw'].get('timeout', 1800)))
+        check = _run_check(command, work, spec['raw'].get('timeout', 1800))
+        checks.append(check)
         record['verification'] = list(checks)
         context.save()
+        if check.get('timeout'):
+            # A timed-out check may still have live descendants writing to the
+            # worktree, and the kill that was attempted may not be proven. Stop
+            # here: no later verification command, profile query, Agent or Git
+            # write may start, and the run is not retryable automatically.
+            raise DeliveryError('a verification process tree may still be running; '
+                                'refusing to continue or retry automatically')
         _require_live_config(context, spec)
-    if any(check.get('timeout') for check in checks):
-        raise DeliveryError('a verification process tree may still be running; refusing to '
-                            'continue or retry automatically')
     if not _all_zero(checks):
         raise DeliveryError('verification failed', 'FAILED')
     if _head(work) != record['head'] or _fingerprint(work, record['base']) != record['diff_sha256']:

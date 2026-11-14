@@ -1710,6 +1710,53 @@ class CheckRunnerTests(DeliveryCase):
         time.sleep(3)
         self.assertFalse((work / 'child-marker').exists())
 
+    def test_a_windows_tree_kill_is_reported_only_when_taskkill_proved_it(self):
+        # `taskkill /T` is the only proof that the whole tree is gone on
+        # Windows. A non-zero exit (or a failed spawn) leaves descendants
+        # unaccounted for, so the caller must be told the kill was not proven.
+        process = mock.Mock(pid=4242)
+        failed = mock.Mock(returncode=128)
+        with mock.patch.object(delivery.os, 'name', 'nt'), \
+                mock.patch.object(delivery.subprocess, 'run', return_value=failed) as run:
+            self.assertIs(delivery._kill_group(process), False)
+        self.assertEqual(run.call_args.args[0][:1], ['taskkill'])
+        process.kill.assert_called()
+        succeeded = mock.Mock(returncode=0)
+        with mock.patch.object(delivery.os, 'name', 'nt'), \
+                mock.patch.object(delivery.subprocess, 'run', return_value=succeeded):
+            self.assertIs(delivery._kill_group(process), True)
+        with mock.patch.object(delivery.os, 'name', 'nt'), \
+                mock.patch.object(delivery.subprocess, 'run', side_effect=OSError('gone')):
+            self.assertIs(delivery._kill_group(process), False)
+
+    def test_a_timeout_never_claims_a_tree_kill_it_cannot_prove(self):
+        process = mock.Mock(pid=4242)
+        process.communicate.side_effect = subprocess.TimeoutExpired('check', 1)
+        work = self.worktree('one')
+        with mock.patch.object(delivery, '_popen', return_value=process), \
+                mock.patch.object(delivery, '_kill_group', return_value=False):
+            entry = delivery._run_check([PY, '-c', 'pass'], work, timeout=1)
+        self.assertIsNone(entry['exit_code'])
+        self.assertIs(entry['timeout'], True)
+        self.assertIn('could not prove', entry['output_tail'])
+        self.assertNotIn('killed', entry['output_tail'])
+        with mock.patch.object(delivery, '_popen', return_value=process), \
+                mock.patch.object(delivery, '_kill_group', return_value=True):
+            entry = delivery._run_check([PY, '-c', 'pass'], work, timeout=1)
+        self.assertIs(entry['timeout'], True)
+        self.assertEqual(entry['output_tail'], 'timed out; process group killed')
+
+    def test_a_timed_out_session_never_claims_a_kill_it_cannot_prove(self):
+        work = self.worktree('one')
+        process = mock.Mock(pid=4242)
+        process.communicate.side_effect = subprocess.TimeoutExpired('opencode', 1)
+        with mock.patch.object(delivery, '_popen', return_value=process), \
+                mock.patch.object(delivery, '_kill_group', return_value=False):
+            result = delivery.opencode(work, 'prompt', 'execution', timeout=1)
+        self.assertIs(result['timeout'], True)
+        self.assertIn('could not prove', result['detail'])
+        self.assertNotIn('killed', result['detail'])
+
     def test_a_recorded_pid_is_provably_dead_before_a_resume_continues(self):
         # The resume gate asks whether the previous runner can still write.
         # A live PID (this process) must never answer "dead", and a process the
@@ -2169,6 +2216,35 @@ class IssuePlanTests(DeliveryCase):
 
 
 class TimeoutTests(DeliveryCase):
+    def test_a_timeout_stops_the_run_before_the_next_verification_command(self):
+        # A timed-out check may leave descendants behind. The next command is
+        # another external side effect, so it must not start once the timeout is
+        # recorded -- and neither may the profile query that precedes it.
+        work = self.worktree('one')
+        first, second = self.root / 'first-check-ran', self.root / 'second-check-ran'
+        task = self.task('one', work, ['a.txt'], verify=[
+            [PY, '-c',
+             f'import pathlib,time; pathlib.Path({str(first)!r}).write_text("x"); '
+             'time.sleep(10)'],
+            [PY, '-c', f'import pathlib; pathlib.Path({str(second)!r}).write_text("x")']])
+        task['timeout'] = 1
+        plan = self.plan([task])
+
+        def profiles(where):
+            if first.exists():
+                raise AssertionError('the profile was queried after the timeout')
+            return self.profiles(where)
+
+        state, agents = self.run_delivery(plan, profiles=profiles)
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('process tree', record['reason'])
+        self.assertTrue(first.exists())
+        self.assertFalse(second.exists())
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertEqual(len(record['verification']), 1)
+        self.assertTrue(record['verification'][0]['timeout'])
+
     def test_timeout_is_blocked_and_not_retryable(self):
         work = self.worktree('one')
         task = self.task('one', work, ['a.txt'],
