@@ -1095,6 +1095,17 @@ class RestoredContractTests(DeliveryCase):
         self.assertEqual(state['tasks']['good']['status'], 'PREPARED')
         self.assertEqual(agents.calls, ['execution', 'review'])
 
+    def test_an_invalid_or_missing_task_worktree_does_not_stop_other_tasks(self):
+        good = self.worktree('good')
+        bad = self.task('bad', self.root / 'missing', ['x.txt'])
+        bad['worktree'] = ''
+        plan = self.plan([bad, self.task('good', good, ['a.txt'])])
+        state, agents = self.run_delivery(plan)
+        self.assertEqual(state['tasks']['bad']['status'], 'BLOCKED')
+        self.assertIn('configuration is invalid', state['tasks']['bad']['reason'])
+        self.assertEqual(state['tasks']['good']['status'], 'PREPARED')
+        self.assertEqual(agents.calls, ['execution', 'review'])
+
     def test_stream_and_transcript_disagreement_blocks_approval(self):
         work = self.worktree('one')
 
