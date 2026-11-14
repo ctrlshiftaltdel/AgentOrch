@@ -105,12 +105,11 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 
 真实调用后的摘要，未包含会话标识或个人路径；原始 journal 只在本机受保护目录，不入库。
 
-- 在 AgentOrch 本仓库（`github` edition）对一个文档任务做了 prepare-only 运行：真实执行会话与真实审查会话均为 `succeeded`、目录为该任务 worktree、Agent 不同；验证命令退出 0；审查 transcript 中全部验收标准 `PASS`、结论 `APPROVE` 且绑定该 commit 与 diff 指纹；最终 `PREPARED`，未改动目标分支与 `main`。
-- 在同一计划上请求自动合并时，运行在启动 Agent 之前被拒绝（见 §1）。
-- 真实失败也保留：同一任务的审查前两次只给出散文而未给出机器可读结论，任务停在 `REVIEW_REJECTED`，没有被当作批准；第三次审查在提示中提供了 runner 已从 Git 核验的 head、diff 指纹与变更路径后，逐条 AC 给出 `PASS` 并 `APPROVE`，最终 `PREPARED`、CLI 退出码 0（仅表示可供人工合并）。
-- 另一次自动化尝试被运行前的 edition 检查拒绝，未启动 Agent；依赖任务在上游仅 `PREPARED` 时保持 `PENDING`。
+- **较早候选版本**上，在 AgentOrch 本仓库（`github` edition）对一个文档任务做过 prepare-only 运行：真实执行与审查会话均为 `succeeded`、目录为该任务 worktree、Agent 不同；验证命令退出 0；审查 transcript 中全部验收标准 `PASS`、结论绑定该 commit 与 diff 指纹；最终 `PREPARED`，未改动目标分支与 `main`。该运行是历史证据，**不能代表当前 head 的完整实现**。
+- **当前 head** 的同一任务重跑：执行、提交与验证（退出 0）完成，但审查会话在 provider 侧返回 401（`User not found`），没有可用会话与结论；runner 按设计停在 `REVIEW_REJECTED`，没有伪造审查或继续。该失败是外部服务状态，不是审查门的否定结论。
+- 自动合并请求在启动 Agent 之前被拒绝；依赖任务在上游仅 `PREPARED` 时保持 `PENDING`；edition 缺失/非法在派发前拒绝。
 
-**没有验证、也不宣称的事项**：自动合并、GitHub PR/CI 接线、Issue/PR 状态同步、从 `docs/implementation-plan.md` 自动选任务、MCP/插件通道与 OS 隔离、模型独立、Windows 真机、真实 CI 触发。
+**没有验证、也不宣称的事项**：当前 head 上的真实审查结论、自动合并、GitHub PR/CI 接线、Issue/PR 状态同步、从 `docs/implementation-plan.md` 自动选任务、MCP/插件通道与 OS 隔离、模型独立、Windows 真机、真实 CI 触发。
 
 ## 7. 已知限制
 
