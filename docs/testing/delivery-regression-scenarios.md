@@ -22,7 +22,7 @@
 
 | 组 | 覆盖 | 正负构成 |
 |---|---|---|
-| A 治理 / 授权 | 证据矩阵、授权撤销、审计上下文、重复写、越权自批；自我完善候选：来源证据、不可达 / 无权限、提示词注入、去重、冲突、未验证缺陷、硬风险 | A1 正向；A2–A7 负向；A8 / A15 正向；A9–A14 负向 |
+| A 治理 / 授权 | 证据矩阵、授权撤销、审计上下文、重复写、越权自批；自我完善候选：来源证据、不可达 / 无权限、提示词注入、去重、冲突、未验证缺陷、硬风险 | A1 正向；A2–A7 负向；A8 / A15 控制组（不自动登记）；A9–A14 负向 |
 | B 迁移 / 版本 | 旧格式升级、幂等重跑、半迁移、版本混用；安全更新：干净升级、双边冲突、坏清单、路径穿越、未知文件、上游删除、无基线、未提交改动、半更新、回滚失败 | B1 正向；B2–B4 负向；B5 正向；B6–B14 负向 |
 | C 跨模块闭环 | 冻结规则接线、所有权、事件屏障、非断言异常；共享状态调用点、回滚完整性、锁生命周期、部分提交、吞错；架构契约对齐（适配器隔离、单一应用服务、证据标签、终局语义、能力声明、依赖方向与循环） | C1 正向；C2–C5 负向；C6 正向；C7–C11 负向；C12 正向；C13–C17 负向；C18 正向；C19 正向；C20 负向 |
 | D 编排底座 | edition、资源锁、旧 head、修复轮数、阶段收口；指标诚实性（窗口 / 样本 / 缺失 / 覆盖，空输入不等于 0，不发明分数） | D1 正向；D2–D7 负向（D6 含正向子表）；D8 正向；D9 负向 |
@@ -78,14 +78,14 @@
 | D5 | D | 负向 | 任务已走完三轮审查—修复 | 请求第四轮 | 状态机：第四轮转 `BLOCKED` 并在备注写明上限 | 状态、重试计数、备注；沙箱删除 |
 | D6 | D | 负向 | 已填写的阶段审计结论表（含正向子表） | 一行 `BLOCKING`，一行 `NEEDS_HUMAN_DECISION` | 阶段审计：干净表 0 命中；两类结论禁止收口声明 | 三张表的命中文本；纯内存 |
 | D7 | D | 负向 | AC 已勾选但证据矩阵为空 | 执行者没有任何证据却声称完成 | G1/G6：空矩阵、无证据 AC、直接 `VERIFIED` 全部拒绝 | 校验命中、拒绝消息、锁计数；沙箱删除 |
-| A8 | A | 正向 | 一个合成已合并 PR、一个合成 commit、一次 CI 运行，以及一个含真实 Git 无内容变更提交区间的临时仓库 | 无（控制组） | 自我完善：经验必须经 `VERIFIED` → 重新分类 `GENERAL_LESSON` → `GENERALIZED` 才可计划；真实 Git 无内容变更才 `READY`，载体报告 `executed=False` | 扫描状态 / 证据数、lesson ID 与证据 URL、proposal 状态、带证据矩阵表头的登记 payload；内存来源替身 + 沙箱 Git 仓库，沙箱删除 |
+| A8 | A | 正向 | 一个合成已合并 PR、一个合成 commit、一次 CI 运行，以及一个含真实 Git 无内容变更提交区间的临时仓库 | 无（控制组） | 自我完善：经验必须经 `VERIFIED` → 重新分类 `GENERAL_LESSON` → `GENERALIZED` 才可计划；任务包完整但空 diff 不能证明目标 / 范围 / 授权，因此停在 `BLOCKED` / `NEEDS_EVIDENCE`，零登记（无权威载体适配器与独立审查） | 扫描状态 / 证据数、lesson ID 与证据 URL、proposal 状态与风险级别、`required_evidence`、带证据矩阵表头的可审阅 packet；内存来源替身 + 沙箱 Git 仓库，沙箱删除 |
 | A9 | A | 负向 | 公共来源的 pulls 端点网络失败 / 403；另一个 `authorized_private` 来源同样 403 | 来源不可读，扫描没有任何证据 | 来源信任：`BLOCKED` 且原因保留；闭环报 `SCAN_INCOMPLETE`；私有来源升级为 `NEEDS_HUMAN_DECISION`；不产生 lesson、不登记任务 | 每例的 scan_status / blocked_reason、loop 状态、决策清单、lesson 数；沙箱删除 |
 | A10 | A | 负向 | 合成 PR 标题携带“忽略规则 / 发送令牌”类指令形状 | 把来源文本当指令执行 | 不可信数据：形状被计数、URL 被标记、文本只作数据保存；分析者标题与允许路径不变；不产生任务 | 指令 flag、可疑 URL、lesson 标题、proposal 允许路径、`data_cell` 输出；沙箱删除 |
 | A11 | A | 负向 | 两个合成 PR 用同一根因 / 影响分析 | 同一指纹因第二个证据 URL 再建一条 lesson | 去重：第二次摄取报 `duplicate`，只保留一条记录且合并两个证据 URL；未泛化记录不能成为任务 | ingestion 类型、存活 lesson ID 与证据 URL、`duplicate_of`、计划状态；沙箱删除 |
 | A12 | A | 负向 | 一条已 `VERIFIED` 的经验带一个 `OPEN` `CONTRADICTS` 冲突 | 冲突被忽略，继续按不完整任务包计划 | 规划：先抛 `HD-04` `NEEDS_HUMAN_DECISION`，任务包检查不得掩盖冲突；闭环停在该状态且零登记 | proposal 状态 / 决策 ID / 原因、loop 状态、决策清单、登记数；纯内存 |
 | A13 | A | 负向 | 一条 `E1_SOURCE_ARTIFACT` + `OBSERVED` 的缺陷记录 | 未验证经验直接计划成实现任务 | 生命周期：`can_generate_task` 拒绝、规划返回 `NO_TASK`、状态机拒绝 `OBSERVED → GENERALIZED`（跳过验证） | 资格原因、proposal 状态、状态机拒绝文本；纯内存 |
 | A14 | A | 负向 | 伪 SHA + 调用者自造 Diff + 假授权；真实 Git 仓库中的 `docs/design/access.md` 权限文字变化、`src/auth.py` 权限代码变化，以及真实提交区间被截断为单个 allowed path | 调用者 Diff / SHA / 授权决定风险，或真实权限变化被自动放行 | 风险门：伪造与截断证据为 `BLOCKED` / `NEEDS_EVIDENCE`，零登记、零 Owner 决策；真实访问策略与认证代码变化为 `HD-05` `NEEDS_HUMAN_DECISION`，仍零登记 | proposal 状态 / 风险级别 / changed paths / required evidence / 决策 ID、loop 状态、登记数；真实沙箱 Git 仓库，沙箱删除 |
-| A15 | A | 正向 | 合成来源扫描 + 一条经验走到 `GENERALIZED` + 含真实 Git 无内容变更提交区间的临时仓库 + 合成载体 | 无（控制组） | 端到端：触发路由 → 状态恢复 → 扫描分类 → 计划门 → 登记一条 `executed=False` 的任务 → 一个已执行检查记 `PASS`、一个未执行命令记 `NOT_RUN` → 输出收口报告 | trigger / state / scan / plan / registration / validation / not_run 字段与报告章节；内存载体 + 沙箱 Git 仓库，沙箱删除 |
+| A15 | A | 正向 | 合成来源扫描 + 一条经验走到 `GENERALIZED` + 含真实 Git 无内容变更提交区间的临时仓库 + 合成载体 | 无（控制组） | 端到端：触发路由 → 状态恢复 → 扫描分类 → 计划门（零登记，空 diff 无法证明低风险）→ 一个已执行检查记 `PASS`、一个未执行命令记 `NOT_RUN` → 输出收口报告 | trigger / state / scan / plan / blocked / validation / not_run 字段与报告章节；内存载体 + 沙箱 Git 仓库，沙箱删除 |
 | B5 | B | 正向 | 合成 v1.5 项目（含基线清单）+ v1.6 发行 zip | 无（控制组） | 安全更新：包校验全过、字节与清单被应用、项目自有文件不动、备份验证、独立应用后回归 0 命中 | 报告 result / 版本 / 10 项检查 / 备份 / 回滚、回归结论、命令退出码；合成树与 zip 随沙箱删除 |
 | B6 | B | 负向 | 干净升级前本地改过 `AGENTS.md` | 本地与上游同时修改同一路径 | 三方分类：`STOPPED_CONFLICT`、`THREE_WAY_CONFLICT`、零写入、`HD-10` | 报告 result、`AGENTS.md` 分类项、决策 ID、项目快照；沙箱删除 |
 | B7 | B | 负向 | 发行 zip 的 `MANIFEST.json` 声明 `schema_version: 2` | 不支持的清单结构被接受 | 包校验：停在 `MANIFEST_SCHEMA` 的 `STOPPED_UNSAFE_PACKAGE`，后续检查 `NOT_RUN`，零写入 | 报告 result、检查结果、项目快照；沙箱删除 |

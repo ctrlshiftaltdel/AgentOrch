@@ -95,6 +95,7 @@
 以下任一情况在真实 Git 证据支持时进入 `NEEDS_HUMAN_DECISION`，决策 ID 只引用 [`entrypoints-and-decisions.md`](entrypoints-and-decisions.md) §5：
 
 - 实际改变权限 / 安全边界、锁 / 状态机、数据迁移、外部依赖、隐私、破坏兼容或不可逆动作 → `HD-05`（契约 / schema 级改为 `HD-13`）。
+- 任务目标 / 允许范围本身声明破坏性或不可逆动作（例如「删除全部用户数据」），而当前 diff 无法证明它时同样 `HD-05`；空 diff 不能作为「无风险」的反证。
 - Lesson 冲突无法靠证据解除 → `HD-04`。
 - 把 Lesson 提升为通用规则且影响上述边界 → `HD-03`。
 - 来源访问授权问题 → `HD-01` / `HD-02`。
@@ -107,7 +108,7 @@
 
 调用者提供的 Diff、`changed_paths`、40 位 SHA 字符串、`low_risk` / `approved` 布尔值、spec 内 `review` 或 `authorization` 字段都不是证据；伪造或截断的 Diff 不能缩小真实 changed paths。`allowed_paths` 中的绝对路径、反斜杠、通配符和任何 `..` 段在任何证据之前直接拒绝，不能被其他合法路径或 Diff 冲掉。
 
-除空 diff 且目标 / 范围无风险外，**没有自动 `LOW`**：纯空白等价、Markdown 代码块 / 命令、普通文档、代码和治理面都不再凭后缀或空白自动放行。任何非空内容变化都保持 `NEEDS_EVIDENCE` / `BLOCKED`，并写出结构化 `required_evidence` 与 `next_action`。
+空 diff 不能证明拟实施目标、允许范围或授权安全，因此**没有自动 `LOW`**：空 diff / 空 tree 与纯空白等价、Markdown 代码块 / 命令、普通文档、代码和治理面一样，都不凭后缀或空白自动放行。任何非空内容变化都保持 `NEEDS_EVIDENCE` / `BLOCKED`，并写出结构化 `required_evidence` 与 `next_action`。因此本切片的规划阶段不会产出 `READY`（`LOW` 保留给接入后的取证路径）：任务包完整性、依赖与 `required_evidence` 照常记录，登记必须等权威载体适配器与独立审查接入。
 
 **当前切片没有接入权威任务载体适配器或真实独立审查**：`state.task` 只能作为任务定位符；spec / `state.task` / 调用者提供的 review、authorization 或自算摘要都不会触发 READY。`review_status` 明确为 `NOT_WIRED`。未来路径必须由独立适配器从 local SQLite / GitHub 认证 PR Review / Owner 权限取证，并绑定 task id、目标与 allowed-path hash、base/head、完整 diff、reviewer 身份/角色/独立性与有效期/撤销；在这条链路实现前，普通错字也只能停在 `NEEDS_EVIDENCE`，不能声称已自动推进。治理面及真实权限 / 安全 / 锁 / 状态机 / 数据 / 外部 / 不可逆变化仍升级 `NEEDS_HUMAN_DECISION`。二进制、rename / copy / type change、symlink、submodule、删除、dirty / untracked / hidden-index 工作树、缺失或不可验证的提交都显式阻塞。两种任务载体 payload 记录 Git base/head、diff SHA-256、changed paths、review status 与 next_action，但记录的是待取证状态，不是授权。
 

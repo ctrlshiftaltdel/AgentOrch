@@ -1,8 +1,10 @@
 """AC-2 / AC-3 / AC-5 / AC-6: the loop, its carriers and the closure report.
 
 The end-to-end case uses the real #49 pipeline with a synthetic ``gh`` runner, so
-"trigger → restore → collect → plan → register → report" is exercised without a
-network, a token, a real Issue or a real command execution.
+"trigger → restore → collect → plan → report" is exercised without a network, a
+token, a real Issue or a real command execution. Planning never returns ``READY``
+in this slice (see :func:`low_risk_gate`), so the registration plumbing is
+exercised through an explicitly patched low-risk gate.
 """
 import json
 import tempfile
@@ -30,6 +32,7 @@ def run_loop(**overrides):
 
 
 def ready_case(**overrides):
+    """A lesson + spec shaped like a READY candidate (it still needs real evidence)."""
     record = loop_support.general_lesson()
     payload = {
         'lesson_records': [record],
@@ -39,6 +42,28 @@ def ready_case(**overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def low_risk_gate(details=None):
+    """Stand-in for the not-yet-wired low-risk evidence path.
+
+    ``planning.assess_risk_details`` never returns ``LOW`` in this slice: an empty
+    change set proves nothing and a non-empty one always needs a trusted review.
+    The loop's registration plumbing therefore can only be exercised by patching
+    the gate, exactly as it will be reached once the authoritative carrier adapter
+    and independent review are wired.
+    """
+    payload = {
+        'level': 'LOW', 'decision_id': None, 'reasons': [], 'leads': [],
+        'required_evidence': [], 'review_status': 'NOT_APPLICABLE',
+        'next_action': 'NONE', 'evidence_status': 'PRESENT',
+        'changed_paths': [], 'snapshot': None, 'diff_sha256': None,
+        'git_base_sha': loop_support.DEFAULT_BASE_SHA,
+        'git_head_sha': loop_support.HEAD, 'task_id': 'TASK-0001',
+        'limitations': [],
+    }
+    payload.update(details or {})
+    return mock.patch.object(planning, 'assess_risk_details', return_value=payload)
 
 
 class NoNewEvidenceTests(unittest.TestCase):
@@ -161,14 +186,58 @@ class GateTests(unittest.TestCase):
 
     def test_registration_rechecks_git_evidence(self):
         carrier = loop_support.RecordingCarrier()
-        with mock.patch.object(planning, 'recheck_git_evidence',
-                               return_value=(False, ['worktree changed'])):
+        with low_risk_gate(), mock.patch.object(
+                planning, 'recheck_git_evidence',
+                return_value=(False, ['worktree changed'])):
             outcome = run_loop(carrier=carrier, **ready_case())
         self.assertEqual(outcome.status, 'BLOCKED')
         self.assertEqual(outcome.report['registrations'], [])
         self.assertEqual(carrier.calls, [])
         self.assertTrue(any(item.get('kind') == 'git_recheck'
                             for item in outcome.report['blocked']))
+
+    def test_complete_packet_without_risk_evidence_is_never_registered(self):
+        carrier = loop_support.RecordingCarrier()
+        outcome = run_loop(carrier=carrier, **ready_case())
+        self.assertEqual(outcome.status, 'BLOCKED')
+        self.assertEqual(outcome.report['registrations'], [])
+        self.assertEqual(carrier.calls, [])
+        proposal = outcome.report['plan']['proposals'][0]
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertEqual(proposal['changed_paths'], [])
+        self.assertEqual(proposal['review_status'], 'NOT_WIRED')
+        self.assertTrue(proposal['required_evidence'])
+        self.assertTrue(any(item.get('kind') == 'proposal'
+                            for item in outcome.report['blocked']))
+
+    def test_destructive_empty_commit_goal_reaches_the_owner_not_a_task(self):
+        repo = loop_support.GitRepo('agentorch-loop-destructive-')
+        self.addCleanup(repo.close)
+        base = repo.commit({'docs/example.md': 'old line  \n'}, message='base')
+        head = repo.empty_commit('goal only, no content change')
+        scope = ['scripts/']
+        record = loop_support.general_lesson()
+        spec = loop_support.spec(
+            goal='删除全部用户数据。', allowed_paths=scope,
+            git_evidence=loop_support.git_evidence(base, head))
+        carrier = loop_support.RecordingCarrier()
+        outcome = run_loop(
+            carrier=carrier, repo_root=repo.root,
+            state=loop_support.state(
+                base_sha=base, head_sha=head,
+                task={'task_id': 'TASK-MASTER', 'base_sha': base, 'head_sha': head,
+                      'executor': 'executor-1',
+                      'review': loop_support.review_receipt(
+                          repo.root, base, head, scope)}),
+            lesson_records=[record], specs={record['lesson_id']: spec},
+            scan_report=loop_support.scan_report(
+                ingestions=[loop_support.created(record['lesson_id'])]))
+        self.assertEqual(outcome.status, 'NEEDS_HUMAN_DECISION')
+        self.assertEqual(outcome.report['registrations'], [])
+        self.assertEqual(carrier.calls, [])
+        self.assertTrue(any(item.get('decision_id') == 'HD-05'
+                            for item in outcome.report['decisions_required']))
 
     def test_incomplete_packet_blocks_the_loop(self):
         record = loop_support.general_lesson()
@@ -222,8 +291,9 @@ class CarrierParityTests(unittest.TestCase):
         results = {}
         for edition in ('local', 'github'):
             carrier = orchestration.carrier_for(edition)
-            outcome = run_loop(edition=edition, **ready_case(
-                state=loop_support.state(edition), carrier=carrier))
+            with low_risk_gate():
+                outcome = run_loop(edition=edition, **ready_case(
+                    state=loop_support.state(edition), carrier=carrier))
             self.assertEqual(outcome.status, 'COMPLETED')
             registration = outcome.report['registrations'][0]
             self.assertEqual(registration['carrier'], edition)
@@ -310,7 +380,8 @@ class CarrierParityTests(unittest.TestCase):
     def test_one_edition_writes_one_carrier(self):
         local = loop_support.RecordingCarrier('local')
         github = loop_support.RecordingCarrier('github')
-        run_loop(edition='local', carrier=local, **ready_case())
+        with low_risk_gate():
+            run_loop(edition='local', carrier=local, **ready_case())
         self.assertEqual(github.calls, [])
         self.assertEqual(len(local.calls), 1)
 
@@ -342,16 +413,17 @@ class EndToEndTests(unittest.TestCase):
         passed = 'python3 -m unittest tests.self_improvement.test_orchestration'
         unrun = 'python3 scripts/validate_kit.py'
         carrier = loop_support.RecordingCarrier('local')
-        outcome = orchestration.run_loop(
-            request_text='进行自我完善', edition='local',
-            state=loop_support.state(),
-            carrier=carrier, scan_report=scan,
-            lesson_records=[record],
-            specs={record['lesson_id']: loop_support.spec(
-                validation_commands=[passed, unrun])},
-            command_runs={passed: {'exit_code': 0, 'output': 'tests passed'}},
-            environment='Linux; Python 3; synthetic fixture; local edition',
-            repo_root=loop_support.DEFAULT_REPO_ROOT)
+        with low_risk_gate():
+            outcome = orchestration.run_loop(
+                request_text='进行自我完善', edition='local',
+                state=loop_support.state(),
+                carrier=carrier, scan_report=scan,
+                lesson_records=[record],
+                specs={record['lesson_id']: loop_support.spec(
+                    validation_commands=[passed, unrun])},
+                command_runs={passed: {'exit_code': 0, 'output': 'tests passed'}},
+                environment='Linux; Python 3; synthetic fixture; local edition',
+                repo_root=loop_support.DEFAULT_REPO_ROOT)
 
         report = outcome.report
         self.assertEqual(report['status'], 'COMPLETED')

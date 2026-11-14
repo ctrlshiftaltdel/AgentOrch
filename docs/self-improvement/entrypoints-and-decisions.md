@@ -61,7 +61,7 @@
 
 路径或关键词命中只是调查线索。风险判断必须来自受控仓库的真实 Git 证据，并从任务载体取得 base/head 基线（提交存在、祖先关系、`HEAD` 与 head 一致、与任务载体 base/head 一致、工作树干净且非浅克隆、屏蔽 replace refs 与隐藏 diff 的配置/环境、完整 diff 与 changed paths）。调用者提供的 Diff、`changed_paths`、SHA 字符串、`low_risk` / `approved` 布尔值、spec 内 `review` 或 `authorization` 字段都不是证据，字面 `granted_by` 与 URL 也不等于授权。无法证明完整性时保持待调查 / 阻塞，不自动询问 Owner，也不判为低风险。
 
-除空 diff 且目标 / 范围无风险外没有自动低风险：纯空白、Markdown 代码块 / 命令、普通文档、代码和治理面都不再凭后缀或空白自动放行。**当前未接入权威任务载体适配器或真实独立审查**；`state.task` 只是定位符，spec / state / 调用者提供的 review、authorization 或自算摘要都不构成授权。需要继续时返回结构化的 `required_evidence` / `next_action`，由 Agent/Master 取证；在适配器与独立审查接入前，普通错字也只能 `NEEDS_EVIDENCE`。真实权限 / 安全 / 锁 / 状态机 / 数据 / 外部 / 不可逆变化进入 `HD-05` / `HD-13`。非法、绝对、反斜杠、通配符或含 `..` 的 `allowed_paths` 必须先拒绝，不能被其他证据冲掉；外部项目须单独批准。
+空 diff 不能证明拟实施目标、允许范围或授权安全，因此没有自动低风险：纯空白、Markdown 代码块 / 命令、普通文档、代码和治理面都不再凭后缀或空白自动放行。**当前未接入权威任务载体适配器或真实独立审查**；`state.task` 只是定位符，spec / state / 调用者提供的 review、authorization 或自算摘要都不构成授权。需要继续时返回结构化的 `required_evidence` / `next_action`，由 Agent/Master 取证；在适配器与独立审查接入前，普通错字也只能 `NEEDS_EVIDENCE`。真实权限 / 安全 / 锁 / 状态机 / 数据 / 外部 / 不可逆变化进入 `HD-05` / `HD-13`。非法、绝对、反斜杠、通配符或含 `..` 的 `allowed_paths` 必须先拒绝，不能被其他证据冲掉；外部项目须单独批准。
 
 ## 4. 停止条件
 

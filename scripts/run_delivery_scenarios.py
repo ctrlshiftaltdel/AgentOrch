@@ -408,14 +408,16 @@ SCENARIOS = (
              'the executor claims completion without any evidence item',
              'G1/G6: empty matrix, unbacked AC and direct VERIFIED are all refused',
              'validator findings, refusal message, lock count', 'sandbox removed', scenario_d7),
-    Scenario('A8', 'A', 'positive', 'synthetic source evidence becomes a reviewable task',
+    Scenario('A8', 'A', 'positive', 'synthetic source evidence becomes a reviewable packet',
              'one synthetic merged pull request, one synthetic commit, one CI run, and a '
              'real throw-away Git repository with a no-content commit range',
-             'none (positive control)',
+             'none (control)',
              'self-improvement: the lesson is verified, reclassified and generalized before '
-             'planning; only READY reaches the carrier, which reports executed=False',
-             'scan status / evidence count, lesson id and evidence URLs, proposal status, '
-             'registration payload with the evidence-matrix header',
+             'planning; a complete packet without risk evidence stays BLOCKED / '
+             'NEEDS_EVIDENCE and nothing is registered, because no wired carrier adapter or '
+             'independent review exists',
+             'scan status / evidence count, lesson id and evidence URLs, proposal status and '
+             'risk level, required evidence, evidence-matrix header',
              'in-memory source stand-in plus a sandbox Git repository; sandbox removed',
              scenario_a8),
     Scenario('A9', 'A', 'negative', 'source unreachable or forbidden',
@@ -471,11 +473,11 @@ SCENARIOS = (
     Scenario('A15', 'A', 'positive', 'self-improvement loop end to end',
              'a synthetic source scan, one lesson driven to GENERALIZED, a real throw-away Git '
              'repository with a no-content commit range, and a synthetic carrier',
-             'none (positive control)',
-             'loop: trigger routed, state restored, scan classified, plan gated, one task '
-             'registered with executed=False, one executed check recorded PASS and one '
-             'unexecuted command NOT_RUN, closure report written',
-             'trigger / state / scan / plan / registration / validation / not_run fields, '
+             'none (control)',
+             'loop: trigger routed, state restored, scan classified, plan gated with zero '
+             'registrations (no wired low-risk evidence path), one executed check recorded '
+             'PASS and one unexecuted command NOT_RUN, closure report written',
+             'trigger / state / scan / plan / blocked / validation / not_run fields, '
              'closure markdown sections', 'in-memory carrier plus a sandbox Git repository; '
              'sandbox removed', scenario_a15),
     Scenario('B5', 'B', 'positive', 'clean older install upgrades end to end',

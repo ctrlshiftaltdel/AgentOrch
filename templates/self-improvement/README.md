@@ -127,8 +127,8 @@ start it.
    rely on the later incremental scans once an `OK` watermark exists.
 
 4. Planning and the loop report live in `scripts/self_improvement/planning.py` and
-   `scripts/self_improvement/orchestration.py`. A proposal is `READY` only for an
-   eligible lesson, a complete task packet, verified dependencies and real Git
+   `scripts/self_improvement/orchestration.py`. `READY` would require an eligible
+   lesson, a complete task packet, verified dependencies and real low-risk
    evidence whose base/head come from the task carrier, not the proposal. The
    repository must prove that both commits exist, that base is an ancestor of head,
    that `HEAD` and the carrier head match, that the worktree is clean and that the
@@ -136,9 +136,14 @@ start it.
    / environment are disabled; assume-unchanged / skip-worktree, ignored files
    under allowed paths, binary, rename / copy / type, symlink, submodule, deletion,
    dirty or untracked worktree all block. There is no automatic low-risk verdict
-   for non-empty content, including whitespace-only or Markdown changes.
+   at all in this slice: an empty diff or empty tree cannot prove the intended
+   goal, the allowed-path scope or the authorization, and non-empty content still
+   needs a trusted review. A destructive or irreversible goal (for example
+   "delete all user data") escalates to `NEEDS_HUMAN_DECISION` / `HD-05` even when
+   the diff is empty.
 
-   A blocked content change currently stays `BLOCKED` / `NEEDS_EVIDENCE`.
+   Every proposal therefore currently stays `BLOCKED` / `NEEDS_EVIDENCE` (or goes
+   to `NEEDS_HUMAN_DECISION` when high risk is declared or evidenced).
    This release has no authoritative task-carrier adapter and no wired
    independent review: `state.task` is only a locator, and caller-supplied
    review, authorization or self-computed digests never unlock READY. The

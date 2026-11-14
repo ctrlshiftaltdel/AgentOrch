@@ -62,10 +62,11 @@ LIMITATIONS = (
     'Risk uses the repository’s own Git evidence and the task carrier base/head, not '
     'caller-supplied diffs, SHA strings, review or authorization fields. Replace refs and '
     'diff-hiding config are disabled, hidden index flags / ignored allowed paths / stale '
-    'snapshots block, and no non-empty content change is auto-LOW. The authoritative '
-    'carrier adapter and independent review are not wired in this release, so blocked '
-    'content changes stay NEEDS_EVIDENCE with next_action; caller review cannot unlock '
-    'READY. Evidenced permission or security changes still end in NEEDS_HUMAN_DECISION.',
+    'snapshots block, and no change set is auto-LOW: an empty commit range cannot prove '
+    'the goal, the allowed-path scope or the authorization. The authoritative carrier '
+    'adapter and independent review are not wired in this release, so every proposal '
+    'stops at NEEDS_EVIDENCE with next_action; caller review cannot unlock READY. '
+    'Declared permission/security/destructive changes still end in NEEDS_HUMAN_DECISION.',
 )
 
 
@@ -312,7 +313,14 @@ class LoopOutcome:
 def _validation_rows(plan, command_runs, head_sha, environment):
     rows = []
     seen = []
-    for proposal in plan.ready:
+    # Every command declared by a *candidate* proposal is accounted for, not only
+    # the READY ones: with no low-risk evidence path wired, nothing is READY and
+    # dropping the declared commands would silently hide what was never run.
+    # NO_TASK / ALREADY_REGISTERED proposals are not candidates and contribute
+    # nothing.
+    for proposal in plan.proposals:
+        if proposal.get('status') not in ('READY', 'BLOCKED', 'NEEDS_HUMAN_DECISION'):
+            continue
         for command in proposal.get('validation_commands') or []:
             if command not in seen:
                 seen.append(command)

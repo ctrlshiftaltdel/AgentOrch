@@ -11,12 +11,14 @@ This module answers two questions and nothing else:
 ``plan_tasks``
     Given lesson records that already exist (``scripts/self_improvement/lessons``)
     and an explicit, caller-written task specification, produce an improvement
-    proposal. A proposal is ``READY`` only when the lesson is eligible, the task
-    packet is complete, dependencies are verified and the real Git diff proves
-    only a mechanical, non-semantic change. A missing, forged or incomplete Git
-    claim stays ``BLOCKED`` (``risk_level: NEEDS_EVIDENCE``); an evidenced
-    permission/security change reaches ``NEEDS_HUMAN_DECISION``. Everything
-    else is ``NO_TASK`` / ``BLOCKED``; nothing is invented from source text.
+    proposal. Risk is decided from the repository's own Git evidence, and every
+    proposal stays below ``READY`` in this slice: an empty change set proves
+    nothing about the intended goal, the allowed-path scope or the authorization,
+    and a non-empty change set always needs a trusted review. A missing, forged or
+    incomplete Git claim stays ``BLOCKED`` (``risk_level: NEEDS_EVIDENCE``); an
+    evidenced or declared permission/security/destructive change reaches
+    ``NEEDS_HUMAN_DECISION``. Everything else is ``NO_TASK`` / ``BLOCKED``;
+    nothing is invented from source text.
 
 What the module does **not** do: adopt a lesson, invent a root cause or an
 acceptance criterion, create an Issue / task, run a command, or approve a
@@ -215,6 +217,9 @@ RISK_LOW = 'LOW'
 RISK_HIGH = 'HIGH'
 RISK_NEEDS_EVIDENCE = 'NEEDS_EVIDENCE'
 RISK_LEVELS = (RISK_LOW, RISK_HIGH, RISK_NEEDS_EVIDENCE)
+# ``RISK_LOW`` is kept for the future wired-evidence path (authoritative carrier
+# adapter + independent review). This slice never returns it: an empty change set
+# proves nothing, and a non-empty change set always needs a trusted review.
 
 # Surfaces whose text or code carries authority. A real change here is never
 # auto-downgraded by the absence of a keyword; it needs an authoritative
@@ -282,6 +287,20 @@ SCOPE_KEYWORDS = (
     'bypass review', 'approve without review', '跳过审查', '绕过审查',
     '无审查', '权限扩大', '扩大权限', '外部项目', '外部仓库', '不可逆迁移',
 )
+# Destructive / irreversible task intent. This is a *wording* lead, never proof:
+# it can only raise the risk level, so an incomplete table fails closed (the
+# unclassified case is still never LOW). It exists because a task goal such as
+# "删除全部用户数据" is not covered by SCOPE_KEYWORDS and used to slip through an
+# empty commit range as LOW.
+DESTRUCTIVE_INTENT_RE = re.compile(
+    r'(?:删除全部|删除所有|删除整个|删除数据|删除用户数据|删库|删表|清库|清表|'
+    r'清空全部|清空所有|清空数据|清空数据库|抹除数据|擦除数据|销毁数据|永久删除|'
+    r'\bdelete\s+all\b|\bdelete\s+from\b|'
+    r'\bdelete\s+the\s+(?:data|database|table|record)s?\b|'
+    r'\bdrop\s+(?:table|database|schema)\b|\btruncate\b|\bwipe\b|\bpurge\b|'
+    r'\bdestroy\s+(?:all|the)\s+(?:data|records?|database)\b|'
+    r'\brm\s+-rf\b|\brmtree\b|\bunlink\b|\bforce\s+push\b|'
+    r'\bpush\s+--force\b|\breset\s+--hard\b)')
 
 
 class GitEvidenceError(Exception):
@@ -732,9 +751,17 @@ def _scope_leads(proposal, lesson):
     return keyword_hits, high_paths
 
 
+def _destructive_intent_hits(proposal, lesson):
+    """Destructive wording in the task scope. A lead only, never proof."""
+    text = (_lesson_scope_text(lesson) + ' '
+            + str(proposal.get('goal') or '')).casefold()
+    return sorted({match.group(0).strip() for match in
+                   DESTRUCTIVE_INTENT_RE.finditer(text)})
+
+
 def _classify_git_evidence(proposal, lesson, evidence):
     result = {'high': [], 'content': [], 'authority': [], 'structural': [],
-              'scope': [], 'low': [], 'decision_id': None}
+              'scope': [], 'decision_id': None}
     allowed = [_canonical_allowed_path(path)
                for path in proposal.get('allowed_paths') or []]
 
@@ -830,11 +857,24 @@ def _classify_git_evidence(proposal, lesson, evidence):
                 f'code change needs review: {path}')
 
     keyword_hits, high_paths = _scope_leads(proposal, lesson)
-    if high_paths and keyword_hits:
+    intent_hits = _destructive_intent_hits(proposal, lesson)
+    empty_change = not evidence['entries']
+    if intent_hits:
+        detail = 'a destructive or irreversible task goal/scope: ' + ', '.join(intent_hits)
         _append_unique(
             result['high'],
-            'task scope requests a high-risk change not proven by the current '
-            'diff: ' + ', '.join(sorted(set(keyword_hits + high_paths))))
+            ('an empty change set cannot prove ' if empty_change else
+             'task goal/scope requests a change not proven by the current diff: ')
+            + detail)
+        result['decision_id'] = result['decision_id'] or DECISION_HIGH_RISK
+    if high_paths and keyword_hits:
+        detail = ', '.join(sorted(set(keyword_hits + high_paths)))
+        _append_unique(
+            result['high'],
+            ('an empty change set cannot prove a high-risk task scope: '
+             if empty_change else
+             'task scope requests a high-risk change not proven by the current diff: ')
+            + detail)
         result['decision_id'] = result['decision_id'] or DECISION_HIGH_RISK
     elif high_paths:
         _append_unique(
@@ -847,21 +887,31 @@ def _classify_git_evidence(proposal, lesson, evidence):
             'task wording mentions a high-risk area; review the actual diff: '
             + ', '.join(sorted(set(keyword_hits))))
 
-    if not evidence['entries']:
-        result['low'].append('no changed paths in the verified commit range')
     return result
+
+
+def _empty_change_reasons(result):
+    """Why an empty change set cannot stand in for risk evidence."""
+    reasons = ['an empty change set cannot prove the intended goal, the '
+               'allowed-path scope or the authorization']
+    for key in ('structural', 'scope', 'content', 'authority'):
+        for reason in result[key]:
+            _append_unique(reasons, reason)
+    return reasons
 
 
 def assess_risk_details(proposal, lesson, trusted_task=None, repo_root=None,
                         required_base_sha=None, required_head_sha=None):
     """Assess one proposal using *real Git evidence*, not caller text.
 
-    ``LOW`` is returned only for a verified commit range with no changed paths
-    and no risky task scope. Every non-empty content change is
-    ``NEEDS_EVIDENCE`` or ``HIGH``; a missing, forged or incomplete Git claim
-    stays ``NEEDS_EVIDENCE``. No caller-supplied review or authorization is
-    accepted: the authoritative carrier adapter and independent review are not
-    wired in this slice.
+    An empty change set is never ``LOW``: it cannot prove the intended goal, the
+    allowed-path scope or that the authorization is safe, so it stays
+    ``NEEDS_EVIDENCE`` (or ``HIGH`` when the declared goal/scope is destructive,
+    permission/security or otherwise high risk). Every non-empty content change is
+    ``NEEDS_EVIDENCE`` or ``HIGH``, and a missing, forged or incomplete Git claim
+    stays ``NEEDS_EVIDENCE``. ``LOW`` is reserved for the not-yet-wired
+    authoritative carrier adapter plus independent review and is not returned by
+    this slice. No caller-supplied review or authorization is accepted.
     """
     proposal = proposal or {}
     task_id = trusted_task.get('task_id') if isinstance(trusted_task, dict) else None
@@ -913,9 +963,12 @@ def assess_risk_details(proposal, lesson, trusted_task=None, repo_root=None,
     limitations = base_limitations + [
         'Git evidence proves the checked-out commit range and a clean worktree '
         'at assessment time; it does not cover later edits or another carrier',
-        'no content change is auto-LOW: documentation, code, authority '
-        'surfaces, binary, rename/copy/type, symlink, submodule, deletion and '
-        'worktree state all need a trusted review or remain blocked']
+        'no change set is auto-LOW: documentation, code, authority surfaces, '
+        'binary, rename/copy/type, symlink, submodule, deletion and worktree '
+        'state all need a trusted review or remain blocked',
+        'an empty change set is not evidence of the proposed work: it proves '
+        'neither the goal, the allowed-path scope nor that authorization is safe',
+    ]
     if evidence.get('ignored_paths'):
         limitations.append(
             'ignored worktree paths outside allowed_paths were observed: '
@@ -936,6 +989,19 @@ def assess_risk_details(proposal, lesson, trusted_task=None, repo_root=None,
                 'reasons': result['high'], 'leads': result['high'],
                 'required_evidence': [], 'review_status': 'NOT_APPLICABLE',
                 'next_action': 'OWNER_DECISION', **common}
+    if not evidence['entries']:
+        reasons = _empty_change_reasons(result)
+        return {'level': RISK_NEEDS_EVIDENCE, 'decision_id': None,
+                'reasons': reasons, 'leads': reasons,
+                'required_evidence': [
+                    'supply a verified commit range that actually contains the '
+                    'proposed change; an empty diff cannot prove the goal, the '
+                    'allowed-path scope or the authorization',
+                    'a low-risk decision needs the not-yet-wired authoritative '
+                    'task-carrier adapter plus independent review; nothing in '
+                    'this slice can unlock LOW/READY from an empty change set'],
+                'review_status': 'NOT_WIRED', 'next_action': 'INVESTIGATE',
+                **common}
     blocking = result['structural'] + result['scope']
     if blocking:
         required = []
@@ -972,10 +1038,19 @@ def assess_risk_details(proposal, lesson, trusted_task=None, repo_root=None,
                 'reasons': reviewable, 'leads': reviewable,
                 'required_evidence': required, 'review_status': 'NOT_WIRED',
                 'next_action': 'MASTER_REVIEW', **common}
-    return {'level': RISK_LOW, 'decision_id': None, 'reasons': result['low'],
-            'leads': result['low'],
-            'required_evidence': [], 'review_status': 'NOT_NEEDED',
-            'next_action': 'NONE', **common}
+    # Fail closed: every non-empty change set already produces a lead above, so
+    # this branch means the classifier could not account for the change. LOW is
+    # deliberately not reachable in this slice — it needs the authoritative
+    # task-carrier adapter and independent review, which are not wired.
+    fallback = ['the verified change set produced no classifiable risk lead; '
+                'treat it as unproven']
+    return {'level': RISK_NEEDS_EVIDENCE, 'decision_id': None,
+            'reasons': fallback, 'leads': fallback,
+            'required_evidence': [
+                'classify the changed paths through the authoritative carrier '
+                'adapter and independent review before any low-risk decision'],
+            'review_status': 'NOT_WIRED', 'next_action': 'INVESTIGATE',
+            **common}
 
 
 def git_diff_digest(repo_root, base_sha, head_sha):
@@ -1196,10 +1271,12 @@ def build_proposal(lesson, spec, *, edition, dependency_state=None, coverage=Non
                    required_base_sha=None, required_head_sha=None):
     """Turn one lesson + one explicit spec into a gated proposal.
 
-    Status order is deliberate: illegal paths are rejected first, then an
-    evidenced high-risk change is escalated before any structural check, so a
-    broken packet never hides a human decision. A missing or untrusted Git claim
-    blocks with a concrete next step instead of becoming a false owner
+    Status order is deliberate: illegal paths are rejected first, an OPEN conflict
+    escalates next, and an evidenced or declared high-risk change is escalated
+    before any structural check, so a broken packet never hides a human decision.
+    A complete packet and verified dependencies are then required before the
+    proposal can report "risk evidence is insufficient"; a missing or untrusted
+    Git claim blocks with a concrete next step instead of becoming a false owner
     question.
     """
     if edition not in ('local', 'github'):
@@ -1280,15 +1357,14 @@ def build_proposal(lesson, spec, *, edition, dependency_state=None, coverage=Non
         proposal['status_reason'] = 'high-risk change: ' + '; '.join(risk['reasons'])
         proposal['required_human_decision'] = risk['decision_id']
         return proposal
-    if level == RISK_NEEDS_EVIDENCE:
-        proposal['status'] = 'BLOCKED'
-        proposal['status_reason'] = 'risk evidence is insufficient: ' + '; '.join(
-            risk['reasons'])
-        return proposal
 
+    # A broken packet or an unverified dependency is reported on its own terms
+    # before "risk evidence is insufficient", so the concrete gap stays visible.
     if missing:
         proposal['status'] = 'BLOCKED'
         proposal['status_reason'] = 'task spec is incomplete: ' + ', '.join(missing)
+        proposal['required_evidence'] = [
+            'supply the missing task-packet fields: ' + ', '.join(missing)]
         return proposal
 
     if packet_errors:
@@ -1304,6 +1380,14 @@ def build_proposal(lesson, spec, *, edition, dependency_state=None, coverage=Non
             str(ref) for ref in unresolved)
         return proposal
 
+    if level == RISK_NEEDS_EVIDENCE:
+        proposal['status'] = 'BLOCKED'
+        proposal['status_reason'] = 'risk evidence is insufficient: ' + '; '.join(
+            risk['reasons'])
+        return proposal
+
+    # Unreachable while :func:`assess_risk_details` returns no LOW: this is the
+    # future wired-evidence path, not an auto-approval shortcut.
     proposal['status'] = 'READY'
     proposal['status_reason'] = 'eligible lesson, complete packet, verified dependencies, low risk'
     return proposal

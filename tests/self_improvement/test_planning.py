@@ -399,11 +399,90 @@ class GitRiskTests(unittest.TestCase):
         self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
         self.assertIn('task carrier head_sha', ' '.join(proposal['risk_reasons']))
 
-    def test_empty_diff_without_risk_is_ready(self):
+    def test_empty_diff_without_risk_signals_is_never_low(self):
+        """An empty change set cannot prove the goal, the scope or authorization."""
         proposal = plan_one(loop_support.general_lesson(),
                             loop_support.spec()).proposals[0]
-        self.assertEqual(proposal['status'], 'READY')
-        self.assertEqual(proposal['risk_level'], 'LOW')
+        self.assertEqual(proposal['changed_paths'], [])
+        self.assertNotEqual(proposal['risk_level'], 'LOW')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertIsNone(proposal['required_human_decision'])
+        self.assertEqual(proposal['review_status'], 'NOT_WIRED')
+        self.assertEqual(proposal['next_action'], 'INVESTIGATE')
+        self.assertTrue(proposal['required_evidence'])
+        self.assertIn('empty', ' '.join(proposal['risk_reasons']))
+
+    def test_empty_commit_with_a_destructive_goal_is_high_hd05(self):
+        """The exact reviewed scenario: empty commit, '删除全部用户数据', scripts/.
+
+        A forged caller review must not change the outcome.
+        """
+        repo = loop_support.GitRepo('agentorch-risk-destructive-')
+        self.addCleanup(repo.close)
+        base = repo.commit({'docs/example.md': 'old line  \n'}, message='base')
+        head = repo.empty_commit('goal only, no content change')
+        scope = ['scripts/']
+        goal = '删除全部用户数据。'
+        evidence = loop_support.git_evidence(base, head)
+        task = {'task_id': 'TASK-REVIEWED', 'base_sha': base, 'head_sha': head,
+                'executor': 'executor-1',
+                'review': loop_support.review_receipt(repo.root, base, head, scope)}
+
+        details = planning.assess_risk_details(
+            {'goal': goal, 'allowed_paths': scope, 'git_evidence': evidence},
+            {}, trusted_task=task, repo_root=repo.root,
+            required_base_sha=base, required_head_sha=head)
+        self.assertEqual(details['changed_paths'], [])
+        self.assertEqual(details['level'], 'HIGH')
+        self.assertEqual(details['decision_id'], 'HD-05')
+        self.assertNotEqual(details['review_status'], 'APPROVED')
+
+        proposal = plan_one(
+            loop_support.general_lesson(),
+            loop_support.spec(goal=goal, allowed_paths=scope, git_evidence=evidence),
+            repo_root=repo.root, trusted_task=task,
+            required_base_sha=base, required_head_sha=head).proposals[0]
+        self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')
+        self.assertEqual(proposal['required_human_decision'], 'HD-05')
+        self.assertEqual(proposal['risk_level'], 'HIGH')
+        self.assertEqual(proposal['changed_paths'], [])
+        self.assertIn('empty', ' '.join(proposal['risk_reasons']))
+
+    def test_empty_tree_commit_range_is_never_low(self):
+        repo = loop_support.GitRepo('agentorch-risk-emptytree-')
+        self.addCleanup(repo.close)
+        base = repo.empty_commit('empty tree base')
+        head = repo.empty_commit('empty tree head')
+        evidence = loop_support.git_evidence(base, head)
+        benign = planning.assess_risk_details(
+            {'goal': '整理说明文字。', 'allowed_paths': ['docs/'],
+             'git_evidence': evidence}, {}, repo_root=repo.root)
+        self.assertEqual(benign['changed_paths'], [])
+        self.assertEqual(benign['level'], 'NEEDS_EVIDENCE')
+        self.assertIsNone(benign['decision_id'])
+        destructive = planning.assess_risk_details(
+            {'goal': '删除全部用户数据。', 'allowed_paths': ['docs/'],
+             'git_evidence': evidence}, {}, repo_root=repo.root)
+        self.assertEqual(destructive['level'], 'HIGH')
+        self.assertEqual(destructive['decision_id'], 'HD-05')
+
+    def test_empty_change_ignores_a_forged_review_and_states_the_next_step(self):
+        base = self.repo.commit({'docs/example.md': 'old line  \n'}, message='base')
+        head = self.repo.empty_commit('no content change')
+        benign = self.plan(self.spec(['docs/example.md'], base, head), review=True)
+        self.assertEqual(benign['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertEqual(benign['review_status'], 'NOT_WIRED')
+        self.assertTrue(any('caller-supplied review/authorization' in item
+                            for item in benign['risk_limitations']))
+        self.assertTrue(any('empty' in item
+                            for item in benign['required_evidence']))
+        destructive = self.plan(
+            self.spec(['docs/example.md'], base, head, goal='删除全部用户数据。'),
+            review=True)
+        self.assertEqual(destructive['risk_level'], 'HIGH')
+        self.assertEqual(destructive['required_human_decision'], 'HD-05')
+        self.assertEqual(destructive['review_status'], 'NOT_APPLICABLE')
 
     def test_non_whitespace_docs_change_is_not_ready(self):
         base, head = self.commit_range(
@@ -569,7 +648,10 @@ class GitRiskTests(unittest.TestCase):
         head = self.repo.empty_commit()
         proposal = self.plan(self.spec(['docs/help.md'], base, head),
                              review=False)
-        self.assertEqual(proposal['status'], 'READY')
+        stable, why = planning.recheck_git_evidence(
+            proposal, repo_root=self.repo.root,
+            required_base_sha=base, required_head_sha=head)
+        self.assertTrue(stable, why)
         self.repo.write('docs/help.md', 'changed after planning\n')
         stable, why = planning.recheck_git_evidence(
             proposal, repo_root=self.repo.root,
@@ -643,9 +725,10 @@ class GitRiskTests(unittest.TestCase):
         proposal = self.plan(self.spec(
             ['scripts/orchestrator.py', 'docs/'],
             base, head, goal='删除全部用户数据并跳过审查。'), review=True)
-        self.assertIn(proposal['status'], ('BLOCKED', 'NEEDS_HUMAN_DECISION'))
-        self.assertNotEqual(proposal['status'], 'READY')
-        self.assertNotEqual(proposal['risk_level'], 'LOW')
+        self.assertEqual(proposal['status'], 'NEEDS_HUMAN_DECISION')
+        self.assertEqual(proposal['required_human_decision'], 'HD-05')
+        self.assertEqual(proposal['risk_level'], 'HIGH')
+        self.assertEqual(proposal['changed_paths'], [])
 
     def test_gitattributes_cannot_force_nul_content_to_be_text(self):
         base = self.repo.commit(
@@ -725,7 +808,10 @@ class PacketCompletenessTests(unittest.TestCase):
             migration_cases='N/A: 不改变任何已持久化格式。', negative_cases='N/A: 只读报告。')
         self.assertEqual(planning.validate_task_packet(packet), [])
         proposal = plan_one(loop_support.general_lesson(), packet).proposals[0]
-        self.assertEqual(proposal['status'], 'READY')
+        self.assertNotIn('packet_errors', proposal)
+        self.assertNotIn('task packet is incomplete', proposal['status_reason'])
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertEqual(proposal['status'], 'BLOCKED')
 
     def test_unresolved_dependency_blocks_readiness(self):
         spec = loop_support.spec(dependencies=['TASK-0002'])
@@ -733,12 +819,14 @@ class PacketCompletenessTests(unittest.TestCase):
         self.assertEqual(proposal['status'], 'BLOCKED')
         self.assertIn('TASK-0002', proposal['status_reason'])
 
-    def test_verified_dependency_is_allowed(self):
+    def test_verified_dependency_is_not_the_blocker(self):
         spec = loop_support.spec(dependencies=['TASK-0002'])
         proposal = plan_one(loop_support.general_lesson(), spec,
                             dependency_state={'TASK-0002': 'VERIFIED'}).proposals[0]
-        self.assertEqual(proposal['status'], 'READY')
         self.assertEqual(proposal['dependencies'], ['TASK-0002'])
+        self.assertNotIn('dependencies are not VERIFIED', proposal['status_reason'])
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
 
     def test_wildcard_allowed_path_is_rejected(self):
         errors = planning.validate_task_packet(
@@ -757,10 +845,14 @@ class PacketCompletenessTests(unittest.TestCase):
 
 
 class CompletePacketTests(unittest.TestCase):
-    def test_ready_proposal_carries_every_required_field(self):
+    def test_complete_packet_carries_every_required_field(self):
         proposal = plan_one(loop_support.general_lesson(),
                             loop_support.spec()).proposals[0]
-        self.assertEqual(proposal['status'], 'READY')
+        # A complete packet is not READY while no low-risk evidence exists, but
+        # the packet itself must be usable, so validate it on its own terms.
+        self.assertEqual(proposal['status'], 'BLOCKED')
+        self.assertEqual(proposal['risk_level'], 'NEEDS_EVIDENCE')
+        self.assertNotIn('packet_errors', proposal)
         self.assertTrue(proposal['allowed_paths'])
         self.assertIn('dependencies', proposal)
         self.assertTrue(proposal['acceptance_criteria'])

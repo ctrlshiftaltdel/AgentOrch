@@ -471,7 +471,14 @@ def _si_verified_generalized(lesson):
 # Group A, second family - self-improvement candidate governance
 # --------------------------------------------------------------------------- #
 def scenario_a8(ctx):
-    """Positive control: source evidence becomes a reviewable task, never a self-approval."""
+    """Control: source evidence becomes a reviewable packet, never an auto-task.
+
+    A goal, an allowed-path scope and an authorization cannot be proven from the
+    task's commit range (empty here), so planning stops at
+    ``NEEDS_EVIDENCE``/``BLOCKED`` and nothing is registered. Only a wired
+    carrier adapter plus independent review may ever unlock ``READY``, and
+    neither exists in this slice.
+    """
     si = _si()
     outcome, store, runner = _si_scan(ctx)
     _require(len(store) == 1, f'expected one lesson from one analysed evidence item, got {len(store)}')
@@ -497,31 +504,36 @@ def scenario_a8(ctx):
         trusted_task=_risk_task(si, risk_root, risk_base, risk_head,
                                 ['docs/example.md'], review=False),
         required_base_sha=risk_base, required_head_sha=risk_head)
-    _require(len(plan.ready) == 1,
-             f'expected one READY proposal, got {plan.counts()}: '
-             f'{[p["status_reason"] for p in plan.proposals]}')
-    proposal = plan.ready[0]
+    _require(len(plan.ready) == 0,
+             f'an unwired risk gate produced a READY proposal: {plan.counts()}')
+    proposal = plan.proposals[0]
+    _require(proposal['status'] == 'BLOCKED',
+             f'a complete packet without risk evidence became {proposal["status"]}')
+    _require(proposal['risk_level'] == 'NEEDS_EVIDENCE', proposal['risk_level'])
+    _require(proposal['changed_paths'] == [], proposal['changed_paths'])
+    _require(proposal['review_status'] == 'NOT_WIRED', proposal['review_status'])
+    _require(proposal['required_evidence'], 'no next evidence step was recorded')
     _require(proposal['evidence_urls'] == [SI_PR_URL], proposal['evidence_urls'])
     _require(proposal['allowed_paths'] == ['docs/example.md'],
              f'the source text changed the allowed paths: {proposal["allowed_paths"]}')
+    _require(si.planning.validate_task_packet(proposal) == [],
+             'the blocked packet is not reviewable on its own terms')
 
-    registration = si.orchestration.carrier_for('github').register(proposal)
-    _require(registration.executed is False,
-             'a dry-run carrier reported an executed write')
-    body = registration.payload['issue_body']
+    body = si.planning.render_github_issue_body(proposal)
     _require('| ac_id |' in body and 'AC-1' in body,
-             'the registered task is not reviewable as an evidence matrix')
-    _require(proposal['status'] != 'APPROVED' and proposal['status'] != 'VERIFIED',
+             'the reviewable packet lacks the evidence-matrix header')
+    _require(proposal['status'] not in ('APPROVED', 'VERIFIED'),
              'planning must not approve or verify its own proposal')
     return [f'scan: source {SI_SOURCE_ID} {source_report["scan_status"]}, '
             f'{source_report["evidence_count"]} evidence item(s) over '
             f'{len(runner.commands)} read-only gh calls',
             f'lesson: {generalized["lesson_id"]} GENERAL_LESSON/GENERALIZED, '
             f'evidence {generalized["source"]["evidence_urls"]}',
-            f'plan: {proposal["status"]} ({proposal["status_reason"]})',
-            f'registration: carrier={registration.carrier} status={registration.status} '
-            f'executed={registration.executed} ref={registration.ref}',
-            'reviewable task carries the 4.1 evidence-matrix header and AC-1']
+            f'plan: {proposal["status"]} / {proposal["risk_level"]} '
+            f'({proposal["status_reason"]})',
+            'registrations: 0 (no wired carrier adapter or independent review)',
+            f'required evidence: {proposal["required_evidence"]}',
+            'reviewable packet carries the 4.1 evidence-matrix header and AC-1']
 
 
 def scenario_a9(ctx):
@@ -843,12 +855,15 @@ def scenario_a15(ctx):
         command_runs={documented: {'exit_code': 0, 'output': 'synthetic suite passed'}},
         environment='synthetic scenario, stdlib only')
     report = loop.report
-    _require(loop.status == 'COMPLETED', f'the loop ended {loop.status}: {report["reason"]}')
-    _require(len(report['registrations']) == 1,
-             f'expected one registration, got {report["registrations"]}')
-    registration = report['registrations'][0]
-    _require(registration['executed'] is False and registration['status'] == 'PLANNED',
-             f'the carrier fabricated an execution: {registration}')
+    _require(loop.status == 'BLOCKED',
+             f'the loop ended {loop.status}: {report["reason"]}')
+    _require(report['registrations'] == [],
+             f'an unwired low-risk path registered something: {report["registrations"]}')
+    _require(report['counts']['proposal_READY'] == 0, report['counts'])
+    _require(report['counts'].get('proposal_BLOCKED') == 1,
+             f'the proposal was not left blocked: {report["counts"]}')
+    _require(any(item.get('kind') == 'proposal' for item in report['blocked']),
+             f'the blocked proposal is missing from the report: {report["blocked"]}')
     _require(report['counts']['not_run_commands'] == 1,
              f'the unexecuted command was not counted: {report["counts"]}')
     validation = {row['command']: row for row in report['validation']}
@@ -867,9 +882,10 @@ def scenario_a15(ctx):
             f'state: branch={report["state"]["branch"]} head={report["state"]["head_sha"]}',
             f'scan: {report["scan"]["conclusion"]} over '
             f'{len(report["scan"]["sources"])} source(s)',
-            f'plan: {report["counts"]["proposal_READY"]} READY of '
+            f'plan: {report["counts"]["proposal_READY"]} READY / '
+            f'{report["counts"].get("proposal_BLOCKED")} BLOCKED of '
             f'{report["counts"]["lessons"]} lesson(s)',
-            f'registration: {registration["ref"]} executed={registration["executed"]}',
+            'registration: 0 (no wired carrier adapter or independent review)',
             f'validation: {validation[documented]["status"]} + '
             f'{validation[undocumented]["status"]}; not_run={report["not_run"]}',
             f'loop status: {loop.status}']
