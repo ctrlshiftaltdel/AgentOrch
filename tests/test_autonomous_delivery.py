@@ -1963,7 +1963,7 @@ class EditionBoundaryTests(DeliveryCase):
         self.state.unlink(missing_ok=True)
         work = self.worktree(f'edition{index}')
         plan = self.plan([self.task('one', work, ['a.txt'])])
-        queried = []
+        queried, exported = [], []
 
         def profiles(where):
             queried.append(where)
@@ -1971,10 +1971,18 @@ class EditionBoundaryTests(DeliveryCase):
                 self._project().write_text(self._project().read_text() + line)
             return self.profiles(where)
 
-        state, agents = self.run_delivery(plan, profiles=profiles)
+        def probe(session, where):
+            exported.append(session)
+            return self.default_probe(session, where)
+
+        state, agents = self.run_delivery(plan, profiles=profiles, session_probe=probe)
         record = state['tasks']['one']
         self.assertEqual(record['status'], 'BLOCKED')
         self.assertIn('edition', record['reason'])
+        # The declaration went bad while the first profile query was being
+        # answered: no second external call of any kind may follow it.
+        self.assertEqual(len(queried), 1)
+        self.assertEqual(exported, [])
         self.assertEqual(agents.calls, [])
 
     def test_an_edition_duplicate_added_during_the_profile_query_blocks_dispatch(self):
@@ -2000,7 +2008,7 @@ class EditionBoundaryTests(DeliveryCase):
         self.assertEqual(record['status'], 'BLOCKED')
         self.assertIn('edition', record['reason'])
         self.assertEqual(agents.calls, [])
-        self.assertGreaterEqual(len(queried), 2)
+        self.assertEqual(len(queried), 2)
 
     def test_any_invalid_or_ambiguous_edition_added_mid_run_fails_closed(self):
         # The first edition check must not be the only one: every boundary that
@@ -2032,6 +2040,33 @@ class EditionBoundaryTests(DeliveryCase):
         self.assertIsNone(record.get('head'))
         self.assertEqual(_head_of(work), _head_of(self.repo))
 
+    def test_an_edition_change_during_execution_blocks_before_the_session_export(self):
+        # The execution agent is an external call, and the export that follows
+        # it is another one. A declaration invalidated by the agent must stop
+        # the run before the export and before any later action.
+        work = self.worktree('one')
+        project = self._project()
+        exported = []
+
+        def execution(where, prompt):
+            self.write_default(where, prompt)
+            project.write_text(project.read_text() + '- **`edition`**: `github`\n')
+
+        def probe(session, where):
+            exported.append(session)
+            return self.default_probe(session, where)
+
+        state, agents = self.run_delivery(
+            self.plan([self.task('one', work, ['a.txt'])]),
+            FakeAgents(self, execution=execution), session_probe=probe)
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        self.assertEqual(exported, [])
+        self.assertEqual(agents.calls, ['execution'])
+        self.assertIsNone(record.get('head'))
+        self.assertEqual(_head_of(work), _head_of(self.repo))
+
     def test_an_edition_change_during_verification_blocks_before_review(self):
         work = self.worktree('one')
         project = self._project()
@@ -2043,6 +2078,98 @@ class EditionBoundaryTests(DeliveryCase):
         self.assertEqual(record['status'], 'BLOCKED')
         self.assertIn('edition', record['reason'])
         self.assertEqual(agents.calls, ['execution'])
+
+    def test_an_edition_duplicate_added_by_the_first_check_blocks_the_second_check(self):
+        # The reported repro: the first verification command invalidates the
+        # declaration and exits 0. The second command is another external call,
+        # so it must never start; deciding afterwards is a crossed side effect.
+        work = self.worktree('one')
+        project = self._project()
+        first, second = self.root / 'first-check-ran', self.root / 'second-check-ran'
+        bump = (f'import pathlib; p = pathlib.Path({str(project)!r}); '
+                f'p.write_text(p.read_text() + "- **`edition`**: `github`\\n"); '
+                f'pathlib.Path({str(first)!r}).write_text("x")')
+        plan = self.plan([self.task('one', work, ['a.txt'], verify=[
+            [PY, '-c', bump],
+            [PY, '-c', f'import pathlib; pathlib.Path({str(second)!r}).write_text("x")']])])
+        state, agents = self.run_delivery(plan)
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        self.assertTrue(first.exists())
+        self.assertFalse(second.exists())
+        self.assertEqual(len(record['verification']), 1)
+        self.assertEqual(record['verification'][0]['exit_code'], 0)
+        self.assertEqual(agents.calls, ['execution'])
+
+    def test_an_edition_duplicate_added_by_the_review_session_blocks_before_its_export(self):
+        # The review agent is an external call: when it invalidates the
+        # declaration, the export that would read the verdict must not happen
+        # and the record must not become PREPARED.
+        work = self.worktree('one')
+        project = self._project()
+
+        def review(where, prompt):
+            project.write_text(project.read_text() + '- **`edition`**: `github`\n')
+            return None  # let FakeAgents answer with a well-formed verdict
+
+        exported = []
+
+        def probe(session, where):
+            exported.append(session)
+            return self.default_probe(session, where)
+
+        state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]),
+                                          FakeAgents(self, review=review),
+                                          session_probe=probe)
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        self.assertEqual(agents.calls, ['execution', 'review'])
+        self.assertNotIn(agents.review_session, exported)
+        self.assertEqual(set(exported), {record['execution_session']})
+        self.assertIsNone(record.get('review_verdict'))
+        self.assertIsNone(record.get('review_session'))
+        self.assertNotEqual(record['status'], 'PREPARED')
+
+    def test_an_edition_duplicate_added_during_the_review_export_blocks_the_approval(self):
+        # The change lands while the review verdict is being read back. The
+        # export may start, but the approval it would produce may not.
+        work = self.worktree('one')
+        project = self._project()
+
+        def probe(session, where):
+            if session.startswith('ses_rev'):
+                project.write_text(project.read_text() + '- **`edition`**: `github`\n')
+            return self.default_probe(session, where)
+
+        state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]),
+                                          session_probe=probe)
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        self.assertEqual(agents.calls, ['execution', 'review'])
+        self.assertIsNone(record.get('review_verdict'))
+        self.assertIsNone(record.get('review_session'))
+        self.assertNotEqual(record['status'], 'PREPARED')
+
+    def test_an_edition_duplicate_added_after_approval_voids_the_prepared_record(self):
+        # Another task's trusted verification command invalidates the project
+        # config after the first task was approved. The final summary must
+        # re-prove the edition, not just the Git facts, and refuse to report a
+        # PREPARED record whose project config no longer authorizes it.
+        one, two = self.worktree('one'), self.worktree('two')
+        project = self._project()
+        bump = (f'import pathlib; p = pathlib.Path({str(project)!r}); '
+                f'p.write_text(p.read_text() + "- **`edition`**: `github`\\n")')
+        plan = self.plan([self.task('one', one, ['a.txt']),
+                          self.task('two', two, ['b.txt'], verify=[[PY, '-c', bump]])])
+        state, agents = self.run_delivery(plan)
+        self.assertEqual(agents.calls, ['execution', 'review', 'execution'])
+        record = state['tasks']['one']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('edition', record['reason'])
+        self.assertNotEqual(state['tasks']['two']['status'], 'PREPARED')
 
 
 class CliTests(DeliveryCase):
