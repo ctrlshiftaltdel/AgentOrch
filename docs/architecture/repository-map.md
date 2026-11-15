@@ -196,7 +196,7 @@ docs/README.md ─────┘  面向人的导航与使用说明
 
 | 文件 | 处置 | 依据与保留理由 |
 |---|---|---|
-| [`docs/self-improvement-and-update-plan.md`](../self-improvement-and-update-plan.md) | `reference` + `IMPLEMENTED`；不是当前字段 / 状态语义的权威。 | 计划阶段 #47–#53 已在 [`docs/implementation-plan.md`](../implementation-plan.md) §11 登记为完成；契约语义已拆分到 `docs/self-improvement/` 与 `docs/contracts/schemas/`。保留作设计与背景追溯，仍被 `README.md` 与阶段计划引用。 |
+| [`docs/self-improvement-and-update-plan.md`](../self-improvement-and-update-plan.md) | `reference` + `IMPLEMENTED`；不是当前字段 / 状态语义的权威。 | 计划阶段 #47–#53 的完成事实由 #47–#53 的 Issue / PR 记录与 [`docs/implementation-plan.md`](../implementation-plan.md)「历史追溯」段承载（旧 §11 已随 #152 精简移除）；契约语义已拆分到 `docs/self-improvement/` 与 `docs/contracts/schemas/`。保留作设计与背景追溯，仍被 `README.md` 与阶段计划引用。 |
 | [`docs/self-improvement/live-scan-2026-10-26.md`](../self-improvement/live-scan-2026-10-26.md) | `reference` + `ARCHIVED`；不进入默认阅读路径。 | 首轮真实扫描的一次性脱敏报告，保留审计价值；扫描状态与来源注册表在 [`docs/self-improvement/sources.json`](../self-improvement/sources.json) 与 [`sources-and-trust.md`](../self-improvement/sources-and-trust.md)。 |
 
 ### 9.2 已确认 `outdated`
@@ -208,7 +208,7 @@ docs/README.md ─────┘  面向人的导航与使用说明
 | 文件 / 位置 | 观察 | 可定位证据 | 影响与建议 |
 |---|---|---|---|
 | [`docs/design/next-phase-governance-and-agent-performance.md`](../design/next-phase-governance-and-agent-performance.md) 文件头 | 文件仍写 `PROPOSED` 且要求“合并并 `VERIFIED` 前保持 `PROPOSED`”；但 #147 已被登记为已完成 / `VERIFIED`。 | [`docs/implementation-plan.md`](../implementation-plan.md) §1 的 #147 行（PR [#148](https://github.com/ctrlshiftaltdel/AgentOrch/pull/148) 合并 `3528e3ff5a8e868f92b8b2a36c523823cfe9ad6e`）；所有者在本 Issue 的说明 [comment 6544993213](https://github.com/ctrlshiftaltdel/AgentOrch/issues/150#issuecomment-6544993213)。 | 读者可能误以为设计尚未冻结。**不得**用本任务或评论直接改写设计冻结语义；建议由 Master / Owner 决定单独的“设计状态同步”任务，并保留本行作为差异记录。 |
-| [`docs/self-improvement-and-update-plan.md`](../self-improvement-and-update-plan.md) 文件头 | 文件头仍称“当前没有任何检查器、更新脚本或运行时”，与 #47–#53 已完成的事实不一致。 | [`docs/implementation-plan.md`](../implementation-plan.md) §11 的 #47–#53 行；`scripts/self_improvement/`、`scripts/update_agentorch/` 与对应测试已存在。 | 文件整体仍有设计追溯价值，故不标 `outdated`。建议后续文档任务修正状态段落，或由所有者确认是否转为 `SUPERSEDED`；替代候选是 [`docs/self-improvement/README.md`](../self-improvement/README.md) 与 [`docs/contracts/README.md`](../contracts/README.md)，但替代关系尚未经任务载体批准。 |
+| [`docs/self-improvement-and-update-plan.md`](../self-improvement-and-update-plan.md) 文件头 | 文件头仍称“当前没有任何检查器、更新脚本或运行时”，与 #47–#53 已完成的事实不一致。 | #47–#53 的 Issue / PR 记录与 [`docs/implementation-plan.md`](../implementation-plan.md)「历史追溯」段（旧 §11 已随 #152 精简移除）；`scripts/self_improvement/`、`scripts/update_agentorch/` 与对应测试已存在。 | 文件整体仍有设计追溯价值，故不标 `outdated`。建议后续文档任务修正状态段落，或由所有者确认是否转为 `SUPERSEDED`；替代候选是 [`docs/self-improvement/README.md`](../self-improvement/README.md) 与 [`docs/contracts/README.md`](../contracts/README.md)，但替代关系尚未经任务载体批准。 |
 | [`docs/README.md`](../README.md) §5 目录结构 | 目录树曾把核心契约重复列三次并分别标注“核心编排 / 通用验收程序 / 会话入口”，还列出仓库中不存在的 `prompts/`；#151 路径迁移已改为单一 `docs/orchestration.md` 条目并删除 `prompts/` 行。 | 实际跟踪文件见仓库 `git ls-files`；核心契约是合并后的单份 [`docs/orchestration.md`](../orchestration.md)，`prompts/` 已在 1.5 迁移中并入模板（见 [`docs/upgrade.md`](../upgrade.md) §12）。 | 已随 #151 路径迁移收口，保留本行作为差异记录。 |
 | [`docs/upgrade.md`](../upgrade.md) 标题 | 标题写“从旧版升级到 1.3（2026-10）”，正文已包含 1.4 的 `docs/PLAN.md` 迁移与当前更新入口等内容。 | 文件自身 §10.6 与 §13；[`docs/README.md`](../README.md) 第 10 节。 | 标题范围落后于内容，容易让读者误判适用版本。建议后续文档任务调整标题 / 适用范围；本任务不改写升级语义。 |
 
