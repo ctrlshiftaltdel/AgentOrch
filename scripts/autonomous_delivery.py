@@ -2,7 +2,7 @@
 
 This slice deliberately has **no automatic merge**. It runs one real OpenCode
 execution session per task, verifies the diff with the plan's commands, starts a
-different session with a declared read-only agent for review, and leaves the
+different session with an agent that cannot edit for review, and leaves the
 task in ``PREPARED`` for a human or the Master to review and merge. Every write path is
 fail-closed:
 
@@ -20,7 +20,8 @@ fail-closed:
   against its head, diff digest and clean worktree immediately before the
   summary: a later trusted command that changed it blocks the approval without
   re-running that command, and the reviewer profile is re-queried there so an
-  approval cannot outlive the read-only profile that supported it;
+  approval cannot outlive an edit denial: if that profile can edit again, the
+  approval is withdrawn. Shell access is not part of that proof;
 * the edition is re-read from the project config at every side-effect boundary,
   and an invalid, duplicate, empty or ambiguous declaration blocks immediately
   instead of reusing the first check. Every external call — the profile query,
@@ -2666,7 +2667,7 @@ def _review(context, spec, record):
     # The execution-session export above is an external call of its own, and
     # the profile that gated this phase was read before it. Query the runtime
     # again immediately before the reviewer starts, so a profile widened while
-    # that export was answered cannot start a write-capable review session.
+    # that export was answered cannot start a review session that can edit.
     _reviewer_gate(context, spec, work, record)
     review = context.agent(work, _review_prompt(spec, record, patch), 'review')
     # The review session is an external call and the export below is another:
@@ -2741,8 +2742,9 @@ def _recheck_approved(context):
     summary would otherwise report stale approvals. This check re-reads the
     project config (edition, authorization) as well as Git state, and it
     re-queries the reviewer profile: the profile is shared runtime state a later
-    trusted command can widen, and an approval that was reviewed under a
-    read-only profile is not supportable once that profile allows writes. It
+    trusted command can widen, and an approval is not supportable once that
+    profile can edit again. Shell access is not that proof: the gate does not
+    claim the review session is read-only. The check
     never re-runs a verification command, starts an agent or writes to a
     worktree. An invalid project config or an unproven profile therefore blocks
     every approval instead of being reported as prepared.

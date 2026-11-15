@@ -563,6 +563,9 @@ class ReviewGateTests(DeliveryCase):
         self.assertEqual(state['tasks']['one']['status'], 'PREPARED',
                          state['tasks']['one'].get('reason'))
         self.assertEqual(agents.calls, ['execution', 'review'])
+        # Shell access must not become a merge of the target branch.
+        self.assertNotIn(state['tasks']['one']['head'],
+                         _git(self.repo, 'rev-parse', 'HEAD').stdout.decode())
 
     def test_reviewer_profile_must_deny_edits_and_shell_tool(self):
         work = self.worktree('one')
@@ -584,6 +587,15 @@ class ReviewGateTests(DeliveryCase):
         gate = delivery.profile_gate(profile)
         self.assertTrue(gate['ready'], gate['reasons'])
         self.assertEqual(gate['scoped_allows'], [])
+
+    def test_a_scoped_edit_glob_allow_is_not_proved_unable_to_edit(self):
+        profile = {'permissions': [
+            {'action': '*', 'resource': '*', 'effect': 'allow'},
+            {'action': 'edit', 'resource': '*', 'effect': 'deny'},
+            {'action': 'e*', 'resource': 'docs/*', 'effect': 'allow'}]}
+        gate = delivery.profile_gate(profile)
+        self.assertFalse(gate['ready'])
+        self.assertTrue(gate['scoped_allows'])
 
     def test_a_scoped_edit_allow_is_not_proved_unable_to_edit(self):
         profile = {'permissions': [
