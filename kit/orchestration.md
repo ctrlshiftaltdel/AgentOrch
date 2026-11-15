@@ -169,6 +169,25 @@ PLANNED → READY → DISPATCHED → IN_PROGRESS → [PR_OPEN] → REVIEW_READY 
 
 状态改变由底座载体记录：`local` 通过 `scripts/orchestrator.py` 写入任务库，不要手工编辑 SQLite；`github` 通过 Issue / PR 状态转换与评论记录。载体提供的是治理记账，不会代替运行时真正派发或运行测试。
 
+批次级阶段（见 2.2 节）映射到同一组载体，不另立载体：`github` 用批次 Issue 的 `ORCH-TASK-REGISTRY`（`mode: batch`）与最终 PR，`local` 用任务记录、分支与最终本地合并。
+
+### 2.2 交付批次（Batch）
+
+单一任务状态机保持不变：批次级阶段只描述一组相关任务如何推进，**不新增任务状态，也不替代**上文的任务状态。
+
+```text
+PLANNED → READY → DISPATCHED/IN_PROGRESS → TASK_VERIFIED → INTEGRATED → BATCH_REVIEWED → [PR_OPEN] → MERGED → VERIFIED
+非成功状态：BLOCKED / NEEDS_HUMAN_DECISION / FAILED / CANCELED
+```
+
+- `PLANNED` / `READY` / `DISPATCHED` / `IN_PROGRESS`：批次及其任务仍按单一任务状态机登记与派发；未取得锁、未完成派发前不得开始写入。
+- `TASK_VERIFIED`（**批次内部**）：该任务自身的验收标准在当前 head 上有完整证据，且任务级验证通过。它是批内里程碑，不是外部 `VERIFIED`。
+- `INTEGRATED`（**批次内部**）：任务已并入集成分支。同批次后续任务可以把它当作已满足的依赖；它不解锁外部依赖，也不构成任何交付声明。
+- `BATCH_REVIEWED`：批次最终 Diff 已按 4.2 节完成该风险等级要求的审查与验证。
+- `PR_OPEN` / `MERGED` / `VERIFIED`：与单一任务一致。`PR_OPEN` 仅 `github` 底座使用；`local` 由 `BATCH_REVIEWED` 直接进入 `MERGED`。`VERIFIED` 只在真实合并后的主分支验证通过时产生。
+- 非成功状态按单一任务状态机记录；单个任务失败不阻塞无依赖、无路径冲突的同批次任务，依赖它的任务保持未开始并记录原因。
+- 旧工具输出的 `PREPARED` 只是过渡态，表示“已准备、待人工或 Master 审查”；它既不是 `INTEGRATED`，也不是 `VERIFIED`，不得据此合并、释放外部依赖或宣称交付。
+
 ## 3. 派发、活动任务锁与依赖
 
 ### 3.1 取得活动任务锁
@@ -190,9 +209,13 @@ PLANNED → READY → DISPATCHED → IN_PROGRESS → [PR_OPEN] → REVIEW_READY 
 5. 只有任务进入 `VERIFIED` 或 `CANCELED` 才把登记块标记为释放；`FAILED` 与状态未知保持锁定并写 `blocked_reason`。
 6. 每次启动或恢复 Master 时，先读取 Issue 登记块与开放 PR 列表，再核对 `git status`、主分支与分支 head；不要从聊天记忆重建。
 
+**批次派发**：一个批次按批次内任务路径的**并集**取得锁——`local` 为并集路径锁，`github` 为 `mode: batch` 登记块的 `locked_paths`，并对该并集做开放 PR 冲突检查。批次内每个任务可以有自己的分支 / Worktree，但同一 Worktree 同一时刻只允许一个写入者；同一批次内任务路径不得重叠（相同或互为前缀），否则视为派发前冲突，不得开始。批次锁的释放条件与单一任务一致：只有批次进入 `VERIFIED` / `CANCELED` 才释放；部分任务失败时其余任务保持各自的锁状态。
+
 ### 3.2 依赖与并行
 
 - 依赖应构成有向无环图。依赖必须达到 `VERIFIED`，不能仅因为代码已提交、已合并或 PR 已批准就派发下游任务。
+- **批次内例外**：同一批次内的依赖可以由 `INTEGRATED`（内部里程碑，见 2.2 节）满足；跨批次 / 外部依赖仍必须达到 `VERIFIED`。不得用批内里程碑满足外部依赖，也不得据此提前标记 `VERIFIED`。
+- 单个任务失败或被阻塞时，无依赖且路径不冲突的任务继续推进；依赖它的任务保持未开始并记录原因。
 - 同一文件或目录前缀冲突的任务串行；不冲突且无依赖的任务可以并行。
 - 并行度按机器余量决定，不写固定数字。派发前观察 CPU / 内存 / 磁盘 / 测试资源争用，有余量即可并行；同一 Worktree 同一时刻只允许一个测试进程。
 - 派发前估一次这次任务包 + 必读集合的量级（文件数、章节范围），把估计写进任务包 `Context` 或证据 `notes`，让接手者知道要读多少；这只是记录口径，不设数值门槛、不新增字段、不新增指标。
@@ -252,9 +275,11 @@ PLANNED → READY → DISPATCHED → IN_PROGRESS → [PR_OPEN] → REVIEW_READY 
 门禁之后：
 
 - `APPROVED` 必须带当前完整 commit SHA。工作树或提交头有任何变化，批准立即失效，需重新审查。
+- 批次交付允许一个批次只开一个最终 PR / 做一次合并；合并前必须在该批次最终 head 上通过必需检查与批次审查（2.2、4.2 节），一个批次 PR 可以包含多个任务 ID。不得用逐任务 PR 的旧规则否定批次交付，也不得用批次合并跳过单任务验收。
 - 只有 Master 执行合并（`local` 例如 `git merge --no-ff <branch>`，`github` 例如平台合并按钮 / `gh pr merge`；具体策略由项目配置决定）。执行者不能自批自合。
 - 合并前备份或确认可恢复；遇到冲突不自动覆盖他人 / 主分支内容。
 - 合并后运行 `docs/PROJECT.md` 指定的验证命令，保存日志与退出码；全部通过后转 `VERIFIED`。默认集合是快速测试 + 完整回归 + `backup` + 静态检查；只有 `verification_profile` 精确为 `risk_pilot` 且调用者显式证明变更为 L0 时，才可以省略完整回归，`validate_kit`、`py_compile` 与 `backup` 仍必须执行。证明缺失、语义标记为真或路径命中编排器 / `kit/orchestration.md` / CI / `PROJECT.md` / `PLAN.md` / `AGENTS.md` / `editions/` / `scripts/` / `release/` / `templates/` 时不得省略。
+- 批次交付同样要求合并后验证：只有验证通过后才把批次内任务逐个标记 `VERIFIED`；不得把 `INTEGRATED` / `PREPARED` 写成 `VERIFIED`。批次 PR 的描述与证据见 `editions/github/pr-template.md`。
 - 合并成功与分支清理分开记账。清理失败不能触发重复合并。
 - 默认最多 3 轮审查—修复往返；达到上限仍未通过 → `BLOCKED`，由项目所有者决定拆分、扩大范围或取消。
 
@@ -262,7 +287,7 @@ PLANNED → READY → DISPATCHED → IN_PROGRESS → [PR_OPEN] → REVIEW_READY 
 
 G1 的“逐条验收”以**证据矩阵**记账：每条验收标准（AC）至少映射一条 evidence item，同一 AC 可以有多条（不同方法、不同环境、不同负向场景）。
 
-字段名与判定规则只在本节定义。`templates/task-packet.md`、`editions/github/issue-template.md` 与底座手册只引用这些字段名，并说明证据存放在哪里、如何取回，**不得另写一套定义或改写取值含义**。两个底座的字段完全相同，差异只在载体：`local` 写入任务记录 / 证据文件，`github` 写入 Issue 验收清单与 PR 评论。
+字段名与判定规则只在本节定义。`templates/task-packet.md`、`editions/github/issue-template.md` 与底座手册只引用这些字段名，并说明证据存放在哪里、如何取回，**不得另写一套定义或改写取值含义**。两个底座的字段完全相同，差异只在载体：`local` 写入任务记录 / 证据文件，`github` 写入 Issue 验收清单与 PR 评论。批次交付不改变这一点：每个任务仍有自己的证据矩阵，批次最终审查在批次 head 上逐任务核对这些矩阵，不得用一张批次汇总表替代。
 
 **证据条目（evidence item）字段** — 唯一权威定义：
 
@@ -309,7 +334,47 @@ G1 的“逐条验收”以**证据矩阵**记账：每条验收标准（AC）�
 
 结构检查：`python scripts/validate_kit.py` 默认校验模板内嵌样例与两底座字段一致性；`python scripts/validate_kit.py --task-packet <path>` 可单独校验一份填好的任务包（缺字段、空 AC、AC 无证据、`NOT_RUN` 被标成通过、SHA 不一致都会报错）。结构检查只证明“矩阵格式合法且没有把未执行标成通过”，不能代替 Master 的 G1 判定。
 
-**旧任务兼容策略**：4.1 是**增量**要求，不改变既有状态机、门禁、权限与 `APPROVED` / `MERGED` / `VERIFIED` 的语义，也不引入新的状态。启用证据矩阵之前已派发或已进入审查的任务，其自然语言验收清单继续有效：Master 仍按 G1 逐条判定，只需在 PR 评论 / 任务记录中按 AC 编号补齐结论与证据引用，不必回填完整九字段矩阵。任务一旦在其任务包或 Issue 中声明使用证据矩阵，该任务整体按本节判定，不得部分回填后又按自然语言清单宣称通过。结构检查不追溯既有任务，也不把旧任务的缺失字段判为失败。
+**旧任务兼容策略**：4.1 是**增量**要求，不改变既有状态机、门禁、权限与 `APPROVED` / `MERGED` / `VERIFIED` 的语义，也不引入新的任务状态（批次内部里程碑见 2.2 节）。启用证据矩阵之前已派发或已进入审查的任务，其自然语言验收清单继续有效：Master 仍按 G1 逐条判定，只需在 PR 评论 / 任务记录中按 AC 编号补齐结论与证据引用，不必回填完整九字段矩阵。任务一旦在其任务包或 Issue 中声明使用证据矩阵，该任务整体按本节判定，不得部分回填后又按自然语言清单宣称通过。结构检查不追溯既有任务，也不把旧任务的缺失字段判为失败。
+
+### 4.2 风险分层与批次审查
+
+批次审查与检查深度由**真实 Diff** 的路径风险决定。分级是分类结果，不是声明：不得由执行者自填“低风险”来降级，风险分类也不接受调用者传入的等级。
+
+| 等级 | 判定（按变更路径） | 审查 / 检查深度 |
+|------|--------------------|------------------|
+| `L0` | 仅 `docs/` 下的 Markdown / 文本 / 图片（`L2` 列出的文件除外）、`release/README.md`、`assets/`，以及除 `AGENTS.md` / `VERSION.md` / `LICENSE.md` / `README.md` 外的根 `*.md` | 结构、范围与链接等自动检查；不要求第二模型审查；必需检查仍必须真实通过 |
+| `L1` | 其余可执行 / 配置路径：未列入 `L2` 的 `scripts/*.py`、`tests/`、`.github/` 非 workflow 文件、`pyproject.toml`、`README.md`、其他根文档等 | 相关增量检查 + 对批次最终 Diff 的一次独立审查 |
+| `L2` | `AGENTS.md`、`kit/`、`editions/`、`templates/`、`docs/PROJECT.md`、`docs/PLAN.md`、`docs/orchestration.md`、`.github/workflows/`、`release/`（`release/README.md` 除外）、`VERSION.md`、`scripts/orchestrator.py`、`scripts/validate_kit.py`、`scripts/build_release.py`、`scripts/check_drift.py`、`scripts/check_scope.py`、`scripts/verification_profile.py`、`scripts/autonomous_delivery.py`、`scripts/batch_delivery.py`、`scripts/delivery_risk.py`、`scripts/agent_selection/`、`scripts/update_agentorch/`、`scripts/self_improvement/` | 独立审查 + 相关负向场景 + 完整回归 |
+| `L3` | 凭据 / 密钥形态的路径（`.env`、`.env.*`（`.env.example` 除外）、`*secret*`、`*token*`、`*.pem`、`*.key`、`credentials*`），或删除 `LICENSE.md` | 人工授权；未获授权不得推送或合并 |
+
+判定规则：
+
+- 多个等级混合时取最高级；无法归类的路径按 `L2` 处理（失败关闭），不得当作 `L0`。
+- 空 Diff 视为 `L0` 并记录 `empty diff`；它本身不构成验收证据。
+- 风险按批次最终 head 的 `<base>...<head>` 真实 Diff 计算；分类实现见 4.3 节的 `scripts/delivery_risk.py`。
+- 本节只决定**审查与检查的深度**，不豁免 G1–G6、必需检查、证据矩阵或范围检查。G1–G6 仍按批次最终 Diff 执行，证据矩阵仍逐任务记账（4.1 节）。
+- `L0` 只免除第二模型审查；Master 的 G1 / G2 / G4–G6 判定、必需检查与证据矩阵不因此减免。
+- `L2` / `L3` 的独立审查不得由执行者自任，也不得由被审查 Diff 的同一次执行会话充当；`L3` 的人工授权必须记录在任务载体中。
+
+### 4.3 批次工具（实现，不是新权威）
+
+`scripts/batch_delivery.py` 是 2.2 节批次流程的**参考实现**；`scripts/delivery_risk.py` 按 4.2 节规则从真实 Diff 计算风险等级。两者都不替代本文件的状态机、锁、G1–G6 或 CI：工具输出不构成验收结论，也不能把 `INTEGRATED` 写成 `VERIFIED`。
+
+```bash
+python3 scripts/batch_delivery.py check --plan PLAN [--repo PATH]
+python3 scripts/batch_delivery.py run --plan PLAN --journal JOURNAL [--repo PATH] \
+    [--execute] [--only T1,T2] [--retry T1,T2] [--resume] [--timeout SECONDS]
+python3 scripts/batch_delivery.py finalize --plan PLAN --journal JOURNAL [--repo PATH] \
+    [--review] [--push] [--merge --authorization TEXT] [--resume] \
+    [--checks-timeout SECONDS] [--next-plan PLAN2]
+python3 scripts/batch_delivery.py status --journal JOURNAL [--json]
+python3 scripts/delivery_risk.py --repo PATH --base REF --head REF [--json]
+```
+
+- 退出码：`0` 成功；`1` 部分成功 / 失败 / 阻塞；`2` 输入或前置检查非法（未开始写入）。`1` 与 `2` 都不得当作通过。
+- `--journal` 是本地恢复记录，不是任务库、Issue 登记块或证据矩阵的替代，也不得写在仓库或任务 Worktree 内。恢复判断以 Git 与权威载体为准，journal 只能帮助定位，不能单独证明交付。
+- `--merge` 要求 `--authorization` 与计划中的授权文本逐字一致；合并后仍必须在主分支执行合并后验证，通过后才转 `VERIFIED`（2.2 节）。
+- 命令形式以参考实现为准。当前 head 上未真实执行的命令只能标为待探测（未验证），不得写成已验证；计划格式、恢复语义与限制见随包的 `templates/batch-delivery.md`。
 
 ## 5. 运行时能力契约 C1–C4
 
@@ -414,7 +479,7 @@ G1 的“逐条验收”以**证据矩阵**记账：每条验收标准（AC）�
 - [ ] 旧任务按 4.1 节的兼容策略处理：未回填完整矩阵的既有任务仍按自然语言清单逐条判定，且没有被宣称“已通过矩阵验收”。
 - [ ] G2 变更路径全部属于允许路径；没有未授权文件或夹带重构。
 - [ ] G3 分支基于最新主分支，合并预演无冲突。
-- [ ] G4 必需检查在当前 head SHA 全绿；`local` 为配置中的测试与静态检查，`github` 为 CI 工作流（`.github/workflows/ci.yml`：`pull_request`→`main`、`push`→`main`、`workflow_dispatch`；Python 3.12 / 3.13 矩阵；`permissions: contents: read`）。`github` 底座下 CI 含打包自检：两个 Python 版本都执行 `python scripts/build_release.py`，失败即 job 失败（无 `continue-on-error` / `|| true`），因此打包回归在 PR 上即可暴露；`py_compile` 同时覆盖 `scripts/check_drift.py`。
+- [ ] G4 必需检查在当前 head SHA 全绿；`local` 为配置中的测试与静态检查，`github` 为 CI 工作流（`.github/workflows/ci.yml`：`pull_request`→`main`、`push`→`main`、`workflow_dispatch`；`permissions: contents: read`）。必需 context 仍是 Ubuntu 上的 `checks (Python 3.12)` 与 `checks (Python 3.13)`，作业名与矩阵标签不得改。`risk` 作业按真实 Diff（PR base/head SHA）调用 `scripts/delivery_risk.py` 得到 `L0`–`L3` 与 `full`：`L0` 只跑定向结构检查；`L1` 跑完整 Ubuntu 检查（完整 `unittest`、合成场景、指标、语法检查）但不跑发布打包；`L2` / `L3`、push 到 `main`、`workflow_dispatch` 另跑发布打包自检与 macOS / Windows。没有 `continue-on-error`、`|| true` 或 `paths-ignore`；分类失败会让必需检查变红，不得出现“缺省即通过”的空绿。`py_compile` 同时覆盖 `scripts/check_drift.py`。
 - [ ] `github`：G4 以**当前 head SHA** 的 CI 运行为主要证据，证据矩阵记录运行 URL 与 head SHA；可在 PR 的 Checks 区域或 `gh pr checks <PR 编号>` 复核。本地四条命令（`validate_kit`、`unittest`、`py_compile`、`build_release`）是补充证据，不能替代 CI；CI 绿灯同样不能折算为 G1 的逐条通过。
 
 - [ ] G5 命令、输出、退出码与 head SHA 一致；失败测试未被删除、跳过或弱化。

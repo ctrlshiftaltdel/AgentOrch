@@ -3,6 +3,8 @@
 > 状态：`ACTIVE`，**仅仓库**，不在 `scripts/validate_kit.py` 的 `REQUIRED` 清单中，不随发行包发布。它不替代 `kit/orchestration.md` 的状态机、G1–G6 合并门、Issue 登记块、路径锁或资源锁。
 >
 > 入口：`scripts/autonomous_delivery.py`。当前交付的是**证据采集与人工接管切片**：对已授权的任务 worktree 真实执行、验证、独立审查，最后停在 `PREPARED` 等人工/Master 审阅与合并。**runner 自身不提供合并写路径**；这不等同于整机安全隔离，见 §1 与 §7。
+>
+> 状态补充（2026-11-16）：批次协调器 `scripts/batch_delivery.py` 是真实交付的**前进路径**（执行 → 验证 → 集成 → 审查 → 合并 → 合并后验证）；本文描述的 `autonomous_delivery.py` 仍是加固后的 prepare-only 切片，不合并、也不写权威载体。批次规则见 `kit/orchestration.md` 2.2 / 4.2 / 4.3 节与 `templates/batch-delivery.md`（§8）。本条不改变下方任何限制，也不提供实测结果。
 
 ## 1. 能做什么、不能做什么
 
@@ -130,3 +132,16 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 - 任务 worktree 必须是独立 linked worktree：等于仓库自身 worktree、或使用仓库当前分支的 worktree 会被拒绝；该检查在所有执行/恢复/重试/重证路径共用。
 - 审查门只证明 `edit` 最终为 `deny`，以及没有无法枚举的 `edit` 作用域 allow。`shell`/`bash` 允许运行，不证明那些命令只读；未知工具、MCP/插件与操作系统权限未证实。
 - Windows 上进程存活检查直接 fail closed；锁使用 `msvcrt`，未在 Windows 真机实测。
+
+## 8. 批次交付（Batch delivery）
+
+面向真实交付的前进路径是批次协调器 `scripts/batch_delivery.py`（参考实现；规则见 `kit/orchestration.md` 2.2 / 4.2 / 4.3 节，用法见 `templates/batch-delivery.md`）：相关任务共用一个集成分支与一个最终 PR / 合并，审查与检查深度按真实 Diff 的风险等级决定，合并后验证通过后才逐个任务标记 `VERIFIED`。批次内 `INTEGRATED` 只是内部里程碑，不是 `VERIFIED`。
+
+它的限制与本文相同，不因进入批次而消失：
+
+- 没有沙箱：OpenCode / Agent / MCP 插件仍可能访问 shell、网络、外部目录与凭据；工具只约束自己发起的写入。
+- transcript 不是防篡改证据；本地 journal 也不是权威载体，恢复以 Git 与任务载体（任务库 / Issue / PR）为准。
+- 仓库存在 clean / process filter、`core.fsmonitor` 或 commit hook 时拒绝自动提交（见 §7）；批次工具同样不得绕过。
+- 未获单独授权的真实第三方项目变更、实质扩大安全权限与不可逆迁移仍不得执行；`L3` 必须先取得人工授权。
+
+本章只描述能力边界与用法，**不提供实测结果**：本仓库当前 head 上未真实运行的批次、命令与结论保持 `UNKNOWN` / 未验证，不得写成已通过。
