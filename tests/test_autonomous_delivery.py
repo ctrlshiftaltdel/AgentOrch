@@ -2631,6 +2631,12 @@ class TimeoutTests(DeliveryCase):
                         'verification': [{'program': 'x', 'argv_sha256': '0' * 64,
                                           'exit_code': None, 'timeout': True}]}}}))
 
+    def _seed_plain(self, plan, journal):
+        journal.write_text(json.dumps({
+            'version': 4, 'plan_hash': self.plan_hash(plan),
+            'carrier_digest': None, 'mode': delivery.MODE,
+            'tasks': {'one': {'status': 'PREPARED', 'phase': 'done'}}}))
+
     def _git_probe(self):
         calls = []
         original = delivery.git
@@ -2640,6 +2646,27 @@ class TimeoutTests(DeliveryCase):
             return original(where, *args)
 
         return calls, mock.patch.object(delivery, 'git', probe)
+
+    def _redirect_git_metadata(self):
+        """A real worktree whose metadata lives outside it, with no `.git` entry.
+
+        Moving ``.git`` into a sibling directory and selecting it through
+        ``GIT_DIR``/``GIT_WORK_TREE`` leaves the worktree root with nothing for
+        a filesystem walk to find, while real Git still resolves the root. The
+        subdirectory returned as ``repo`` is what the old proof compared
+        against, mistaking the journal at the root for "outside".
+        """
+        metadata = self.root / 'metadata.git'
+        os.rename(self.repo / '.git', metadata)
+        environment = {'GIT_DIR': str(metadata), 'GIT_WORK_TREE': str(self.repo)}
+        scope = self.repo / 'docs'
+        result = subprocess.run(
+            ['git', '--no-optional-locks', 'rev-parse', '--show-toplevel'],
+            cwd=scope, env=dict(os.environ, **environment), check=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(Path(result.stdout.decode().strip()).resolve(),
+                         self.repo.resolve())
+        return environment, scope
 
     def test_a_journal_inside_the_repository_is_never_rewritten_by_a_halt(self):
         # `run` only compared the journal with the repository path it was given.
@@ -2684,6 +2711,53 @@ class TimeoutTests(DeliveryCase):
         self.assertEqual(calls, [])
         self.assertEqual(journal.read_text(), before)
         self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_a_halt_never_writes_when_a_separate_git_dir_hides_the_worktree(self):
+        # With GIT_DIR/GIT_WORK_TREE pointing at a separate metadata directory,
+        # the worktree root has no `.git` entry. `_enclosing_worktree` then
+        # found nothing and the proof compared only the subdirectory passed as
+        # the repository, so a journal at the real root looked outside: the
+        # halt write rewrote it and created its lock inside the worktree. A
+        # location the filesystem cannot prove must fail closed before writing.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        journal = self.repo / 'state.json'
+        self._seed_timeout(plan, journal)
+        before = journal.read_text()
+        environment, scope = self._redirect_git_metadata()
+        calls, probe = self._git_probe()
+        with mock.patch.dict(os.environ, environment), probe:
+            with self.assertRaises(ValueError) as caught:
+                delivery.run(scope, plan, journal, agent=FakeAgents(self),
+                             session_probe=self.default_probe, profiles=self.profiles,
+                             reviewer_agent='scout')
+        self.assertIn('cannot prove', str(caught.exception))
+        self.assertEqual(calls, [])
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_an_unscannable_journal_shape_stops_a_run_before_any_git(self):
+        # Valid JSON with a task list instead of a task mapping hid every
+        # recorded timeout from the scan. `run` then started `_root` (a real
+        # Git process) before the later shape check refused it. A journal the
+        # scan cannot read reliably must fail closed before any external call.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        self.state.write_text(json.dumps(
+            {'tasks': [{'verification': [{'timeout': True}]}]}))
+        before = self.state.read_text()
+        calls, probe = self._git_probe()
+        with probe:
+            with self.assertRaises(delivery.RunHaltError) as caught:
+                delivery.run(self.repo, plan, self.state, agent=FakeAgents(self),
+                             session_probe=self.default_probe, profiles=self.profiles,
+                             reviewer_agent='scout')
+        self.assertIn('state journal', str(caught.exception))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.state.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(self.state).exists())
 
     def _cli_issue_args(self, journal, repo=None, worktree=None):
         return ['delivery', '--repo', str(repo or self.repo), '--issue', '230',
@@ -2739,6 +2813,102 @@ class TimeoutTests(DeliveryCase):
                 self._cli_issue_args(journal, worktree=work))
         self.assertEqual(code, 2)
         self.assertIn('outside every task worktree', errors)
+        self.assertEqual(calls, [])
+        loader.assert_not_called()
+        gh.assert_not_called()
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_the_cli_proves_an_unprovable_git_location_before_a_halt_write(self):
+        # `--plan --resume` halts on a recorded timeout by writing the journal
+        # and creating its lock. With the metadata in a separate GIT_DIR the
+        # worktree root had no `.git` entry, so the proof compared only the
+        # subdirectory passed as `--repo` and the halt wrote inside the real
+        # worktree. An unprovable location must stop the CLI before any write.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        planfile = self.root / 'plan.json'
+        planfile.write_text(json.dumps(plan))
+        journal = self.repo / 'state.json'
+        self._seed_timeout(plan, journal)
+        before = journal.read_text()
+        environment, scope = self._redirect_git_metadata()
+        calls, probe = self._git_probe()
+        errors = io.StringIO()
+        args = ['delivery', '--repo', str(scope), '--plan', str(planfile),
+                '--state', str(journal), '--execute', '--resume']
+        with mock.patch.dict(os.environ, environment), probe, \
+                mock.patch('sys.argv', args), contextlib.redirect_stderr(errors), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                delivery.main()
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn('cannot prove', errors.getvalue())
+        self.assertEqual(calls, [])
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_the_cli_proves_the_shape_before_the_issue_query(self):
+        # `{"tasks": [...]}` is valid JSON, but the scan cannot read a task list
+        # as a mapping and used to call it "no timeout". `--issue --resume`
+        # then started `git rev-parse` and `gh issue view`. An unscannable
+        # structure must fail closed before any external call.
+        self.state.write_text(json.dumps(
+            {'tasks': [{'verification': [{'timeout': True}]}]}))
+        before = self.state.read_text()
+        calls, probe = self._git_probe()
+        with probe:
+            code, errors, loader, gh = self._run_cli(
+                self._cli_issue_args(self.state, worktree=self.root / 'work-one'))
+        self.assertEqual(code, 2)
+        self.assertIn('state journal', errors)
+        self.assertEqual(calls, [])
+        loader.assert_not_called()
+        gh.assert_not_called()
+        self.assertEqual(self.state.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(self.state).exists())
+
+    def test_the_cli_proves_the_task_worktree_before_the_issue_query_without_a_timeout(
+            self):
+        # The CLI proved the journal boundary only when it found a recognizable
+        # timeout. A journal with no timeout inside the task worktree therefore
+        # reached `git rev-parse` and the `gh issue view` query before `run`'s
+        # proof refused it. The location must be proved before either, timeout
+        # or not.
+        work = self.worktree('one')
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        journal = work / 'state.json'
+        self._seed_plain(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        with probe:
+            code, errors, loader, gh = self._run_cli(
+                self._cli_issue_args(journal, worktree=work))
+        self.assertEqual(code, 2)
+        self.assertIn('outside every task worktree', errors)
+        self.assertEqual(calls, [])
+        loader.assert_not_called()
+        gh.assert_not_called()
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_the_cli_proves_the_repository_before_the_issue_query_without_a_timeout(
+            self):
+        # The same rule covers the repository boundary: a journal with no
+        # timeout at the repository root and a subdirectory passed as `--repo`
+        # used to reach `git rev-parse` first, then fail for the wrong reason.
+        work = self.worktree('one')
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        journal = self.repo / 'state.json'
+        self._seed_plain(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        with probe:
+            code, errors, loader, gh = self._run_cli(
+                self._cli_issue_args(journal, repo=self.repo / 'docs', worktree=work))
+        self.assertEqual(code, 2)
+        self.assertIn('outside the repository', errors)
         self.assertEqual(calls, [])
         loader.assert_not_called()
         gh.assert_not_called()

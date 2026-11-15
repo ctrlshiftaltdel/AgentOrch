@@ -1117,6 +1117,13 @@ def _journal_path(state_path):
     return path.resolve()
 
 
+# A Git location override makes the `.git` entry a filesystem walk relies on
+# irrelevant: Git may resolve a different directory, or a worktree whose root
+# carries no `.git` entry at all. Any of these makes the location unprovable
+# without starting Git, which the halt path must never do.
+_GIT_LOCATION_OVERRIDES = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR')
+
+
 def _enclosing_worktree(path):
     """The nearest enclosing Git worktree root of ``path``, without Git.
 
@@ -1127,7 +1134,9 @@ def _enclosing_worktree(path):
     very reason it exists is that a timed-out check's surviving tree, or a
     helper run inside a Git process, must not influence it. A path given as a
     subdirectory of the worktree therefore still resolves to the root.
-    ``None`` means no ancestor carries a ``.git`` entry.
+    ``None`` means no ancestor carries a ``.git`` entry, which is only
+    trustworthy while no Git location override is active (see
+    ``_prove_journal_outside``).
     """
     current = Path(path).resolve()
     for candidate in (current, *current.parents):
@@ -1147,7 +1156,20 @@ def _prove_journal_outside(state_path, repo, worktrees=()):
     write and before the journal lock is created: a journal that is inside a
     worktree is never rewritten to record a stop, and a repository path that
     cannot be resolved is reported instead of being written around.
+
+    With ``GIT_DIR``/``GIT_WORK_TREE``/``GIT_COMMON_DIR`` set, the ``.git``
+    entry the walk depends on is not authoritative: Git may resolve a separate
+    metadata directory, and a worktree root can then carry no ``.git`` entry at
+    all. The boundary is then unprovable from the filesystem alone, so it fails
+    closed here instead of comparing only the path that was passed in.
     """
+    overrides = [name for name in _GIT_LOCATION_OVERRIDES if os.environ.get(name)]
+    if overrides:
+        raise ValueError(
+            'cannot prove the journal is outside the repository and every task '
+            f'worktree from the filesystem while {", ".join(overrides)} is set: a '
+            'separate Git directory hides the worktree root, so unset it and run '
+            'again')
     journal = Path(state_path).resolve()
     boundary = [Path(repo).resolve(strict=True)]
     enclosing = _enclosing_worktree(boundary[0])
@@ -1166,19 +1188,43 @@ def _prove_journal_outside(state_path, repo, worktrees=()):
             raise ValueError('state must be outside every task worktree')
 
 
+def _journal_shape_error(detail):
+    return RunHaltError(
+        f'the state journal {detail}; whether it records a timed-out check cannot '
+        'be proved, so nothing may start until it is inspected manually')
+
+
 def _journal_timeout(state):
     """The first saved record whose verification recorded a timeout, or ``None``.
 
     This reads the journal as data. It starts no Git process, no Agent, no
-    profile query and no carrier query, so it can run before any of them.
+    profile query and no carrier query, so it can run before any of them. A
+    structure it cannot scan reliably is not treated as "no timeout": a journal
+    with a task list instead of a mapping, or a non-mapping record or check, is
+    exactly the case where a recorded timeout could be hidden from the scan.
+    It therefore fails closed before any external call can start.
     """
-    tasks = state.get('tasks') if isinstance(state, dict) else None
+    if not isinstance(state, dict):
+        raise _journal_shape_error('is not a JSON object')
+    tasks = state.get('tasks')
     if not isinstance(tasks, dict):
-        return None
+        raise _journal_shape_error('does not hold a task mapping')
     for ident in sorted(tasks):
         record = tasks[ident]
-        if isinstance(record, dict) and _timed_out(record):
-            return ident, record
+        if not isinstance(record, dict):
+            raise _journal_shape_error(f'holds a non-mapping record for task {ident}')
+        checks = record.get('verification')
+        if checks is None:
+            continue
+        if not isinstance(checks, list):
+            raise _journal_shape_error(
+                f'holds a non-list verification for task {ident}')
+        for check in checks:
+            if not isinstance(check, dict):
+                raise _journal_shape_error(
+                    f'holds a non-mapping verification check for task {ident}')
+            if check.get('timeout'):
+                return ident, record
     return None
 
 
@@ -1234,14 +1280,18 @@ def _halt_saved_timeout(state_path, task_ids=(), *, repo, worktrees=()):
     file and its own lock are touched, and the boundary is proved before either:
     the journal is never rewritten or locked while it sits inside the repository
     or a task worktree, and a boundary that cannot be proved stops the run
-    instead of being written around. An existing journal that cannot be read or
-    parsed is not the same as a missing one -- whether it records a timeout
-    cannot be proved -- so it fails closed before any Git or ``gh`` call. The
-    journal is re-read under the lock so a concurrent writer's state is what
-    gets halted, and the halted state is saved before returning. ``None`` means
-    no record carries a timeout, so the caller may continue.
+    instead of being written around. That proof is made before the journal is
+    even read, so it does not depend on whether the journal holds a recognizable
+    timeout: a caller's next step is an external call either way. An existing
+    journal that cannot be read or parsed is not the same as a missing one --
+    whether it records a timeout cannot be proved -- so it fails closed before
+    any Git or ``gh`` call. The journal is re-read under the lock so a concurrent
+    writer's state is what gets halted, and the halted state is saved before
+    returning. ``None`` means no record carries a timeout, so the caller may
+    continue.
     """
     path = Path(state_path)
+    _prove_journal_outside(path, repo, worktrees)
     try:
         peek = json.loads(path.read_text(encoding='utf-8'))
     except FileNotFoundError:
@@ -1253,7 +1303,6 @@ def _halt_saved_timeout(state_path, task_ids=(), *, repo, worktrees=()):
             'nothing may start until it is inspected manually') from None
     if _journal_timeout(peek) is None:
         return None
-    _prove_journal_outside(path, repo, worktrees)
     try:
         handle = _lock(_journal_lock_path(path))
     except DeliveryError as exc:
