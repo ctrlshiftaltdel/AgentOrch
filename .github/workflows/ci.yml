@@ -30,9 +30,186 @@ env:
   PYTHONIOENCODING: "utf-8"
 
 jobs:
+  # Delivery risk classification of this run's exact commit range.
+  #
+  # The tier decides how much validation the *required* `checks` contexts run
+  # (see the step conditions inside `checks`). It is derived only from the Git
+  # range the run actually built: no PR label, no commit message, no branch
+  # name and no caller-supplied value is read, because a label is something the
+  # author can flip after the fact and that would turn the gate into a
+  # self-service opt-out.
+  #
+  # Fail-closed rules, mirrored by the conditions in `checks`:
+  #   * L2/L3, a push to main, a manual run and any classification failure all
+  #     report `full=true`;
+  #   * `full=false` is possible only for a classified L0/L1 pull_request run.
+  #
+  # `classified` is the honest part: it stays `false` unless a real report was
+  # parsed, and `checks` turns that into a red required context instead of a
+  # quietly downgraded run.
+  risk:
+    name: risk (delivery classifier)
+    runs-on: ubuntu-latest
+    outputs:
+      level: ${{ steps.classify.outputs.level }}
+      full: ${{ steps.classify.outputs.full }}
+      classified: ${{ steps.classify.outputs.classified }}
+      base: ${{ steps.classify.outputs.base }}
+      head: ${{ steps.classify.outputs.head }}
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          # The classifier resolves both endpoints and their merge base, so a
+          # shallow clone would look unclassifiable on every run.
+          fetch-depth: 0
+
+      # actions/checkout checks out the PR merge commit; the PR head commit
+      # itself is absent for a fork PR. Fetch it here so a fork PR is still
+      # classified instead of defaulting to full validation every time.
+      - name: Fetch pull request head commit
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -u
+          head="${{ github.event.pull_request.head.sha }}"
+          if git cat-file -e "${head}^{commit}" 2>/dev/null; then
+            exit 0
+          fi
+          git fetch --no-tags origin "refs/pull/${{ github.event.pull_request.number }}/head:refs/remotes/ci-pr-head"
+          git cat-file -e "${head}^{commit}"
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      # The step always exits 0 and always writes its outputs: a Git failure, a
+      # missing classifier or an unparsable report must leave L2/full defaults
+      # behind, not abort the job before `checks` can see them. `checks` then
+      # fails the required context through `classified`.
+      #
+      # Event inputs come from the event payload (base/head SHAs), never from
+      # text a contributor controls.
+      - name: Classify delivery risk
+        id: classify
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          RUN_HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -u
+
+          # Fail-closed defaults: anything that stops a real classification is
+          # reported as L2 with full validation required.
+          level="L2"
+          full="true"
+          classified="false"
+          base=""
+          head=""
+          event="${EVENT_NAME:-}"
+          err="$RUNNER_TEMP/delivery-risk.err"
+
+          case "$event" in
+            pull_request)
+              base="${PR_BASE_SHA:-}"
+              head="${PR_HEAD_SHA:-}"
+              ;;
+            push)
+              head="${RUN_HEAD_SHA:-}"
+              base="${PUSH_BEFORE_SHA:-}"
+              case "$base" in
+                0000000000000000000000000000000000000000) base="" ;;
+              esac
+              # A brand-new branch has no `before` commit: compare against the
+              # commit this push built on.
+              if [ -z "$base" ] && [ -n "$head" ] \
+                 && git rev-parse --verify --quiet "${head}^" >/dev/null 2>&1; then
+                base="${head}^"
+              fi
+              ;;
+            workflow_dispatch)
+              head="${RUN_HEAD_SHA:-}"
+              if [ -n "$head" ] \
+                 && git rev-parse --verify --quiet "${head}^" >/dev/null 2>&1; then
+                base="${head}^"
+              fi
+              ;;
+          esac
+
+          if [ -z "$base" ] || [ -z "$head" ]; then
+            echo "::warning::no comparable commit range for '${event}'; keeping the L2 fail-closed defaults"
+          elif uv run python scripts/delivery_risk.py --repo . --base "$base" --head "$head" --json >"$RUNNER_TEMP/delivery-risk.json" 2>"$err"; then
+            # Parse without jq and without third-party modules: the report keys
+            # are the stable part of the classifier's interface.
+            risk_level=""
+            risk_full="true"
+            if parsed="$(uv run python -c 'import json, sys; d = json.load(sys.stdin); lv = d.get("level"); fv = d.get("full_validation"); print(lv if isinstance(lv, str) else "-", "true" if fv is True else "false"); sys.exit(0 if lv in ("L0", "L1", "L2", "L3") and isinstance(fv, bool) else 1)' < "$RUNNER_TEMP/delivery-risk.json")"; then
+              risk_level="${parsed% *}"
+              risk_full="${parsed##* }"
+            fi
+            case "$risk_level" in
+              L0|L1|L2|L3)
+                level="$risk_level"
+                full="$risk_full"
+                classified="true"
+                ;;
+              *)
+                echo "::warning::delivery_risk.py produced a report this workflow does not understand"
+                ;;
+            esac
+          else
+            echo "::warning::delivery_risk.py failed; keeping the L2 fail-closed defaults"
+            if [ -f "$err" ]; then
+              sed -n '1,40p' "$err" >&2
+            fi
+          fi
+
+          # A tier the classifier did not vouch for always needs full
+          # validation, and only a pull_request run may skip the cross-platform
+          # jobs: a push to main proves the merged tree, not the PR tier.
+          case "$level" in
+            L0|L1) ;;
+            *) full="true" ;;
+          esac
+          if [ "$classified" != "true" ] || [ "$event" != "pull_request" ]; then
+            full="true"
+          fi
+
+          {
+            echo "level=$level"
+            echo "full=$full"
+            echo "classified=$classified"
+            echo "base=$base"
+            echo "head=$head"
+          } >>"$GITHUB_OUTPUT"
+
+          {
+            echo "### Delivery risk"
+            echo ""
+            echo "- event: \`${event}\`"
+            echo "- level: \`${level}\`"
+            echo "- full validation: \`${full}\`"
+            echo "- classified: \`${classified}\`"
+            echo "- range: \`${base:-none}...${head:-none}\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  # The two required status-check contexts are `checks (Python 3.12)` and
+  # `checks (Python 3.13)` on ubuntu; the repository ruleset binds those exact
+  # names, so neither the job name nor the matrix labels may change. This job
+  # is never gated on the risk tier: it always runs every step that the tier
+  # requires, so the required contexts always report a real conclusion.
   checks:
     name: checks (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    needs: [risk]
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -40,6 +217,10 @@ jobs:
     steps: &checks-steps
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # `git diff --check` compares this run against the base commit the
+          # `risk` job resolved, so that commit has to exist locally.
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -51,8 +232,28 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
 
+      # Always. Structural validation is cheap and covers every tier: a
+      # docs-only change can still break the kit's required file set.
       - name: Validate kit structure
         run: uv run python scripts/validate_kit.py
+
+      # Always. Whitespace errors are invisible in review but land in the tree,
+      # so they are caught on the exact range this run built. An unresolvable
+      # base is an error, never a silent pass.
+      - name: Whitespace check (git diff --check)
+        shell: bash
+        run: |
+          set -u
+          base="${{ needs.risk.outputs.base }}"
+          if [ -z "$base" ]; then
+            echo "::error::the risk job did not resolve a base commit, so the whitespace check cannot run"
+            exit 1
+          fi
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "::error::base commit ${base} is not present in the checkout"
+            exit 1
+          fi
+          git diff --check "$base" HEAD
 
       # This repository ships the checker but no Architecture Contract, so the
       # run is a read-only regression: it must exit 0 in diagnostic mode and
@@ -61,17 +262,33 @@ jobs:
       - name: Architecture contract check (diagnostic)
         run: uv run python scripts/architecture/check.py --project . --json
 
+      # L0 (docs-only, no second-model review): only the structural and scope
+      # regressions that a documentation change can actually break. The full
+      # suite, the synthetic delivery scenarios and release packaging are the
+      # parts that cannot be affected by a Markdown edit.
+      #
+      # The reduced path is reachable only with `full == 'false'`, which the
+      # classifier reports only for a positively classified L0/L1 pull_request.
+      # A docs-only push to main, a manual run or an unclassified range keeps
+      # `full=true` and therefore runs the whole suite below: the merged tree is
+      # what ships, so it never gets the PR shortcut.
+      - name: Targeted structural tests (risk L0)
+        if: needs.risk.outputs.level == 'L0' && needs.risk.outputs.full == 'false'
+        run: uv run python -m unittest tests.test_validate_kit tests.test_check_scope
+
       - name: Run unit tests
+        if: needs.risk.outputs.full == 'true' || needs.risk.outputs.level != 'L0'
         run: uv run python -m unittest discover -s tests
 
       # Synthetic delivery scenarios: every scenario must PASS (a negative
       # scenario passing means its gate really fired), the report must carry no
-      # ERROR, and the exit code must be 0. No `continue-on-error`: a broken gate
-      # has to turn this job red. The report is written to the runner temp
-      # directory, never into the repository. `runner.temp` is used instead of
-      # the platform-specific $RUNNER_TEMP shell variable so the same step works
-      # under bash and under the Windows runner's pwsh.
+      # ERROR, and the exit code must be 0. A broken gate has to turn this job
+      # red. The report is written to the runner temp directory, never into the
+      # repository. `runner.temp` is used instead of the platform-specific
+      # $RUNNER_TEMP shell variable so the same step works under bash and under
+      # the Windows runner's pwsh.
       - name: Synthetic delivery scenarios
+        if: needs.risk.outputs.full == 'true' || needs.risk.outputs.level != 'L0'
         run: >-
           uv run python scripts/run_delivery_scenarios.py --json
           --output "${{ runner.temp }}/delivery-scenarios.json"
@@ -80,38 +297,61 @@ jobs:
       # with seven metrics and an explicit window. The report is read-only and
       # never touches a task library or a credential.
       - name: Delivery metrics (gold sample)
+        if: needs.risk.outputs.full == 'true' || needs.risk.outputs.level != 'L0'
         run: >-
           uv run python scripts/report_metrics.py --gold-sample
           --since 2026-01-01 --until 2026-02-01 --json
 
-      # Cross-platform syntax check. The explicit list pins the core scripts; the
-      # two wildcard directories are expanded in Python because the Windows
-      # runner's default pwsh does not expand `scripts/*/*.py` the way bash does,
-      # and a silently unexpanded glob would leave those modules unchecked.
+      # Cross-platform syntax check, and always part of every tier. The explicit
+      # list pins the core scripts; the two wildcard directories are expanded in
+      # Python because the Windows runner's default pwsh does not expand
+      # `scripts/*/*.py` the way bash does, and a silently unexpanded glob would
+      # leave those modules unchecked.
       - name: Syntax check
         run: >-
           uv run python -c "import glob, py_compile, sys; files = list(sys.argv[1:]) + sorted(glob.glob('scripts/update_agentorch/*.py')) + sorted(glob.glob('scripts/self_improvement/*.py')); [py_compile.compile(f, doraise=True) for f in files]; print('syntax ok: %d files' % len(files))"
           scripts/orchestrator.py scripts/validate_kit.py scripts/check_drift.py
+          scripts/delivery_risk.py scripts/batch_delivery.py
           scripts/architecture/check.py scripts/architecture/contract.py
           scripts/architecture/report.py scripts/architecture/rules.py
           scripts/architecture/adapters/python_ast.py scripts/architecture/adapters/rust.py
 
-      # Release packaging self-check. No `continue-on-error`, no `|| true`: a
-      # packaging regression (missing file, broken link inside the package,
-      # manifest mismatch, forbidden path) must turn this job red, exactly as it
-      # would at release time. The zip is written to the runner's `release/`
-      # directory, which `.gitignore` already excludes; it is never committed or
-      # uploaded. Runs on every matrix entry of every OS on purpose: the
-      # self-check executes the shipped test suite inside the extracted archive,
-      # so each supported platform/version proves the artifact it would receive.
+      # Release packaging self-check. A packaging regression (missing file,
+      # broken link inside the package, manifest mismatch, forbidden path) must
+      # turn this job red, exactly as it would at release time. The zip is
+      # written to the runner's `release/` directory, which `.gitignore`
+      # already excludes; it is never committed or uploaded. Runs on every
+      # matrix entry of every OS on purpose: the self-check executes the shipped
+      # test suite inside the extracted archive, so each supported
+      # platform/version proves the artifact it would receive.
+      #
+      # Gated on `full` rather than on `level` on purpose: an empty or missing
+      # output (the risk job failed) keeps this step running. Packaging is only
+      # skipped when the classifier explicitly reported L0/L1.
       - name: Release self-check (build_release.py)
+        if: needs.risk.outputs.full != 'false'
         run: uv run python scripts/build_release.py
+
+      # Fail closed, last. `risk` writes `classified=true` only after it parsed
+      # a real report; every other outcome (missing scripts/delivery_risk.py,
+      # Git failure, malformed report, unresolvable range) leaves this required
+      # context red instead of quietly downgrading the validation that ran.
+      - name: Fail closed when delivery risk could not be classified
+        if: needs.risk.outputs.classified != 'true'
+        run: |
+          echo "::error::delivery risk classification failed; a required check cannot pass on an unknown tier"
+          exit 1
 
   # Real macOS runner. Same steps as `checks`, single Python version: this job
   # exists to prove the kit on the platform, not to widen the version promise.
+  # Gated on `full`: the cross-platform jobs are the expensive half of the
+  # matrix and an L1 change that touches no shipped script cannot exercise them
+  # differently from ubuntu.
   checks-macos:
     name: checks-macos (Python ${{ matrix.python-version }})
     runs-on: macos-latest
+    needs: [risk]
+    if: needs.risk.outputs.full == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -125,6 +365,8 @@ jobs:
   checks-windows:
     name: checks-windows (Python ${{ matrix.python-version }})
     runs-on: windows-latest
+    needs: [risk]
+    if: needs.risk.outputs.full == 'true'
     strategy:
       fail-fast: false
       matrix:
