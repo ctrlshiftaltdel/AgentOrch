@@ -73,6 +73,16 @@ def _git(where, *args, check=True):
                           stderr=subprocess.PIPE)
 
 
+def _backslash_separates_names():
+    """Whether the host filesystem treats a backslash as a path separator.
+
+    Such a filesystem (Windows) cannot hold a backslash inside one file name.
+    Only the fixture's attempt to create that name is skipped there; the
+    production refusal it feeds is asserted on every platform.
+    """
+    return '\\' in os.sep or '\\' in (os.altsep or '')
+
+
 def _shell_command(*parts):
     """A Git filter/hook command line that survives the shell Git runs it with.
 
@@ -1756,13 +1766,18 @@ class CheckRunnerTests(DeliveryCase):
     def test_a_timeout_is_killed_only_after_the_group_probe_is_gone(self):
         process = mock.Mock(pid=4242)
         process.communicate.return_value = ('', '')
+        # `os.killpg` does not exist on Windows, so `create=True` lets the
+        # posix branch be mocked and exercised there too; the assertions below
+        # are the same on every platform.
         with mock.patch.object(delivery.os, 'name', 'posix'), \
-                mock.patch.object(delivery.os, 'killpg', return_value=None), \
+                mock.patch.object(delivery.os, 'killpg', return_value=None,
+                                  create=True), \
                 mock.patch.object(delivery, '_kill_group', return_value=(True, 4242)):
             self.assertEqual(delivery._stop_timed_out(process),
                              'timed out; could not prove the process group was terminated')
         with mock.patch.object(delivery.os, 'name', 'posix'), \
-                mock.patch.object(delivery.os, 'killpg', side_effect=ProcessLookupError), \
+                mock.patch.object(delivery.os, 'killpg',
+                                  side_effect=ProcessLookupError, create=True), \
                 mock.patch.object(delivery, '_kill_group', return_value=(True, 4242)):
             self.assertEqual(delivery._stop_timed_out(process),
                              'timed out; process group killed')
@@ -2806,17 +2821,31 @@ class TimeoutTests(DeliveryCase):
 
         Git decodes ``\\\\`` in a value into one backslash, so the line names
         the path below; a reader that only unescapes inside quotes keeps both
-        characters and resolves a path that is not the worktree at all. The
-        ``config --get`` equality is the fixture's evidence; the file must carry
-        the escaped spelling.
+        characters and resolves a path that is not the worktree at all. On a
+        filesystem that can hold a backslash in one file name (POSIX) the
+        ``config --get`` equality is the fixture's evidence and the file must
+        carry the escaped spelling. Windows cannot hold that name, so only
+        that creation is skipped there: the escaped spelling is written into
+        the config directly and the production refusal is asserted the same.
         """
         escaped = self.root / 'escaped\\root'
-        _git(self.repo, 'config', 'core.worktree', str(escaped))
-        self.assertEqual(_git(self.repo, 'config', '--get', 'core.worktree'
-                              ).stdout.decode().rstrip('\n'), str(escaped))
-        self.assertIn('\\\\', (self.repo / '.git' / 'config').read_text(
-            encoding='utf-8'))
-        _git(self.repo / 'docs', 'rev-parse', '--show-toplevel')
+        config = self.repo / '.git' / 'config'
+        if not _backslash_separates_names():
+            escaped.mkdir()
+            _git(self.repo, 'config', 'core.worktree', str(escaped))
+            self.assertEqual(_git(self.repo, 'config', '--get', 'core.worktree'
+                                  ).stdout.decode().rstrip('\n'), str(escaped))
+            self.assertIn('\\\\', config.read_text(encoding='utf-8'))
+            _git(self.repo / 'docs', 'rev-parse', '--show-toplevel')
+        else:
+            # `Path` splits ``escaped\\root`` into two components on Windows,
+            # and Git may reject a value naming that path. Write the escaped
+            # spelling straight into the file, as the bare-carriage-return
+            # fixture does, so the reader still meets what Git would decode.
+            with config.open('a', encoding='utf-8') as handle:
+                handle.write('\n[core]\n\tworktree = escaped\\\\root\n')
+            self.assertIn('worktree = escaped\\\\root',
+                          config.read_text(encoding='utf-8'))
         return escaped
 
     def _core_worktree_with_a_bare_carriage_return(self):
