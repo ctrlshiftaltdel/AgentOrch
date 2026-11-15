@@ -348,10 +348,9 @@ class VersionConsistencyTests(unittest.TestCase):
         self.assertFalse(self.versions.tag_matches_format('v1.6.2', format_version))
         self.assertFalse(self.versions.tag_matches_format('v1.6.3', format_version))
         self.assertFalse(self.versions.tag_matches_format('v1.5', '1.6'))
-        # The current updater accepts v2.0.0 only through its explicit matrix,
-        # and the matrix is keyed on the package's Format, not on the release
-        # number: no matrix, a matrix missing 1.7, and a package Format of 2.0
-        # must all fail closed.
+        # The current updater accepts v2.0.0 through its explicit matrix, which
+        # is keyed on the package's Format, not on the release number: no matrix
+        # and a matrix missing 1.7 must fail closed.
         declared = self.versions.format_compatibility(
             f'v{release}', format_version, self.versions.DECLARED_SUPPORTED_FORMATS)
         self.assertTrue(declared.accepted)
@@ -363,6 +362,14 @@ class VersionConsistencyTests(unittest.TestCase):
         missing_format = self.versions.format_compatibility(
             f'v{release}', '1.6', self.versions.DECLARED_SUPPORTED_FORMATS)
         self.assertFalse(missing_format.accepted)
+        # A package that declares Format 2.0 is accepted by the *historical*
+        # rule instead, because tag 2.0 equals Format 2.0; the matrix plays no
+        # part. Keeping this assertion makes the two rules explicitly distinct
+        # rather than implying the matrix gates every non-1.7 Format.
+        format_2 = self.versions.format_compatibility(
+            f'v{release}', '2.0', self.versions.DECLARED_SUPPORTED_FORMATS)
+        self.assertTrue(format_2.accepted)
+        self.assertEqual(format_2.rule, self.versions.RULE_TAG_MATCHES_FORMAT)
         # The published bridge (v1.7.1) also matches under the historical rule,
         # which is what makes the two-step upgrade path through it possible.
         self.assertTrue(self.versions.format_compatibility(
