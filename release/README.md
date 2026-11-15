@@ -213,9 +213,13 @@
 
 - **状态：候选，准备中，未发布。** 没有 tag、没有 GitHub Release、没有上传任何资产；本节记录候选范围、构建与兼容性检查，不是发布事实。最终发布由 Master 按第 4 节执行并在发布后重新取证。
 - 目标：`Release version` `1.7.2`，`Format version` 仍为 `1.7`。版本基准是最新已发布 tag `v1.7.1`（`git tag --sort=-v:refname` 与 `gh release list` 的首项），与本候选准备前的 `VERSION.md`（`Release version: 1.7.1`）一致，满足 §5.3 的基准一致性检查。
-- **更新器版本匹配（本机真实执行）**：`tag_matches_format('v1.7.2', '1.7')` 为 `True`，`tag_matches_format('v1.7.2', '1.6')` 为 `False`；`versions.format_compatibility('v1.7.2', '1.7')` 返回 `accepted=True`、`rule='tag_matches_format'`。因此已发布的 v1.7.0 客户端（旧规则）与 v1.7.1 客户端（桥接矩阵 `DECLARED_SUPPORTED_FORMATS = ('1.7',)`）都能通过 `VERSION_MATCH` 安装本候选。对照：`v1.8.0` + Format `1.7` 仍被旧规则拒绝（`False`），且不带显式兼容矩阵时被 `format_compatibility()` 拒绝（`accepted=False`）。
+- **版本匹配与端到端升级是两件事（本机只做了前者）**：`tag_matches_format('v1.7.2', '1.7')` 为 `True`，`tag_matches_format('v1.7.2', '1.6')` 为 `False`；`versions.format_compatibility('v1.7.2', '1.7')` 返回 `accepted=True`、`rule='tag_matches_format'`。这**只**说明已发布的 v1.7.0 客户端（只用旧规则）与 v1.7.1 客户端（桥接矩阵 `DECLARED_SUPPORTED_FORMATS = ('1.7',)`）会通过 `VERSION_MATCH` **这一道检查**；它不证明包校验、逐文件分类、备份、写入或升级会成功，也不证明本候选可以被安装。真实从 GitHub 下载 `v1.7.2` 并升级为 `NOT_RUN`（见下）。对照：`v1.8.0` + Format `1.7` 过不了旧规则（`False`），且不带显式兼容矩阵时被 `format_compatibility()` 拒绝（`accepted=False`）。
 - **包内文件集合 131 个（130 `REQUIRED` + `MANIFEST.json`）**：与 v1.7.1 相同。自 v1.7.1 以来随包文件只有修改、**没有新增、删除、改名或移动**；`MANIFEST.json` schema 1 与 `format_version` 1.7 不变。
-- 分类（按 §5.3）：建议 **PATCH**（`v1.7.2`）。依据：包格式、`REQUIRED` 集合、`MANIFEST.json` schema、CLI、状态机 / 锁与更新引擎均未变化；随包变更全部是自我完善风险门禁的收紧（fail-closed）、交付场景口径修正、发行号同步与对应测试，对外没有新增能力或放宽行为。唯一的对外行为变化是**收回**原先的低风险自动 `READY`：提案改停在 `BLOCKED` / `NEEDS_EVIDENCE`，或有证据 / 声明的高风险线索时进入 `NEEDS_HUMAN_DECISION`。这是安全修正，不是对外接口破坏；最终级别仍由 Master / Owner 按 §5.3 裁定。
+- 分类（按 §5.3）：**未成立，不能按 PATCH 记录**。§5.3 的 PATCH 要求「公开行为无对外不兼容变化」，本候选至少有两处不满足：
+  - **新增输入要求（调用方不兼容）**：`scripts/self_improvement/orchestration.py` 的 `restore_state()` 现在要求 state 带完整 40 位 `base_sha`，而 v1.7.1 接受不含该字段的 state。按 v1.7.1 形状构造 state 的调用方会在 `restore_state()` 得到 `state.base_sha` 错误，`run_loop()` 直接以 `BLOCKED`（`state could not be restored from real facts`）返回，不再进入扫描 / 规划。同一处还要求 `state.task`（如给出）必须是映射；v1.7.1 完全忽略该字段。`planning.py` 新增的 `repo_root` / `required_base_sha` / `required_head_sha` 都是带默认值的关键字参数，按位置传参的旧调用不会因签名失败。
+  - **行为收缩**：v1.7.1 在「lesson 合格 + 任务包完整 + 依赖已验证 + 无高风险表面」时可给出 `READY` 并交给 carrier（当时是 dry-run 记录）；本候选的风险判定不返回 `LOW`，`READY` 分支保留但不可达，提案停在 `BLOCKED` / `NEEDS_EVIDENCE`，或有证据 / 声明的高风险线索时进入 `NEEDS_HUMAN_DECISION`。
+  - 包内文件集合、`MANIFEST.json` schema 与 `format_version` 不变只说明**格式**没变，不能推出公开行为兼容，因此不得用「文件集合未变」证明 PATCH。
+- **发布状态：分类待 Master / Owner 按 §5.3 裁定，本候选暂不宣称可发布。** 若维持 PATCH，需要先恢复旧调用的兼容性（至少 `restore_state()` 的输入契约）并由 Owner 接受 `READY` 收缩；若不恢复，则按较高级别（含 MAJOR）处理，并在发布说明中明确哪些旧更新器不能自动升级。本轮没有实现任何兼容层，也没有修改代码。
 - 随包的实质性变更（11 个文件，只改内容）：
   - `scripts/self_improvement/planning.py`：风险判定改为**仓库自身 Git 证据**。`base_sha` / `head_sha` 只作定位符并与 Git 交叉核对，**调用方 diff、SHA 字符串、评审结论或授权字段都不再是证据**；空提交范围不能证明目标、允许路径范围或授权，因此**没有自动 LOW 判定**。首个 Git 命令前对仓库配置做 fail-closed 预检：`filter.<driver>.clean` / `.process`、`include` / `includeIf`、已初始化 submodule / 嵌套仓库中的可执行配置、promisor / 部分克隆远端、`ext::` 传输与 HTTP alternates 一律拒绝；replace refs、diff 隐藏配置、`core.fsmonitor` 与 hooks 通过覆盖禁用，并设 `GIT_NO_LAZY_FETCH=1`。隐藏索引位（assume-unchanged / skip-worktree）、允许路径下的 ignored 文件、二进制 / 改名 / 复制 / 类型变化 / 符号链接 / submodule / 删除、脏或未跟踪工作区都会阻断。新增公开辅助 `recheck_git_evidence()`，在登记前重读并比对快照。
   - `scripts/self_improvement/planning.py` 的高风险识别：固定路径表 + 有限关键词 / 文件名正则；权威路径上的权限 / 安全 / 破坏性变更 → `NEEDS_HUMAN_DECISION`（`HD-05`，schema 走 `HD-13`）；普通文档里只提到权限的措辞保持 `NEEDS_EVIDENCE`；无法识别的变更**不当作安全**。
@@ -233,6 +237,7 @@
   - 没有已发布的 `v1.7.2` 资产，因此“从 GitHub 下载真实 `v1.7.2` 并升级”为 `NOT_RUN`，`gh release create` 也未执行；本候选没有重跑 v1.7.1 的隔离升级夹具（升级引擎自 v1.7.1 未改动，`scripts/update_agentorch/` 不在本候选的随包变更里）。
   - 包内自检只在本机 Linux x86_64 / CPython 3.13.5 上执行；PR 上的三平台 CI 由 Master 另行取证，Windows / macOS 与大小写不敏感文件系统为 `UNKNOWN`。
   - 自我完善闭环的 Git 证据路径由合成 / 一次性仓库的随包测试覆盖，不代表在真实下游项目、真实载体或真实 OpenCode 会话上验证过。
+  - 没有用按 v1.7.1 形状（缺 `base_sha`，或 `task` 不是映射）构造的 state 跑过随包循环；本候选没有兼容层，也没有面向下游的迁移说明，该不兼容项的实际影响面为 `UNKNOWN`。
   - `§5.1.5` 记录的“登记路径读取的属性未证明”这一限制在本发同样成立。
 - 历史 `v1.7.1`、`v1.7.0` 及其资产保留原样，不删除、不覆盖、不改写。
 
@@ -240,7 +245,7 @@
 
 - **1.6.1 / 1.6.2 / 1.6.3 是补丁发行，不属于 Format 变更**：Format 仍为 `1.6`，见 5.1.1 / 5.1.2 / 5.1.3；本节只记录真正的格式版本升级。其中 1.6.3 在 Format 1.6 内新增了 `REQUIRED` 文件（见 5.1.3），但包格式、`MANIFEST.json` schema 与 `format_version` 未变，仍不是 Format 变更。
 
-- **1.7.2 是 Format 1.7 内的补丁候选（准备中，未发布），不属于 Format 变更**：`Format version` 保持 `1.7`，只升 `Release version`；包内文件集合仍为 131 个（130 `REQUIRED` + `MANIFEST.json`），`MANIFEST.json` schema 与 `format_version` 不变。随包变更、建议分类与限制见 5.1.6。
+- **1.7.2 候选（准备中，未发布）不改变 Format，不属于 Format 变更**：`Format version` 保持 `1.7`，只升 `Release version`；包内文件集合仍为 131 个（130 `REQUIRED` + `MANIFEST.json`），`MANIFEST.json` schema 与 `format_version` 不变。随包变更、不兼容项与待定分类见 5.1.6。
 
 - **1.7.1 是 Format 1.7 内的桥接 / 补丁发行，不属于 Format 变更**：`Format version` 保持 `1.7`，只升 `Release version`；包内文件集合从 118 个（117 `REQUIRED` + `MANIFEST.json`）变为 131 个（130 + 1），新增文件与桥接修复见 5.1.5。包格式、`MANIFEST.json` schema 与 `format_version` 不变。
 
