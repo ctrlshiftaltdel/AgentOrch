@@ -1195,6 +1195,79 @@ def _resolve_gitdir(entry):
     return path.resolve()
 
 
+def _git_config_continuation(current, path):
+    """Whether ``current``'s odd trailing backslash continues the next line.
+
+    Git joins physical lines only while its value parser reads them: one
+    backslash immediately before the newline continues the value, but a
+    backslash sitting in a comment is comment text and the newline ends both
+    the comment and the line. A section header or a key name never continues;
+    Git reports such a file as a bad config. So the trailing backslash is a
+    continuation only in a value, and the value case is the only one this
+    reader proves here. A comment (at the start of a line, after a section
+    header, or inline after a value) ends the line, while any other context is
+    refused rather than guessed at.
+    """
+    trailing = len(current) - len(current.rstrip('\\'))
+    body = current[:len(current) - trailing]
+    section = quoted = escaped = comment = value = after_section = False
+    only_space = True
+    for char in body:
+        if comment:
+            continue
+        if escaped:
+            escaped = False
+            only_space = after_section = False
+            continue
+        if quoted:
+            if char == '\\':
+                escaped = True
+            elif char == '"':
+                quoted = False
+            continue
+        if char == '\\':
+            escaped = True
+            only_space = after_section = False
+            continue
+        if char in ' \t':
+            continue
+        if char == '"':
+            quoted = True
+            only_space = after_section = False
+            continue
+        if section:
+            only_space = False
+            if char == ']':
+                section, after_section = False, True
+            continue
+        if char in '#;':
+            if only_space or value or after_section:
+                comment = True
+                continue
+            raise _unprovable_boundary(
+                f'the Git config {path} has a comment where Git expects a '
+                'variable, so the line a trailing backslash continues is '
+                'unknown')
+        if char == '[' and only_space:
+            section = True
+            only_space = after_section = False
+            continue
+        if char == '=':
+            value = True
+        only_space = after_section = False
+    if comment:
+        return False
+    if section:
+        raise _unprovable_boundary(
+            f'the Git config {path} continues a section header across a line, '
+            'which Git rejects')
+    if not value:
+        raise _unprovable_boundary(
+            f'the Git config {path} continues a line outside a value, which '
+            'Git rejects')
+    return True
+
+
 def _git_config_logical_lines(raw, path):
     """Decode a Git config file and join its backslash continuations.
 
@@ -1203,6 +1276,11 @@ def _git_config_logical_lines(raw, path):
     ``str.splitlines`` would treat as a line break stays inside the line here,
     so it is decoded as the whitespace Git decodes it as (or refused), instead
     of starting a new variable and silently shortening the value above it.
+
+    A backslash only continues a line when Git's value parser would join it;
+    a trailing backslash in a comment is comment text, and joining it would
+    drop the following line into the comment. ``_git_config_continuation``
+    decides that context and refuses what cannot be proved.
     """
     try:
         text = raw.decode('utf-8')
@@ -1216,8 +1294,9 @@ def _git_config_logical_lines(raw, path):
             piece = piece[:-1]
         current += piece
         if (len(current) - len(current.rstrip('\\'))) % 2:
-            current = current[:-1]
-            continue
+            if _git_config_continuation(current, path):
+                current = current[:-1]
+                continue
         logical.append(current)
         current = ''
     if current:

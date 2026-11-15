@@ -2840,6 +2840,56 @@ class TimeoutTests(DeliveryCase):
         self.assertNotEqual(decoded, prefix, 'Git reads the whole line')
         return prefix
 
+    def _relocate_core_worktree_after_a_line_start_comment(self):
+        """A relocation on the line after a comment ending in a backslash.
+
+        Git ends a comment at the newline whatever it ends with, so the
+        whole-line ``[core] worktree`` below still moves the root. A reader
+        that joins a trailing backslash before recognizing comments drops that
+        line into the comment and sees no relocation at all. The ``rev-parse``
+        and ``config --get`` calls are the fixture's evidence, not the proof
+        under test.
+        """
+        relocated = self.root / 'comment-root'
+        relocated.mkdir()
+        with (self.repo / '.git' / 'config').open('a', encoding='utf-8') as handle:
+            handle.write(f'\n# comment ending in slash \\\n'
+                         f'[core] worktree = {relocated.as_posix()}\n')
+        self.assertIn('# comment ending in slash \\\n',
+                      (self.repo / '.git' / 'config').read_text(encoding='utf-8'))
+        result = _git(self.repo / 'docs', 'rev-parse', '--show-toplevel')
+        self.assertEqual(Path(result.stdout.decode().strip()).resolve(),
+                         relocated.resolve())
+        self.assertEqual(_git(self.repo, 'config', '--get', 'core.worktree'
+                              ).stdout.decode().strip(), relocated.as_posix())
+        self.assertFalse((relocated / '.git').exists())
+        return relocated, self.repo / 'docs'
+
+    def _relocate_core_worktree_after_an_inline_comment(self):
+        """A relocation after a value whose inline comment ends in a backslash.
+
+        Git ends the inline comment at the newline, so the second ``worktree``
+        line supplies the root. A reader that joins the trailing backslash
+        before recognizing the comment swallows that line into the comment and
+        keeps the decoy the first line names. ``config --get`` returns the last
+        value Git uses; that equality is the fixture's evidence.
+        """
+        actual = self.root / 'inline-actual-root'
+        decoy = self.root / 'inline-decoy-root'
+        actual.mkdir()
+        decoy.mkdir()
+        with (self.repo / '.git' / 'config').open('a', encoding='utf-8') as handle:
+            handle.write(f'\n[core]\n\tworktree = {decoy.as_posix()} '
+                         f'# note ending in slash \\\n'
+                         f'\tworktree = {actual.as_posix()}\n')
+        result = _git(self.repo / 'docs', 'rev-parse', '--show-toplevel')
+        self.assertEqual(Path(result.stdout.decode().strip()).resolve(),
+                         actual.resolve())
+        self.assertEqual(_git(self.repo, 'config', '--get', 'core.worktree'
+                              ).stdout.decode().strip(), actual.as_posix())
+        self.assertFalse((actual / '.git').exists())
+        return actual, self.repo / 'docs'
+
     def test_a_journal_inside_the_repository_is_never_rewritten_by_a_halt(self):
         # `run` only compared the journal with the repository path it was given.
         # A journal at the repository root, with a subdirectory passed as the
@@ -3341,6 +3391,155 @@ class TimeoutTests(DeliveryCase):
         plan = self.plan([self.task('one', work, ['a.txt'])])
         relocated, scope = self._relocate_worktree_config_beside_a_subsection()
         journal = relocated / 'state.json'
+        self._seed_plain(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        with probe:
+            code, errors, loader, gh = self._run_cli(
+                self._cli_issue_args(journal, repo=scope, worktree=work))
+        self.assertEqual(code, 2)
+        self.assertIn('outside the repository', errors)
+        self.assertEqual(calls, [])
+        loader.assert_not_called()
+        gh.assert_not_called()
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_a_halt_never_writes_after_a_line_start_comment_trailing_backslash(
+            self):
+        # A comment line ending in one backslash is still a comment: Git ends
+        # it at the newline. Joining it to the next line before recognizing
+        # comments dropped `[core] worktree = <root>` into the comment, so the
+        # reader saw no relocation and the halt rewrote and locked a journal
+        # inside the worktree. The relocation has to be proved first.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        relocated, scope = self._relocate_core_worktree_after_a_line_start_comment()
+        journal = relocated / 'state.json'
+        self._seed_timeout(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        with probe:
+            with self.assertRaises(ValueError) as caught:
+                delivery.run(scope, plan, journal, agent=FakeAgents(self),
+                             session_probe=self.default_probe, profiles=self.profiles,
+                             reviewer_agent='scout')
+        self.assertIn('outside the repository', str(caught.exception))
+        self.assertEqual(calls, [])
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_the_cli_plan_resume_never_writes_after_a_line_start_comment(self):
+        # The same comment through `--plan --resume`: the CLI halts on the
+        # recorded timeout by writing the journal and creating its lock, so a
+        # comment that swallowed the relocation must not let it write inside
+        # the real worktree.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        planfile = self.root / 'plan.json'
+        planfile.write_text(json.dumps(plan))
+        relocated, scope = self._relocate_core_worktree_after_a_line_start_comment()
+        journal = relocated / 'state.json'
+        self._seed_timeout(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        errors = io.StringIO()
+        args = ['delivery', '--repo', str(scope), '--plan', str(planfile),
+                '--state', str(journal), '--execute', '--resume']
+        with probe, mock.patch('sys.argv', args), contextlib.redirect_stderr(errors), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                delivery.main()
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn('outside the repository', errors.getvalue())
+        self.assertEqual(calls, [])
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_the_cli_issue_resume_proves_a_line_start_comment_before_git(self):
+        # Without a timeout there is no halt write, but `--issue --resume`
+        # still starts `git rev-parse` first. A comment whose trailing
+        # backslash hid the relocation let that proof pass while the journal
+        # sat in the real worktree, so it must reject before any Git or `gh`.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        relocated, scope = self._relocate_core_worktree_after_a_line_start_comment()
+        journal = relocated / 'state.json'
+        self._seed_plain(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        with probe:
+            code, errors, loader, gh = self._run_cli(
+                self._cli_issue_args(journal, repo=scope, worktree=work))
+        self.assertEqual(code, 2)
+        self.assertIn('outside the repository', errors)
+        self.assertEqual(calls, [])
+        loader.assert_not_called()
+        gh.assert_not_called()
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_a_halt_never_writes_after_an_inline_comment_trailing_backslash(self):
+        # Git ends an inline comment at the newline, so the next `worktree`
+        # line supplies the root. Joining the trailing backslash swallowed
+        # that line into the comment and kept the decoy, so the halt rewrote
+        # and locked a journal inside the real worktree.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        actual, scope = self._relocate_core_worktree_after_an_inline_comment()
+        journal = actual / 'state.json'
+        self._seed_timeout(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        with probe:
+            with self.assertRaises(ValueError) as caught:
+                delivery.run(scope, plan, journal, agent=FakeAgents(self),
+                             session_probe=self.default_probe, profiles=self.profiles,
+                             reviewer_agent='scout')
+        self.assertIn('outside the repository', str(caught.exception))
+        self.assertEqual(calls, [])
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_the_cli_plan_resume_never_writes_after_an_inline_comment(self):
+        # The same inline comment through `--plan --resume`: the halt write
+        # and journal lock must not land in the root Git really reports.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        planfile = self.root / 'plan.json'
+        planfile.write_text(json.dumps(plan))
+        actual, scope = self._relocate_core_worktree_after_an_inline_comment()
+        journal = actual / 'state.json'
+        self._seed_timeout(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        errors = io.StringIO()
+        args = ['delivery', '--repo', str(scope), '--plan', str(planfile),
+                '--state', str(journal), '--execute', '--resume']
+        with probe, mock.patch('sys.argv', args), contextlib.redirect_stderr(errors), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                delivery.main()
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn('outside the repository', errors.getvalue())
+        self.assertEqual(calls, [])
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_the_cli_issue_resume_proves_an_inline_comment_before_git(self):
+        # No timeout, so `--issue --resume` proves the boundary itself before
+        # its first `git rev-parse`; an inline comment that hid the relocation
+        # must not let that call start inside the worktree.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        actual, scope = self._relocate_core_worktree_after_an_inline_comment()
+        journal = actual / 'state.json'
         self._seed_plain(plan, journal)
         before = journal.read_text()
         calls, probe = self._git_probe()
