@@ -9,13 +9,13 @@
   - **正式 Release 资产**：`uv run python scripts/build_release.py --release-version 1.6` 产出 `release/AgentOrch-1.6.zip`，zip 顶层目录与资产 stem 一致，即 `AgentOrch-1.6/`。对应 Git tag 为 `v1.6`、资产名为 `AgentOrch-1.6.zip`。参数写 `1.6`，**不要写 `v1.6`**：`v1.6` 是 tag 名而不是资产名，带 `v` 前缀或预发布后缀会被构建直接拒绝。补丁发行把版本号写全：`--release-version 1.6.1` 产出 `AgentOrch-1.6.1.zip` / 顶层目录 `AgentOrch-1.6.1/`，tag 为 `v1.6.1`；补丁号只改变资产名与顶层目录，不改变 Format。
   - **日期构建（默认，保持不变）**：`uv run python scripts/build_release.py`（今天）或 `--date YYYYMMDD` 产出 `release/agentorch-{YYYYMMDD}.zip`，顶层目录 `agentorch-{YYYYMMDD}/`。CI 与 `docs/upgrade.md` 的基线重建继续用这个模式。
   - `--date` 与 `--release-version` **互斥**：同时给出即报错退出（`argparse` 退出码 2），不存在"谁覆盖谁"的隐含优先级；不带任何命名参数时仍按今天日期命名。
-- **发布名只决定资产名与顶层目录**：包内文件集合、`MANIFEST.json` schema 与 `format_version` 在两种模式下完全相同。**Release 版本号不是 Format 版本**：`Release 1.6` 发布时与 `Format version` 1.6 数值相同；候选 `Release 1.7.1`（准备中，**未发布**）与 `Format 1.7` 的 major.minor 相同、编号仍各自独立。两者仍是两条序列（发行号 vs 格式契约），`MANIFEST.json` 的 `format_version` 由 `VERSION.md` 的 `Format version:` 一行生成；两者的区别与当前发行记录见第 5 节。
+- **发布名只决定资产名与顶层目录**：包内文件集合、`MANIFEST.json` schema 与 `format_version` 在两种模式下完全相同。**Release 版本号不是 Format 版本**：`Release 1.6` 发布时与 `Format version` 1.6 数值相同；已发布的 `Release 1.7.1` 与 `Format 1.7` 的 major.minor 相同，而候选 `Release 2.0.0`（准备中，**未发布**）与 `Format 1.7` 的 major.minor **不同**——因此历史 `VERSION_MATCH` 规则会拒绝 `v2.0.0` + `1.7`，只有带显式兼容矩阵的新更新器可通过 `VERSION_MATCH`（匹配通过不等于安装或升级成功，且本发没有已验证的旧客户端迁移路径）。两者仍是两条序列（发行号 vs 格式契约），`MANIFEST.json` 的 `format_version` 由 `VERSION.md` 的 `Format version:` 一行生成；两者的区别与当前发行记录见第 5 节。
 - 产物不纳入 git：`.gitignore` 忽略 `release/*.zip`；仓库只保留流程文档、构建脚本与本标准；历史版本记录由 GitHub Releases 承担。`release/README.md` 不入忽略范围。**已发布的历史资产（如 `agentorch-20261023.zip`）不删除、不覆盖、不改写**；新 Release 用新的资产名。
 - 产物可随时重建：运行 `uv run python scripts/build_release.py`（默认输出到 `release/`），或按上面的正式 Release 命令指定 `--release-version`。构建是**可复现**的：同一仓库状态下（同一命名模式与同一 top dir），包内文件集合、各文件内容与 zip 的校验和均一致（归档时间戳使用固定值），因此 zip 的校验和可被任何人重建复核。可复现性不依赖检出行尾：构建时文本文件按 LF 归一后打包、二进制文件原样打包（仓库以 `.gitattributes` 统一 LF），故任何检出（含 Windows 上 `core.autocrlf=true`）重建都得到同一校验和。
 
 ## 2. 包内容规范
 
-- 只含通用可复用产出；不得包含本仓库特有的演进决策、任务记录或个人环境信息。**1.7.1 桥接发行不打包任何 `docs/` 文件**：核心契约 `kit/orchestration.md` 随包分发，`build_release.py` 的 `PACKAGE_DOC_PATHS` 是空集合，其余 `docs/` 路径一律拒绝。暂不改到 `docs/orchestration.md` 是兼容约束，不是遗漏：已发布的 v1.7.0 更新器把 `docs/` 当项目自有路径，拒绝写入，且目标包缺少 `kit/orchestration.md` 会被判为 `UPSTREAM_REMOVAL` 并停止（见 §5.1.5）。
+- 只含通用可复用产出；不得包含本仓库特有的演进决策、任务记录或个人环境信息。**1.7.1 桥接发行与候选 2.0.0 都不打包任何 `docs/` 文件**：核心契约 `kit/orchestration.md` 随包分发，`build_release.py` 的 `PACKAGE_DOC_PATHS` 是空集合，其余 `docs/` 路径一律拒绝。暂不改到 `docs/orchestration.md` 是兼容约束，不是遗漏：已发布的 v1.7.0 更新器把 `docs/` 当项目自有路径，拒绝写入，且目标包缺少 `kit/orchestration.md` 会被判为 `UPSTREAM_REMOVAL` 并停止（见 §5.1.5）。
 - 包内文件集合 == `scripts/validate_kit.py` 中的 `REQUIRED` 列表 **+ 构建时生成的 `MANIFEST.json`**（数量与名称都一致，即 `len(REQUIRED) + 1` 个文件）。`REQUIRED` 是分发内容的唯一来源，构建脚本直接解析它，不再维护第二份清单；`MANIFEST.json` 是唯一不来自 `REQUIRED` 的成员。
 - **规则一致性由检查保证**：`REQUIRED` 中的 `docs/` 路径必须全部在白名单 `PACKAGE_DOC_PATHS` 内，白名单只能列 `docs/` 文件，`scripts/build_release.py` 与 `.orchestration` / `release` / `.worktrees` / `.workbuddy` 必须列为禁止项；`scripts/validate_kit.py` 的文档一致性门禁逐条核对，本文件也必须记录这三条规则（`REQUIRED`、`PACKAGE_DOC_PATHS`、`MANIFEST.json`），口径见 `docs/testing/document-consistency-gates.md` §6（仓库文档，不随包发布）。上游设计、架构与归档文档因此不会被自动塞进发行包。
 - **`MANIFEST.json`（机器可读清单）**：由 `scripts/check_drift.py` 生成，构建脚本导入该模块而不另写一份规则，因此分类只有一处实现。字段固定为：
@@ -193,25 +193,61 @@
   - macOS / Windows 之外的操作系统与用户桌面环境为 `UNKNOWN`；CI 只覆盖 GitHub-hosted 的三个 runner。
 - 历史 `v1.6.3`、`v1.6.2`、`v1.6.1`、`v1.6` 与 `v1.5` Release 及其资产保留原样，不删除、不覆盖、不改写。
 
-### 5.1.5 发行记录：Release 1.7.1（桥接发行，准备中，未发布）
+### 5.1.5 发行记录：Release 1.7.1（桥接发行，已发布）
 
-- **状态：候选，准备中，未发布。** 没有 tag、没有 GitHub Release、没有上传任何资产；本节记录的是构建与兼容性验证，不是发布事实。最终发布由 Master 按第 4 节执行并重新取证。
+- **状态：已发布（2026-11-13）。** tag `v1.7.1` → `ef445b0`（`Merge pull request #239`），[Release v1.7.1](https://github.com/ctrlshiftaltdel/AgentOrch/releases/tag/v1.7.1) 非 draft、非 prerelease，唯一资产 `AgentOrch-1.7.1.zip` 793,951 bytes，GitHub API `assets[].digest` 为 `sha256:fefcf7eb…45fe`，与本节的候选构建记录一致。下列构建与兼容性数字来自发布前的候选取证，发布后没有重跑。
 - 目标：`Release version` `1.7.1`，`Format version` 仍为 `1.7`；`tag_matches_format('v1.7.1', '1.7')` 为真，因此已发布的 v1.7.0 客户端可以通过 `VERSION_MATCH` 并安装它。
 - **包内文件集合 131 个（130 `REQUIRED` + `MANIFEST.json`）**：相对 v1.7.0 的 118 个（117 + 1）**新增 13 个 `REQUIRED` 文件、无删除、无改名**（`scripts/agent_selection/peer_review.py`、`scripts/delivery_scenarios/`、`scripts/update_agentorch/migrate.py`、`scripts/verification_profile.py` 与 3 个随包测试等）。**包内没有任何 `docs/` 文件**，契约仍为 `kit/orchestration.md`；`MANIFEST.json` schema 1、`format_version` 1.7 不变。
 - 构建：`python3 scripts/build_release.py --release-version 1.7.1`，自检 a–l 全过，无跳过项；本任务在最终 head 上用仓库工作树与 `git archive` 导出树各构建一次，产物逐字节相同：`AgentOrch-1.7.1.zip` 793,951 bytes，SHA256 `fefcf7ebe2929e81a8ecaff0b26f2f92bcc62b7e9d4ba7c6d1a0cea335ee45fe`。该数值只由随包文件决定，任何随包文件变化都会使它失效并必须重算；旧的候选值不再代表当前产物。
 - **与已发布 v1.7.0 客户端的兼容性（真实旧分类器）**：仓库内新增的持续回归 `tests/update_agentorch/test_v170_classifier_compat.py` 使用从官方 `AgentOrch-1.7.0.zip` 冻结的 `classify.py`（SHA256 `95313520…9ff0`）与冻结的 v1.7.0 清单，对当前 `REQUIRED` 跑正负例：PLAN/APPLY 均不阻断，`UPSTREAM_REMOVAL` / `UPSTREAM_RENAME` / `THREE_WAY_CONFLICT` 全为 0；删除 `kit/orchestration.md`、或把契约移入 `docs/` 的负向控制仍然阻断。冻结清单的语义摘要独立钉在测试模块中（不信任 fixture 自身声明），篡改任一条目或大小都会使测试失败。该回归不联网、不读 git tag，也不依赖浅克隆。
 - **隔离升级验证（引擎层，不是发布证据）**：用真实已发布 v1.7.0 资产中的引擎代码（`engine.__file__` 指向解压的 `AgentOrch-1.7.0/`，与 zip 成员哈希一致）在仓库外 fixture 上执行。传输层替换为本地候选字节与按未来 `v1.7.1` 形状构造的 Release 记录；其余校验 / 分类 / 备份 / 写入均为 v1.7.0 原代码。`PLAN` = `PLANNED`、零写入；`APPLY` = `APPLIED`，写入 62 个路径（49 修改 + 13 新增，0 删除），`130/130` 包内文件与候选包逐字节一致，`MANIFEST.json` 与候选包相同，项目自有 `docs/PROJECT.md` / `docs/PLAN.md` / `docs/orchestration.md` / `src/` / `.github/` / `LOCAL-NOTES.md` 字节不变，备份 `required=true` / `verified=true`，`rollback.result=NOT_NEEDED`，head 前后不变；升级后项目 `validate_kit` 退出码 0（downstream）、`check_drift` clean。
 - **仍未验证 / 精确限制（不得写成已验证）**：
-  - 没有已发布的 `v1.7.1` 资产，因此“从 GitHub 下载真实 `v1.7.1` 并升级”为 `NOT_RUN`；隔离升级的传输是本地字节，不是官方 HTTPS 客户端；`--request "更新 AgentOrch"` 的入口路由 / 交付包层为 `NOT_RUN`；隔离 `agentorch/` 布局的安装 / 升级路径为 `NOT_RUN`。
+  - 发布说明（[Release v1.7.1](https://github.com/ctrlshiftaltdel/AgentOrch/releases/tag/v1.7.1)）记录真实 GitHub 下载升级、入口路由与隔离 `agentorch/` 安装路径在发布前为 `NOT_RUN`；本文件没有发布后补证，因此这些项仍按 `NOT_RUN` 记录。隔离升级的传输是本地字节，不是官方 HTTPS 客户端；`--request "更新 AgentOrch"` 的入口路由 / 交付包层为 `NOT_RUN`；隔离 `agentorch/` 布局的安装 / 升级路径为 `NOT_RUN`。
   - **登记路径读取的属性未证明（不得写成已验证）**：本发（1.7.1 桥接发行）的随包 `validate_kit` / 文档一致性检查不执行登记路径读取（`repository_map_errors` / `legacy_path_errors` 及其整树扫描与 `_safe_registry_stat`）；这些函数只保留给本仓库测试直接调用。单文件标记（例如 `docs/upgrade.md`）是可复制的普通文件，不能证明调用方是上游仓库，因此不能据此声称这些检查“只在真正的上游运行”。即便由测试直接调用，本发也不证明读取始终发生在当前根路径内、不证明扫描完整性，同 UID 并发换链、同设备 bind mount 与 Windows 句柄遍历均为未验证 / `NOT_RUN`。延期标记只做本地冻结字符串匹配，探测通过也不是安全证明，不能据此声称严格隔离。
   - 仅在 Linux x86_64 + CPython 3.13.5 上执行；Windows / macOS / 大小写不敏感文件系统为 `UNKNOWN`。
   - 本地修改、冲突、回滚故障注入只由合成测试覆盖，本轮没有在真实迁移上重跑。
   - 这段记录绑定本任务最终 head；head 变化后必须在新 head 上重新构建、重新取证。
 - 历史 `v1.7.0` 及其资产保留原样，不删除、不覆盖、不改写。
 
+### 5.1.6 发行记录：Release 2.0.0（MAJOR 候选，准备中，未发布）
+
+- **状态：候选，准备中，未发布。** 没有 tag、没有 GitHub Release、没有上传任何资产；本节记录候选范围、构建与兼容性检查，不是发布事实。最终发布由 Master 按第 4 节执行并在发布后重新取证。
+- 级别与目标：项目所有者于 2026-11-15 明确选择 **MAJOR `v2.0.0`**，`Release version` 定为 `2.0.0`，`Format version` 仍为 `1.7`。版本基准是最新已发布 tag `v1.7.1`（`git tag --sort=-v:refname` 与 `gh release list` 的首项），与本候选准备前的 `VERSION.md`（`Release version: 1.7.1`）一致，满足 §5.3 的基准一致性检查。
+- **版本匹配规则（本机真实执行，仅纯函数层面）**：历史规则 `tag_matches_format('v2.0.0', '1.7')` 为 **`False`**（tag 的 major.minor 不再等于 Format），`v2.0` 同样为 `False`。当前更新器通过显式矩阵接受它：`versions.format_compatibility('v2.0.0', '1.7', DECLARED_SUPPORTED_FORMATS)` 返回 `accepted=True`、`rule='declared_supported_format'`；`DECLARED_SUPPORTED_FORMATS` 当前为 `('1.7',)`。不带矩阵时 `format_compatibility('v2.0.0', '1.7')` 返回 `accepted=False`；矩阵不含目标 Format（例如包声明 `1.6`）时也不接受。据此：**已发布的 v1.7.0 更新器（只有历史规则）拒绝 `v2.0.0` + Format `1.7`**；**已发布的 v1.7.1 更新器（带桥接矩阵）可通过 `VERSION_MATCH`**。两者都只是入口判定，不证明安装或升级成功。
+- **`VERSION_MATCH` 通过不等于升级已成功**：以上只覆盖 tag / Format 的入口判定，不证明包校验、逐文件分类、备份、写入或升级成功，也不证明本候选可以安装。真实 `v1.7.1 → 2.0.0` 下载与升级为 **`NOT_RUN`**；`gh release create` 未执行。
+- **旧客户端迁移：尚无已验证路径。** ≤1.7.0 的安装不能直接自动升级到 `2.0.0`（旧规则只接受 `v1.7.x` + `1.7`）。`v1.7.1` 只是在**版本匹配层**必要的桥接候选：它的 tag 满足旧规则，它自带的更新器也声明支持 Format `1.7`；但**已发布的 v1.7.1 CLI 与「更新 AgentOrch」入口都不能选择它**——`sources.GitHubReleaseSource.fetch_release()` 在未给 tag 时固定请求 `/releases/latest`，CLI 只有 `--project` / `--mode` / `--edition` / `--output`，没有 tag 参数，入口也没有 tag 选择。一旦 `v2.0.0` 成为 latest，旧 CLI 无法自行回到 `v1.7.1`。因此**实际迁移方案（谁、何时、用哪个受支持入口完成桥接）尚未验证**，也不能用未经验证的手工覆盖来代替；已安装 1.7.1 的项目，其自带 CLI 取 `latest` 会得到 `2.0.0` 并在版本匹配层接受它，但端到端仍为 `NOT_RUN`。
+- **包内文件集合 131 个（130 `REQUIRED` + `MANIFEST.json`）**：与 v1.7.1 相同。自 v1.7.1 以来随包文件只有修改、**没有新增、删除、改名或移动**；`MANIFEST.json` schema 1 与 `format_version` 1.7 不变。
+- 分类（按 §5.3）：**MAJOR**。本候选有两处对外不兼容变化，PATCH / MINOR 均不成立：
+  - **新增输入要求（调用方不兼容）**：`scripts/self_improvement/orchestration.py` 的 `restore_state()` 现在要求 state 带完整 40 位 `base_sha`，而 v1.7.1 接受不含该字段的 state。按 v1.7.1 形状构造 state 的调用方会在 `restore_state()` 得到 `state.base_sha` 错误，`run_loop()` 直接以 `BLOCKED`（`state could not be restored from real facts`）返回，不再进入扫描 / 规划。同一处还要求 `state.task`（如给出）必须是映射；v1.7.1 完全忽略该字段。`planning.py` 新增的 `repo_root` / `required_base_sha` / `required_head_sha` 都是带默认值的关键字参数，按位置传参的旧调用不会因签名失败。
+  - **行为收缩**：v1.7.1 在「lesson 合格 + 任务包完整 + 依赖已验证 + 无高风险表面」时可给出 `READY` 并交给 carrier（当时是 dry-run 记录）；本候选的风险判定不返回 `LOW`，`READY` 分支保留但不可达，提案停在 `BLOCKED` / `NEEDS_EVIDENCE`，或有证据 / 声明的高风险线索时进入 `NEEDS_HUMAN_DECISION`。
+  - 包内文件集合、`MANIFEST.json` schema 与 `format_version` 不变只说明**格式**没变，不能推出公开行为兼容，因此不能用「文件集合未变」降级分类。
+- **发布状态：级别由 Owner 定为 MAJOR `v2.0.0`；本轮只准备候选，不宣称已发行、不宣称可安装。** 实际发布仍须 Master 按第 4 节执行，并在发布说明中写明旧客户端**没有已验证的迁移路径**、`VERSION_MATCH` 通过不等于升级成功，以及所有未验证项。
+- 随包的实质性变更（11 个文件，只改内容）：
+  - `scripts/self_improvement/planning.py`：风险判定改为**仓库自身 Git 证据**。`base_sha` / `head_sha` 只作定位符并与 Git 交叉核对，**调用方 diff、SHA 字符串、评审结论或授权字段都不再是证据**；空提交范围不能证明目标、允许路径范围或授权，因此**没有自动 LOW 判定**。首个 Git 命令前对仓库配置做 fail-closed 预检：`filter.<driver>.clean` / `.process`、`include` / `includeIf`、已初始化 submodule / 嵌套仓库中的可执行配置、promisor / 部分克隆远端、`ext::` 传输与 HTTP alternates 一律拒绝；replace refs、diff 隐藏配置、`core.fsmonitor` 与 hooks 通过覆盖禁用，并设 `GIT_NO_LAZY_FETCH=1`。隐藏索引位（assume-unchanged / skip-worktree）、允许路径下的 ignored 文件、二进制 / 改名 / 复制 / 类型变化 / 符号链接 / submodule / 删除、脏或未跟踪工作区都会阻断。新增公开辅助 `recheck_git_evidence()`，在登记前重读并比对快照。
+  - `scripts/self_improvement/planning.py` 的高风险识别：固定路径表 + 有限关键词 / 文件名正则；权威路径上的权限 / 安全 / 破坏性变更 → `NEEDS_HUMAN_DECISION`（`HD-05`，schema 走 `HD-13`）；普通文档里只提到权限的措辞保持 `NEEDS_EVIDENCE`；无法识别的变更**不当作安全**。
+  - `scripts/self_improvement/orchestration.py`：`restore_state()` 要求完整 40 位 `base_sha`（`task` 记录若给出必须是映射）；登记前对 `READY` 提案重跑 Git 复核，快照变化或无法复核时记 `git_recheck` 且不登记；`_validation_rows()` 覆盖所有候选提案声明的命令（不再只看 `READY`），未运行命令继续如实记为 `NOT_RUN`。
+  - `scripts/delivery_scenarios/common.py`、`scripts/delivery_scenarios/group_a.py`、`scripts/run_delivery_scenarios.py`：场景 `kind` 新增 `safety`；A8 / A15 从“正向能力控制”改标为**临时安全回退**（正向 `READY` / 登记路径未实现，PASS 只证明拒绝与安全停止，不再计为正向能力证明）并改用真实一次性 Git 仓库；A14 改为“伪造 / 截断的风险证据”场景；报告单列 `safety` 计数，未知 `kind` 直接报错。
+  - `templates/self-improvement/README.md`：同步上述门禁、`required_evidence` / `next_action` / `review_status` 字段与限制口径。
+  - 对应随包测试：`tests/self_improvement/loop_support.py`、`tests/self_improvement/test_acceptance_report.py`、`tests/self_improvement/test_orchestration.py`、`tests/self_improvement/test_planning.py`、`tests/test_run_delivery_scenarios.py`。
+- 随包的发行号同步（2 个文件）：`VERSION.md` 的 `Release version` 由 `1.7.1` 改为 `2.0.0`（`Format version` 保持 `1.7`，同一行说明 MAJOR 与 Format 解耦、旧更新器会拒绝）；`tests/test_release_drift.py` 的版本一致性断言同步为新版本，并同时覆盖新旧两条规则的正负例（历史规则拒绝 `v2.0.0` + `1.7`、显式矩阵通过 `VERSION_MATCH`、无矩阵或 Format 不匹配仍拒绝、Format 2.0 由历史规则接受）——没有删断言、没有 skip / xfail、没有弱化。
+- **本发明确的限制（不得写成已发布能力）**：
+  - 自我完善闭环**没有**权威任务载体适配器、**没有**接线的独立审查（`review_status` 为 `NOT_WIRED`）；因此每个提案停在 `BLOCKED` / `NEEDS_EVIDENCE`，或在有证据 / 声明的高风险线索下进入 `NEEDS_HUMAN_DECISION`。`READY` 分支仍留在代码里，但当前不可达。
+  - 高风险识别是固定表 + 有限正则，不是完整语义分析；`kit/orchestration.md` 的契约语义未变。
+  - `scripts/autonomous_delivery.py`、`scripts/opencode_probe.py`、`tests/test_autonomous_delivery.py`、`tests/test_opencode_probe.py` 是**仓库专用的准备型切片，不在 `REQUIRED`，不随包发布**；它们也不提供自动合并闭环，不能写成已发布的完整闭环。
+- 构建：`python3 scripts/build_release.py --release-version 2.0.0 --output-dir /tmp/opencode/release-2.0.0-review2-20261115-m1`（Linux x86_64 / CPython 3.13.5），自检 a–l 全过、无跳过项，输出 `131` 个文件：`AgentOrch-2.0.0.zip` 837,787 bytes，SHA256 `dc1548af0435d13ba9e834a2507941c538c3411caca13f9963c819df6607fed2`。该值来自复审修复后的单次构建，只由随包字节决定；任何随包文件（含 `VERSION.md`）变化都会使它失效并必须重算。候选产物写在仓库外唯一的新目录，没有覆盖任何既有文件或历史资产。
+- **仍未验证 / 已知限制（不得写成已验证）**：
+  - 没有已发布的 `v2.0.0` 资产，因此“从 GitHub 下载真实 `v2.0.0` 并升级”为 `NOT_RUN`，`gh release create` 也未执行；本候选没有重跑 v1.7.1 的隔离升级夹具（升级引擎自 v1.7.1 未改动，`scripts/update_agentorch/` 不在本候选的随包变更里）。`v1.7.0 → v1.7.1 → v2.0.0` 的两步路径同样未执行。
+  - 包内自检只在本机 Linux x86_64 / CPython 3.13.5 上执行；PR 上的三平台 CI 由 Master 另行取证，Windows / macOS 与大小写不敏感文件系统为 `UNKNOWN`。
+  - 自我完善闭环的 Git 证据路径由合成 / 一次性仓库的随包测试覆盖，不代表在真实下游项目、真实载体或真实 OpenCode 会话上验证过。
+  - 没有用按 v1.7.1 形状（缺 `base_sha`，或 `task` 不是映射）构造的 state 跑过随包循环；本候选没有兼容层，也没有面向下游的迁移说明，该不兼容项的实际影响面为 `UNKNOWN`。
+  - `§5.1.5` 记录的“登记路径读取的属性未证明”这一限制在本发同样成立。
+- 历史 `v1.7.1`、`v1.7.0` 及其资产保留原样，不删除、不覆盖、不改写。
+
 ### 5.2 Format version 变更
 
 - **1.6.1 / 1.6.2 / 1.6.3 是补丁发行，不属于 Format 变更**：Format 仍为 `1.6`，见 5.1.1 / 5.1.2 / 5.1.3；本节只记录真正的格式版本升级。其中 1.6.3 在 Format 1.6 内新增了 `REQUIRED` 文件（见 5.1.3），但包格式、`MANIFEST.json` schema 与 `format_version` 未变，仍不是 Format 变更。
+
+- **2.0.0 候选（准备中，未发布）是 Release 的 MAJOR，但不是 Format 变更**：`Format version` 保持 `1.7`，只升 `Release version`；包内文件集合仍为 131 个（130 `REQUIRED` + `MANIFEST.json`），`MANIFEST.json` schema 与 `format_version` 不变。Release 号与 Format 解耦后，`v2.0.0` + `1.7` 不被历史 `VERSION_MATCH` 接受，在版本匹配层只能由声明支持 Format `1.7` 的新更新器通过；破坏性变化与旧客户端迁移见 5.1.6。
 
 - **1.7.1 是 Format 1.7 内的桥接 / 补丁发行，不属于 Format 变更**：`Format version` 保持 `1.7`，只升 `Release version`；包内文件集合从 118 个（117 `REQUIRED` + `MANIFEST.json`）变为 131 个（130 + 1），新增文件与桥接修复见 5.1.5。包格式、`MANIFEST.json` schema 与 `format_version` 不变。
 
