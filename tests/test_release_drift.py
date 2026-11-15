@@ -319,7 +319,7 @@ class VersionConsistencyTests(unittest.TestCase):
     def test_release_tag_matches_the_format_version(self):
         release = self.release_version()
         _, format_version = drift.read_version(ROOT)
-        self.assertEqual(release, '1.7.1')
+        self.assertEqual(release, '1.7.2')
         self.assertEqual(format_version, '1.7')
         self.assertTrue(self.versions.tag_matches_format(f'v{release}', format_version))
         # The rule compares major.minor: a different major.minor (v1.5) must NOT
