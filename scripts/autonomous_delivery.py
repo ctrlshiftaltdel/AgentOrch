@@ -1130,9 +1130,11 @@ _GIT_LOCATION_OVERRIDES = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR')
 # do not move the root during Git's worktree setup. The files below are
 # therefore the ones a filesystem proof has to read, and anything it cannot
 # interpret with confidence fails closed instead of assuming "no relocation".
+# That includes a value written with Git's quoting or escape syntax: this
+# reader does not implement `parse_value`, so such a value is refused rather
+# than approximated.
 _GIT_CONFIG_INCLUDE_SECTIONS = ('include', 'includeif')
 _GIT_CONFIG_NAME = re.compile(r'[a-z0-9][a-z0-9-]*\Z')
-_GIT_CONFIG_ESCAPES = {'n': '\n', 't': '\t', 'b': '\b', '\\': '\\', '"': '"'}
 
 
 def _unprovable_boundary(detail):
@@ -1194,15 +1196,25 @@ def _resolve_gitdir(entry):
 
 
 def _git_config_logical_lines(raw, path):
-    """Decode a Git config file and join its backslash continuations."""
+    """Decode a Git config file and join its backslash continuations.
+
+    A line ends at ``\\n`` and one ``\\r`` before it is dropped, which is how
+    Git's own reader splits the file. Every other character that
+    ``str.splitlines`` would treat as a line break stays inside the line here,
+    so it is decoded as the whitespace Git decodes it as (or refused), instead
+    of starting a new variable and silently shortening the value above it.
+    """
     try:
         text = raw.decode('utf-8')
     except UnicodeDecodeError as exc:
         raise _unprovable_boundary(
             f'the Git config {path} is not UTF-8 ({exc})') from None
     logical, current = [], ''
-    for line in text.splitlines():
-        current += line
+    pieces = text.split('\n')
+    for index, piece in enumerate(pieces):
+        if index < len(pieces) - 1 and piece.endswith('\r'):
+            piece = piece[:-1]
+        current += piece
         if (len(current) - len(current.rstrip('\\'))) % 2:
             current = current[:-1]
             continue
@@ -1214,11 +1226,16 @@ def _git_config_logical_lines(raw, path):
 
 
 def _git_config_section(line, path):
-    """The lowercased section name and any remainder after the ``]`` header.
+    """The section name, its subsection, and any remainder after the ``]``.
 
     Git accepts a variable on the same line as its section header
     (``[core] worktree = ...``), so the remainder is returned to be parsed as
-    one instead of being dropped.
+    one instead of being dropped. The subsection is returned separately
+    because it is part of the key: ``[core "unused"] worktree`` is
+    ``core.unused.worktree``, which is not ``core.worktree``. Only its
+    presence is used; a header whose subsection this reader cannot delimit
+    exactly (an escape inside it, or the deprecated ``[section.subsection]``
+    spelling this reader rejects as a section name) fails closed.
     """
     quoted, end = False, None
     for index in range(1, len(line)):
@@ -1231,54 +1248,65 @@ def _git_config_section(line, path):
     if end is None:
         raise _unprovable_boundary(f'the Git config {path} has an unterminated section')
     inner = line[1:end].strip()
-    name = inner.split('"', 1)[0].strip()
-    if '"' in inner and not inner.split('"', 1)[1].rstrip().endswith('"'):
-        raise _unprovable_boundary(
-            f'the Git config {path} has a malformed quoted subsection')
+    name, separator, rest = inner.partition('"')
+    name = name.strip()
     if not _GIT_CONFIG_NAME.match(name):
         raise _unprovable_boundary(
             f'the Git config {path} has a section name this reader cannot '
             f'interpret: {name!r}')
-    return name, line[end + 1:]
+    subsection = None
+    if separator:
+        if '\\' in inner or not rest.endswith('"') or '"' in rest[:-1]:
+            raise _unprovable_boundary(
+                f'the Git config {path} has a subsection this reader cannot '
+                'interpret')
+        subsection = rest[:-1]
+    return name, subsection, line[end + 1:]
 
 
-def _git_config_value(text, path):
-    """A Git config value with quotes, escapes and comments resolved."""
-    text = text.lstrip(' \t')
-    out, quoted, index = [], False, 0
-    while index < len(text):
-        char = text[index]
-        if char == '"':
-            quoted = not quoted
-            index += 1
-        elif char == '\\' and quoted:
-            index += 1
-            if index >= len(text):
-                raise _unprovable_boundary(
-                    f'the Git config {path} ends inside an escape')
-            escaped = text[index]
-            if escaped not in _GIT_CONFIG_ESCAPES:
-                raise _unprovable_boundary(
-                    f'the Git config {path} uses an escape this reader cannot '
-                    f'interpret: \\{escaped}')
-            out.append(_GIT_CONFIG_ESCAPES[escaped])
-            index += 1
-        elif not quoted and char in '#;':
+def _git_config_value(text, path, key):
+    """The value of a key the proof has to act on, or a refusal.
+
+    Git's ``parse_value`` is a grammar this reader does not implement: it
+    resolves quotes and backslash escapes and decides for itself which
+    whitespace belongs to the value. Reading a path with a partial imitation is
+    how one gets mis-resolved -- ``"/path/root "`` keeps a trailing space a
+    trim would drop, and ``/path/\\\\root`` decodes to fewer characters than the
+    file shows -- so the boundary could end up comparing the journal with a
+    directory that is not the worktree. Only an unquoted token with no internal
+    whitespace, quote or backslash is taken as written; every other value fails
+    closed instead of being approximated.
+    """
+    cut = len(text)
+    for index, char in enumerate(text):
+        if char in '#;':
+            cut = index
             break
-        else:
-            out.append(char)
-            index += 1
-    if quoted:
-        raise _unprovable_boundary(f'the Git config {path} ends inside a quote')
-    return ''.join(out).rstrip(' \t')
+    body = text[:cut]
+    if '"' in body or '\\' in body:
+        raise _unprovable_boundary(
+            f'the Git config {path} sets {key} with a quote or escape this '
+            'reader does not decode, so the exact path it names is unknown')
+    body = body.strip(' \t')
+    if any(char.isspace() for char in body):
+        raise _unprovable_boundary(
+            f'the Git config {path} sets {key} with whitespace this reader does '
+            'not decode, so the exact path it names is unknown')
+    return body
 
 
 def _git_config_entries(path):
-    """The ordered ``(section, name, value)`` entries of one Git config file.
+    """The ordered ``(section, subsection, name, raw value)`` entries of one file.
 
-    ``path`` may be missing, which contributes nothing. Anything this reader
-    cannot interpret raises ``ValueError``: Git accepts more syntax than it
-    does, and the callers must not treat "not understood" as "no relocation".
+    ``subsection`` is ``None`` for a plain section and the subsection text
+    otherwise, so a caller matching a key never confuses ``core.worktree`` with
+    ``core.unused.worktree``. ``path`` may be missing, which contributes
+    nothing. A value is kept as the raw text after ``=`` and only decoded when
+    a call site acts on it, because that decode refuses what it cannot
+    reproduce exactly while unrelated keys (`user.name`, a remote URL) must not
+    make the whole config unreadable. Parsing itself raises ``ValueError`` for
+    anything this reader cannot interpret: Git accepts more syntax than it
+    does, and "not understood" must never be treated as "no relocation".
     """
     try:
         raw = path.read_bytes()
@@ -1287,13 +1315,13 @@ def _git_config_entries(path):
     except OSError as exc:
         raise _unprovable_boundary(
             f'the Git config {path} cannot be read ({exc})') from None
-    entries, section = [], None
+    entries, section, subsection = [], None, None
     for line in _git_config_logical_lines(raw, path):
         stripped = line.lstrip(' \t')
         if not stripped or stripped[0] in '#;':
             continue
         if stripped[0] == '[':
-            section, remainder = _git_config_section(stripped, path)
+            section, subsection, remainder = _git_config_section(stripped, path)
             stripped = remainder.lstrip(' \t')
             if not stripped or stripped[0] in '#;':
                 continue
@@ -1314,22 +1342,27 @@ def _git_config_entries(path):
             raise _unprovable_boundary(
                 f'the Git config {path} has a variable this reader cannot '
                 f'interpret: {name!r}')
-        value = _git_config_value(remainder, path) if separator else 'true'
-        entries.append((section_name, variable, value))
+        value = remainder if separator else 'true'
+        entries.append((section_name, subsection, variable, value))
     return entries
 
 
 def _config_value(entries, section, variable):
-    """The last value Git would use for one key, or ``None`` when absent."""
+    """The last raw value Git would use for a plain-section key, or ``None``.
+
+    A key under a subsection is a different key, so those entries never match:
+    `[core "unused"] worktree` cannot move the root `[core] worktree` names.
+    """
     value = None
-    for entry_section, entry_variable, entry_value in entries:
-        if entry_section == section and entry_variable == variable:
+    for entry_section, entry_subsection, entry_variable, entry_value in entries:
+        if (entry_section == section and entry_subsection is None
+                and entry_variable == variable):
             value = entry_value
     return value
 
 
 def _config_bool(value, path, key):
-    lowered = value.strip().lower()
+    lowered = _git_config_value(value, path, key).lower()
     if lowered in ('true', 'yes', 'on', '1', ''):
         return True
     if lowered in ('false', 'no', 'off', '0'):
@@ -1357,9 +1390,12 @@ def _git_worktree_roots(root, entry):
     worktree from the common config (``$GIT_DIR/config``) and for any worktree
     from ``$GIT_DIR/config.worktree`` once ``extensions.worktreeConfig`` is on.
     A linked worktree ignores the common config's value, whose relative path
-    would resolve against the wrong directory. Every file this depends on is
-    read directly -- never through Git -- and anything it cannot interpret
-    fails closed.
+    would resolve against the wrong directory. Only the plain `core` and
+    `extensions` sections carry these keys: the same name under a subsection is
+    a different key (`core.unused.worktree`), so it moves nothing. A value
+    spelled with Git's quoting or escape syntax is not decoded here and fails
+    closed. Every file this depends on is read directly -- never through Git --
+    and anything it cannot interpret fails closed.
     """
     roots = [root]
     gitdir_ = _resolve_gitdir(entry)
@@ -1388,7 +1424,7 @@ def _git_worktree_roots(root, entry):
                 f'the Git common directory {common} does not exist')
     config = common / 'config'
     entries = _git_config_entries(config)
-    for section, _, _ in entries:
+    for section, _, _, _ in entries:
         if section in _GIT_CONFIG_INCLUDE_SECTIONS:
             raise _unprovable_boundary(
                 f'the Git config {config} includes another file, whose conditions '
@@ -1396,20 +1432,26 @@ def _git_worktree_roots(root, entry):
     if common == gitdir_:
         relocated = _config_value(entries, 'core', 'worktree')
         if relocated is not None:
-            roots.append(_resolve_core_worktree(gitdir_, relocated, config))
+            roots.append(_resolve_core_worktree(
+                gitdir_,
+                _git_config_value(relocated, config, 'core.worktree'),
+                config))
     extension = _config_value(entries, 'extensions', 'worktreeconfig')
     if extension is not None and _config_bool(
             extension, config, 'extensions.worktreeConfig'):
         local = gitdir_ / 'config.worktree'
         local_entries = _git_config_entries(local)
-        for section, _, _ in local_entries:
+        for section, _, _, _ in local_entries:
             if section in _GIT_CONFIG_INCLUDE_SECTIONS:
                 raise _unprovable_boundary(
                     f'the Git config {local} includes another file, whose '
                     'conditions cannot be evaluated without Git')
         relocated = _config_value(local_entries, 'core', 'worktree')
         if relocated is not None:
-            roots.append(_resolve_core_worktree(gitdir_, relocated, local))
+            roots.append(_resolve_core_worktree(
+                gitdir_,
+                _git_config_value(relocated, local, 'core.worktree'),
+                local))
     return roots
 
 

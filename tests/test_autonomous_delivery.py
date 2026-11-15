@@ -2678,13 +2678,22 @@ class TimeoutTests(DeliveryCase):
         one looked outside: the halt rewrote it and created its lock inside the
         real worktree. The ``rev-parse`` below is the fixture's evidence, not
         the proof under test.
+
+        The value is written in the forward-slash form Git itself accepts
+        unquoted, because a Git-written absolute Windows path is quoted and
+        escaped: those forms now fail closed (see the quoted and escaped
+        regressions below), so a fixture for the provable form must not depend
+        on them.
         """
         relocated = self.root / 'relocated-worktree'
         relocated.mkdir()
-        _git(self.repo, 'config', 'core.worktree', str(relocated))
+        with (self.repo / '.git' / 'config').open('a', encoding='utf-8') as handle:
+            handle.write(f'\n[core]\n\tworktree = {relocated.as_posix()}\n')
         result = _git(self.repo / 'docs', 'rev-parse', '--show-toplevel')
         self.assertEqual(Path(result.stdout.decode().strip()).resolve(),
                          relocated.resolve())
+        self.assertEqual(_git(self.repo, 'config', '--get', 'core.worktree'
+                              ).stdout.decode().strip(), relocated.as_posix())
         self.assertFalse((relocated / '.git').exists())
         return relocated, self.repo / 'docs'
 
@@ -2698,8 +2707,8 @@ class TimeoutTests(DeliveryCase):
         relocated = self.root / 'config-worktree-root'
         relocated.mkdir()
         _git(self.repo, 'config', 'extensions.worktreeConfig', 'true')
-        (self.repo / '.git' / 'config.worktree').write_text(
-            f'[core]\n\tworktree = {relocated}\n')
+        _git(self.repo, 'config', '--file', str(self.repo / '.git' / 'config.worktree'),
+             'core.worktree', relocated.as_posix())
         result = _git(self.repo / 'docs', 'rev-parse', '--show-toplevel')
         self.assertEqual(Path(result.stdout.decode().strip()).resolve(),
                          relocated.resolve())
@@ -2715,12 +2724,121 @@ class TimeoutTests(DeliveryCase):
         relocated = self.root / 'same-line-root'
         relocated.mkdir()
         with (self.repo / '.git' / 'config').open('a', encoding='utf-8') as handle:
-            handle.write(f'\n[core] worktree = {relocated}\n')
+            handle.write(f'\n[core] worktree = {relocated.as_posix()}\n')
         result = _git(self.repo / 'docs', 'rev-parse', '--show-toplevel')
         self.assertEqual(Path(result.stdout.decode().strip()).resolve(),
                          relocated.resolve())
         self.assertFalse((relocated / '.git').exists())
         return relocated, self.repo / 'docs'
+
+    def _relocate_core_worktree_beside_a_subsection(self):
+        """A real relocation next to a same-named subsection Git ignores.
+
+        A Git key is ``section.variable``, and a subsection inserts a level:
+        ``[core "unused"] worktree`` is ``core.unused.worktree``, never
+        ``core.worktree``. Real Git therefore keeps the root at ``[core]``'s
+        value, while a reader that drops the subsection takes the decoy. The
+        ``config --get`` calls below are the fixture's evidence, not the proof
+        under test.
+        """
+        actual = self.root / 'actual-root'
+        decoy = self.root / 'decoy-root'
+        actual.mkdir()
+        decoy.mkdir()
+        _git(self.repo, 'config', 'core.worktree', actual.as_posix())
+        _git(self.repo, 'config', 'core.unused.worktree', decoy.as_posix())
+        result = _git(self.repo / 'docs', 'rev-parse', '--show-toplevel')
+        self.assertEqual(Path(result.stdout.decode().strip()).resolve(),
+                         actual.resolve())
+        self.assertEqual(_git(self.repo, 'config', '--get', 'core.worktree'
+                              ).stdout.decode().strip(), actual.as_posix())
+        self.assertEqual(_git(self.repo, 'config', '--get', 'core.unused.worktree'
+                              ).stdout.decode().strip(), decoy.as_posix())
+        self.assertFalse((actual / '.git').exists())
+        return actual, self.repo / 'docs'
+
+    def _relocate_worktree_config_beside_a_subsection(self):
+        """``extensions.worktreeConfig`` stays true beside a decoy subsection.
+
+        ``[extensions "unused"] worktreeConfig = false`` is
+        ``extensions.unused.worktreeConfig``, so real Git still reads
+        ``[extensions] worktreeConfig = true`` and still honors
+        ``$GIT_DIR/config.worktree``. A reader that drops the subsection takes
+        the decoy's ``false`` and stops looking for the relocation.
+        """
+        relocated = self.root / 'config-worktree-root'
+        relocated.mkdir()
+        _git(self.repo, 'config', 'extensions.worktreeConfig', 'true')
+        _git(self.repo, 'config', 'extensions.unused.worktreeConfig', 'false')
+        _git(self.repo, 'config', '--file', str(self.repo / '.git' / 'config.worktree'),
+             'core.worktree', relocated.as_posix())
+        result = _git(self.repo / 'docs', 'rev-parse', '--show-toplevel')
+        self.assertEqual(Path(result.stdout.decode().strip()).resolve(),
+                         relocated.resolve())
+        self.assertEqual(_git(self.repo, 'config', '--get', 'extensions.worktreeConfig'
+                              ).stdout.decode().strip(), 'true')
+        self.assertEqual(
+            _git(self.repo, 'config', '--get', 'extensions.unused.worktreeConfig'
+                 ).stdout.decode().strip(), 'false')
+        self.assertFalse((relocated / '.git').exists())
+        return relocated, self.repo / 'docs'
+
+    def _quote_core_worktree_to_a_trailing_space(self):
+        """A quoted root whose name ends in a space, written by Git itself.
+
+        Git strips whitespace outside a quoted value and keeps it inside, so
+        ``worktree = "/path/root "`` names a directory ending in a space. A
+        reader that trims the whole value resolves ``/path/root`` and compares
+        the journal with a different directory. ``config --get`` echoes the
+        decoded value verbatim; that equality is the fixture's evidence.
+        """
+        quoted = self.root / 'quoted-root '
+        _git(self.repo, 'config', 'core.worktree', str(quoted))
+        self.assertEqual(_git(self.repo, 'config', '--get', 'core.worktree'
+                              ).stdout.decode().rstrip('\n'), str(quoted))
+        self.assertIn('worktree = "', (self.repo / '.git' / 'config').read_text(
+            encoding='utf-8'))
+        _git(self.repo / 'docs', 'rev-parse', '--show-toplevel')
+        return quoted
+
+    def _escape_core_worktree(self):
+        """A root Git reaches through a backslash escape in an unquoted value.
+
+        Git decodes ``\\\\`` in a value into one backslash, so the line names
+        the path below; a reader that only unescapes inside quotes keeps both
+        characters and resolves a path that is not the worktree at all. The
+        ``config --get`` equality is the fixture's evidence; the file must carry
+        the escaped spelling.
+        """
+        escaped = self.root / 'escaped\\root'
+        _git(self.repo, 'config', 'core.worktree', str(escaped))
+        self.assertEqual(_git(self.repo, 'config', '--get', 'core.worktree'
+                              ).stdout.decode().rstrip('\n'), str(escaped))
+        self.assertIn('\\\\', (self.repo / '.git' / 'config').read_text(
+            encoding='utf-8'))
+        _git(self.repo / 'docs', 'rev-parse', '--show-toplevel')
+        return escaped
+
+    def _core_worktree_with_a_bare_carriage_return(self):
+        """A value holding a bare ``\\r``, which Git keeps inside the line.
+
+        A config line ends only at ``\\n`` (one ``\\r`` before it is dropped),
+        so this value is not just ``<prefix>/a``: Git decodes the whole line.
+        ``str.splitlines`` would cut at the bare ``\\r`` instead, read
+        ``<prefix>/a`` as the root and start a second variable from ``b = c``.
+        The value Git reads back is the fixture's evidence, and it is compared
+        without assuming how the running Git spells the inner whitespace.
+        """
+        prefix = f'{(self.root / "cr-value").as_posix()}/a'
+        config = self.repo / '.git' / 'config'
+        with config.open('a', encoding='utf-8') as handle:
+            handle.write(f'\n[core]\n\tworktree = {prefix}\rb = c\n')
+        self.assertIn(b'\r', config.read_bytes())
+        decoded = _git(self.root, 'config', '--file', str(config), '--get',
+                       'core.worktree').stdout.decode().rstrip('\n')
+        self.assertTrue(decoded.startswith(prefix), decoded)
+        self.assertNotEqual(decoded, prefix, 'Git reads the whole line')
+        return prefix
 
     def test_a_journal_inside_the_repository_is_never_rewritten_by_a_halt(self):
         # `run` only compared the journal with the repository path it was given.
@@ -3116,6 +3234,237 @@ class TimeoutTests(DeliveryCase):
         gh.assert_not_called()
         self.assertEqual(journal.read_text(), before)
         self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_a_halt_never_writes_inside_a_core_worktree_beside_a_subsection(self):
+        # A subsection adds a level to the key: `[core "unused"] worktree` is
+        # `core.unused.worktree`, never `core.worktree`. Dropping it made the
+        # reader take the decoy as the root, so a timeout journal at the real
+        # root looked outside and the halt rewrote it and created its lock
+        # inside the worktree.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        actual, scope = self._relocate_core_worktree_beside_a_subsection()
+        journal = actual / 'state.json'
+        self._seed_timeout(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        with probe:
+            with self.assertRaises(ValueError) as caught:
+                delivery.run(scope, plan, journal, agent=FakeAgents(self),
+                             session_probe=self.default_probe, profiles=self.profiles,
+                             reviewer_agent='scout')
+        self.assertIn('outside the repository', str(caught.exception))
+        self.assertEqual(calls, [])
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_the_cli_plan_resume_never_writes_inside_a_subsection_relocation(self):
+        # The same decoy through `--plan --resume`: the CLI halts on the
+        # recorded timeout by writing the journal and creating its lock, so the
+        # subsection must not be able to move the root it compares against.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        planfile = self.root / 'plan.json'
+        planfile.write_text(json.dumps(plan))
+        actual, scope = self._relocate_core_worktree_beside_a_subsection()
+        journal = actual / 'state.json'
+        self._seed_timeout(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        errors = io.StringIO()
+        args = ['delivery', '--repo', str(scope), '--plan', str(planfile),
+                '--state', str(journal), '--execute', '--resume']
+        with probe, mock.patch('sys.argv', args), contextlib.redirect_stderr(errors), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                delivery.main()
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn('outside the repository', errors.getvalue())
+        self.assertEqual(calls, [])
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_the_cli_issue_resume_proves_a_subsection_relocation_before_git(self):
+        # Without a timeout there is no halt write, but `--issue --resume`
+        # still starts `git rev-parse` first. The subsection decoy let that
+        # proof pass while the journal sat in the real worktree, so the proof
+        # has to reject before any Git or `gh` call.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        actual, scope = self._relocate_core_worktree_beside_a_subsection()
+        journal = actual / 'state.json'
+        self._seed_plain(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        with probe:
+            code, errors, loader, gh = self._run_cli(
+                self._cli_issue_args(journal, repo=scope, worktree=work))
+        self.assertEqual(code, 2)
+        self.assertIn('outside the repository', errors)
+        self.assertEqual(calls, [])
+        loader.assert_not_called()
+        gh.assert_not_called()
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_a_halt_never_writes_inside_a_worktree_config_beside_a_subsection(self):
+        # `[extensions "unused"] worktreeConfig = false` is
+        # `extensions.unused.worktreeConfig`, so Git still reads the real
+        # `[extensions] worktreeConfig = true` and still honors
+        # `$GIT_DIR/config.worktree`. Taking the decoy hid the relocation.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        relocated, scope = self._relocate_worktree_config_beside_a_subsection()
+        journal = relocated / 'state.json'
+        self._seed_timeout(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        with probe:
+            with self.assertRaises(ValueError) as caught:
+                delivery.run(scope, plan, journal, agent=FakeAgents(self),
+                             session_probe=self.default_probe, profiles=self.profiles,
+                             reviewer_agent='scout')
+        self.assertIn('outside the repository', str(caught.exception))
+        self.assertEqual(calls, [])
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_the_cli_issue_resume_proves_a_worktree_config_subsection_before_git(self):
+        # The same decoy with no timeout recorded: `--issue --resume` must
+        # reject before its first `git rev-parse` and before `gh issue view`.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        relocated, scope = self._relocate_worktree_config_beside_a_subsection()
+        journal = relocated / 'state.json'
+        self._seed_plain(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        with probe:
+            code, errors, loader, gh = self._run_cli(
+                self._cli_issue_args(journal, repo=scope, worktree=work))
+        self.assertEqual(code, 2)
+        self.assertIn('outside the repository', errors)
+        self.assertEqual(calls, [])
+        loader.assert_not_called()
+        gh.assert_not_called()
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_a_quoted_core_worktree_fails_closed_before_the_halt_write(self):
+        # `worktree = "/path/root "` names a directory whose name ends in a
+        # space; reading it as `/path/root` compared the journal with a
+        # different directory and wrote the halt inside the real worktree. A
+        # quoted value is not decoded byte-for-byte here, so it must fail
+        # closed instead of being guessed at.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        self._seed_timeout(plan, self.state)
+        before = self.state.read_text()
+        self._quote_core_worktree_to_a_trailing_space()
+        calls, probe = self._git_probe()
+        with probe:
+            with self.assertRaises(ValueError) as caught:
+                delivery.run(self.repo, plan, self.state, agent=FakeAgents(self),
+                             session_probe=self.default_probe, profiles=self.profiles,
+                             reviewer_agent='scout')
+        self.assertIn('cannot prove', str(caught.exception))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.state.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(self.state).exists())
+
+    def test_the_cli_issue_resume_fails_closed_on_a_quoted_core_worktree(self):
+        # No timeout, so the CLI's own proof is the only thing between the
+        # journal and `git rev-parse`; a quoted root it cannot decode exactly
+        # must stop it before that call and before `gh issue view`.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        self._seed_plain(plan, self.state)
+        before = self.state.read_text()
+        self._quote_core_worktree_to_a_trailing_space()
+        calls, probe = self._git_probe()
+        with probe:
+            code, errors, loader, gh = self._run_cli(
+                self._cli_issue_args(self.state, worktree=work))
+        self.assertEqual(code, 2)
+        self.assertIn('cannot prove', errors)
+        self.assertEqual(calls, [])
+        loader.assert_not_called()
+        gh.assert_not_called()
+        self.assertEqual(self.state.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(self.state).exists())
+
+    def test_an_escaped_core_worktree_fails_closed_before_the_halt_write(self):
+        # Git decodes `\\` in an unquoted value to one backslash. Keeping both
+        # characters resolved a path that is not the worktree, so the journal
+        # at the real root looked outside and the halt wrote into it. An escape
+        # this reader does not decode exactly must fail closed.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        self._seed_timeout(plan, self.state)
+        before = self.state.read_text()
+        self._escape_core_worktree()
+        calls, probe = self._git_probe()
+        with probe:
+            with self.assertRaises(ValueError) as caught:
+                delivery.run(self.repo, plan, self.state, agent=FakeAgents(self),
+                             session_probe=self.default_probe, profiles=self.profiles,
+                             reviewer_agent='scout')
+        self.assertIn('cannot prove', str(caught.exception))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.state.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(self.state).exists())
+
+    def test_the_cli_issue_resume_fails_closed_on_an_escaped_core_worktree(self):
+        # The same undecodable value without a timeout: the CLI's proof must
+        # still run first and refuse, starting no Git and no `gh issue view`.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        self._seed_plain(plan, self.state)
+        before = self.state.read_text()
+        self._escape_core_worktree()
+        calls, probe = self._git_probe()
+        with probe:
+            code, errors, loader, gh = self._run_cli(
+                self._cli_issue_args(self.state, worktree=work))
+        self.assertEqual(code, 2)
+        self.assertIn('cannot prove', errors)
+        self.assertEqual(calls, [])
+        loader.assert_not_called()
+        gh.assert_not_called()
+        self.assertEqual(self.state.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(self.state).exists())
+
+    def test_a_bare_carriage_return_in_a_value_fails_closed_before_the_halt_write(self):
+        # Git ends a config line only at `\n`, so a bare `\r` stays inside the
+        # value. Splitting there read the value as a shorter path and started a
+        # second variable from its tail, so the boundary could miss the root the
+        # value really names. A value the reader cannot reproduce exactly must
+        # fail closed instead.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        self._seed_timeout(plan, self.state)
+        before = self.state.read_text()
+        self._core_worktree_with_a_bare_carriage_return()
+        calls, probe = self._git_probe()
+        with probe:
+            with self.assertRaises(ValueError) as caught:
+                delivery.run(self.repo, plan, self.state, agent=FakeAgents(self),
+                             session_probe=self.default_probe, profiles=self.profiles,
+                             reviewer_agent='scout')
+        self.assertIn('cannot prove', str(caught.exception))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.state.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(self.state).exists())
 
     def test_an_unreadable_journal_stops_a_resume_before_git_or_the_carrier_query(self):
         # A journal that exists but cannot be read may record a timeout. It was
