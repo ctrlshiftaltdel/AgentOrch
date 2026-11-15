@@ -74,6 +74,12 @@ Self-checks (see release/README.md for the published standard):
      --since ... --until ... --json` reports seven metrics with a window, sample
      size, missing rate and coverage, and the same script reports an empty input
      as `no data` (never 0).
+  m. inside the extracted archive: `scripts/batch_delivery.py --help` and
+     `scripts/delivery_risk.py --help` both exit 0 and identify their command,
+     and `scripts/batch_delivery.py check` accepts a one-task plan in a throwaway
+     Git repository (edition `local`), prints the task id and edition, and leaves
+     that repository clean. The packaged batch capability must therefore work
+     without network, a real OpenCode session, a real `gh`, or a model.
   h. inside the extracted archive: `scripts/architecture/check.py` exits 0 with
      a JSON report marked `enforcement_mode: OFF` and `blocking: false` (the
      package ships no contract, so the checker must degrade to read-only
@@ -321,8 +327,160 @@ def package_set_errors(packaged, required, manifest_name=None):
     return failures
 
 
+BATCH_SELF_CHECK_TASK_ID = 't01'
+BATCH_SELF_CHECK_REPO = 'batch-self-check-repo'
+BATCH_SELF_CHECK_SCRATCH = 'batch-self-check'
+
+
+def _prepare_batch_self_check_repo(repo):
+    """Create the throwaway Git repository self-check (m) plans against.
+
+    Returns an empty string on success or one `(m)` failure line. The repository
+    lives under the self-check temp directory (never inside the extracted
+    package), has its own identity so a global Git config cannot leak in, and
+    commits one small file so the plan has a real base commit to name.
+    """
+    repo.mkdir(parents=True, exist_ok=True)
+    commands = (
+        ('init', ('init', '-q', '-b', 'main')),
+        ('config user.email', ('config', 'user.email',
+                               'release-self-check@example.invalid')),
+        ('config user.name', ('config', 'user.name', 'Release Self Check')),
+    )
+    for label, args in commands:
+        try:
+            rc, out = run(['git', *args], repo)
+        except OSError as exc:
+            return f'(m) cannot run git for the batch self-check ({label}): {exc}'
+        if rc != 0:
+            return (f'(m) git {label} failed while preparing the throwaway repository '
+                    f'(exit {rc}):\n{indent(out)}')
+    (repo / 'docs').mkdir()
+    (repo / 'docs' / 'PROJECT.md').write_text(
+        '# Project configuration\n\n'
+        '- `edition`: `local`\n'
+        '- 允许改动路径：`app.py`、`tests/`、`docs/`\n'
+        '- 永远禁止改动路径 / 文件：`LICENSE.md`\n',
+        encoding='utf-8')
+    (repo / 'app.py').write_text('print("batch self-check")\n', encoding='utf-8')
+    actions = (
+        ('add', ('add', 'app.py', 'docs/PROJECT.md')),
+        ('commit', ('-c', 'commit.gpgsign=false', 'commit', '-q', '-m',
+                    'batch self-check base')),
+    )
+    for label, args in actions:
+        try:
+            rc, out = run(['git', *args], repo)
+        except OSError as exc:
+            return f'(m) cannot run git for the batch self-check ({label}): {exc}'
+        if rc != 0:
+            return (f'(m) git {label} failed while preparing the throwaway repository '
+                    f'(exit {rc}):\n{indent(out)}')
+    return ''
+
+
+def _batch_self_check_plan(scratch_dir, repo):
+    """Return a one-task batch plan with every absolute path under the temp dir.
+
+    `check` is read-only: the plan only has to validate. The worktrees are named
+    but never created, `required_checks` is empty because this is a `local`
+    edition, and `authorization` is a non-empty literal because the coordinator
+    requires explicit authorization text even for `check` (this plan is never
+    pushed or merged). Verification commands are `sys.executable -c pass` so
+    nothing outside the standard library runs.
+    """
+    worktrees = scratch_dir / 'worktrees'
+    task_id = BATCH_SELF_CHECK_TASK_ID
+    return {
+        'version': 1,
+        'batch': {
+            'id': 'batch-self-check',
+            'title': 'Release self-check batch',
+            'summary': 'prove the packaged batch capability is present',
+            'repo': str(repo.resolve()),
+            'base': 'main',
+            'branch': 'task/batch-self-check',
+            'worktree': str((worktrees / 'batch').resolve()),
+        },
+        'executor_agent': 'self-check-executor',
+        'reviewer_agent': 'self-check-reviewer',
+        'tasks': [{
+            'id': task_id,
+            'title': 'self-check task',
+            'prompt': 'This task exists only to validate a batch plan.',
+            'worktree': str((worktrees / 'task-1').resolve()),
+            'branch': 'task/batch-self-check-1',
+            'paths': ['app.py'],
+            'acceptance': ['the packaged batch plan validates'],
+            'verify': [[sys.executable, '-c', 'pass']],
+            'depends': [],
+        }],
+        'finalize': {
+            'verify': [[sys.executable, '-c', 'pass']],
+            'post_merge_verify': [[sys.executable, '-c', 'pass']],
+            'required_checks': [],
+            'merge_method': 'merge',
+            'authorization': 'release self-check only; this plan is never merged',
+        },
+    }
+
+
+def batch_capability_errors(pkg_root, scratch_dir):
+    """Self-check (m): the package really carries a working batch capability.
+
+    The package must expose both shipped CLIs (`batch_delivery.py`,
+    `delivery_risk.py`) through `--help`, and the coordinator must accept a
+    one-task plan in a throwaway Git repository. This runs with no network, no
+    real OpenCode, no real `gh` and no model: `check` only reads the plan, the
+    project edition and Git, and it must leave the repository clean.
+    """
+    failures = []
+    scripts = pkg_root / 'scripts'
+    for filename in ('batch_delivery.py', 'delivery_risk.py'):
+        stem = filename[:-len('.py')]
+        rc, out = run([sys.executable, str(scripts / filename), '--help'], pkg_root)
+        if rc != 0:
+            failures.append(f'(m) {filename} --help failed inside package '
+                            f'(exit {rc}):\n{indent(out)}')
+        elif stem not in out:
+            failures.append(f'(m) {filename} --help does not identify {stem!r}:\n'
+                            f'{indent(out)}')
+
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    repo = scratch_dir / BATCH_SELF_CHECK_REPO
+    setup_error = _prepare_batch_self_check_repo(repo)
+    if setup_error:
+        failures.append(setup_error)
+        return failures
+
+    plan_path = scratch_dir / 'batch-plan.json'
+    plan_path.write_text(json.dumps(_batch_self_check_plan(scratch_dir, repo),
+                                    ensure_ascii=False, indent=2),
+                         encoding='utf-8')
+    rc, out = run([sys.executable, str(scripts / 'batch_delivery.py'), 'check',
+                   '--plan', str(plan_path), '--repo', str(repo.resolve())], pkg_root)
+    if rc != 0:
+        failures.append(f'(m) batch_delivery.py check rejected the packaged plan '
+                        f'(exit {rc}):\n{indent(out)}')
+    else:
+        if f'{BATCH_SELF_CHECK_TASK_ID}:' not in out:
+            failures.append('(m) batch_delivery.py check did not print the task id '
+                            f'{BATCH_SELF_CHECK_TASK_ID!r}:\n{indent(out)}')
+        if 'edition: local' not in out:
+            failures.append('(m) batch_delivery.py check did not print edition '
+                            f'"local":\n{indent(out)}')
+    rc, status = run(['git', 'status', '--porcelain'], repo)
+    if rc != 0:
+        failures.append('(m) cannot read the throwaway repository status '
+                        f'(exit {rc}):\n{indent(status)}')
+    elif status.strip():
+        failures.append('(m) batch_delivery.py check modified the throwaway repository; '
+                        f'`check` must be read-only:\n{indent(status)}')
+    return failures
+
+
 def run_self_check(zip_path, required, top_dir, extra_patterns=()):
-    """Run checks a-j and return a list of human-readable failure strings."""
+    """Run checks a-m and return a list of human-readable failure strings."""
     failures = []
 
     with zipfile.ZipFile(zip_path) as archive:
@@ -533,6 +691,14 @@ def run_self_check(zip_path, required, top_dir, extra_patterns=()):
                 if empty_report.get('summary', {}).get('headline') != 'no data':
                     failures.append('(l) an empty input was not reported as "no data"')
 
+        # (m) the packaged batch capability must be present and minimally
+        # functional. Both shipped CLIs have to answer --help, and the
+        # coordinator has to accept a one-task plan in a throwaway repository
+        # without network, a real OpenCode session, a real `gh` or a model.
+        # `check` is read-only, so the repository must still be clean afterwards.
+        failures.extend(batch_capability_errors(
+            pkg_root, Path(tmp) / BATCH_SELF_CHECK_SCRATCH))
+
         # (f) line-ending assertion: no packaged *text* file may contain CRLF.
         # Text is the same rule normalize_line_endings() uses (no NUL byte and
         # valid UTF-8); binary payloads ship verbatim and are exempt. A CRLF here
@@ -625,7 +791,7 @@ def main():
 
     size = zip_path.stat().st_size
     sha256 = sha256_file(zip_path)
-    print('Release self-check passed (checks a-l).')
+    print('Release self-check passed (checks a-m).')
     print(f'  package files : {len(files)} ({len(required)} REQUIRED + {MANIFEST_NAME})')
     print(f'  manifest      : schema {manifest["schema_version"]}, suite {manifest["suite"]!r}, '
           f'format {manifest["format_version"]}')
