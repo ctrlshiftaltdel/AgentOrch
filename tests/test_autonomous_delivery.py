@@ -543,6 +543,30 @@ class ReviewGateTests(DeliveryCase):
         state, _ = self.run_delivery(self.plan([task]), FakeAgents(self, review=partial))
         self.assertIn('AC-2', state['tasks']['one']['reason'])
 
+    def test_a_reviewer_may_run_commands_when_it_cannot_edit(self):
+        # Owner correction: bash/shell deny is not a review qualification.
+        # A reviewer that cannot edit may run checks. Command access is not a
+        # claim that those commands are read-only, and it is not a merge.
+        profile = {'permissions': [
+            {'action': '*', 'resource': '*', 'effect': 'allow'},
+            {'action': 'edit', 'resource': '*', 'effect': 'deny'},
+            {'action': 'shell', 'resource': '*', 'effect': 'allow'}]}
+        gate = delivery.profile_gate(profile)
+        self.assertTrue(gate['ready'], gate['reasons'])
+        self.assertEqual(gate['effective']['edit'], 'deny')
+        self.assertEqual(gate['effective']['shell'], 'allow')
+        self.assertEqual(gate['missing'], [])
+        work = self.worktree('one')
+        state, agents = self.run_delivery(
+            self.plan([self.task('one', work, ['a.txt'])]),
+            profiles=lambda where: {'scout': profile})
+        self.assertEqual(state['tasks']['one']['status'], 'PREPARED',
+                         state['tasks']['one'].get('reason'))
+        self.assertEqual(agents.calls, ['execution', 'review'])
+        # Shell access must not become a merge of the target branch.
+        self.assertNotIn(state['tasks']['one']['head'],
+                         _git(self.repo, 'rev-parse', 'HEAD').stdout.decode())
+
     def test_reviewer_profile_must_deny_edits_and_shell_tool(self):
         work = self.worktree('one')
         weak = lambda where: {'scout': {'permissions': [
@@ -550,15 +574,34 @@ class ReviewGateTests(DeliveryCase):
         state, agents = self.run_delivery(self.plan([self.task('one', work, ['a.txt'])]),
                                           profiles=weak)
         self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
-        self.assertIn('not provably read-only', state['tasks']['one']['reason'])
+        self.assertIn('can still edit', state['tasks']['one']['reason'])
         self.assertEqual(agents.calls, [])
 
-    def test_scoped_allow_after_a_wildcard_deny_is_not_read_only(self):
+    def test_a_scoped_shell_allow_does_not_block_a_reviewer(self):
+        # A command allow on one pattern is the point of letting reviewers run
+        # checks. It must not be treated as an edit.
         profile = {'permissions': [
             {'action': '*', 'resource': '*', 'effect': 'allow'},
-            {'action': 'shell', 'resource': '*', 'effect': 'deny'},
             {'action': 'edit', 'resource': '*', 'effect': 'deny'},
-            {'action': 'shell', 'resource': 'rm *', 'effect': 'allow'}]}
+            {'action': 'shell', 'resource': 'git *', 'effect': 'allow'}]}
+        gate = delivery.profile_gate(profile)
+        self.assertTrue(gate['ready'], gate['reasons'])
+        self.assertEqual(gate['scoped_allows'], [])
+
+    def test_a_scoped_edit_glob_allow_is_not_proved_unable_to_edit(self):
+        profile = {'permissions': [
+            {'action': '*', 'resource': '*', 'effect': 'allow'},
+            {'action': 'edit', 'resource': '*', 'effect': 'deny'},
+            {'action': 'e*', 'resource': 'docs/*', 'effect': 'allow'}]}
+        gate = delivery.profile_gate(profile)
+        self.assertFalse(gate['ready'])
+        self.assertTrue(gate['scoped_allows'])
+
+    def test_a_scoped_edit_allow_is_not_proved_unable_to_edit(self):
+        profile = {'permissions': [
+            {'action': '*', 'resource': '*', 'effect': 'allow'},
+            {'action': 'edit', 'resource': '*', 'effect': 'deny'},
+            {'action': 'edit', 'resource': 'docs/*', 'effect': 'allow'}]}
         gate = delivery.profile_gate(profile)
         self.assertFalse(gate['ready'])
         self.assertTrue(gate['scoped_allows'])
@@ -574,9 +617,9 @@ class ReviewGateTests(DeliveryCase):
 
         def profiles(where):
             rules = [{'action': '*', 'resource': '*', 'effect': 'allow'},
-                     {'action': 'edit', 'resource': '*', 'effect': 'deny'}]
+                     {'action': 'shell', 'resource': '*', 'effect': 'allow'}]
             if Path(where).resolve() != alias.resolve():
-                rules.append({'action': 'shell', 'resource': '*', 'effect': 'deny'})
+                rules.append({'action': 'edit', 'resource': '*', 'effect': 'deny'})
             return {'scout': {'permissions': rules}}
 
         state, agents = self.run_delivery(
@@ -584,7 +627,7 @@ class ReviewGateTests(DeliveryCase):
                        self.task('two', alias, ['b.txt'])]), profiles=profiles)
         self.assertEqual(state['tasks']['one']['status'], 'PREPARED')
         self.assertEqual(state['tasks']['two']['status'], 'BLOCKED')
-        self.assertIn('not provably read-only', state['tasks']['two']['reason'])
+        self.assertIn('can still edit', state['tasks']['two']['reason'])
         self.assertEqual(agents.calls, ['execution', 'review'])
 
     def test_reviewer_profile_is_requeried_at_every_boundary(self):
@@ -607,7 +650,7 @@ class ReviewGateTests(DeliveryCase):
         state, agents = self.run_delivery(plan, profiles=profiles)
         record = state['tasks']['one']
         self.assertEqual(record['status'], 'BLOCKED')
-        self.assertIn('not provably read-only', record['reason'])
+        self.assertIn('can still edit', record['reason'])
         self.assertFalse(marker.exists())
         self.assertEqual(agents.calls, ['execution'])
         self.assertGreaterEqual(len(queried), 3)
@@ -644,7 +687,7 @@ class ReviewGateTests(DeliveryCase):
         state, agents = self.run_delivery(plan, profiles=profiles)
         record = state['tasks']['one']
         self.assertEqual(record['status'], 'BLOCKED')
-        self.assertIn('not provably read-only', record['reason'])
+        self.assertIn('can still edit', record['reason'])
         self.assertTrue(marker.exists())
         self.assertEqual(agents.calls, ['execution'])
         self.assertGreaterEqual(len(queried), 5)
@@ -675,7 +718,7 @@ class ReviewGateTests(DeliveryCase):
                                           profiles=profiles, session_probe=probe)
         record = state['tasks']['one']
         self.assertEqual(record['status'], 'BLOCKED')
-        self.assertIn('not provably read-only', record['reason'])
+        self.assertIn('can still edit', record['reason'])
         # Only the execution session was exported: the review never started and
         # its verdict was never read back. (The first export follows execution,
         # the second proves the session before verification, the third before
@@ -715,7 +758,7 @@ class ReviewGateTests(DeliveryCase):
         state, agents = self.run_delivery(plan, profiles=profiles)
         record = state['tasks']['one']
         self.assertEqual(record['status'], 'BLOCKED')
-        self.assertIn('not provably read-only', record['reason'])
+        self.assertIn('can still edit', record['reason'])
         self.assertTrue(first.exists())
         self.assertFalse(second.exists())
         self.assertEqual(agents.calls, ['execution'])
@@ -927,7 +970,7 @@ class ResumeTests(DeliveryCase):
             {'action': '*', 'resource': '*', 'effect': 'allow'}]}}
         state, agents = self.run_delivery(plan, resume=True, profiles=weak)
         self.assertEqual(state['tasks']['one']['status'], 'BLOCKED')
-        self.assertIn('not provably read-only', state['tasks']['one']['reason'])
+        self.assertIn('can still edit', state['tasks']['one']['reason'])
         self.assertFalse(marker.exists())
 
     def test_resume_of_a_merge_checkpoint_is_refused(self):
@@ -1192,7 +1235,7 @@ class ApprovedRecheckTests(DeliveryCase):
         self.assertEqual(agents.calls, ['execution', 'review', 'execution'])
         record = state['tasks']['one']
         self.assertEqual(record['status'], 'BLOCKED')
-        self.assertIn('not provably read-only', record['reason'])
+        self.assertIn('can still edit', record['reason'])
         # The journal on disk says the same thing.
         self.assertEqual(self.journal()['tasks']['one']['status'], 'BLOCKED')
         # Nothing re-ran the command and the approved head is untouched.
@@ -1235,7 +1278,7 @@ class ApprovedRecheckTests(DeliveryCase):
         for name, work in (('one', one), ('two', two)):
             record = state['tasks'][name]
             self.assertEqual(record['status'], 'BLOCKED')
-            self.assertIn('not provably read-only', record['reason'])
+            self.assertIn('can still edit', record['reason'])
             # The journal on disk says the same thing.
             self.assertEqual(self.journal()['tasks'][name]['status'], 'BLOCKED')
             # Nothing re-ran and the approved head is untouched.
@@ -1279,7 +1322,7 @@ class ApprovedRecheckTests(DeliveryCase):
         for name, work in (('one', one), ('two', two)):
             record = state['tasks'][name]
             self.assertEqual(record['status'], 'BLOCKED')
-            self.assertIn('not provably read-only', record['reason'])
+            self.assertIn('can still edit', record['reason'])
             # The journal on disk says the same thing.
             self.assertEqual(self.journal()['tasks'][name]['status'], 'BLOCKED')
             # Nothing re-ran and the approved head is untouched.
@@ -1606,7 +1649,7 @@ class NoDestructiveTests(DeliveryCase):
         state, agents = self.run_delivery(plan, retry=['one'], profiles=profiles)
         record = state['tasks']['one']
         self.assertEqual(record['status'], 'BLOCKED')
-        self.assertIn('not provably read-only', record['reason'])
+        self.assertIn('can still edit', record['reason'])
         self.assertTrue(queried)
         self.assertFalse(marker.exists())
         self.assertEqual(agents.calls, [])
@@ -2058,15 +2101,24 @@ class DiffReviewTests(DeliveryCase):
 
 
 class RuleSemanticsTests(DeliveryCase):
-    def test_action_globs_and_later_allows_are_not_read_only(self):
-        deny_then_glob_allow = {'permissions': [
+    def test_a_shell_glob_allow_does_not_remove_the_edit_denial(self):
+        shell_reallowed = {'permissions': [
             {'action': '*', 'resource': '*', 'effect': 'allow'},
             {'action': 'edit', 'resource': '*', 'effect': 'deny'},
-            {'action': 'shell', 'resource': '*', 'effect': 'deny'},
             {'action': 's*', 'resource': '*', 'effect': 'allow'}]}
-        gate = delivery.profile_gate(deny_then_glob_allow)
+        gate = delivery.profile_gate(shell_reallowed)
+        self.assertTrue(gate['ready'], gate['reasons'])
+        self.assertEqual(gate['effective']['edit'], 'deny')
+        self.assertEqual(gate['effective']['shell'], 'allow')
+
+    def test_an_edit_glob_allow_is_not_unable_to_edit(self):
+        edit_reallowed = {'permissions': [
+            {'action': '*', 'resource': '*', 'effect': 'allow'},
+            {'action': 'edit', 'resource': '*', 'effect': 'deny'},
+            {'action': 'e*', 'resource': '*', 'effect': 'allow'}]}
+        gate = delivery.profile_gate(edit_reallowed)
         self.assertFalse(gate['ready'])
-        self.assertIn('shell', gate['missing'])
+        self.assertIn('edit', gate['missing'])
 
     def test_unknown_channels_are_recorded_as_unproven(self):
         work = self.worktree('one')

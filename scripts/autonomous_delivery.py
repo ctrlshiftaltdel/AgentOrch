@@ -2,8 +2,10 @@
 
 This slice deliberately has **no automatic merge**. It runs one real OpenCode
 execution session per task, verifies the diff with the plan's commands, starts a
-different session with a declared read-only agent for review, and leaves the
-task in ``PREPARED`` for a human or the Master to review and merge. Every write path is
+different session whose ``edit`` tool is denied for review, and leaves the
+task in ``PREPARED`` for a human or the Master to review and merge. Denying the
+``edit`` tool does not stop the reviewer from writing through ``shell``; the
+gate is not a read-only proof. Every write path is
 fail-closed:
 
 * a plan may not ask for a merge; ``merge``/``--merge-into`` is refused before
@@ -20,7 +22,8 @@ fail-closed:
   against its head, diff digest and clean worktree immediately before the
   summary: a later trusted command that changed it blocks the approval without
   re-running that command, and the reviewer profile is re-queried there so an
-  approval cannot outlive the read-only profile that supported it;
+  approval cannot outlive an edit denial: if that profile can edit again, the
+  approval is withdrawn. Shell access is not part of that proof;
 * the edition is re-read from the project config at every side-effect boundary,
   and an invalid, duplicate, empty or ambiguous declaration blocks immediately
   instead of reusing the first check. Every external call — the profile query,
@@ -142,9 +145,12 @@ VERDICT_KEYS = {'verdict', 'head', 'base', 'diff_sha256', 'diff_digest', 'task_d
                 'paths', 'mode', 'acceptance', 'findings'}
 MAX_DIFF_BYTES = 65536
 MODE = 'prepare-only'
-# The runtime's write-capable tool actions we can name. MCP/plugin channels are
-# not enumerable here, so this gate is never presented as an OS read-only proof.
-MUTATING_ACTIONS = ('edit', 'shell')
+# The reviewer must not be able to edit the change under review. Shell access
+# is allowed: a review that cannot run checks is not a review. Command access
+# is not proof those commands are read-only, and an APPROVE is not a merge.
+# MCP/plugin channels are not enumerable here, so this gate is never an OS
+# isolation proof.
+REVIEWER_DENIED_ACTIONS = ('edit',)
 VALID_EDITIONS = ('local', 'github')
 # A declaration is a bullet whose first token is `edition`, with any mix of
 # backticks or Markdown emphasis around it (including nested forms such as
@@ -2086,24 +2092,26 @@ def _rule_matches(rule, action):
     return pattern == '*' or fnmatch.fnmatchcase(action, pattern) or pattern == action
 
 
-def _covers_mutating(rule):
-    return any(_rule_matches(rule, action) for action in MUTATING_ACTIONS)
+def _covers_edit(rule):
+    return _rule_matches(rule, 'edit')
 
 
 def profile_gate(profile):
-    """Fail-closed tool-level read-only check for a reviewer profile.
+    """Fail closed unless the reviewer profile cannot edit.
 
-    Rules are evaluated in order with the runtime's last-match semantics for the
-    wildcard resource. Any allow rule for a mutating action on a scoped resource
-    (even if an earlier wildcard deny exists) is unproven, because this runner
-    cannot enumerate the resources that rule can reach.
+    Shell may be allowed. A reviewer that cannot run a check cannot review, and
+    this runner cannot tell a read-only command from any other command, so it
+    does not pretend ``bash: allow`` is read-only. An approval is still not a
+    merge. Rules use the runtime's last-match semantics for the wildcard
+    resource. An allow that could cover ``edit`` on a scoped resource is
+    unproven, because this runner cannot enumerate what that pattern reaches.
     """
     rules = (profile or {}).get('permissions') or []
     if not isinstance(rules, list):
         return {'ready': False, 'missing': ['permissions'], 'scoped_allows': [],
                 'effective': {}, 'reasons': ['profile permissions are not a list']}
     effective, scoped_allows = {}, []
-    for action in MUTATING_ACTIONS:
+    for action in ('edit', 'shell'):
         effect = None
         for rule in rules:
             if isinstance(rule, dict) and _rule_matches(rule, action) \
@@ -2116,17 +2124,15 @@ def profile_gate(profile):
         resource = rule.get('resource')
         if resource in (None, '*'):
             continue
-        # Any allow for a pattern that *could* cover edit/shell is unproven. A
-        # later identical-scope deny does not make it safe: the runner cannot
-        # enumerate what the glob reaches.
-        if _covers_mutating(rule):
+        if _covers_edit(rule):
             scoped_allows.append({'action': rule.get('action'), 'resource': resource})
-    missing = [action for action in MUTATING_ACTIONS if effective.get(action) != 'deny']
+    missing = [action for action in REVIEWER_DENIED_ACTIONS
+               if effective.get(action) != 'deny']
     reasons = []
     if missing:
         reasons.append('effective rule does not deny ' + ', '.join(missing))
     if scoped_allows:
-        reasons.append('scoped allow rules cannot be proven read-only: '
+        reasons.append('scoped allow rules cannot be proved unable to edit: '
                        + ', '.join(f"{item['action']}:{item['resource']}"
                                    for item in scoped_allows))
     return {'ready': not reasons, 'missing': missing, 'scoped_allows': scoped_allows,
@@ -2341,7 +2347,7 @@ def _reviewer_gate(context, spec, work, record):
                                   'unknown_channels_unproven': True,
                                   'tool_gate_passed': gate['ready']}
     if not gate['ready']:
-        raise DeliveryError('reviewer agent profile is not provably read-only: '
+        raise DeliveryError('reviewer agent profile can still edit: '
                             + '; '.join(gate['reasons']))
     return fresh
 
@@ -2663,7 +2669,8 @@ def _review(context, spec, record):
     # The execution-session export above is an external call of its own, and
     # the profile that gated this phase was read before it. Query the runtime
     # again immediately before the reviewer starts, so a profile widened while
-    # that export was answered cannot start a write-capable review session.
+    # that export was answered cannot start a review session whose ``edit``
+    # tool gate fails. Shell may still write; this is not a read-only proof.
     _reviewer_gate(context, spec, work, record)
     review = context.agent(work, _review_prompt(spec, record, patch), 'review')
     # The review session is an external call and the export below is another:
@@ -2738,8 +2745,9 @@ def _recheck_approved(context):
     summary would otherwise report stale approvals. This check re-reads the
     project config (edition, authorization) as well as Git state, and it
     re-queries the reviewer profile: the profile is shared runtime state a later
-    trusted command can widen, and an approval that was reviewed under a
-    read-only profile is not supportable once that profile allows writes. It
+    trusted command can widen, and an approval is not supportable once that
+    profile no longer passes the ``edit`` tool gate. Shell may still write
+    files; the gate does not claim the review session is read-only. The check
     never re-runs a verification command, starts an agent or writes to a
     worktree. An invalid project config or an unproven profile therefore blocks
     every approval instead of being reported as prepared.
