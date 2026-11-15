@@ -58,6 +58,7 @@ python scripts/batch_delivery.py status   --journal JOURNAL [--json]
       "branch": "task/example-batch-t1",
       "paths": ["src/app.py", "tests/test_app.py"],
       "acceptance": ["AC text, one result per item"],
+      "acceptance_checks": [["python", "-c", "assert result_is_present()"]],
       "verify": [["python", "-m", "unittest", "tests.test_app"]],
       "depends": []
     }
@@ -80,20 +81,23 @@ python scripts/batch_delivery.py status   --journal JOURNAL [--json]
 - `paths` 是相对 POSIX 路径；不接受绝对路径、`..`、反斜杠、通配符、`.git`、`.orchestration`、`.local`。任务之间不得有路径前缀重叠。
 - 依赖只能指向批次中更早的任务，依赖由 `INTEGRATED` 满足，而不是 `VERIFIED`。
 - 每个任务必须有非空 `acceptance` 与 `verify`；`finalize.verify` 与 `finalize.post_merge_verify` 也必须非空。
+- `acceptance_checks`（可选）是逐条验收标准对应的 argv 列表，长度必须与 `acceptance` 相同。`L0` 批次只有在每个任务都有完整 `acceptance_checks` 时才可能自动合并；否则需要独立审查或直接阻塞。检查在已审查的 head 上执行，任一 AC 失败即拒绝合并。
+- 授权载体是必需的：`github` 批次必须有 `batch.issue` 与 `batch.issue_repo`，并在任何 Agent 启动前写入 `ORCH-TASK-REGISTRY`（`status: DISPATCHED`）；`local` 批次必须有 `scripts/orchestrator.py` 与每个任务的记录，并在任何 Agent 启动前完成 `READY` / `DISPATCHED`。载体缺失时批次阻塞，不会以 `not_applicable` 假装交付。
 - 密钥形态的路径（如 `.env`、`*.pem`、`*token*`）在预检阶段直接拒绝。
 - `merge_method` 取 `merge`、`squash` 或 `rebase`。
 - `--merge` 时 `--authorization` 必须与 `finalize.authorization` 完全相等且非空；缺失或不等是预检错误，不会先推送再失败。
 - 项目底座由 `docs/PROJECT.md` 的 `edition` 唯一决定。`local` 只在本地合并，不调用 `gh`；`github` 使用 `gh` 的 PR、检查和合并流程。
-- 项目允许/禁止路径从 `docs/PROJECT.md` 的「允许改动路径」「永远禁止改动路径」读取。缺失该节时不会声称检查过；journal 记录 `project_paths: unknown`，只做计划级路径检查。
+- 项目允许/禁止路径从 `docs/PROJECT.md` 的「允许改动路径」「永远禁止改动路径」读取。缺失该节时不会声称检查过；journal 记录 `project_paths: unknown`，只做计划级路径检查。journal 同时绑定 `docs/PROJECT.md` 的 SHA-256；run / finalize 之间该文件变化即拒绝继续，必须重新对齐计划。
+- `github` 的必需检查以 `gh pr checks <n> --required` 返回的权威 context 为准：计划里的名字必须全部出现在其中，额外 context 也会被等待；权威集合为空或计划自带检查不在其中时失败。推送和合并使用审查过的确切 SHA，并在合并前重新核对 PR base、head 与 `mergeable == MERGEABLE`。
 
 ## 3. 风险分级
 
-`scripts/delivery_risk.py` 是只读分类器。它只看 `git diff --name-status --no-renames`，不接受调用方指定的等级。
+`scripts/delivery_risk.py` 是只读分类器。它只看 NUL 分隔的 `git diff --name-status -z --no-renames`，因此带空格、制表符或非 ASCII 的路径不会被 Git 的引号格式降级；不接受调用方指定的等级。
 
 | 等级 | 典型路径 | 验证 | 审查 |
 |---|---|---|---|
-| `L0` | `docs/` 下的 Markdown / 文本 / 图片、`assets/`、根目录 Markdown（契约与版本文件除外） | 结构检查与批次验证 | 不需要第二模型 |
-| `L1` | 其他 `scripts/`、`tests/`、非 workflow 的 `.github/`、`pyproject.toml`、`README.md` | 增量检查与批次验证 | 一次独立批次审查 |
+| `L0` | `docs/` 下的 Markdown / 文本 / 图片、`assets/`、根目录 Markdown（契约与版本文件除外） | 结构检查与批次验证；有 `acceptance_checks` 时逐条执行 | 不需要第二模型（缺 `acceptance_checks` 时需独立审查） |
+| `L1` | 其他 `scripts/`、`tests/`、非 workflow 的 `.github/`、普通源码（`.py`、`.js`、`.ts`、`.go`、`.rs` 等）、常见配置（`package.json`、`Dockerfile`、`.toml`、`.yaml`、`.json` 等） | 增量检查与批次验证 | 一次独立批次审查 |
 | `L2` | 契约、`kit/`、`editions/`、`templates/`、项目配置、workflow、发布与运行时控制脚本 | 完整验证 | 必须独立审查 |
 | `L3` | 密钥形态路径，或删除许可证文件 | 不自动交付 | 必须人工授权，命令停止 |
 
@@ -101,6 +105,7 @@ python scripts/batch_delivery.py status   --journal JOURNAL [--json]
 
 ## 4. 阶段与状态
 
+- `run --execute` 先完成权威派发：`github` 写 Issue 的 `ORCH-TASK-REGISTRY`（保留首次 `dispatched_at`），`local` 走 `task ready` / `task dispatch`；随后才创建/校验任务 Worktree。派发失败时任何 Agent 都不会启动，已取得的锁仍按契约保留并需人工核对。
 - `run --execute` 按稳定依赖顺序：创建/校验任务 Worktree → 启动一个 `opencode run --standalone --format json --agent ...` 会话 → 检查实际改动是否都在声明路径内 → 用任务命令验证 → 在集成分支上 `git merge --no-ff`。
 - 合并成功只把任务标为 `INTEGRATED`。这是**内部里程碑**：它只说明改动已进入集成分支，不说明外部交付完成。
 - `finalize` 做批次验证、风险分类、审查、推送、PR、必需检查、合并、合并后验证和载体更新。

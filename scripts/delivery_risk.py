@@ -75,8 +75,20 @@ L2_RELEASE_EXCEPTION = 'release/README.md'
 
 # Everything below is still executable or configurable by the delivery
 # machinery, so it gets incremental checks and one batch review.
-L1_EXACT = frozenset({'README.md', 'pyproject.toml'})
+L1_EXACT = frozenset({'README.md', 'pyproject.toml', 'Dockerfile', 'Makefile',
+                      'package.json'})
 L1_PREFIX = ('scripts/', 'tests/', '.github/')
+# Ordinary application source and configuration outside the high-risk set is
+# L1, not "unclassified L2": the tier exists so downstream projects do not pay
+# full validation for every source edit. The list is conservative; anything
+# else stays L2.
+SOURCE_SUFFIXES = ('.py', '.js', '.jsx', '.ts', '.tsx', '.go', '.rs', '.java',
+                   '.kt', '.c', '.h', '.cc', '.cpp', '.cs', '.rb', '.php',
+                   '.swift', '.sh', '.sql', '.html', '.css', '.scss', '.vue',
+                   '.svelte')
+CONFIG_SUFFIXES = ('.toml', '.yaml', '.yml', '.json', '.ini', '.cfg')
+CONFIG_NAMES = frozenset({'Dockerfile', 'Makefile', 'package.json',
+                          'pyproject.toml'})
 
 # Documentation, text and images only. This list is intentionally explicit:
 # an unrecognized extension under docs/ makes the path unclassified (L2), not
@@ -165,7 +177,12 @@ def _l2(name):
 
 
 def _l1(name):
-    return name in L1_EXACT or any(_under(name, prefix) for prefix in L1_PREFIX)
+    if name in L1_EXACT or any(_under(name, prefix) for prefix in L1_PREFIX):
+        return True
+    basename = name.rsplit('/', 1)[-1]
+    if basename in CONFIG_NAMES:
+        return True
+    return name.endswith(SOURCE_SUFFIXES + CONFIG_SUFFIXES)
 
 
 def _l0(name):
@@ -198,18 +215,24 @@ def _classify_one(name, status):
 
 
 def _diff(repo, base, head):
-    result = _run(repo, 'diff', '--name-status', '--no-renames',
+    # -z keeps Git's raw bytes: without it Git quotes unusual paths and a
+    # quoted ``"docs/\303\251/.env"`` would look like an unknown path instead of
+    # a secret-shaped one. --name-status -z emits ``<status>\0<path>\0`` pairs.
+    result = _run(repo, 'diff', '--name-status', '-z', '--no-renames',
                   f'{base}...{head}')
     if result.returncode != 0:
         raise RiskError('git diff failed')
+    fields = result.stdout.split(b'\0')
     changed = []
-    for line in result.stdout.decode('utf-8', 'replace').splitlines():
-        if not line.strip():
+    index = 0
+    while index + 1 < len(fields):
+        status_token = fields[index]
+        raw_path = fields[index + 1]
+        index += 2
+        if not status_token:
             continue
-        fields = line.split('\t')
-        if len(fields) < 2:
-            raise RiskError(f'unreadable diff line {line!r}')
-        status, raw = fields[0][:1], fields[-1]
+        status = status_token.decode('ascii', 'replace')[:1]
+        raw = raw_path.decode('utf-8', 'surrogateescape')
         try:
             name = _safe_name(raw)
         except RiskError as exc:

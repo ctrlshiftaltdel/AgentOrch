@@ -139,6 +139,49 @@ class ClassificationTests(RiskCase):
         self.assertEqual(data['level'], 'L2')
         self.assertIn('unclassified path: .env.example', data['reasons'])
 
+    def test_ordinary_source_and_config_are_l1(self):
+        for name in ('app.py', 'src/main.py', 'package.json', 'Dockerfile'):
+            with self.subTest(name=name):
+                self.setUp()
+                self.branch()
+                self.commit([(name, 'x\n')])
+                data = self.result()
+                self.assertEqual(data['level'], 'L1', data)
+
+    def test_unknown_binary_stays_l2(self):
+        self.branch()
+        self.commit([('mystery.bin', 'data\n')])
+        data = self.result()
+        self.assertEqual(data['level'], 'L2')
+
+    def test_non_ascii_secret_path_stays_l3(self):
+        self.branch()
+        self.commit([('docs/é/.env', 'TOKEN=x\n')])
+        data = self.result()
+        self.assertEqual(data['level'], 'L3')
+        self.assertEqual(data['changed_paths'], ['docs/é/.env'])
+
+    def test_secret_path_with_spaces_stays_l3(self):
+        self.branch()
+        self.commit([('docs/my secret/.env', 'TOKEN=x\n')])
+        data = self.result()
+        self.assertEqual(data['level'], 'L3')
+
+    def test_non_ascii_source_is_l1(self):
+        self.branch()
+        self.commit([('src/é.py', 'print(1)\n')])
+        data = self.result()
+        self.assertEqual(data['level'], 'L1')
+
+    def test_high_risk_paths_stay_l2(self):
+        for name in ('AGENTS.md', 'scripts/batch_delivery.py'):
+            with self.subTest(name=name):
+                self.setUp()
+                self.branch()
+                self.commit([(name, 'x\n')])
+                data = self.result()
+                self.assertEqual(data['level'], 'L2')
+
     def test_mixed_levels_take_the_maximum(self):
         self.branch()
         self.commit([('docs/note.md', 'note\n'), ('AGENTS.md', 'contract\n')])
