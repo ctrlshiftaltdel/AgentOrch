@@ -104,13 +104,16 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 
 运行：`python3 -m unittest tests.test_autonomous_delivery tests.test_opencode_probe`。这些测试不启动真实模型；真实运行摘要见 §6。
 
-## 6. 实测摘要（2026-11-14，本机 OpenCode v2.2.7）
+## 6. 实测摘要（2026-11-14 / 2026-11-15，本机 OpenCode v2.2.7）
 
 真实调用后的摘要，未包含会话标识或个人路径；原始 journal 只在本机受保护目录，不入库。
 
 - **较早候选版本**上，在 AgentOrch 本仓库（`github` edition）对一个文档任务做过 prepare-only 运行：真实执行与审查会话均为 `succeeded`、目录为该任务 worktree、Agent 不同；验证命令退出 0；审查 transcript 中全部验收标准 `PASS`、结论绑定该 commit 与 diff 指纹；最终 `PREPARED`，未改动目标分支与 `main`。该运行的 head **没有被记录**，无法定位到具体提交；相关记录最早出现在提交 `17ca355d781eb89c711a514e4ac2a8747fd1699e`（2026-11-14）。它是历史证据，**不能代表当前候选 head 的完整实现**。
 - 同一任务的另一次重跑（同样是较早候选，head 未记录；该记录由提交 `17ca355` 引入）：执行、提交与验证（退出 0）完成，但审查会话在 provider 侧返回 401（`User not found`），没有可用会话与结论；runner 按设计停在 `REVIEW_REJECTED`，没有伪造审查或继续。该失败是外部服务状态，不是审查门的否定结论，**也不是当前候选 head 的运行结果**。
-- **当前候选 head：`NOT_RUN`**。本文件没有任何真实运行可以被当作当前候选的实现证据；`PREPARED`、退出码与审查结论都只有上面的历史候选记录，不得把它们归给当前候选。要更新本段，必须先在当前 head 上真实重跑并记录可定位的提交与结果。
+- **2026-11-15 的 prepare-only 重跑（base `27e296c95efb14c508055b05ba20c7e31e60e8b6`，PR #244 合并后的 `main`）**：执行产物是提交 `ad847736131f4c1a3342523f6adea915aac5a0f8`（`ad84773`，提交说明 `230-map-section-ref: autonomous delivery`，只改 `docs/architecture/repository-map.md` 的两处证据表述）。journal 记录的终态是 `REVIEW_REJECTED`：审查 Agent `scout` 在 provider 侧返回 OpenRouter `401`（`User not found`），没有可用会话与结论。因此这次运行**不是 `PREPARED`**——它没有通过审查门，runner 没有伪造审查、没有继续到批准，也没有合并。该 401 是外部服务状态，不是审查门对 diff 的否定结论；但也不能反过来把它读成审查通过。
+- 上述执行提交之后的措辞修正 `16d42772c4ea923a25170bde22fade7f4ceee747`（`16d4277`，父提交正是 `ad84773`，同样只改 `docs/architecture/repository-map.md` 的这两处证据表述）**不是由 runner 的 `PREPARED` 状态换来的**：它经 Master 指定的审查者审查后由 Master 合并，合并提交为 `3096739fa6c3d0f69e1f888578c2895c6af7555d`（PR #246，父提交为 `27e296c` 与 `16d4277`）。这两笔改动进入 `main` 的路径是人工/Master 合并，不是本切片的自动合并、不是 `PREPARED` 批准，也不构成 CI 接线或当前 head 上的审查结论。
+- **本段涉及的提交有 runner 记录，但那次记录的审查不满足用户指定的审查角色要求**：journal 确实记录了针对本提交（base `3096739fa6c3d0f69e1f888578c2895c6af7555d`、head `f68a204ec72034a870fc0c0089c0afbdca82a670`）的一次运行，runner 记录的原始状态是 `PREPARED`，审查 Agent 是 `scout-free`。用户要求独立审查必须由名称以 `reviewer` 开头的 subagent 执行，`scout-free` 不满足该要求，所以该 `APPROVE` 不能采信：当前提交**没有可引用的、符合用户指定审查角色要求的工具审查结论**，`f68a204` 也不能被说成经过有效工具审查的 `PREPARED` 结果。
+- **当前候选 head：`NOT_RUN` 表示“没有符合审查角色要求的可引用工具审查结论”，不表示这次文档运行没有发生**：如上一段所述，journal 里确实有一次以 `f68a204` 为 head 的运行，原始状态 `PREPARED`、审查 Agent 是 `scout-free`（不满足 `reviewer` 开头的要求）。因此当前 head 上仍没有可引用的合规审查结论，本文件也不引用该次运行的 `PREPARED` 或退出码作为实现证据。要更新本段，必须在当前 head 上重跑并由 `reviewer` 开头的 subagent 完成独立审查，记录可定位的提交与结果。
 - 自动合并请求在启动 Agent 之前被拒绝；依赖任务在上游仅 `PREPARED` 时保持 `PENDING`；edition 缺失/非法在派发前拒绝。
 
 **没有验证、也不宣称的事项**：当前 head 上的真实审查结论、自动合并、GitHub PR/CI 接线、Issue/PR 状态同步、从 `docs/implementation-plan.md` 自动选任务、MCP/插件通道与 OS 隔离、模型独立、Windows 真机、真实 CI 触发。
