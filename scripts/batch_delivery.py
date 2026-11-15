@@ -2172,10 +2172,6 @@ def _github_flow(plan, state, journal, args, base, head, digest, risk):
 
 def _local_flow(plan, state, journal, args, base, head, digest, risk):
     repo = plan['batch']['repo']
-    expected = plan['finalize']['authorization']
-    if not expected or args.authorization != expected:
-        raise InputError('--authorization must exactly equal the nonempty '
-                         'finalize.authorization before a local merge')
     if _branch(repo) != plan['batch']['base']:
         raise BatchError(f'the repository is not on {plan["batch"]["base"]!r}')
     if not _clean(repo):
@@ -2187,6 +2183,10 @@ def _local_flow(plan, state, journal, args, base, head, digest, risk):
         state['phase'] = 'review'
         _atomic_json(journal, state)
         return
+    expected = plan['finalize']['authorization']
+    if not expected or args.authorization != expected:
+        raise InputError('--authorization must exactly equal the nonempty '
+                         'finalize.authorization before a local merge')
     if state['merge'].get('state') == 'merged':
         commit = state['merge']['commit']
     elif _ancestor(repo, head, 'HEAD'):

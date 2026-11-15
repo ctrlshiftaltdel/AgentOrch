@@ -413,7 +413,9 @@ class BatchCase(unittest.TestCase):
     # -- fixtures ---------------------------------------------------------
     def _executable(self, name, text):
         path = self.bin / name
-        path.write_text(text)
+        # The fakes are launched once per gate; -S keeps interpreter startup
+        # from dominating the suite. The standard library still works.
+        path.write_text(text.replace(f'#!{PY}\n', f'#!{PY} -S\n', 1))
         path.chmod(0o755)
         return path
 
