@@ -295,12 +295,16 @@ class ReleaseAssetNamingTests(unittest.TestCase):
 
 
 class VersionConsistencyTests(unittest.TestCase):
-    """Format and Release version have to agree for the published tag.
+    """Release tag, Format version and the updater's compatibility rules agree.
 
-    The update engine's VERSION_MATCH check accepts a release only when the
-    tag's major.minor equals MANIFEST.json's format_version (versions.py owns
-    that rule), so the two numbers in VERSION.md cannot be reviewed separately:
-    a `v1.6` tag with a `1.5` Format version is rejected as UNSAFE_PACKAGE.
+    Two rules can accept a release: the historical VERSION_MATCH rule (the tag's
+    major.minor equals MANIFEST.json's format_version, which every published
+    client still applies) and the explicit compatibility matrix of the current
+    updater. A MAJOR release can keep the Format while the old rule still
+    rejects it, so both rules need positive and negative assertions: a `v2.0.0`
+    tag with Format `1.7` must fail the old rule and pass only the declared
+    matrix, while a `v1.6` tag with a `1.5` Format version stays an
+    UNSAFE_PACKAGE under the old rule.
     """
 
     @classmethod
@@ -319,14 +323,19 @@ class VersionConsistencyTests(unittest.TestCase):
     def test_release_tag_matches_the_format_version(self):
         release = self.release_version()
         _, format_version = drift.read_version(ROOT)
-        self.assertEqual(release, '1.7.2')
+        self.assertEqual(release, '2.0.0')
         self.assertEqual(format_version, '1.7')
-        self.assertTrue(self.versions.tag_matches_format(f'v{release}', format_version))
-        # The rule compares major.minor: a different major.minor (v1.5) must NOT
-        # be accepted, while patch tags that share the Format (v1.7 / v1.7.0)
-        # match. A silent mismatch would be a real defect.
+        # A MAJOR release number is not the Format contract: the current v2.0.0
+        # tag deliberately does NOT satisfy the historical rule, so the published
+        # v1.7.0 client fails closed instead of installing a package whose
+        # semantics it does not know. Both spellings of the tag must fail.
+        self.assertFalse(self.versions.tag_matches_format(f'v{release}', format_version))
+        self.assertFalse(self.versions.tag_matches_format('v2.0', format_version))
+        # The historical rule keeps accepting every tag whose major.minor equals
+        # the Format; the 1.7 patch tags still match Format 1.7.
         self.assertTrue(self.versions.tag_matches_format('v1.7', format_version))
         self.assertTrue(self.versions.tag_matches_format('v1.7.0', format_version))
+        self.assertTrue(self.versions.tag_matches_format('v1.7.1', format_version))
         self.assertFalse(self.versions.tag_matches_format('v1.5', format_version))
         # Historical compatibility: the 1.6 patch tags still match Format 1.6,
         # and they must NOT be accepted by the current Format 1.7.
@@ -339,6 +348,29 @@ class VersionConsistencyTests(unittest.TestCase):
         self.assertFalse(self.versions.tag_matches_format('v1.6.2', format_version))
         self.assertFalse(self.versions.tag_matches_format('v1.6.3', format_version))
         self.assertFalse(self.versions.tag_matches_format('v1.5', '1.6'))
+        # The current updater accepts v2.0.0 only through its explicit matrix,
+        # and the matrix is keyed on the package's Format, not on the release
+        # number: no matrix, a matrix missing 1.7, and a package Format of 2.0
+        # must all fail closed.
+        declared = self.versions.format_compatibility(
+            f'v{release}', format_version, self.versions.DECLARED_SUPPORTED_FORMATS)
+        self.assertTrue(declared.accepted)
+        self.assertEqual(declared.rule, self.versions.RULE_DECLARED_SUPPORTED_FORMAT)
+        self.assertIn(format_version, self.versions.DECLARED_SUPPORTED_FORMATS)
+        no_matrix = self.versions.format_compatibility(f'v{release}', format_version)
+        self.assertFalse(no_matrix.accepted)
+        self.assertIsNone(no_matrix.rule)
+        missing_format = self.versions.format_compatibility(
+            f'v{release}', '1.6', self.versions.DECLARED_SUPPORTED_FORMATS)
+        self.assertFalse(missing_format.accepted)
+        # The published bridge (v1.7.1) also matches under the historical rule,
+        # which is what makes the two-step upgrade path through it possible.
+        self.assertTrue(self.versions.format_compatibility(
+            'v1.7.1', format_version, self.versions.DECLARED_SUPPORTED_FORMATS).accepted)
+        self.assertEqual(
+            self.versions.format_compatibility(
+                'v1.7.1', format_version, self.versions.DECLARED_SUPPORTED_FORMATS).rule,
+            self.versions.RULE_TAG_MATCHES_FORMAT)
 
     def test_manifest_generated_from_version_file_records_format_1_7(self):
         suite, format_version = drift.read_version(ROOT)
