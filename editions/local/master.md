@@ -31,6 +31,15 @@
 - 路径相同或父子重叠即冲突；多路径任务任一冲突则整体失败，不产生半套锁。
 - 只有 `VERIFIED` / `CANCELED` 自动释放；失败、超时、状态不明保持锁定，需显式 `task unlock` 并记录理由。
 
+## 交付批次（Batch）
+
+- 相关任务可以组成一个**交付批次**：批次内每个任务仍是独立的验收单位，保留自己的任务 ID、验收标准、证据与失败 / 恢复记录。
+- 锁机制不变：仍由 `task dispatch` 逐个任务取得原子路径锁。批次派发可以是逐个任务 `task dispatch`，也可以是批次工具的本地 journal 加逐个任务的路径锁；两种都不跳过原子锁。**journal 不是任务库**：任务状态仍只写 `.orchestration/state.sqlite3`，不得用 journal 代替 `task status` 或释放锁。
+- 批次使用一个集成分支与多个任务 Worktree，同一 Worktree 同一时刻只允许一个写入者；批次结束时由 Master 执行一次本地合并。
+- 批次内部使用 `INTEGRATED` 作为内部里程碑：任务进入集成分支后可作为同批次后续任务的依赖；它不是 `VERIFIED`，也不解锁外部依赖。
+- `local` 的批次收口是把集成分支合并到主分支后重新验证；Git 不提供跨任务原子性，冲突、部分失败与恢复必须逐个记录，不得声称整批原子成功。
+- 只有合并后的主分支验证通过，任务才逐个标记 `VERIFIED`；单个任务失败不阻塞无依赖、无路径冲突的同批次任务。
+
 ## 命令入口
 
 ```bash
@@ -121,7 +130,7 @@ python agentorch/scripts/orchestrator.py --layout isolated task list
    - 5a. 子代理驱动路径（C1–C4 全部通过时）：每个任务用独立上下文的子代理执行完整任务包（目标、允许 / 禁止路径、逐条验收、验证命令、风险），逐任务顺序派发而非并行轰炸；子代理返回后必须回收其交付证据（变更文件清单、`git status --short`、head SHA、验证命令输出与退出码、验收自检、未完成项），证据不全视为未交付，不得进入审查。Master 仍然只派发与审查，不亲手实现；子代理不得自批或合并。提示词见 `editions/local/master.md`。
    - 5b. 多会话交接路径（任一能力不满足时）：由当前操作者另开本地会话执行，Master 不等待，也不声称已派发成功；人工会话同样不得自批或合并。提示词见 `editions/local/master.md`。
 6. 收回分支 / Diff / head SHA / 测试输出后，独立审查。退回任务要写明验收条款、缺失证据、修复指引与轮次。
-7. 通过后将 `APPROVED` 绑定到当前 head SHA，再由 Master 合并。合并后重新运行验证，只有结果通过才标记 `VERIFIED`。
+7. 通过后将 `APPROVED` 绑定到当前 head SHA，再由 Master 合并。合并后重新运行验证，只有结果通过才标记 `VERIFIED`。批次交付时，`APPROVED` 绑定批次最终 head SHA，合并与合并后验证按批次执行，再逐任务标记 `VERIFIED`；批内 `INTEGRATED` 不是 `VERIFIED`。
 8. 在任务库记录每次状态与证据。每阶段末运行 `python scripts/orchestrator.py backup`。
 
 ## 自我完善闭环（local）

@@ -5,7 +5,7 @@
 ## 开工前
 
 1. 确认 Issue 已被派发给你，且 `ORCH-TASK-REGISTRY` 登记块存在、`status` 为 `DISPATCHED` 或 `IN_PROGRESS`、`locked_paths` 与任务一致。缺失或矛盾时不要改文件，在 Issue 评论报告阻塞。
-2. 确认依赖 Issue 均为 `VERIFIED`。
+2. 确认依赖 Issue 均为 `VERIFIED`。批次内依赖可以由内部里程碑 `INTEGRATED` 满足；跨批次 / 外部依赖仍必须 `VERIFIED`。
 3. 列出所有开放 PR 的变更文件，确认没有与本任务 `locked_paths` 相交：
 
    ```bash
@@ -13,31 +13,35 @@
    ```
 
    有相交则停止，在 Issue 评论说明冲突对象，不得“先开工后协调”。
-4. 从最新主分支创建分支：
+4. 创建任务分支：
 
    ```bash
    git fetch origin
    git switch -c task/<issue-number>-<short-name> origin/main
    ```
 
+   单任务交付从最新主分支创建；任务属于批次时，基线是该批次集成分支的当前 head（由批次集成负责人给出准确 SHA），不是 `origin/main`。不要直接向集成分支合并或 rebase 其他任务的分支。
+
 ## 执行中
 
 - 只修改允许路径。先读现有代码和规范，优先做最小的完整实现与必要测试；不要自动格式化、重构或升级无关文件。
-- 尽早创建 **Draft PR**，回链 Issue，正文按 `editions/github/pr-template.md` 填写：
+- **默认不为每个任务单独开 PR。** 在任务自己的分支 / Worktree 完成实现与验证，把 head SHA、变更路径、验证输出与风险汇报给批次集成负责人。仅当任务单独交付（单任务批次）或批次协调者 / Master 明确要求时，才创建 Draft PR，回链 Issue，正文按 `editions/github/pr-template.md` 填写：
 
   ```bash
   gh pr create --draft --base main --head task/<issue-number>-<short-name> \
     --title "<任务标题>" --body-file <pr-body.md>
   ```
 
-- 保持分支与最新主分支同步；落后时先 rebase 再继续：
+- 批次交付时只负责自己的任务范围：不向集成分支合并、不 rebase 其他任务的分支，也不代替批次负责人做集成；冲突或范围不符时停止并报告。批次内每个任务仍按当前 head 记录自己的逐条验收与证据。
+
+- 单任务交付保持分支与最新主分支同步；落后时先 rebase 再继续：
 
   ```bash
   git fetch origin
   git rebase origin/main
   ```
 
-  进入审查后若必须 rebase 或 force-push，先在 PR 评论说明原因，并重新触发检查。
+  批次任务按批次负责人给出的基线处理，不自行 rebase 到 `origin/main`。进入审查后若必须 rebase 或 force-push，先在 PR 评论说明原因，并重新触发检查。
 - 真正执行配置的检查命令，并记录完整命令、退出码、必要输出和当前 head SHA。CI 未通过时不要转为 Ready for review。
 - 保持 PR 为可合并状态（`MERGEABLE`）；解决冲突而不是关闭检查：
 
@@ -69,11 +73,11 @@
 
 ## 交回
 
-实现完成且 CI 在当前 head 全绿后，把 Draft PR 转为 Ready for review，并在 PR 评论交回：
+实现完成且 CI 在当前 head 全绿后交回。单任务交付：把 Draft PR 转为 Ready for review，并在 PR 评论交回。批次交付：不转 Ready、不合并，把同一份交回内容发给批次集成负责人并在 Issue 评论记录；需要 PR 时由批次负责人统一处理。
 
 ```text
 任务 ID / Issue：
-PR：
+PR：（批次交付时写“无逐任务 PR”，批次 PR 由批次负责人统一创建）
 改动摘要：
 变更路径：
 当前 head SHA：
@@ -83,4 +87,4 @@ PR：
 风险 / 需要决策：
 ```
 
-不得批准或合并自己的 PR，不得把 Issue 标记为 `VERIFIED`，不得关闭 Issue。
+不得批准或合并自己的 PR、实现或其所属批次，不得把 Issue 或任务标记为 `VERIFIED`，不得关闭 Issue。

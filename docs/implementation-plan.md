@@ -6,7 +6,8 @@
 
 | 任务 | 状态 |
 |---|---|
-| [#230](https://github.com/ctrlshiftaltdel/AgentOrch/issues/230) | **P0，正在实施**：按所有者本次纠偏授权，优先推进计划 → 真实 Agent 执行 → 验证 → 独立审查 → 安全合并 → 恢复 → 下一任务，减少不必要的人工干预。闭环尚未证明交付；不要求先冻结 #229。每个实际环节须有可定位证据。 |
+| [#230](https://github.com/ctrlshiftaltdel/AgentOrch/issues/230) | **P0，正在实施**：按所有者本次纠偏授权，优先推进计划 → 真实 Agent 执行 → 验证 → 独立审查 → 安全合并 → 恢复 → 下一任务，减少不必要的人工干预。闭环尚未证明交付；不要求先冻结 #229。每个实际环节须有可定位证据。批次交付（#250）是它采用的交付 / 审查 / CI 模式，两者由同一实现批次推进。 |
+| [#250](https://github.com/ctrlshiftaltdel/AgentOrch/issues/250) | **P0，正在实施**：批次交付（一个集成分支 / 一个最终 PR）的实现、契约同步、风险分层审查与发行接入；仅在真实端到端证据齐备后记录完成，当前不声称已交付。 |
 | [#240](https://github.com/ctrlshiftaltdel/AgentOrch/issues/240) | **已关闭**：针对过期 CI 的修复 PR [#241](https://github.com/ctrlshiftaltdel/AgentOrch/pull/241) 已合并，合并提交为 `72e45c803bacd0c15f13ce3db5e30fafb58cdd72`；合并后 CI 运行 [43429593642](https://github.com/ctrlshiftaltdel/AgentOrch/actions/runs/43429593642) 在 Linux 3.12 / 3.13、macOS 与 Windows 均通过。以上事实以该 Issue 的关闭评论为准；平台侧事件顺序与耗时收益未实测，不作断言。 |
 | [#179](https://github.com/ctrlshiftaltdel/AgentOrch/issues/179) | **后续，真实运行时待验证**：实际权限拒绝与上下文隔离链路仍需真实证据；夹具或只读交接不能证明实机能力。历史 PR [#231](https://github.com/ctrlshiftaltdel/AgentOrch/pull/231) 已关闭，不表示该链路已交付。 |
 | [#181](https://github.com/ctrlshiftaltdel/AgentOrch/issues/181) 与 [DSH](https://github.com/ctrlshiftaltdel/AgentOrch/issues/160) | **延期**：#181 在 #179 后再评估；该整链不阻塞 #230；[#163](https://github.com/ctrlshiftaltdel/AgentOrch/issues/163) 已重标 P2 / 延期，运行时仍阻塞且能力尚未实测，后续工作不得假定已就绪。历史设计及依赖见 [设计文档](design/deepseek-harness-agent-role-tools.md)。 |

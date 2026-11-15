@@ -60,18 +60,20 @@
 
 ### 3.1 CI 与本标准的覆盖分工
 
-`.github/workflows/ci.yml` 在 `pull_request`→`main`、`push`→`main` 与手动触发时，用同一份步骤定义在三个 GitHub-hosted runner 上执行同一套自检：
+`.github/workflows/ci.yml` 在 `pull_request`→`main`、`push`→`main` 与手动触发时运行，先由 `risk` 作业按真实 Diff 给出 `L0`–`L3`，再按档执行；必需的 `checks (Python 3.12)` / `checks (Python 3.13)` context 仍在 Ubuntu 上，名称不得改：
 
-| job | runner | Python |
-| --- | --- | --- |
-| `checks` | `ubuntu-latest` | 3.12 / 3.13 |
-| `checks-macos` | `macos-latest` | 3.13 |
-| `checks-windows` | `windows-latest` | 3.13 |
+| job | runner | Python | 何时运行 |
+| --- | --- | --- | --- |
+| `checks` | `ubuntu-latest` | 3.12 / 3.13 | 始终；档位决定步骤 |
+| `checks-macos` | `macos-latest` | 3.13 | `full=true`：`L2` / `L3`、push 到 `main`、`workflow_dispatch` |
+| `checks-windows` | `windows-latest` | 3.13 | 同上 |
 
-- **包内自检在三个平台都真实执行**：`uv run python scripts/build_release.py` 在每个 job 上各跑一次，脚本用 `sys.executable`（不是裸 `python`）在解压目录里执行 `validate_kit.py` 与 `unittest discover -s tests`（自检 b、d），所以"这一平台 / Python 版本拿到的包是否可用"是实机验证的，不是从 Linux 推断的。
-- **失败即红**：没有 `continue-on-error`、`|| true` 或跳过开关；产物只写到 runner 的 `release/`（`.gitignore` 已忽略），不提交、不上传、不使用密钥。
+- **必需 Ubuntu 检查按风险档执行**：`L0` 只跑定向结构检查（`validate_kit`、`check_scope` 等）；`L1` 跑完整单元测试、合成场景、指标与语法检查；`L2` / `L3`、push 到 `main`、`workflow_dispatch` 跑完整检查 + 发布打包自检。
+- **`L0` / `L1` 的 PR 不跑发布打包自检**，也不跑 macOS / Windows；这两个平台作业与发布打包只在 `full=true` 时运行。`L0` / `L1` 的 PR 只证明该档位需要的增量检查，不是全套通过。
+- **包内自检在 `full=true` 时于三个平台真实执行**：`uv run python scripts/build_release.py` 在每个运行的 job 上各跑一次，脚本用 `sys.executable`（不是裸 `python`）在解压目录里执行 `validate_kit.py` 与 `unittest discover -s tests`（自检 b、d），所以"这一平台 / Python 版本拿到的包是否可用"是实机验证的，不是从 Linux 推断的。
+- **失败即红**：没有 `continue-on-error`、`|| true`、`paths-ignore` 或跳过开关；风险分类失败会让必需 context 变红，不会出现缺省通过；产物只写到 runner 的 `release/`（`.gitignore` 已忽略），不提交、不上传、不使用密钥。
 - **行尾与可复现性**：Windows 检出不会破坏可复现性 —— 仓库 `.gitattributes` 统一 `eol=lf`，打包前还会把文本文件归一为 LF，自检 f 断言包内文本不含 CRLF；场景沙箱里的 git 仓库也固定 `core.autocrlf=false` / `core.eol=lf`，不依赖 runner 的全局 git 配置。
-- **CI 证明什么**：包能构建，且内置自检 a–l 在该平台 / Python 版本上通过 —— 覆盖"打包内容集合 / 包内结构校验 / 发布扫描 / 可复现归档 / 包内合成回归与指标口径"这类回归。
+- **CI 证明什么**：包能在该平台构建，且内置自检 a–l 在该平台 / Python 版本上通过 —— 覆盖"打包内容集合 / 包内结构校验 / 发布扫描 / 可复现归档 / 包内合成回归与指标口径"这类回归。这只在 `L2` / `L3`、push 到 `main` 与手动运行上成立。
 - **CI 不证明什么**：**不证明发布本身**。CI 不校验发布命名（`AgentOrch-<X.Y>.zip` 或 `agentorch-{YYYYMMDD}.zip`）、不生成 GitHub Release、不写发布记录，也不覆盖真实安装器与用户桌面环境（这些平台承诺仍标 `UNKNOWN`）。发布仍按第 4 节由 Master 执行并逐项留证；CI 绿灯不能替代第 4 节的审查记录。
 
 ### 3.2 包内自检在三种树下的行为
@@ -97,7 +99,7 @@
 1. 在任务载体登记发布任务（唯一 ID、单一目标、允许路径与验收）。
 2. 从最新主分支创建独立分支 / Worktree；不在共享工作区直接构建。
 3. 构建：正式 Release 用 `uv run python scripts/build_release.py --release-version 1.6` 生成 `release/AgentOrch-1.6.zip`（补丁发行写全版本号，如 `--release-version 1.6.1` → `release/AgentOrch-1.6.1.zip`）；日期构建仍用 `uv run python scripts/build_release.py`（或 `--date YYYYMMDD`）生成 `release/agentorch-{YYYYMMDD}.zip`。
-4. 自检：确认脚本内置 a–l 全部通过并记录退出码；产物路径、字节数与校验和一并留证。CI 虽已在 PR 上跑过同一自检（见 3.1），发布时仍须在本分支上重跑并在发布记录里写入实际输出，不能用 CI 绿灯代替。
+4. 自检：确认脚本内置 a–l 全部通过并记录退出码；产物路径、字节数与校验和一并留证。CI 在 `full=true` 的运行（`L2` / `L3`、push 到 `main`、手动触发）上已跑过同一自检（见 3.1），`L0` / `L1` 的 PR 不跑打包自检；发布时仍须在本分支上重跑并在发布记录里写入实际输出，不能用 CI 绿灯代替。
 5. 可复现性：用同一命令再构建一次到另一个输出目录（例如 `--output-dir /tmp/release-b`），比对两份 zip 的 SHA256 一致。
 6. Master 独立审查（逐条对照本文件的自检清单与验收标准）。
 7. 合并到主分支；合并后重新运行验证并记录结果。
