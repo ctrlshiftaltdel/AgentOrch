@@ -1,0 +1,2428 @@
+"""Batch delivery coordinator: execute, verify, review, integrate and merge.
+
+A batch plan is a JSON document naming several tasks, one integration worktree
+and one delivery finalization. The coordinator runs each task in its own real
+Git worktree with one real ``opencode run`` session, verifies it with the
+plan's commands, merges it into one batch branch, then performs one independent
+review, one pull request, one check gate and one merge for the whole batch.
+``INTEGRATED`` is an internal milestone only; ``VERIFIED`` requires a merge, a
+post-merge verification run and a recorded carrier update.
+
+Everything is fail-closed. Unknown task or worktree state, changes outside a
+task's declared paths, a review verdict that does not bind the exact base/head/
+diff, a head or diff that moved after review, a missing required check, a plan
+hash mismatch, a journal inside the repository, overlapping task paths,
+configured commit hooks or clean filters, and a second merge attempt all stop
+the command with a non-zero exit.
+
+Limitations, stated honestly:
+
+* this is **not a sandbox**. A worktree, a prompt and path checks do not limit
+  OpenCode's configured permissions; a session can reach the host filesystem,
+  shell, network and credentials. The reviewer profile's ``edit`` denial is a
+  configuration check, not OS isolation.
+* the reviewer transcript and the execution session export are writable files.
+  Consistency between the stream, the export and the journal is checked, but it
+  is not tamper-proof; nothing here signs a transcript.
+* ``git commit`` runs clean/process filters and commit hooks inside its own
+  process. Git exposes no switch that keeps a clean filter from running, so the
+  coordinator refuses to start a commit while any of them can execute instead
+  of claiming to bypass them.
+* external project changes are not authorized. The plan's paths are checked
+  against ``docs/PROJECT.md`` when its policy sections exist; a missing section
+  is recorded as ``project_paths: unknown`` and is never claimed as checked.
+* the journal, lock and local task library are writable by the same user. The
+  coordinator narrows recovery windows; it cannot make them atomic.
+
+Only the Python standard library is used. No shell, no network in any test
+path; ``gh`` and OpenCode are optional executables reached through
+``BATCH_GH``/``BATCH_OPENCODE`` when the caller opts in.
+"""
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+try:  # run as a script (scripts/ on sys.path) or imported as scripts.batch_delivery
+    from delivery_risk import RiskError, classify as classify_risk
+except ImportError:  # pragma: no cover - exercised by the module import path
+    from scripts.delivery_risk import RiskError, classify as classify_risk
+
+JOURNAL_SCHEMA = 'batch-delivery-journal/1'
+PLAN_VERSION = 1
+TASK_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$')
+BRANCH_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]*$')
+SHA_RE = re.compile(r'^[0-9a-f]{40}(?:[0-9a-f]{24})?$')
+DIGEST_RE = re.compile(r'^[0-9a-f]{64}$')
+MAX_DIFF_BYTES = 2 * 1024 * 1024
+DEFAULT_TIMEOUT = 1800
+DEFAULT_CHECKS_TIMEOUT = 3600
+TERMINAL_BAD = ('FAILED', 'BLOCKED', 'SKIPPED')
+INTEGRATED = ('INTEGRATED', 'VERIFIED')
+STATUSES = ('PENDING', 'RUNNING', 'VERIFIED', 'INTEGRATED', 'FAILED', 'BLOCKED',
+            'SKIPPED')
+PHASES = ('tasks', 'review', 'pr', 'merge', 'post_merge', 'verified', 'blocked')
+CHAIN = ('PLANNED', 'READY', 'DISPATCHED', 'IN_PROGRESS', 'REVIEW_READY',
+         'MASTER_REVIEW', 'APPROVED', 'MERGED', 'VERIFIED')
+FAILED_CHECKS = ('FAILURE', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'ERROR')
+MERGE_METHODS = ('merge', 'squash', 'rebase')
+VALID_EDITIONS = ('local', 'github')
+SECRET_PATTERNS = ('.env', '.env.*', '*secret*', '*token*', '*.pem', '*.key',
+                   'credentials*')
+SECRET_EXCEPTIONS = ('.env.example',)
+# A declaration is a bullet whose first token is `edition`, with any mix of
+# backticks or Markdown emphasis around it. Value parsing stays line-exact.
+EDITION_RE = re.compile(
+    r'^[ \t]*[-*+][ \t]+(?P<form>[*_`]*edition[*_`]*)'
+    r'(?=[ \t:：]|$)(?P<rest>[^\n]*)$', re.M)
+VERDICT_KEYS = {'verdict', 'base', 'head', 'diff_sha256', 'risk', 'tasks',
+                'findings'}
+
+
+class InputError(Exception):
+    """Invalid plan, journal or CLI input; the CLI exits 2."""
+
+
+class BatchError(Exception):
+    """A task or batch gate failed; the CLI exits 1.
+
+    ``status`` is the task status to record, ``halt`` stops all later tasks
+    (used when a timed-out process tree could not be proved stopped), and
+    ``conflicts`` carries merge-conflict paths for the summary.
+    """
+
+    def __init__(self, message, status='BLOCKED', *, halt=False, conflicts=None,
+                 verify=None):
+        super().__init__(message)
+        self.status = status
+        self.halt = halt
+        self.conflicts = list(conflicts or [])
+        self.verify = list(verify or [])
+
+    @property
+    def record_status(self):
+        return self.status if self.status in STATUSES else 'BLOCKED'
+
+
+# --------------------------------------------------------------------------- git
+
+def _git(where, *args, timeout=120, binary=False):
+    return subprocess.run(['git', '--no-optional-locks', *args], cwd=str(where),
+                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=timeout,
+                          text=not binary)
+
+
+def _git_text(where, *args, timeout=120):
+    result = _git(where, *args, timeout=timeout)
+    if result.returncode != 0:
+        raise BatchError(f'git {" ".join(args)} failed: '
+                         f'{(result.stderr or "").strip()[:400]}')
+    return (result.stdout or '').strip()
+
+
+def _git_ok(where, *args, timeout=120):
+    return _git(where, *args, timeout=timeout).returncode == 0
+
+
+def _repo_root(path):
+    result = _git(path, 'rev-parse', '--show-toplevel')
+    if result.returncode != 0:
+        raise InputError(f'not a Git worktree: {path}')
+    return Path((result.stdout or '').strip()).resolve()
+
+
+def _head(where):
+    return _git_text(where, 'rev-parse', 'HEAD')
+
+
+def _branch(where):
+    return _git_text(where, 'branch', '--show-current')
+
+
+def _clean(where):
+    result = _git(where, 'status', '--porcelain')
+    return result.returncode == 0 and not (result.stdout or '').strip()
+
+
+def _ancestor(where, ancestor, descendant):
+    return _git_ok(where, 'merge-base', '--is-ancestor', ancestor, descendant)
+
+
+def _resolve_commit(where, ref):
+    result = _git(where, 'rev-parse', '--verify', '--quiet', ref + '^{commit}')
+    value = (result.stdout or '').strip() if result.returncode == 0 else ''
+    if not value or not SHA_RE.match(value):
+        raise InputError(f'unknown ref {ref!r} in {where}')
+    return value
+
+
+def _branch_exists(repo, branch):
+    return _git_ok(repo, 'show-ref', '--verify', '--quiet', f'refs/heads/{branch}')
+
+
+def _names(where, *args):
+    result = _git(where, *args)
+    if result.returncode != 0:
+        raise BatchError(f'git {" ".join(args)} failed')
+    return sorted({line for line in (result.stdout or '').splitlines() if line})
+
+
+def _changed_paths(work, base):
+    """Tracked and untracked paths that differ from ``base`` in the worktree."""
+    tracked = _names(work, 'diff', '--no-ext-diff', '--no-renames', '--name-only',
+                     base, '--')
+    untracked = _names(work, 'ls-files', '--others', '--exclude-standard')
+    return sorted(set(tracked) | set(untracked))
+
+
+def _diff_names(work, base, head):
+    result = _git(work, 'diff', '--no-ext-diff', '--no-renames', '--name-status',
+                  f'{base}..{head}')
+    if result.returncode != 0:
+        raise BatchError(f'cannot read the diff {base}..{head}')
+    names = []
+    for line in (result.stdout or '').splitlines():
+        fields = line.split('\t')
+        if len(fields) >= 2:
+            names.append(fields[-1])
+    return sorted(names)
+
+
+def _changed_paths_range(work, base, head):
+    """Paths the head adds relative to its merge base with ``base``."""
+    result = _git(work, 'diff', '--no-ext-diff', '--no-renames', '--name-only',
+                  f'{base}...{head}')
+    if result.returncode != 0:
+        raise BatchError(f'cannot read the diff {base}...{head}')
+    return sorted({line for line in (result.stdout or '').splitlines() if line})
+
+
+# -------------------------------------------------------------------- path rules
+
+def _safe_rel(name):
+    """Reject every relative task path that is ambiguous across platforms."""
+    if not isinstance(name, str) or not name:
+        raise ValueError('empty path')
+    if '\x00' in name:
+        raise ValueError('path contains a NUL byte')
+    if '\\' in name:
+        raise ValueError(f'path {name!r} contains a backslash separator')
+    if re.match(r'^[A-Za-z]:', name) or name.startswith('/'):
+        raise ValueError(f'path {name!r} is absolute')
+    if ':' in name:
+        raise ValueError(f'path {name!r} contains an ambiguous colon')
+    if any(char.isspace() for char in name):
+        raise ValueError(f'path {name!r} contains whitespace')
+    if any(char in name for char in '*?['):
+        raise ValueError(f'path {name!r} contains a glob character')
+    parts = name.split('/')
+    if any(part in ('', '.', '..') for part in parts):
+        raise ValueError(f'path {name!r} contains an empty, "." or ".." component')
+    if any(part in ('.git', '.orchestration', '.local') for part in parts):
+        raise ValueError(f'path {name!r} is a Git, orchestration or local-state path')
+    return name
+
+
+def _overlaps(left, right):
+    return (left == right or left.startswith(right.rstrip('/') + '/')
+            or right.startswith(left.rstrip('/') + '/'))
+
+
+def _under(name, prefixes):
+    return any(name == prefix or name.startswith(prefix.rstrip('/') + '/')
+               for prefix in prefixes)
+
+
+def _secret_path(name, patterns):
+    basename = name.rsplit('/', 1)[-1]
+    if basename in SECRET_EXCEPTIONS:
+        return False
+    return any(fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(basename, pattern)
+               for pattern in patterns)
+
+
+def _is_within(path, root):
+    try:
+        return Path(path).resolve() == Path(root).resolve() or \
+            Path(path).resolve().is_relative_to(Path(root).resolve())
+    except (OSError, RuntimeError):
+        return False
+
+
+# ----------------------------------------------------------------- project config
+
+def project_config(repo):
+    """Read the edition and path policy from ``docs/PROJECT.md``.
+
+    The edition rule is the kit's strict one-line rule: exactly one declaration
+    whose value is ``local`` or ``github``. A missing, duplicate, empty or
+    invalid declaration is a preflight error, never a default.
+    """
+    path = Path(repo) / 'docs' / 'PROJECT.md'
+    if not path.is_file():
+        raise InputError('docs/PROJECT.md is required to choose an edition')
+    text = path.read_text(encoding='utf-8', errors='replace')
+    values = [_edition_value(form, rest) for form, rest in EDITION_RE.findall(text)]
+    return {'edition': values[0] if len(values) == 1 else None,
+            'edition_count': len(values), 'edition_values': values,
+            'allowed': _policy_paths(text, '允许改动路径'),
+            'forbidden': _policy_paths(text, '禁止改动路径') or [],
+            'secrets': _secret_patterns(text)}
+
+
+def _edition_value(form, raw):
+    if form not in ('edition', '`edition`'):
+        return ''
+    value = raw.strip()
+    if not value or value[0] not in ':：':
+        return ''
+    value = value[1:].strip()
+    if len(value) >= 2 and value.startswith('`') and value.endswith('`'):
+        value = value[1:-1]
+    return value
+
+
+def _policy_paths(text, needle):
+    for line in text.splitlines():
+        if needle in line:
+            paths = []
+            for token in re.findall(r'`([^`]+)`', line):
+                try:
+                    paths.append(_safe_rel(token.strip().rstrip('/')))
+                except ValueError:
+                    continue
+            return paths or None
+    return None
+
+
+def _secret_patterns(text):
+    for line in text.splitlines():
+        if '秘密与隐私文件模式' in line:
+            return [token.strip() for token in re.findall(r'`([^`]+)`', line)
+                    if token.strip()]
+    return []
+
+
+def _require_edition(config, expected=None):
+    if config.get('edition_count') != 1 or config.get('edition') not in VALID_EDITIONS:
+        raise InputError(
+            'docs/PROJECT.md must declare exactly one `edition` of `local` or '
+            f'`github`; found {config.get("edition_count")} declaration(s), values '
+            f'{config.get("edition_values")!r}')
+    if expected is not None and config['edition'] != expected:
+        raise InputError(f'docs/PROJECT.md switched edition from {expected!r} to '
+                         f'{config["edition"]!r}')
+
+
+# ------------------------------------------------------------------- plan input
+
+def _parse_argv_list(value, what):
+    if (not isinstance(value, list) or not value
+            or any(not isinstance(token, str) or not token for token in value)):
+        raise InputError(f'{what} must be a nonempty argv list')
+    return list(value)
+
+
+def _parse_commands(value, what):
+    if not isinstance(value, list) or not value:
+        raise InputError(f'{what} must be a nonempty list of argv lists')
+    return [_parse_argv_list(command, what) for command in value]
+
+
+def _required_string(raw, key, what):
+    value = raw.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise InputError(f'{what}.{key} is required')
+    return value.strip()
+
+
+def _valid_branch(value, what):
+    if not isinstance(value, str) or not BRANCH_RE.match(value):
+        raise InputError(f'{what} is not a valid branch name: {value!r}')
+    if value in ('main', 'master'):
+        raise InputError(f'{what} must not be {value!r}')
+    if '..' in value or value.endswith(('.lock', '.', '/')) or value.startswith('/'):
+        raise InputError(f'{what} is not a valid branch name: {value!r}')
+    return value
+
+
+def _absolute(value, what):
+    if not isinstance(value, str) or not value:
+        raise InputError(f'{what} is required')
+    path = Path(value)
+    if not path.is_absolute():
+        raise InputError(f'{what} must be an absolute path: {value!r}')
+    return str(path.resolve())
+
+
+def _task_spec(raw, index, known_ids, earlier_ids, batch_branch, config):
+    if not isinstance(raw, dict):
+        raise InputError('a task must be a mapping')
+    ident = raw.get('id')
+    if not isinstance(ident, str) or not TASK_ID_RE.match(ident):
+        raise InputError(f'task id is invalid: {ident!r}')
+    if ident in known_ids:
+        raise InputError(f'task id is not unique: {ident}')
+    title = _required_string(raw, 'title', f'task {ident}')
+    prompt = _required_string(raw, 'prompt', f'task {ident}')
+    worktree = _absolute(raw.get('worktree'), f'task {ident} worktree')
+    branch = _valid_branch(raw.get('branch'), f'task {ident} branch')
+    if branch == batch_branch:
+        raise InputError(f'task {ident} branch equals the batch branch')
+    paths_raw = raw.get('paths')
+    if not isinstance(paths_raw, list) or not paths_raw:
+        raise InputError(f'task {ident} paths must be a nonempty list')
+    paths = []
+    for value in paths_raw:
+        try:
+            paths.append(_safe_rel(value.rstrip('/') if isinstance(value, str) else value))
+        except ValueError as exc:
+            raise InputError(f'task {ident}: {exc}') from None
+        if _secret_path(paths[-1], SECRET_PATTERNS):
+            raise InputError(f'task {ident}: path {paths[-1]!r} is secret-shaped')
+    acceptance = raw.get('acceptance')
+    if (not isinstance(acceptance, list) or not acceptance
+            or any(not isinstance(item, str) or not item.strip()
+                   for item in acceptance)):
+        raise InputError(f'task {ident} acceptance criteria are required')
+    acceptance = [item.strip() for item in acceptance]
+    verify = _parse_commands(raw.get('verify'), f'task {ident} verify')
+    depends = raw.get('depends', [])
+    if not isinstance(depends, list) or any(not isinstance(dep, str) for dep in depends):
+        raise InputError(f'task {ident} depends must be a list of task ids')
+    for dep in depends:
+        if dep not in earlier_ids:
+            raise InputError(f'task {ident} depends on {dep!r}, which is not an '
+                             'earlier task in the batch')
+    if config['allowed'] is not None:
+        for name in paths:
+            if not _under(name, config['allowed']):
+                raise InputError(f'task {ident} path {name!r} is not authorized by '
+                                 'docs/PROJECT.md')
+    for name in paths:
+        for forbidden in config['forbidden']:
+            if _overlaps(name, forbidden):
+                raise InputError(f'task {ident} path {name!r} overlaps the forbidden '
+                                 f'path {forbidden!r}')
+        if _secret_path(name, config.get('secrets') or []):
+            raise InputError(f'task {ident} path {name!r} matches a project secret '
+                             'pattern')
+    return {'id': ident, 'index': index, 'title': title, 'prompt': prompt,
+            'worktree': worktree, 'branch': branch, 'paths': paths,
+            'acceptance': acceptance, 'verify': verify, 'depends': list(depends)}
+
+
+def load_plan(path):
+    try:
+        raw = json.loads(Path(path).read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        raise InputError(f'cannot read the batch plan {path}: {exc}') from None
+    if not isinstance(raw, dict):
+        raise InputError('the batch plan must be a JSON object')
+    return raw
+
+
+def validate_plan(raw, repo_override=None):
+    """Validate a plan and return a normalized, importable representation."""
+    if raw.get('version') != PLAN_VERSION:
+        raise InputError(f'plan version must be {PLAN_VERSION}')
+    batch = raw.get('batch')
+    if not isinstance(batch, dict):
+        raise InputError('plan.batch is required')
+    ident = _required_string(batch, 'id', 'batch')
+    title = _required_string(batch, 'title', 'batch')
+    summary = batch.get('summary') or ''
+    if not isinstance(summary, str):
+        raise InputError('batch.summary must be a string')
+    repo_value = repo_override or batch.get('repo') or os.getcwd()
+    repo = _repo_root(repo_value)
+    base = _required_string(batch, 'base', 'batch')
+    branch = _valid_branch(batch.get('branch'), 'batch.branch')
+    if branch == base:
+        raise InputError('batch.branch must differ from batch.base')
+    worktree = _absolute(batch.get('worktree'), 'batch.worktree')
+    if Path(worktree) == repo:
+        raise InputError('batch.worktree must not be the repository root')
+    issue = batch.get('issue')
+    if issue is not None and (not isinstance(issue, int) or issue < 1):
+        raise InputError('batch.issue must be a positive integer')
+    issue_repo = batch.get('issue_repo')
+    if issue_repo is not None and (not isinstance(issue_repo, str) or not issue_repo):
+        raise InputError('batch.issue_repo must be a nonempty string')
+    executor = _required_string(raw, 'executor_agent', 'plan')
+    reviewer = _required_string(raw, 'reviewer_agent', 'plan')
+    if executor == reviewer:
+        raise InputError('the reviewer agent must differ from the executor agent')
+    config = project_config(repo)
+    _require_edition(config)
+    tasks_raw = raw.get('tasks')
+    if not isinstance(tasks_raw, list) or not tasks_raw:
+        raise InputError('plan.tasks must be a nonempty list')
+    tasks, known, identities = [], set(), []
+    for index, item in enumerate(tasks_raw):
+        spec = _task_spec(item, index, known, known, branch, config)
+        known.add(spec['id'])
+        tasks.append(spec)
+        identities.append(Path(spec['worktree']).resolve())
+    branches = [spec['branch'] for spec in tasks]
+    if len(set(branches)) != len(branches):
+        raise InputError('task branches must be unique')
+    batch_identity = Path(worktree).resolve()
+    for identity in identities:
+        if identity == repo:
+            raise InputError('a task worktree must not be the repository root')
+        if identity == batch_identity:
+            raise InputError('a task worktree must not be the batch worktree')
+    if len(set(identities)) != len(identities):
+        raise InputError('two tasks share one worktree')
+    all_worktrees = identities + [batch_identity]
+    for index, left in enumerate(all_worktrees):
+        for right in all_worktrees[index + 1:]:
+            if _is_within(left, right) or _is_within(right, left):
+                raise InputError(f'worktrees must not be inside one another: '
+                                 f'{left} / {right}')
+    for index, left in enumerate(tasks):
+        for right in tasks[index + 1:]:
+            for one in left['paths']:
+                for two in right['paths']:
+                    if _overlaps(one, two):
+                        raise InputError(f'tasks {left["id"]} and {right["id"]} have '
+                                         f'overlapping paths: {one} / {two}')
+    finalize_raw = raw.get('finalize')
+    if not isinstance(finalize_raw, dict):
+        raise InputError('plan.finalize is required')
+    verify = _parse_commands(finalize_raw.get('verify'), 'finalize.verify')
+    post_verify = _parse_commands(finalize_raw.get('post_merge_verify'),
+                                  'finalize.post_merge_verify')
+    checks = finalize_raw.get('required_checks') or []
+    if not isinstance(checks, list) or any(not isinstance(name, str) or not name
+                                           for name in checks):
+        raise InputError('finalize.required_checks must be a list of names')
+    merge_method = finalize_raw.get('merge_method') or 'merge'
+    if merge_method not in MERGE_METHODS:
+        raise InputError('finalize.merge_method must be merge, squash or rebase')
+    if config['edition'] == 'github' and not checks:
+        raise InputError('a github batch needs at least one required_check')
+    authorization = finalize_raw.get('authorization') or ''
+    if not isinstance(authorization, str):
+        raise InputError('finalize.authorization must be a string')
+    if not authorization.strip():
+        raise InputError('finalize.authorization must be nonempty: every merge '
+                         'needs an explicit owner authorization text')
+    next_plan = finalize_raw.get('next_plan')
+    if next_plan is not None and (not isinstance(next_plan, str) or not next_plan):
+        raise InputError('finalize.next_plan must be a nonempty path')
+    return {'version': PLAN_VERSION, 'raw': raw,
+            'batch': {'id': ident, 'title': title, 'summary': summary,
+                      'repo': str(repo), 'base': base, 'branch': branch,
+                      'worktree': worktree, 'issue': issue,
+                      'issue_repo': issue_repo},
+            'executor_agent': executor, 'reviewer_agent': reviewer,
+            'tasks': tasks, 'config': config,
+            'edition': config['edition'],
+            'project_paths': 'known' if config['allowed'] is not None else 'unknown',
+            'finalize': {'verify': verify, 'post_merge_verify': post_verify,
+                         'required_checks': checks, 'merge_method': merge_method,
+                         'authorization': authorization, 'next_plan': next_plan}}
+
+
+def plan_hash(raw):
+    return hashlib.sha256(
+        json.dumps(raw, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+
+
+# --------------------------------------------------------------------- journal
+
+def _atomic_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.batch-', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            json.dump(data, handle, ensure_ascii=False, sort_keys=True, indent=2)
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _journal_lock_path(journal):
+    journal = Path(journal).resolve()
+    digest = hashlib.sha256(str(journal).encode()).hexdigest()[:24]
+    return journal.parent / f'.batch-delivery-{digest}.lock'
+
+
+def _pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    if os.name == 'nt':  # os.kill would terminate the process on Windows
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+class _Lock:
+    """Exclusive journal lock; the OS lock is the authority, the PID is a hint."""
+
+    def __init__(self, journal):
+        self.path = _journal_lock_path(journal)
+        self.handle = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = open(self.path, 'a+')
+        try:
+            if os.name == 'nt':  # pragma: no cover - POSIX CI path
+                import msvcrt
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.handle.seek(0)
+            raw = self.handle.read().strip()
+            self.handle.close()
+            self.handle = None
+            pid = int(raw) if raw.isdigit() else None
+            alive = _pid_alive(pid) if pid else None
+            if alive is False:
+                raise BatchError(
+                    f'the journal lock is held by process {pid}, which is not '
+                    'alive; inspect the lock file and remove it') from None
+            where = f' by process {pid}' if pid else ''
+            raise BatchError(f'the journal is locked{where}; another batch '
+                             'command is running') from None
+        self.handle.seek(0)
+        self.handle.truncate()
+        self.handle.write(str(os.getpid()))
+        self.handle.flush()
+        return self
+
+    def __exit__(self, *exc):
+        if self.handle is not None:
+            try:
+                if os.name == 'nt':  # pragma: no cover
+                    import msvcrt
+                    self.handle.seek(0)
+                    msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                self.handle.close()
+                self.handle = None
+        return False
+
+
+def _resolve_journal(value, plan, new=True):
+    journal = Path(value).expanduser() if value else _default_journal(plan)
+    journal = journal.absolute()
+    if journal.parent.exists() is False and new:
+        journal.parent.mkdir(parents=True, exist_ok=True)
+    if not journal.parent.is_dir():
+        raise InputError(f'journal directory does not exist: {journal.parent}')
+    journal = journal.resolve()
+    roots = [plan['batch']['repo'], plan['batch']['worktree']]
+    roots += [task['worktree'] for task in plan['tasks']]
+    for root in roots:
+        if _is_within(journal, root):
+            raise InputError('the journal must be outside the repository and every '
+                             f'worktree; {journal} is inside {root}')
+    return journal
+
+
+def _default_journal(plan):
+    return Path.home() / '.cache' / 'agentorch' / f'batch-{plan["batch"]["id"]}.json'
+
+
+def _load_journal(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        raise InputError(f'cannot read the batch journal {path}: {exc}') from None
+    if not isinstance(data, dict) or data.get('schema') != JOURNAL_SCHEMA:
+        raise InputError(f'{path} is not a {JOURNAL_SCHEMA} journal')
+    return data
+
+
+def _new_journal(plan, base_sha):
+    return {
+        'schema': JOURNAL_SCHEMA, 'batch_id': plan['batch']['id'],
+        'plan_sha256': plan_hash(plan['raw']), 'repo': plan['batch']['repo'],
+        'edition': plan['edition'], 'base_ref': plan['batch']['base'],
+        'base_sha': base_sha, 'batch_branch': plan['batch']['branch'],
+        'phase': 'tasks', 'tasks': {}, 'review': None, 'pr': None,
+        'merge': {'state': 'none', 'commit': None, 'authorization': None,
+                  'post_verify': []},
+        'batch_verify': [], 'next_plan': None, 'carrier': None, 'error': None,
+        'decision': None, 'project_paths': plan['project_paths'],
+    }
+
+
+def _check_journal_plan(state, plan):
+    if state.get('batch_id') != plan['batch']['id']:
+        raise InputError('the journal belongs to a different batch')
+    if state.get('plan_sha256') != plan_hash(plan['raw']):
+        raise InputError('plan changed; reconcile manually')
+    if state.get('repo') != plan['batch']['repo']:
+        raise InputError('the journal belongs to a different repository')
+
+
+def _task_record(spec, executor_agent):
+    return {'status': 'PENDING', 'attempts': 0, 'branch': spec['branch'],
+            'worktree': spec['worktree'], 'base': None, 'head': None,
+            'changed_paths': [], 'verify': [], 'execution_session': None,
+            'executor_agent': executor_agent, 'integration_sha': None,
+            'error': None, 'pid': None}
+
+
+# ------------------------------------------------------------------- process I/O
+
+def _opencode_binary():
+    return os.environ.get('BATCH_OPENCODE') or 'opencode'
+
+
+def _gh_binary():
+    return os.environ.get('BATCH_GH') or 'gh'
+
+
+def _classify_stream(returncode, output):
+    """Accept only a single-session stream that ends with one terminal stop."""
+    unknown = {'exit_code': None, 'session_id': None, 'text': '',
+               'detail': 'stream is not a completed single-session run'}
+    if returncode != 0:
+        return dict(unknown, detail=f'OpenCode exit code {returncode}')
+    if not (output or '').strip():
+        return dict(unknown, detail='OpenCode produced no events')
+    session, text = None, []
+    started = terminal = in_step = False
+    try:
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if not isinstance(event, dict) or terminal:
+                return dict(unknown, detail='event after the terminal stop')
+            sid = event.get('sessionID')
+            if not isinstance(sid, str) or not sid.startswith('ses_'):
+                return dict(unknown, detail='event without a usable session id')
+            if session is not None and session != sid:
+                return dict(unknown, detail='more than one session in the stream')
+            session = sid
+            part = event.get('part')
+            if part is not None and not isinstance(part, dict):
+                return dict(unknown, detail='event part is not an object')
+            part = part or {}
+            if part.get('sessionID') not in (None, sid):
+                return dict(unknown, detail='event part names another session')
+            kind = event.get('type')
+            if kind == 'step_start':
+                if in_step:
+                    return dict(unknown, detail='step_start inside a running step')
+                in_step, started = True, True
+            elif kind in ('text', 'tool_use', 'tool'):
+                if not in_step:
+                    return dict(unknown, detail='output event outside a step')
+                if kind == 'text':
+                    text.append(part.get('text') or '')
+            elif kind == 'step_finish':
+                if not in_step:
+                    return dict(unknown, detail='step_finish without a running step')
+                in_step = False
+                reason = part.get('reason')
+                if reason == 'stop':
+                    terminal = True
+                elif reason not in ('tool-calls', 'tool_calls'):
+                    return dict(unknown, detail=f'unrecognized finish reason {reason!r}')
+            else:
+                return dict(unknown, detail=f'unexpected event type {kind!r}')
+    except (ValueError, TypeError, AttributeError):
+        return dict(unknown, detail='stream is not readable JSON events')
+    if not started:
+        return dict(unknown, detail='stream never started a step')
+    if in_step:
+        return dict(unknown, detail='stream ended inside a step')
+    if not terminal:
+        return dict(unknown, detail='stream ended without a stop finish')
+    return {'exit_code': returncode, 'session_id': session, 'text': ''.join(text),
+            'detail': 'ok'}
+
+
+KILL_GRACE = 15
+
+
+def _kill_group(process):
+    if os.name == 'nt':  # pragma: no cover - POSIX CI path
+        issued = False
+        try:
+            issued = subprocess.run(
+                ['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL).returncode == 0
+        except OSError:
+            pass
+        try:
+            process.kill()
+        except OSError:
+            pass
+        return issued, None
+    try:
+        pgid = os.getpgid(process.pid)
+        os.killpg(pgid, signal.SIGKILL)
+    except (OSError, AttributeError):
+        return False, None
+    return True, pgid
+
+
+def _prove_stopped(process, issued, pgid):
+    try:
+        process.communicate(timeout=KILL_GRACE)
+    except subprocess.TimeoutExpired:
+        return False
+    if not issued or os.name == 'nt' or pgid is None:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _stop_timed_out(process):
+    issued, pgid = _kill_group(process)
+    if _prove_stopped(process, issued, pgid):
+        return True, 'timed out; process group killed'
+    return False, 'timed out; could not prove the process group was terminated'
+
+
+def _run_process(argv, cwd, timeout, *, env=None, input_text=None):
+    """Run one argv without a shell; return exit, tail and timeout facts."""
+    environment = dict(os.environ, PWD=str(cwd))
+    if env:
+        environment.update(env)
+    try:
+        process = subprocess.Popen(
+            argv, cwd=str(cwd), stdin=subprocess.DEVNULL if input_text is None
+            else subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=environment, start_new_session=(os.name == 'posix'))
+    except OSError as exc:
+        return {'exit': None, 'tail': f'spawn failed: {exc}', 'timeout': False,
+                'stopped': None}
+    if input_text is not None:
+        try:
+            stdout, stderr = process.communicate(input_text, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proven, detail = _stop_timed_out(process)
+            return {'exit': None, 'tail': detail, 'timeout': True, 'stopped': proven}
+    else:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proven, detail = _stop_timed_out(process)
+            return {'exit': None, 'tail': detail, 'timeout': True, 'stopped': proven}
+    return {'exit': process.returncode,
+            'tail': ((stdout or '') + (stderr or ''))[-2000:],
+            'timeout': False, 'stopped': None}
+
+
+def _agent(work, prompt, agent_name, timeout, *, title=None):
+    argv = [_opencode_binary(), 'run', '--standalone', '--format', 'json']
+    if agent_name:
+        argv += ['--agent', agent_name]
+    if title:
+        argv += ['--title', title]
+    argv.append(prompt)
+    environment = dict(os.environ, PWD=str(work))
+    try:
+        process = subprocess.Popen(
+            argv, cwd=str(work), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, env=environment,
+            start_new_session=(os.name == 'posix'))
+    except OSError as exc:
+        return {'exit_code': None, 'session_id': None, 'text': '',
+                'detail': f'spawn failed: {exc}'}
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proven, detail = _stop_timed_out(process)
+        return {'exit_code': None, 'session_id': None, 'text': '', 'timeout': True,
+                'stopped': proven, 'detail': detail}
+    return _classify_stream(process.returncode, output or '')
+
+
+def _session_export(session, work, timeout=120):
+    try:
+        full = subprocess.run(
+            [_opencode_binary(), 'session', 'export', session], cwd=str(work),
+            stdin=subprocess.DEVNULL, env=dict(os.environ, PWD=str(work)),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {'ok': False, 'reason': f'session export unavailable: {exc}'}
+    if full.returncode != 0:
+        return {'ok': False, 'reason': f'session export exit {full.returncode}'}
+    try:
+        data = json.loads(full.stdout)
+        info, messages = data['info'], data['messages']
+    except (ValueError, KeyError, TypeError):
+        return {'ok': False, 'reason': 'session export is not readable JSON'}
+    if not isinstance(info, dict) or not isinstance(messages, list):
+        return {'ok': False, 'reason': 'session export has an unexpected shape'}
+    texts = []
+    agents = []
+    for message in messages:
+        if isinstance(message, dict) and message.get('type') == 'assistant':
+            agents.append(message.get('agent'))
+            for part in message.get('content') or []:
+                if isinstance(part, dict) and part.get('type') == 'text':
+                    texts.append(part.get('text') or '')
+    return {'ok': True, 'session': info.get('id'), 'outcome': info.get('outcome'),
+            'directory': (info.get('location') or {}).get('directory'),
+            'agents': agents, 'texts': texts}
+
+
+def _agent_profiles(work, timeout=120):
+    try:
+        result = subprocess.run([_opencode_binary(), 'debug', 'agents'], cwd=str(work),
+                                stdin=subprocess.DEVNULL,
+                                env=dict(os.environ, PWD=str(work)),
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BatchError(f'agent profiles unavailable: {exc}') from None
+    if result.returncode != 0:
+        raise BatchError(f'agent profile query exit code {result.returncode}')
+    try:
+        data = json.loads(result.stdout)
+    except ValueError as exc:
+        raise BatchError(f'agent profile query is not JSON: {exc}') from None
+    if not isinstance(data, list):
+        raise BatchError('agent profile query returned an unexpected shape')
+    return {item.get('id'): item for item in data if isinstance(item, dict)}
+
+
+def _rule_matches(rule, action):
+    pattern = rule.get('action')
+    if not isinstance(pattern, str):
+        return False
+    return pattern == '*' or fnmatch.fnmatchcase(action, pattern) or pattern == action
+
+
+def _profile_gate(profile):
+    """Fail closed unless the reviewer profile's effective rule denies edit."""
+    rules = (profile or {}).get('permissions') or []
+    if not isinstance(rules, list):
+        return False, 'profile permissions are not a list'
+    effect = None
+    for rule in rules:
+        if (isinstance(rule, dict) and _rule_matches(rule, 'edit')
+                and rule.get('resource') == '*'):
+            effect = rule.get('effect')
+    if effect != 'deny':
+        return False, 'the effective rule does not deny edit'
+    return True, ''
+
+
+# ------------------------------------------------------------------- preflight
+
+def _inert_reasons(where):
+    """Configuration that would execute code inside ``git add``/``commit``.
+
+    Only configuration keys are reported. A filter or fsmonitor value is an
+    arbitrary command line and may carry a secret, so it is never copied into
+    the journal, the CLI output or a carrier comment.
+    """
+    reasons = []
+    hooks_path = _git(where, 'config', '--get', 'core.hooksPath')
+    if hooks_path.returncode == 0 and (hooks_path.stdout or '').strip():
+        reasons.append('core.hooksPath is configured')
+    result = _git(where, 'rev-parse', '--git-path', 'hooks')
+    if result.returncode == 0:
+        directory = Path((result.stdout or '').strip())
+        if not directory.is_absolute():
+            directory = Path(where) / directory
+        if directory.is_dir():
+            for entry in sorted(directory.iterdir()):
+                if entry.name.endswith('.sample') or not entry.is_file():
+                    continue
+                if os.access(entry, os.X_OK):
+                    reasons.append(f'commit hook {entry.name}')
+    filters = _git(where, 'config', '--null', '--name-only', '--get-regexp',
+                   r'^filter\..*\.(clean|process)$')
+    if filters.returncode not in (0, 1):
+        raise BatchError('cannot enumerate Git clean filters')
+    if filters.returncode == 0:
+        names = [name.strip() for name in (filters.stdout or '').split('\0')
+                 if name.strip()]
+        if names:
+            reasons.append('clean/process filter(s): ' + ', '.join(sorted(set(names))))
+    fsmonitor = _git(where, 'config', '--get', 'core.fsmonitor')
+    if fsmonitor.returncode == 0:
+        value = (fsmonitor.stdout or '').strip()
+        if value not in ('', 'false', 'no', 'off', '0'):
+            reasons.append('core.fsmonitor is configured')
+    return reasons
+
+
+def _require_inert(where):
+    reasons = _inert_reasons(where)
+    if reasons:
+        raise BatchError(
+            'creating a commit is not implemented while Git can run code inside '
+            'it: ' + '; '.join(reasons) + '. The change is left for a human')
+
+
+def _prepare_batch_worktree(plan, base_sha, execute):
+    batch = plan['batch']
+    path, branch = Path(batch['worktree']), batch['branch']
+    if path.exists():
+        if _repo_root(path) != path.resolve():
+            raise BatchError(f'batch worktree is not a Git worktree root: {path}')
+        if _branch(path) != branch:
+            raise BatchError(f'batch worktree is on {_branch(path)!r}, not {branch!r}')
+        if not _clean(path):
+            raise BatchError('the batch worktree is not clean')
+        head = _head(path)
+        if not _ancestor(plan['batch']['repo'], base_sha, head):
+            raise BatchError('the base ref is not an ancestor of the batch head')
+        return head
+    if not execute:
+        return base_sha
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    if _branch_exists(plan['batch']['repo'], branch):
+        result = _git(plan['batch']['repo'], 'worktree', 'add', str(path), branch)
+    else:
+        result = _git(plan['batch']['repo'], 'worktree', 'add', '-b', branch,
+                      str(path), base_sha)
+    if result.returncode != 0:
+        raise BatchError('cannot create the batch worktree: '
+                         f'{(result.stderr or "").strip()[:400]}')
+    return _head(path)
+
+
+def _gh(args, cwd, *, input_text=None, timeout=300):
+    argv = [_gh_binary(), *args]
+    kwargs = {
+        'cwd': str(cwd),
+        'env': dict(os.environ, GIT_TERMINAL_PROMPT='0'),
+        'stdout': subprocess.PIPE,
+        'stderr': subprocess.PIPE,
+        'text': True,
+        'timeout': timeout,
+    }
+    if input_text is None:
+        kwargs['stdin'] = subprocess.DEVNULL
+    else:
+        kwargs['input'] = input_text
+    try:
+        return subprocess.run(argv, **kwargs)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BatchError(f'gh {" ".join(args)} unavailable: {exc}') from None
+
+
+def _gh_json(args, cwd, *, input_text=None, timeout=300):
+    result = _gh(args, cwd, input_text=input_text, timeout=timeout)
+    if result.returncode != 0:
+        raise BatchError(f'gh {" ".join(args)} failed with exit code '
+                         f'{result.returncode}: {(result.stderr or "").strip()[:300]}')
+    try:
+        return json.loads(result.stdout)
+    except ValueError as exc:
+        raise BatchError(f'gh {" ".join(args)} returned unreadable JSON: {exc}') from None
+
+
+def _open_pr_conflicts(plan, batch_branch):
+    if plan['edition'] != 'github':
+        return {}
+    payload = _gh_json(['pr', 'list', '--state', 'open', '--json',
+                        'number,headRefName,files'], plan['batch']['repo'])
+    if not isinstance(payload, list):
+        raise BatchError('gh pr list returned an unexpected payload')
+    conflicts = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        head = item.get('headRefName')
+        if head == batch_branch:
+            continue
+        files = []
+        for entry in item.get('files') or []:
+            if isinstance(entry, dict):
+                files.append(entry.get('path') or '')
+            elif isinstance(entry, str):
+                files.append(entry)
+        for spec in plan['tasks']:
+            for name in spec['paths']:
+                if any(_overlaps(name, other) for other in files if other):
+                    conflicts[spec['id']] = (f'open PR #{item.get("number")} '
+                                             f'({head}) touches {name}')
+                    break
+    return conflicts
+
+
+# ------------------------------------------------------------- execution stage
+
+def _prompt(spec, plan, base):
+    lines = [
+        f'TASK_ID={spec["id"]}',
+        'ROLE=executor',
+        f'BATCH={plan["batch"]["id"]}',
+        f'TITLE={spec["title"]}',
+        f'BASE_SHA={base}',
+        f'PATHS_JSON={json.dumps(spec["paths"])}',
+        f'ACCEPTANCE_JSON={json.dumps(spec["acceptance"])}',
+        f'VERIFY_JSON={json.dumps(spec["verify"])}',
+        '',
+        spec['prompt'],
+        '',
+        'Allowed paths (relative to this worktree): ' + ', '.join(spec['paths']),
+        'Acceptance criteria:',
+    ]
+    lines += [f'- AC-{index}: {text}'
+              for index, text in enumerate(spec['acceptance'], start=1)]
+    lines += ['Verification commands:']
+    lines += ['- ' + ' '.join(command) for command in spec['verify']]
+    lines += [
+        '',
+        'Rules: do not touch paths outside the allowed list, do not push, do not '
+        'merge, do not rewrite history, and leave the worktree clean. Commit your '
+        'own work if you prefer, but uncommitted changes are also acceptable.',
+    ]
+    return '\n'.join(lines)
+
+
+def _scope_check(names, spec, plan, *, where='changed'):
+    config = plan['config']
+    for name in names:
+        try:
+            _safe_rel(name)
+        except ValueError as exc:
+            raise BatchError(f'{where} path is unsafe: {exc}', status='FAILED') from None
+        if not _under(name, spec['paths']):
+            raise BatchError(f'scope violation: {name} is outside the task paths',
+                             status='FAILED')
+        for forbidden in config['forbidden']:
+            if _overlaps(name, forbidden):
+                raise BatchError(f'forbidden path: {name} overlaps {forbidden}',
+                                 status='FAILED')
+        if _secret_path(name, config.get('secrets') or SECRET_PATTERNS):
+            raise BatchError(f'privacy boundary: {name} is secret-shaped',
+                             status='FAILED')
+        if config['allowed'] is not None and not _under(name, config['allowed']):
+            raise BatchError(f'project scope violation: {name} is not authorized '
+                             'by docs/PROJECT.md', status='FAILED')
+
+
+def _prepare_task_worktree(plan, spec, base, record):
+    repo = plan['batch']['repo']
+    path = Path(spec['worktree'])
+    allow = record.get('head') if record.get('head') else None
+    if path.exists():
+        if _repo_root(path) != path.resolve():
+            raise BatchError(f'task worktree is not a Git worktree root: {path}',
+                             status='FAILED')
+        if _branch(path) != spec['branch']:
+            raise BatchError(f'task worktree is on {_branch(path)!r}, not '
+                             f'{spec["branch"]!r}', status='FAILED')
+        if not _clean(path):
+            raise BatchError('the task worktree is not clean', status='FAILED')
+        head = _head(path)
+        if head != base and head != allow:
+            raise BatchError('the task worktree is not at the expected base',
+                             status='BLOCKED')
+        return path
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    if _branch_exists(repo, spec['branch']):
+        result = _git(repo, 'worktree', 'add', str(path), spec['branch'])
+    else:
+        result = _git(repo, 'worktree', 'add', '-b', spec['branch'], str(path), base)
+    if result.returncode != 0:
+        raise BatchError('cannot create the task worktree: '
+                         f'{(result.stderr or "").strip()[:400]}', status='FAILED')
+    head = _head(path)
+    if head != base and head != allow:
+        raise BatchError('the task worktree is not at the expected base',
+                         status='BLOCKED')
+    return path
+
+
+def _commit_if_dirty(work, base, spec, plan):
+    if _clean(work):
+        return
+    names = _changed_paths(work, base)
+    _scope_check(names, spec, plan)
+    _require_inert(work)
+    add = _git(work, 'add', '-A')
+    if add.returncode != 0:
+        raise BatchError('cannot stage the task changes', status='FAILED')
+    staged = _names(work, 'diff', '--cached', '--no-ext-diff', '--no-renames',
+                    '--name-only', base, '--')
+    _scope_check(staged, spec, plan)
+    message = f'{plan["batch"]["id"]}/{spec["id"]}: {spec["title"]}'
+    commit = _git(work, 'commit', '--no-gpg-sign', '--no-verify', '-m', message)
+    if commit.returncode != 0:
+        raise BatchError('cannot commit the task changes: '
+                         f'{(commit.stderr or "").strip()[:400]}', status='FAILED')
+
+
+def _verify_task(work, commands, timeout):
+    entries = []
+    for command in commands:
+        result = _run_process(command, work, timeout)
+        record = {'argv_sha256': hashlib.sha256(
+                      json.dumps(command).encode()).hexdigest(),
+                  'exit': result['exit'], 'tail': result['tail'],
+                  'timeout': bool(result['timeout'])}
+        entries.append(record)
+        if result['timeout']:
+            raise BatchError(
+                f'verification timed out: {" ".join(command)}; '
+                f'{result["tail"]}', status='FAILED',
+                halt=not result['stopped'], verify=entries)
+        if result['exit'] != 0:
+            raise BatchError(
+                f'verification failed with exit {result["exit"]}: '
+                f'{" ".join(command)}\n{result["tail"]}', status='FAILED',
+                verify=entries)
+    return entries
+
+
+def _integrate(plan, spec):
+    batch = Path(plan['batch']['worktree'])
+    if not _clean(batch):
+        raise BatchError('the batch worktree is not clean before integration')
+    if _branch(batch) != plan['batch']['branch']:
+        raise BatchError('the batch worktree is not on the batch branch')
+    message = f'batch {plan["batch"]["id"]}: integrate {spec["id"]}'
+    result = _git(batch, 'merge', '--no-ff', spec['branch'], '-m', message)
+    if result.returncode != 0:
+        unmerged = _git(batch, 'diff', '--name-only', '--diff-filter=U')
+        conflicts = sorted({line for line in (unmerged.stdout or '').splitlines()
+                            if line})
+        _git(batch, 'merge', '--abort')
+        raise BatchError('integration conflict for ' + spec['id'] + ': '
+                         + ', '.join(conflicts), status='BLOCKED',
+                         conflicts=conflicts)
+    return _head(batch)
+
+
+def _execute_task(plan, spec, record, base, timeout, save):
+    work = _prepare_task_worktree(plan, spec, base, record)
+    title = f'batch-{plan["batch"]["id"]}-{spec["id"]}'
+    result = _agent(work, _prompt(spec, plan, base), plan['executor_agent'], timeout,
+                    title=title)
+    if result.get('timeout'):
+        raise BatchError(f'execution timed out; {result["detail"]}', status='FAILED',
+                         halt=not result.get('stopped'))
+    if result.get('exit_code') != 0 or not result.get('session_id'):
+        raise BatchError(f'execution session failed: {result.get("detail")}',
+                         status='FAILED')
+    record['execution_session'] = result['session_id']
+    _commit_if_dirty(work, base, spec, plan)
+    head = _head(work)
+    if head == base:
+        raise BatchError('execution produced no changes', status='FAILED')
+    names = _diff_names(work, base, head)
+    _scope_check(names, spec, plan)
+    record.update(head=head, changed_paths=names)
+    save()
+    record['verify'] = _verify_task(work, spec['verify'], timeout)
+    after = _head(work)
+    if after != head:
+        raise BatchError('a verification command changed the task head',
+                         status='FAILED', verify=record['verify'])
+    if not _clean(work):
+        raise BatchError('a verification command left the worktree dirty',
+                         status='FAILED', verify=record['verify'])
+    record['integration_sha'] = _integrate(plan, spec)
+    record['status'] = 'INTEGRATED'
+    record['error'] = None
+    save()
+
+
+def _apply_retry(state, plan, ids):
+    current_batch = _head(Path(plan['batch']['worktree']))
+    for ident in ids:
+        spec = next((task for task in plan['tasks'] if task['id'] == ident), None)
+        if spec is None:
+            raise InputError(f'--retry names unknown task {ident!r}')
+        record = state['tasks'].get(ident)
+        if record is None:
+            raise InputError(f'--retry names a task with no journal record: {ident}')
+        if record.get('status') != 'FAILED':
+            raise InputError(f'--retry only accepts FAILED tasks; {ident} is '
+                             f'{record.get("status")}')
+        if record.get('integration_sha'):
+            raise InputError(f'{ident} is already integrated and cannot be retried')
+        branch = spec['branch']
+        if _branch_exists(plan['batch']['repo'], branch):
+            head = _git_text(plan['batch']['repo'], 'rev-parse',
+                             f'refs/heads/{branch}')
+            if record.get('head'):
+                allowed = {record['head']}
+            else:
+                # A failure before any commit is retryable when the branch is
+                # still exactly at the attempt base or the current batch head.
+                allowed = {record.get('base'), current_batch} - {None}
+            if head not in allowed:
+                raise InputError(f'{ident} branch has commits not represented in '
+                                 'the journal')
+        record.update(status='PENDING', error=None)
+    _reset_dependents(state, plan, ids)
+
+
+def _reset_dependents(state, plan, ids):
+    """Re-open transitive SKIPPED dependents of a retried task."""
+    pending = list(ids)
+    seen = set(ids)
+    while pending:
+        ident = pending.pop()
+        for spec in plan['tasks']:
+            if ident not in spec['depends'] or spec['id'] in seen:
+                continue
+            seen.add(spec['id'])
+            record = state['tasks'].get(spec['id'])
+            if record is not None and record.get('status') == 'SKIPPED':
+                record.update(status='PENDING', error=None)
+                pending.append(spec['id'])
+
+
+def _normalize_interrupted(state, resume):
+    for ident in sorted(state.get('tasks') or {}):
+        record = state['tasks'][ident]
+        if record.get('status') != 'RUNNING':
+            continue
+        if record.get('head'):
+            record.update(status='BLOCKED', error=(
+                'an interrupted attempt left a commit; inspect the worktree '
+                'manually and use --retry after reconciling the branch'))
+        elif resume:
+            record.update(status='PENDING', error=None)
+        else:
+            record.update(status='BLOCKED', error=(
+                'the attempt was interrupted before a commit; rerun with --resume'))
+
+
+def _run_summary(state, plan):
+    print(f'batch {state["batch_id"]}: phase {state["phase"]}')
+    print(f'{"task":6} {"status":11} {"head":12} {"integration":12} error')
+    for spec in plan['tasks']:
+        record = state['tasks'].get(spec['id'], {})
+        print(f'{spec["id"]:6} {record.get("status", "-"):11} '
+              f'{(record.get("head") or "-")[:12]:12} '
+              f'{(record.get("integration_sha") or "-")[:12]:12} '
+              f'{record.get("error") or ""}')
+
+
+def command_run(args):
+    raw = load_plan(args.plan)
+    plan = validate_plan(raw, args.repo)
+    journal = _resolve_journal(args.journal, plan)
+    if not args.execute:
+        print(f'batch {plan["batch"]["id"]}: {len(plan["tasks"])} task(s), '
+              f'edition {plan["edition"]}, project_paths {plan["project_paths"]}')
+        for spec in plan['tasks']:
+            deps = ', '.join(spec['depends']) or '-'
+            print(f'would run {spec["id"]}: {spec["title"]} (depends: {deps})')
+        print('dry run: pass --execute to create worktrees and start agents')
+        return 0
+    only = None
+    if args.only:
+        only = {value.strip() for value in args.only.split(',') if value.strip()}
+        unknown = only - {spec['id'] for spec in plan['tasks']}
+        if unknown:
+            raise InputError(f'--only names unknown task(s): {sorted(unknown)}')
+    with _Lock(journal):
+        state = _load_journal(journal) if journal.exists() else None
+        if state is None:
+            base_sha = _resolve_commit(plan['batch']['repo'], plan['batch']['base'])
+            state = _new_journal(plan, base_sha)
+            for spec in plan['tasks']:
+                state['tasks'][spec['id']] = _task_record(spec, plan['executor_agent'])
+            _atomic_json(journal, state)
+        else:
+            _check_journal_plan(state, plan)
+            if state.get('edition') != plan['edition']:
+                raise InputError('the journal edition does not match the project')
+        base_sha = state['base_sha']
+        try:
+            if not _clean(plan['batch']['repo']):
+                raise BatchError('the repository worktree is not clean')
+            reasons = _inert_reasons(plan['batch']['repo'])
+            if reasons:
+                raise BatchError('refusing to run while Git can execute code during '
+                                 'commit: ' + '; '.join(reasons))
+            conflicts = _open_pr_conflicts(plan, plan['batch']['branch'])
+            _prepare_batch_worktree(plan, base_sha, args.execute)
+        except BatchError as exc:
+            state['phase'] = 'blocked'
+            state['error'] = str(exc)
+            _atomic_json(journal, state)
+            print(f'error: {exc}', file=sys.stderr)
+            return 1
+        if args.retry:
+            _apply_retry(state, plan, [value.strip() for value in args.retry.split(',')
+                                       if value.strip()])
+        _normalize_interrupted(state, args.resume)
+        state['phase'] = 'tasks'
+        state['error'] = None
+        _atomic_json(journal, state)
+
+        def save():
+            _atomic_json(journal, state)
+
+        halt = False
+        for spec in plan['tasks']:
+            record = state['tasks'][spec['id']]
+            if only is not None and spec['id'] not in only:
+                continue
+            if record.get('status') in INTEGRATED or record.get('status') in TERMINAL_BAD:
+                continue
+            if record.get('status') == 'RUNNING':
+                continue
+            if any(state['tasks'][dep]['status'] not in INTEGRATED
+                   for dep in spec['depends']):
+                record.update(status='SKIPPED', error='dependency failed')
+                save()
+                continue
+            if spec['id'] in conflicts:
+                record.update(status='BLOCKED', error=conflicts[spec['id']])
+                save()
+                continue
+            if halt:
+                record.update(status='BLOCKED',
+                              error='the run stopped after an unproven process kill')
+                save()
+                continue
+            base = _head(Path(plan['batch']['worktree']))
+            record.update(status='RUNNING', base=base, error=None,
+                          attempts=int(record.get('attempts') or 0) + 1,
+                          pid=os.getpid())
+            save()
+            try:
+                _execute_task(plan, spec, record, base, args.timeout, save)
+            except BatchError as exc:
+                record.update(status=exc.record_status, error=str(exc),
+                              verify=exc.verify or record.get('verify') or [])
+                save()
+                if exc.halt:
+                    halt = True
+            save()
+        if halt:
+            state['phase'] = 'blocked'
+            for spec in plan['tasks']:
+                record = state['tasks'][spec['id']]
+                if record.get('status') == 'PENDING':
+                    record.update(status='BLOCKED',
+                                  error='the run stopped after an unproven process kill')
+        else:
+            state['phase'] = 'tasks'
+        state['error'] = None if not halt else state.get('error')
+        _atomic_json(journal, state)
+        _run_summary(state, plan)
+        pending = [record for record in state['tasks'].values()
+                   if record.get('status') not in INTEGRATED]
+        return 0 if not pending else 1
+
+
+# -------------------------------------------------------------- batch review
+
+def _diff_for_review(work, base, head):
+    """Return the full textual diff and its SHA-256, refusing binary/oversize."""
+    result = _git(work, 'diff', '--no-ext-diff', '--no-color', '--no-renames',
+                  f'{base}...{head}', binary=True)
+    if result.returncode != 0:
+        raise BatchError(f'cannot compute the batch diff {base}..{head}')
+    raw = result.stdout or b''
+    if len(raw) > MAX_DIFF_BYTES:
+        raise BatchError('the batch diff is larger than 2 MiB; a reviewer must '
+                         'see it whole, so this batch cannot be reviewed')
+    if b'Binary files' in raw or b'\x00' in raw:
+        raise BatchError('the batch diff contains binary content; refusing an '
+                         'incomplete review')
+    return raw.decode('utf-8', 'replace'), hashlib.sha256(raw).hexdigest()
+
+
+def _review_prompt(plan, base, head, digest, risk, diff):
+    tasks = [{'id': spec['id'], 'acceptance': spec['acceptance'],
+              'paths': spec['paths']} for spec in plan['tasks']]
+    lines = [
+        'ROLE=reviewer',
+        f'BATCH={plan["batch"]["id"]}',
+        f'BASE_SHA={base}',
+        f'HEAD_SHA={head}',
+        f'DIFF_SHA256={digest}',
+        f'RISK={risk["level"]}',
+        f'RISK_REASONS_JSON={json.dumps(risk["reasons"])}',
+        f'TASKS_JSON={json.dumps(tasks)}',
+        '',
+        'Review the complete diff below. Answer with exactly one fenced ```json '
+        'block using this shape:',
+        '{"verdict":"APPROVE|REJECT","base":"<sha>","head":"<sha>",'
+        '"diff_sha256":"<sha>","risk":"L1|L2|L3","tasks":[{"id":"T1",'
+        '"acceptance":[{"id":"AC-1","criterion":"<exact>",'
+        '"status":"PASS|FAIL|NOT_RUN","evidence":"..."}]}],"findings":[]}',
+        'Every acceptance criterion must be PASS with evidence, or the verdict '
+        'must be REJECT with findings. Do not edit files.',
+        'DIFF_BEGIN',
+        diff,
+        'DIFF_END',
+    ]
+    return '\n'.join(lines)
+
+
+def _parse_verdict(text):
+    blocks = re.findall(r'```json\s*\n(.*?)```', text or '', re.DOTALL)
+    for block in reversed(blocks):
+        try:
+            data = json.loads(block)
+        except ValueError:
+            continue
+        if isinstance(data, dict) and VERDICT_KEYS.issubset(data):
+            return data
+    return None
+
+
+def _verdict_problem(verdict, plan, base, head, digest, risk):
+    if verdict.get('verdict') != 'APPROVE':
+        return f'review verdict is {verdict.get("verdict")!r}, not APPROVE'
+    if verdict.get('base') != base or verdict.get('head') != head:
+        return 'the review verdict binds a different base or head'
+    if verdict.get('diff_sha256') != digest:
+        return 'the review verdict binds a different diff'
+    if verdict.get('risk') != risk['level']:
+        return 'the review verdict binds a different risk level'
+    entries = verdict.get('tasks')
+    expected = {spec['id']: spec for spec in plan['tasks']}
+    if not isinstance(entries, list) or len(entries) != len(expected):
+        return 'the review verdict does not cover every task'
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return 'a task verdict is malformed'
+        ident = entry.get('id')
+        if ident not in expected or ident in seen:
+            return f'the review verdict names an unknown or repeated task {ident!r}'
+        seen.add(ident)
+        spec = expected[ident]
+        acceptance = entry.get('acceptance')
+        if (not isinstance(acceptance, list)
+                or len(acceptance) != len(spec['acceptance'])):
+            return f'{ident} does not cover every acceptance criterion'
+        for index, item in enumerate(acceptance, start=1):
+            if not isinstance(item, dict):
+                return f'{ident} has a malformed acceptance entry'
+            if item.get('id') != f'AC-{index}':
+                return f'{ident} has an unexpected acceptance id {item.get("id")!r}'
+            if item.get('criterion') != spec['acceptance'][index - 1]:
+                return f'{ident} AC-{index} does not quote the criterion it was given'
+            if item.get('status') != 'PASS':
+                return f'{ident} AC-{index} is {item.get("status")!r}, not PASS'
+            if not str(item.get('evidence') or '').strip():
+                return f'{ident} AC-{index} has no evidence'
+    if verdict.get('findings'):
+        return 'the review approved while listing findings'
+    return None
+
+
+def _review(plan, state, journal, args, base, head, digest, risk):
+    _prove_task_integration(plan, state, base, head)
+    if risk['level'] == 'L0':
+        record = {'head': head, 'diff_sha256': digest, 'risk': risk['level'],
+                  'verdict': 'NOT_REQUIRED_L0', 'session': None,
+                  'reviewer_agent': None,
+                  'reason': 'docs-only diff; structural checks only'}
+        state['review'] = record
+        return record
+    if risk['level'] == 'L3':
+        state['review'] = {'head': head, 'diff_sha256': digest,
+                           'risk': risk['level'], 'verdict': 'NEEDS_HUMAN_DECISION',
+                           'session': None, 'reviewer_agent': None,
+                           'reason': 'a secret-shaped or human-only path changed'}
+        state['decision'] = 'NEEDS_HUMAN_DECISION'
+        raise BatchError('risk L3 requires human authorization; no review, push '
+                         'or merge was attempted', status='BLOCKED')
+    existing = state.get('review') or {}
+    if existing.get('head') and existing['head'] != head:
+        raise BatchError('the head changed after review; the existing approval is '
+                         'invalid. Reconcile the branch and review again.',
+                         status='BLOCKED')
+    if (existing.get('head') == head
+            and existing.get('diff_sha256') == digest
+            and existing.get('verdict') == 'APPROVE'):
+        return existing
+    if not args.review:
+        raise BatchError('risk L1/L2 requires an independent review; rerun '
+                         'finalize with --review', status='BLOCKED')
+    diff, _ = _diff_for_review(plan['batch']['repo'], base, head)
+    work = Path(plan['batch']['worktree'])
+    before_head, before_clean = _head(work), _clean(work)
+    profiles_before = _agent_profiles(work)
+    profile = profiles_before.get(plan['reviewer_agent'])
+    if profile is None:
+        raise BatchError('the reviewer profile is not queryable', status='BLOCKED')
+    ready, why = _profile_gate(profile)
+    if not ready:
+        raise BatchError(f'the reviewer profile may edit: {why}', status='BLOCKED')
+    result = _agent(work, _review_prompt(plan, base, head, digest, risk, diff),
+                    plan['reviewer_agent'], args.timeout,
+                    title=f'batch-{plan["batch"]["id"]}-review')
+    if result.get('timeout'):
+        raise BatchError(f'reviewer timed out; {result["detail"]}', status='BLOCKED',
+                         halt=not result.get('stopped'))
+    if result.get('exit_code') != 0 or not result.get('session_id'):
+        raise BatchError(f'reviewer session failed: {result.get("detail")}',
+                         status='BLOCKED')
+    session = result['session_id']
+    for record in state['tasks'].values():
+        if record.get('execution_session') == session:
+            raise BatchError('the reviewer session is an execution session',
+                             status='BLOCKED')
+    exported = _session_export(session, work)
+    if not exported.get('ok'):
+        raise BatchError(f'reviewer transcript unavailable: {exported.get("reason")}',
+                         status='BLOCKED')
+    if exported.get('session') != session:
+        raise BatchError('the session export does not name the requested session',
+                         status='REVIEW_REJECTED')
+    if exported.get('outcome') != 'succeeded':
+        raise BatchError('the reviewer session did not succeed: '
+                         f'{exported.get("outcome")!r}', status='REVIEW_REJECTED')
+    directory = exported.get('directory')
+    if not directory or Path(directory).resolve() != work.resolve():
+        raise BatchError('the reviewer session ran in a different directory',
+                         status='REVIEW_REJECTED')
+    if plan['reviewer_agent'] not in (exported.get('agents') or []):
+        raise BatchError('the reviewer transcript names a different agent',
+                         status='REVIEW_REJECTED')
+    profiles_after = _agent_profiles(work)
+    after = profiles_after.get(plan['reviewer_agent'])
+    if after is None:
+        raise BatchError('the reviewer profile disappeared during review',
+                         status='BLOCKED')
+    ready, why = _profile_gate(after)
+    if not ready:
+        raise BatchError(f'the reviewer profile changed and may edit: {why}',
+                         status='BLOCKED')
+    stream = _parse_verdict(result.get('text') or '')
+    transcript = _parse_verdict('\n'.join(exported.get('texts') or []))
+    if stream is None or transcript is None or stream != transcript:
+        raise BatchError('the reviewer stream and transcript do not contain the '
+                         'same fenced verdict', status='REVIEW_REJECTED')
+    if _head(work) != before_head or _clean(work) != before_clean:
+        raise BatchError('the reviewer changed the batch worktree', status='REVIEW_REJECTED')
+    problem = _verdict_problem(stream, plan, base, head, digest, risk)
+    if problem:
+        state['review'] = {'head': head, 'diff_sha256': digest,
+                           'risk': risk['level'], 'verdict': stream.get('verdict'),
+                           'session': session,
+                           'reviewer_agent': plan['reviewer_agent'],
+                           'reason': problem}
+        raise BatchError(f'review rejected: {problem}', status='REVIEW_REJECTED')
+    _prove_task_integration(plan, state, base, head)
+    record = {'head': head, 'diff_sha256': digest, 'risk': risk['level'],
+              'verdict': 'APPROVE', 'session': session,
+              'reviewer_agent': plan['reviewer_agent'],
+              'reason': 'approve', 'at': _now()}
+    state['review'] = record
+    return record
+
+
+def _prove_task_integration(plan, state, base, head):
+    """Every INTEGRATED task must still be present in the reviewed head."""
+    repo = plan['batch']['repo']
+    batch_paths = set(_changed_paths_range(repo, base, head))
+    for spec in plan['tasks']:
+        record = state['tasks'].get(spec['id'], {})
+        if record.get('status') not in INTEGRATED:
+            raise BatchError(f'{spec["id"]} is not integrated before review',
+                             status='BLOCKED')
+        integration = record.get('integration_sha')
+        if not integration or not _ancestor(repo, integration, head):
+            raise BatchError(f'{spec["id"]} integration commit is not an ancestor '
+                             'of the reviewed head; the batch branch was rewritten',
+                             status='REVIEW_REJECTED')
+        changed = set(record.get('changed_paths') or [])
+        if not changed:
+            raise BatchError(f'{spec["id"]} has no recorded changed paths',
+                             status='REVIEW_REJECTED')
+        if not changed.issubset(batch_paths):
+            missing = sorted(changed - batch_paths)
+            raise BatchError(f'{spec["id"]} is marked INTEGRATED but is missing from '
+                             f'the batch diff: {", ".join(missing)}',
+                             status='REVIEW_REJECTED')
+
+
+# --------------------------------------------------------------------- carriers
+
+def _batch_report(state, plan, reason):
+    return {'schema': 'batch-delivery-report/1',
+            'batch_id': plan['batch']['id'], 'reason': reason,
+            'tasks': state['tasks'], 'merge': state['merge'],
+            'review': state.get('review'), 'risk': state.get('risk'),
+            'carrier': {'state': 'not_applicable', 'reason': reason}}
+
+
+def _run_orchestrator(repo, arguments):
+    script = Path(repo) / 'scripts' / 'orchestrator.py'
+    argv = [sys.executable, str(script), *arguments]
+    result = subprocess.run(argv, cwd=str(repo), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, timeout=300)
+    return result
+
+
+def _current_task_status(repo, ident):
+    result = _run_orchestrator(repo, ['task', 'show', ident])
+    if result.returncode != 0:
+        return None
+    match = re.search(r'^Status:\s*([A-Za-z_]+)\s*$', result.stdout, re.M)
+    return match.group(1) if match else None
+
+
+def _carrier_local(state, plan, journal, merge_commit):
+    repo = plan['batch']['repo']
+    script = Path(repo) / 'scripts' / 'orchestrator.py'
+    calls = []
+    if not script.is_file():
+        reason = 'no local task library (scripts/orchestrator.py is absent)'
+        report = _batch_report(state, plan, reason)
+        report['carrier'] = {'state': 'not_applicable', 'reason': reason}
+        _atomic_json(journal.parent / 'batch-report.json', report)
+        state['carrier'] = {'state': 'not_applicable', 'reason': reason}
+        return
+    for spec in plan['tasks']:
+        current = _current_task_status(repo, spec['id'])
+        if current is None:
+            reason = (f'task {spec["id"]} is not in the local task library; a '
+                      'batch report was written instead of claiming a SQLite update')
+            report = _batch_report(state, plan, reason)
+            _atomic_json(journal.parent / 'batch-report.json', report)
+            state['carrier'] = {'state': 'not_applicable', 'reason': reason}
+            return
+        if current not in CHAIN:
+            raise BatchError(f'task {spec["id"]} has unrecognized status {current!r}')
+        start = CHAIN.index(current)
+        for target in CHAIN[start + 1:]:
+            if target == 'READY':
+                arguments = ['task', 'ready', spec['id']]
+            elif target == 'DISPATCHED':
+                arguments = ['task', 'dispatch', spec['id']]
+            else:
+                arguments = ['task', 'status', spec['id'], target,
+                             '--note', f'batch {plan["batch"]["id"]}']
+                if target == 'IN_PROGRESS' and state['tasks'][spec['id']].get('head'):
+                    arguments += ['--head-sha', state['tasks'][spec['id']]['head']]
+                if target == 'MERGED':
+                    arguments += ['--merge-sha', merge_commit]
+            result = _run_orchestrator(repo, arguments)
+            calls.append({'argv': arguments, 'exit': result.returncode})
+            if result.returncode != 0:
+                raise BatchError(
+                    f'local carrier update failed for {spec["id"]} at {target}: '
+                    f'{(result.stderr or "")[:300]}')
+    state['carrier'] = {'state': 'updated', 'calls': calls}
+
+
+def _now():
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+def _registry_value(inner, name):
+    match = re.search(r'^[ \t]*' + re.escape(name) + r'[ \t]*:[ \t]*(.*?)[ \t]*$',
+                      inner or '', re.M)
+    return match.group(1) if match else None
+
+
+def _registry_block(state, plan, merge_commit, dispatched_at, updated_at):
+    locked = sorted({name for spec in plan['tasks'] for name in spec['paths']})
+    return '\n'.join([
+        '<!-- ORCH-TASK-REGISTRY',
+        'status: VERIFIED',
+        'mode: batch',
+        'locked_paths: ' + ', '.join(locked),
+        f'branch: {plan["batch"]["branch"]}',
+        f'pr: {state["pr"]["number"]}',
+        f'runner: {plan["executor_agent"]}',
+        f'dispatched_at: {dispatched_at}',
+        f'updated_at: {updated_at}',
+        f'head_sha: {merge_commit}',
+        'blocked_reason: (none)',
+        '-->',
+    ])
+
+
+_HTML_REGISTRY = re.compile(r'<!--\s*ORCH-TASK-REGISTRY\b(?P<inner>.*?)-->', re.S)
+_FENCED_REGISTRY = re.compile(
+    r'```[A-Za-z0-9_-]*\n(?P<inner>[^`]*ORCH-TASK-REGISTRY[^`]*)\n```')
+
+
+def _update_registry(body, state, plan, merge_commit):
+    """Replace the single ORCH-TASK-REGISTRY block in place.
+
+    The authoritative carrier form is an HTML comment. A legacy fenced block is
+    upgraded rather than duplicated, and any duplicate ORCH-TASK-REGISTRY block
+    is removed so the Issue keeps exactly one.
+    """
+    body = body or ''
+    html_matches = list(_HTML_REGISTRY.finditer(body))
+    fenced_matches = list(_FENCED_REGISTRY.finditer(body))
+    existing = html_matches or fenced_matches
+    now = _now()
+    dispatched = None
+    if existing:
+        dispatched = _registry_value(existing[0].group('inner'), 'dispatched_at')
+    block = _registry_block(state, plan, merge_commit,
+                            dispatched or now, now)
+    if not existing:
+        body = body.rstrip()
+        return (body + '\n\n' if body else '') + block + '\n'
+    anchor = existing[0].start()
+    removals = sorted(html_matches + fenced_matches, key=lambda item: item.start())
+    before = sum(len(body[item.start():item.end()]) for item in removals
+                 if item.end() <= anchor)
+    for item in reversed(removals):
+        body = body[:item.start()] + body[item.end():]
+    index = anchor - before
+    return (body[:index] + block + body[index:]).strip('\n') + '\n'
+
+
+def _comment(state, plan, head_or_merge, merged=False):
+    if merged:
+        conclusion = ('Batch verified: merged into the base branch and post-merge '
+                      'verification passed.')
+        delivery = f'Merge commit: `{head_or_merge}`.'
+    else:
+        conclusion = ('Batch review complete; required checks are pending. No merge '
+                      'has been performed and post-merge verification has not run.')
+        delivery = (f'Reviewed head: `{head_or_merge}` (not a merge commit). '
+                    'The merge commit is recorded only after merge and post-merge '
+                    'verification.')
+    lines = [
+        f'## Batch {plan["batch"]["id"]}: {plan["batch"]["title"]}',
+        '',
+        '### Conclusion',
+        conclusion,
+        '',
+        '### User-visible change',
+        plan['batch']['summary'] or plan['batch']['title'],
+        '',
+        '### Acceptance results',
+        '| Task | Acceptance | Verification | Head |',
+        '|---|---|---|---|',
+    ]
+    for spec in plan['tasks']:
+        record = state['tasks'][spec['id']]
+        criteria = '<br>'.join(f'AC-{index}: {text}'
+                               for index, text in enumerate(spec['acceptance'], 1))
+        checks = '<br>'.join(f'{entry["argv_sha256"][:12]}: exit {entry["exit"]}'
+                             for entry in record.get('verify') or [])
+        lines.append(f'| {spec["id"]} | {criteria} | {checks} | '
+                     f'`{(record.get("head") or "")[:12]}` |')
+    lines += [
+        '',
+        '### Risks and next step',
+        f'Risk level: {state.get("risk", {}).get("level", "unknown")}. '
+        f'Review: {state.get("review", {}).get("verdict", "unknown")}. '
+        'No per-task PRs; one batch PR.',
+        delivery,
+    ]
+    return '\n'.join(lines) + '\n'
+
+
+def _carrier_github(state, plan, merge_commit):
+    batch = plan['batch']
+    if not batch.get('issue'):
+        state['carrier'] = {'state': 'not_applicable', 'reason': 'no issue configured'}
+        return
+    repo = batch.get('issue_repo') or batch['repo']
+    number = str(batch['issue'])
+    comment = _comment(state, plan, merge_commit, merged=True)
+    result = _gh(['issue', 'comment', number, '--repo', repo, '--body-file', '-'],
+                 plan['batch']['repo'], input_text=comment)
+    if result.returncode != 0:
+        raise BatchError('the carrier comment could not be posted: '
+                         f'{(result.stderr or "")[:300]}')
+    viewed = _gh_json(['issue', 'view', number, '--repo', repo, '--json', 'body'],
+                      plan['batch']['repo'])
+    body = viewed.get('body') if isinstance(viewed, dict) else ''
+    updated = _update_registry(body or '', state, plan, merge_commit)
+    edited = _gh(['issue', 'edit', number, '--repo', repo, '--body-file', '-'],
+                 plan['batch']['repo'], input_text=updated)
+    if edited.returncode != 0:
+        raise BatchError('the ORCH-TASK-REGISTRY block could not be updated: '
+                         f'{(edited.stderr or "")[:300]}')
+    state['carrier'] = {'state': 'updated', 'issue': batch['issue'],
+                        'registry': 'VERIFIED'}
+
+
+def _verify_list(work, commands, timeout):
+    entries = []
+    for command in commands:
+        result = _run_process(command, work, timeout)
+        entry = {'argv_sha256': hashlib.sha256(
+                     json.dumps(command).encode()).hexdigest(),
+                 'exit': result['exit'], 'tail': result['tail'],
+                 'timeout': bool(result['timeout'])}
+        entries.append(entry)
+        if result['timeout'] or result['exit'] != 0:
+            raise BatchError(
+                f'batch verification failed: {" ".join(command)} '
+                f'(exit {result["exit"]}): {result["tail"]}', status='BLOCKED',
+                verify=entries)
+    return entries
+
+
+def _prove_review_current(state, plan, head, digest):
+    review = state.get('review') or {}
+    if review.get('head') != head or review.get('diff_sha256') != digest:
+        raise BatchError('the head or diff changed after review; the approval no '
+                         'longer applies', status='BLOCKED')
+    if review.get('verdict') not in ('APPROVE', 'NOT_REQUIRED_L0'):
+        raise BatchError('there is no valid review for this head', status='BLOCKED')
+
+
+# ------------------------------------------------------------------ finalize
+
+def _require_tasks_integrated(state, plan):
+    bad = []
+    for spec in plan['tasks']:
+        record = state['tasks'].get(spec['id'], {})
+        if record.get('status') not in INTEGRATED:
+            bad.append(f'{spec["id"]}={record.get("status")}')
+    if bad:
+        raise BatchError('not every task is integrated: ' + ', '.join(bad))
+
+
+def _github_pr(plan, state, head):
+    repo = plan['batch']['repo']
+    branch = plan['batch']['branch']
+    payload = _gh_json(['pr', 'list', '--state', 'open', '--head', branch, '--json',
+                        'number,url,headRefOid,state'], repo)
+    if not isinstance(payload, list):
+        raise BatchError('gh pr list returned an unexpected payload')
+    if payload:
+        item = payload[0]
+        return {'number': item.get('number'), 'url': item.get('url'),
+                'head': item.get('headRefOid') or head}
+    body = _comment(state, plan, state['merge'].get('commit') or head)
+    result = _gh(['pr', 'create', '--base', plan['batch']['base'], '--head', branch,
+                  '--title', f'batch {plan["batch"]["id"]}: '
+                             f'{plan["batch"]["title"]}', '--body-file', '-'],
+                 repo, input_text=body)
+    if result.returncode != 0:
+        raise BatchError('gh pr create failed: '
+                         f'{(result.stderr or "").strip()[:300]}')
+    payload = _gh_json(['pr', 'list', '--state', 'open', '--head', branch, '--json',
+                        'number,url,headRefOid,state'], repo)
+    if not isinstance(payload, list) or not payload:
+        raise BatchError('the created pull request cannot be found')
+    item = payload[0]
+    return {'number': item.get('number'), 'url': item.get('url'),
+            'head': item.get('headRefOid') or head}
+
+
+def _wait_checks(plan, state, pr, head, timeout):
+    required = plan['finalize']['required_checks']
+    repo = plan['batch']['repo']
+    deadline = time.monotonic() + timeout
+    while True:
+        payload = _gh_json(['pr', 'checks', str(pr['number']), '--json',
+                            'name,state,link'], repo)
+        if not isinstance(payload, list):
+            raise BatchError('gh pr checks returned an unexpected payload')
+        states = {}
+        for item in payload:
+            if isinstance(item, dict) and isinstance(item.get('name'), str):
+                states[item['name']] = item.get('state')
+        failed = [name for name in required if states.get(name) in FAILED_CHECKS]
+        if failed:
+            raise BatchError('required checks failed: ' + ', '.join(
+                f'{name}={states.get(name)}' for name in failed))
+        if all(states.get(name) == 'SUCCESS' for name in required):
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            missing = [name for name in required if name not in states]
+            detail = ('missing required check(s): ' + ', '.join(missing)
+                      if missing else 'required checks did not succeed in time')
+            raise BatchError(detail + ' (NOT_RUN is never treated as pass)')
+        time.sleep(min(10, remaining))
+    view = _gh_json(['pr', 'view', str(pr['number']), '--json',
+                     'headRefOid,mergeable,state'], repo)
+    if not isinstance(view, dict):
+        raise BatchError('gh pr view returned an unexpected payload')
+    if view.get('headRefOid') != head:
+        raise BatchError('the pull request head moved after review')
+    if view.get('mergeable') == 'CONFLICTING':
+        raise BatchError('the pull request has merge conflicts')
+    if view.get('state') not in ('OPEN', 'MERGED'):
+        raise BatchError(f'the pull request is {view.get("state")!r}')
+
+
+def _reconcile_github_merge(plan, state):
+    """Adopt a merge the journal missed, so a crash cannot cause a second one."""
+    repo = plan['batch']['repo']
+    pr = state.get('pr')
+    view = None
+    if pr:
+        try:
+            view = _gh_json(['pr', 'view', str(pr['number']), '--json',
+                             'state,mergeCommit,url,headRefOid'], repo)
+        except BatchError:
+            view = None
+    else:
+        try:
+            payload = _gh_json(['pr', 'list', '--state', 'all', '--head',
+                                plan['batch']['branch'], '--json',
+                                'number,url,state,mergeCommit,headRefOid'], repo)
+        except BatchError:
+            payload = []
+        if isinstance(payload, list):
+            merged = [item for item in payload
+                      if isinstance(item, dict) and item.get('state') == 'MERGED']
+            if merged:
+                view = merged[0]
+                state['pr'] = {'number': view.get('number'),
+                               'url': view.get('url'),
+                               'head': view.get('headRefOid')}
+    if not isinstance(view, dict) or view.get('state') != 'MERGED':
+        return False
+    merge = view.get('mergeCommit') or {}
+    commit = merge.get('oid') if isinstance(merge, dict) else merge
+    if not commit:
+        raise BatchError('the pull request is MERGED but names no merge commit')
+    state['merge'].update(state='merged', commit=commit)
+    state['phase'] = 'post_merge'
+    return True
+
+
+def _merge_github(plan, state, pr, head, authorization, timeout):
+    repo = plan['batch']['repo']
+    if state['merge'].get('state') == 'merged':
+        return state['merge']['commit']
+    method = plan['finalize']['merge_method']
+    args = ['pr', 'merge', str(pr['number']), f'--{method}', '--delete-branch',
+            '--match-head-commit', head]
+    result = _gh(args, repo)
+    if result.returncode != 0:
+        try:
+            view = _gh_json(['pr', 'view', str(pr['number']), '--json',
+                             'state,mergeCommit,url,headRefOid'], repo)
+        except BatchError:
+            view = None
+        if isinstance(view, dict) and view.get('state') == 'MERGED':
+            merge = view.get('mergeCommit') or {}
+            commit = merge.get('oid') if isinstance(merge, dict) else merge
+            state['merge'].update(state='merged', commit=commit,
+                                  authorization=authorization)
+            return commit
+        raise BatchError('gh pr merge failed: '
+                         f'{(result.stderr or "").strip()[:300]}')
+    view = _gh_json(['pr', 'view', str(pr['number']), '--json',
+                     'state,mergeCommit,url,headRefOid'], repo)
+    merge = (view or {}).get('mergeCommit') or {}
+    commit = merge.get('oid') if isinstance(merge, dict) else merge
+    if not commit:
+        raise BatchError('the merge succeeded but no merge commit was reported')
+    state['merge'].update(state='merged', commit=commit,
+                          authorization=authorization)
+    return commit
+
+
+def _block_tasks(state, plan):
+    for spec in plan['tasks']:
+        state['tasks'][spec['id']]['status'] = 'BLOCKED'
+
+
+def _post_merge_github(plan, state, merge_commit, timeout):
+    repo = plan['batch']['repo']
+    base = plan['batch']['base']
+    fetched = _git(repo, 'fetch', 'origin', base, timeout=300)
+    if fetched.returncode != 0:
+        state['merge']['state'] = 'merged_but_post_verify_failed'
+        _block_tasks(state, plan)
+        raise BatchError('git fetch origin failed: '
+                         f'{(fetched.stderr or "").strip()[:300]}')
+    origin = f'origin/{base}'
+    if not _ancestor(repo, merge_commit, origin):
+        state['merge']['state'] = 'merged_but_post_verify_failed'
+        _block_tasks(state, plan)
+        raise BatchError('the merge commit is not an ancestor of the base branch; '
+                         'post-merge verification cannot be trusted')
+    if _branch(repo) != base:
+        state['merge']['state'] = 'merged_but_post_verify_failed'
+        _block_tasks(state, plan)
+        raise BatchError(f'the repository is not on {base!r}; refusing to update it')
+    if not _clean(repo):
+        state['merge']['state'] = 'merged_but_post_verify_failed'
+        _block_tasks(state, plan)
+        raise BatchError('the repository worktree is not clean; refusing to pull')
+    pulled = _git(repo, 'pull', '--ff-only', timeout=300)
+    if pulled.returncode != 0:
+        state['merge']['state'] = 'merged_but_post_verify_failed'
+        _block_tasks(state, plan)
+        raise BatchError('git pull --ff-only failed: '
+                         f'{(pulled.stderr or "").strip()[:300]}')
+    try:
+        state['merge']['post_verify'] = _verify_list(
+            repo, plan['finalize']['post_merge_verify'], timeout)
+    except BatchError:
+        state['merge']['state'] = 'merged_but_post_verify_failed'
+        _block_tasks(state, plan)
+        raise
+
+
+def _post_merge_local(plan, state, merge_commit, timeout):
+    repo = plan['batch']['repo']
+    if _branch(repo) != plan['batch']['base']:
+        state['merge']['state'] = 'merged_but_post_verify_failed'
+        _block_tasks(state, plan)
+        raise BatchError('the repository is not on the base branch')
+    if not _clean(repo):
+        state['merge']['state'] = 'merged_but_post_verify_failed'
+        _block_tasks(state, plan)
+        raise BatchError('the repository worktree is not clean')
+    try:
+        state['merge']['post_verify'] = _verify_list(
+            repo, plan['finalize']['post_merge_verify'], timeout)
+    except BatchError:
+        state['merge']['state'] = 'merged_but_post_verify_failed'
+        _block_tasks(state, plan)
+        raise
+
+
+def _github_flow(plan, state, journal, args, base, head, digest, risk):
+    repo = plan['batch']['repo']
+    fetched = _git(repo, 'fetch', 'origin', plan['batch']['base'], timeout=300)
+    if fetched.returncode != 0:
+        raise BatchError('git fetch origin failed: '
+                         f'{(fetched.stderr or "").strip()[:300]}')
+    origin = f'origin/{plan["batch"]["base"]}'
+    if not _ancestor(repo, origin, head):
+        raise BatchError('the batch branch does not contain the base branch; a '
+                         'rebase is required and is never automatic')
+    _prove_review_current(state, plan, head, digest)
+    if state['merge'].get('state') == 'merged':
+        commit = state['merge']['commit']
+        state['phase'] = 'post_merge'
+        _atomic_json(journal, state)
+        _post_merge_github(plan, state, commit, args.timeout)
+        _carrier_github(state, plan, commit)
+        for spec in plan['tasks']:
+            state['tasks'][spec['id']]['status'] = 'VERIFIED'
+        state['phase'] = 'verified'
+        _atomic_json(journal, state)
+        return
+    do_push = args.push or args.merge
+    if not do_push:
+        state['phase'] = 'review'
+        _atomic_json(journal, state)
+        return
+    pushed = _git(repo, 'push', '-u', 'origin', plan['batch']['branch'],
+                  timeout=600)
+    if pushed.returncode != 0:
+        raise BatchError('git push failed: '
+                         f'{(pushed.stderr or "").strip()[:300]}')
+    pr = _github_pr(plan, state, head)
+    state['pr'] = pr
+    state['phase'] = 'pr'
+    _atomic_json(journal, state)
+    _wait_checks(plan, state, pr, head, args.checks_timeout)
+    if not args.merge:
+        state['phase'] = 'pr'
+        return
+    _prove_review_current(state, plan, head, digest)
+    commit = _merge_github(plan, state, pr, head, args.authorization, args.timeout)
+    state['phase'] = 'merge'
+    _atomic_json(journal, state)
+    _post_merge_github(plan, state, commit, args.timeout)
+    state['phase'] = 'post_merge'
+    _atomic_json(journal, state)
+    _carrier_github(state, plan, commit)
+    for spec in plan['tasks']:
+        state['tasks'][spec['id']]['status'] = 'VERIFIED'
+    state['phase'] = 'verified'
+    _atomic_json(journal, state)
+
+
+def _local_flow(plan, state, journal, args, base, head, digest, risk):
+    repo = plan['batch']['repo']
+    expected = plan['finalize']['authorization']
+    if not expected or args.authorization != expected:
+        raise InputError('--authorization must exactly equal the nonempty '
+                         'finalize.authorization before a local merge')
+    if _branch(repo) != plan['batch']['base']:
+        raise BatchError(f'the repository is not on {plan["batch"]["base"]!r}')
+    if not _clean(repo):
+        raise BatchError('the repository worktree is not clean')
+    if not _ancestor(repo, base, head):
+        raise BatchError('the base is not an ancestor of the batch head')
+    _prove_review_current(state, plan, head, digest)
+    if not args.merge:
+        state['phase'] = 'review'
+        _atomic_json(journal, state)
+        return
+    if state['merge'].get('state') == 'merged':
+        commit = state['merge']['commit']
+    elif _ancestor(repo, head, 'HEAD'):
+        commit = _head(repo)
+        state['merge'].update(state='merged', commit=commit,
+                              authorization=args.authorization)
+    else:
+        result = _git(repo, 'merge', '--no-ff', plan['batch']['branch'], '-m',
+                      f'batch {plan["batch"]["id"]}: {plan["batch"]["title"]}')
+        if result.returncode != 0:
+            _git(repo, 'merge', '--abort')
+            raise BatchError('the local merge failed: '
+                             f'{(result.stderr or "").strip()[:300]}')
+        commit = _head(repo)
+        state['merge'].update(state='merged', commit=commit,
+                              authorization=args.authorization)
+    state['phase'] = 'merge'
+    _atomic_json(journal, state)
+    _post_merge_local(plan, state, commit, args.timeout)
+    state['phase'] = 'post_merge'
+    _atomic_json(journal, state)
+    _carrier_local(state, plan, journal, commit)
+    for spec in plan['tasks']:
+        state['tasks'][spec['id']]['status'] = 'VERIFIED'
+    state['phase'] = 'verified'
+    _atomic_json(journal, state)
+
+
+def _spawn_next(plan, args, journal):
+    next_path = args.next_plan or plan['finalize'].get('next_plan')
+    if not next_path:
+        return None
+    next_raw = load_plan(next_path)
+    next_plan = validate_plan(next_raw, plan['batch']['repo'])
+    if next_plan['finalize'].get('next_plan'):
+        raise InputError('a next plan may not itself name a next plan')
+    next_journal = _default_journal(next_plan)
+    script = Path(__file__).resolve()
+    run = subprocess.run([sys.executable, str(script), 'run', '--plan', next_path,
+                          '--journal', str(next_journal), '--repo',
+                          plan['batch']['repo'], '--execute'], cwd=str(Path.cwd()))
+    if run.returncode != 0:
+        return {'plan': next_path, 'run_exit': run.returncode}
+    finalize_args = [sys.executable, str(script), 'finalize', '--plan', next_path,
+                     '--journal', str(next_journal), '--repo', plan['batch']['repo'],
+                     '--review']
+    if next_plan['edition'] == 'github':
+        finalize_args += ['--push', '--merge', '--authorization',
+                          next_plan['finalize'].get('authorization') or '']
+    else:
+        finalize_args += ['--merge', '--authorization',
+                          next_plan['finalize'].get('authorization') or '']
+    result = subprocess.run(finalize_args, cwd=str(Path.cwd()))
+    return {'plan': next_path, 'finalize_exit': result.returncode}
+
+
+def _finalize_body(plan, state, journal, args):
+    batch = Path(plan['batch']['worktree'])
+    if not batch.is_dir() or _repo_root(batch) != batch.resolve():
+        raise BatchError('the batch worktree is missing')
+    if not _clean(batch):
+        raise BatchError('the batch worktree is not clean')
+    if _branch(batch) != plan['batch']['branch']:
+        raise BatchError('the batch worktree is not on the batch branch')
+    head = _head(batch)
+    _require_tasks_integrated(state, plan)
+    if plan['edition'] == 'github':
+        _reconcile_github_merge(plan, state)
+    elif state['merge'].get('state') != 'merged' and _ancestor(
+            plan['batch']['repo'], head,
+            _resolve_commit(plan['batch']['repo'], plan['batch']['base'])):
+        state['merge'].update(state='merged', commit=_head(plan['batch']['repo']))
+    merge_done = state['merge'].get('state') == 'merged'
+    if not merge_done:
+        state['batch_verify'] = _verify_list(
+            batch, plan['finalize']['verify'], args.timeout)
+    try:
+        _, digest = _diff_for_review(plan['batch']['repo'], state['base_sha'], head)
+        risk = classify_risk(plan['batch']['repo'], state['base_sha'], head)
+    except RiskError as exc:
+        raise InputError(f'cannot classify the batch diff: {exc}') from None
+    if not merge_done:
+        state['risk'] = risk
+        _atomic_json(journal, state)
+        _review(plan, state, journal, args, state['base_sha'], head, digest, risk)
+        _atomic_json(journal, state)
+    else:
+        _prove_task_integration(plan, state, state['base_sha'], head)
+        _prove_review_current(state, plan, head, digest)
+    if plan['edition'] == 'github':
+        _github_flow(plan, state, journal, args, state['base_sha'], head, digest,
+                     risk)
+    else:
+        _local_flow(plan, state, journal, args, state['base_sha'], head, digest,
+                    risk)
+    state['next_plan'] = args.next_plan or plan['finalize'].get('next_plan')
+    _atomic_json(journal, state)
+
+
+def command_finalize(args):
+    raw = load_plan(args.plan)
+    plan = validate_plan(raw, args.repo)
+    journal = _resolve_journal(args.journal, plan)
+    if args.merge:
+        expected = plan['finalize']['authorization']
+        if not expected or args.authorization != expected:
+            raise InputError('--authorization must exactly equal the nonempty '
+                             'finalize.authorization in the plan before any push '
+                             'or merge')
+    if not journal.exists():
+        raise InputError(f'no batch journal at {journal}; run the batch first')
+    with _Lock(journal):
+        state = _load_journal(journal)
+        _check_journal_plan(state, plan)
+        if state.get('edition') != plan['edition']:
+            raise InputError('the journal edition does not match the project')
+        if state.get('phase') == 'verified':
+            print(f'batch {state["batch_id"]} is already verified at '
+                  f'{(state.get("merge") or {}).get("commit")}')
+            return 0
+        try:
+            _finalize_body(plan, state, journal, args)
+        except BatchError as exc:
+            if state.get('phase') != 'verified':
+                state['phase'] = 'blocked'
+            state['error'] = str(exc)
+            state.setdefault('merge', {})
+            if state.get('merge', {}).get('state') != 'merged_but_post_verify_failed':
+                if not state['merge'].get('state'):
+                    state['merge']['state'] = 'none'
+            _atomic_json(journal, state)
+            raise
+        state['error'] = None
+        _atomic_json(journal, state)
+        print(f'batch {state["batch_id"]}: {state.get("phase")}; merge '
+              f'{(state.get("merge") or {}).get("commit")}')
+    if state.get('next_plan'):
+        result = _spawn_next(plan, args, journal)
+        if result and (result.get('run_exit') or result.get('finalize_exit')):
+            state['next_plan_result'] = result
+            _atomic_json(journal, state)
+            print(f'next batch failed: {result}')
+            return 1
+    return 0
+
+
+def command_check(args):
+    raw = load_plan(args.plan)
+    plan = validate_plan(raw, args.repo)
+    print(f'batch {plan["batch"]["id"]}: {plan["batch"]["title"]}')
+    print(f'edition: {plan["edition"]}; project_paths: {plan["project_paths"]}')
+    print(f'base: {plan["batch"]["base"]}; branch: {plan["batch"]["branch"]}')
+    print('order: ' + ' -> '.join(spec['id'] for spec in plan['tasks']))
+    for spec in plan['tasks']:
+        print(f'{spec["id"]}: {spec["title"]} '
+              f'(paths: {", ".join(spec["paths"])}; '
+              f'depends: {", ".join(spec["depends"]) or "-"})')
+    return 0
+
+
+def command_status(args):
+    journal = Path(args.journal).expanduser().absolute()
+    if not journal.is_file():
+        raise InputError(f'no batch journal at {journal}')
+    state = _load_journal(journal)
+    if args.json:
+        print(json.dumps(state, ensure_ascii=False, sort_keys=True))
+        return 0
+    print(f'batch {state.get("batch_id")} phase {state.get("phase")}')
+    for ident in sorted(state.get('tasks') or {}):
+        record = state['tasks'][ident]
+        merge = state.get('merge') or {}
+        print(f'{ident}: {record.get("status")} head={record.get("head") or "-"} '
+              f'integration={record.get("integration_sha") or "-"} '
+              f'pr={(state.get("pr") or {}).get("number") or "-"} '
+              f'merge={merge.get("state") or "-"}')
+    return 0
+
+
+# ------------------------------------------------------------------------ CLI
+
+def _parser():
+    parser = argparse.ArgumentParser(
+        description='Batch delivery coordinator (execute, verify, review, merge).')
+    sub = parser.add_subparsers(dest='command', required=True)
+    check = sub.add_parser('check', help='validate a batch plan; change nothing')
+    check.add_argument('--plan', required=True)
+    check.add_argument('--repo')
+    check.set_defaults(func=command_check)
+    run = sub.add_parser('run', help='execute, verify and integrate ready tasks')
+    run.add_argument('--plan', required=True)
+    run.add_argument('--journal')
+    run.add_argument('--repo')
+    run.add_argument('--execute', action='store_true')
+    run.add_argument('--only')
+    run.add_argument('--retry')
+    run.add_argument('--resume', action='store_true')
+    run.add_argument('--timeout', type=int, default=DEFAULT_TIMEOUT)
+    run.set_defaults(func=command_run)
+    finalize = sub.add_parser('finalize', help='review, push, merge and verify')
+    finalize.add_argument('--plan', required=True)
+    finalize.add_argument('--journal')
+    finalize.add_argument('--repo')
+    finalize.add_argument('--review', action='store_true')
+    finalize.add_argument('--push', action='store_true')
+    finalize.add_argument('--merge', action='store_true')
+    finalize.add_argument('--authorization', default=None)
+    finalize.add_argument('--resume', action='store_true')
+    finalize.add_argument('--checks-timeout', type=int, default=DEFAULT_CHECKS_TIMEOUT)
+    finalize.add_argument('--timeout', type=int, default=DEFAULT_TIMEOUT)
+    finalize.add_argument('--next-plan')
+    finalize.set_defaults(func=command_finalize)
+    status = sub.add_parser('status', help='read the journal; change nothing')
+    status.add_argument('--journal', required=True)
+    status.add_argument('--json', action='store_true')
+    status.set_defaults(func=command_status)
+    return parser
+
+
+def main(argv=None):
+    args = _parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except InputError as exc:
+        print(f'error: {exc}', file=sys.stderr)
+        return 2
+    except BatchError as exc:
+        print(f'error: {exc}', file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print('error: interrupted', file=sys.stderr)
+        return 1
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f'error: {exc}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
