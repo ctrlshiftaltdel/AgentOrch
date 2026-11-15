@@ -1,0 +1,3562 @@
+"""Prepare-only delivery runner: execute, verify and independently review.
+
+This slice deliberately has **no automatic merge**. It runs one real OpenCode
+execution session per task, verifies the diff with the plan's commands, starts a
+different session with a declared read-only agent for review, and leaves the
+task in ``PREPARED`` for a human or the Master to review and merge. Every write path is
+fail-closed:
+
+* a plan may not ask for a merge; ``merge``/``--merge-into`` is refused before
+  any agent runs, because automatic merge, its authoritative task lock, atomic
+  recovery and independent-authorization binding are not implemented here;
+* an approval is only trusted while it is live in this process. A task that
+  completes execution, verification and an independent review here is left
+  ``PREPARED`` for a human; a ``PREPARED`` record read from a previous process is
+  re-checked for worktree identity and scope and then refused, because Git
+  history, the journal, the execution session's metadata and the reviewer
+  transcript are all writable and their mutual consistency is not evidence that
+  this execution session produced the recorded head or that an independent
+  reviewer approved it. Every approval still live in this process is re-proved
+  against its head, diff digest and clean worktree immediately before the
+  summary: a later trusted command that changed it blocks the approval without
+  re-running that command, and the reviewer profile is re-queried there so an
+  approval cannot outlive the read-only profile that supported it;
+* the edition is re-read from the project config at every side-effect boundary,
+  and an invalid, duplicate, empty or ambiguous declaration blocks immediately
+  instead of reusing the first check. Every external call — the profile query,
+  each Git fact read, each Agent/session invocation, each session export and
+  each verification command — is bracketed by that proof on both sides, so a
+  declaration that goes bad while one of them is in flight stops the run at that
+  call: no further query, export, session or command starts, and an invalid
+  config never yields a ``PREPARED`` record. That includes a clean filter or a
+  ``core.fsmonitor`` hook, which Git runs *inside* ``status``/``diff``: the
+  shared side-effect proof re-reads the config after those calls and before the
+  agent or command it gates, the repository status read before dispatch is
+  followed by another config and authorization proof before the carrier query or
+  any Agent, the carrier return is followed by one before any later Git call,
+  lock, journal or Agent, every consecutive Git call in the dispatch validation
+  is followed by one before the next, and while a task is processed *every*
+  synchronously awaited Git call is followed by one before the next Git call,
+  Agent or write. A three-call sequence such as ``_changes``' ``diff``,
+  ``diff --cached`` and ``ls-files`` therefore stops after the call whose
+  in-process helper switched the declaration.
+  The runtime profile is part of that gate, so it is re-queried *after* an
+  export and *before* the reviewer session starts, and again before every
+  verification command, not only once per phase;
+* ``git add`` and ``git commit`` are two processes, so the pre-commit proof is
+  taken on the **index** between them: a clean filter that rewrites the staged
+  blob is refused before history exists. The pre-add status is a Git process of
+  its own, so configuration, authorization and the actual scope are re-proved
+  after it returns and before ``git add``; a stale proof never reaches the
+  index. The index proof then reads through Git itself, so it re-reads the
+  project config after those calls;
+* ``git commit`` is a porcelain process that runs clean filters while it
+  refreshes the index, runs a configured ``core.fsmonitor`` helper in that same
+  refresh, and then its commit hooks, *inside* the process and after the index
+  proof. Git exposes no switch that keeps the clean filter from running
+  (``--no-verify --no-status`` still runs it), so a filter or fsmonitor helper
+  can switch ``docs/PROJECT.md`` to another valid edition and a hook can run
+  before the runner sees it; a later ``BLOCKED`` cannot undo that history. This
+  is not a second-writer race. The runner therefore proves before starting the
+  process that no clean filter, fsmonitor helper or commit hook can run, and
+  refuses to start ``git commit`` when it cannot: creating a commit under any of
+  them is an unimplemented capability, and the staged change is left for a
+  human. The refusal names only configuration keys, never their values, because
+  a filter or fsmonitor value is an arbitrary command line that may carry a
+  secret and is copied into the journal and the CLI summary;
+* the final summary re-proves the project config after its Git fact checks, and
+  re-queries the reviewer profile, once more over every live approval before the
+  journal is saved. The config and profile are shared: if that final pass sees
+  the gate fail for one live approval, it voids every live approval, including
+  the ones whose own query had already returned the safe profile. None of this
+  is atomic: the config, the worktrees and the runtime profiles are writable
+  files another process can change between any proof and the following action,
+  and this runner narrows that window instead of claiming to close it;
+* lock identity is the canonical real path, so a symlinked journal directory
+  cannot create a second lock identity for the same journal;
+* resume/retry re-prove the repository identity, the task packet, project
+  authorization (including every *actual* changed path), the execution session's
+  metadata, the reviewer profile and the full verification set before any side
+  effect. This runtime exposes no independently verifiable artifact that ties an
+  execution session to the commit it is supposed to have produced, and both Git
+  history and the journal are writable, so a recorded head is never trusted
+  across processes: an interrupted verify/review attempt is ``BLOCKED`` instead
+  of resumed or retried. Only an attempt that left no commit can start again,
+  and its recorded previous PID must be provably dead first: POSIX probes it
+  with signal 0, while Windows reads the process object because the same call
+  would terminate it;
+* no ``reset``, ``stash`` or delete is ever performed; a worktree that is not
+  exactly at the target baseline, or that has uncommitted/committed leftovers,
+  is refused and left untouched;
+* verification runs in its own process group so a timeout tries to kill the whole
+  tree. Windows has no process group a plain ``Popen`` can signal, so the check's
+  PID tree is stopped with ``taskkill /T`` instead; a descendant that detaches
+  from that tree is still not guaranteed to be caught. The termination attempt
+  is kept separate from the proof that the group is gone: POSIX only claims a
+  kill once the group no longer answers signal 0, and Windows never claims one
+  because ``taskkill``'s zero exit only reports that the command succeeded. A
+  timeout stops the whole run at that check — no later task, closing approval
+  re-check, verification command, profile query, Agent or Git write starts — and
+  a kill that cannot be proven is recorded as unproven, never as killed. A
+  timeout already saved in the journal stops the run before ``_root``,
+  ``_status``, the carrier query or any lock can start a Git/``gh`` process, and
+  its halt write blocks every approval saved on disk, not only the ones this
+  process remembers. That halt only happens after the journal is proved to be
+  outside the repository and every task worktree by filesystem calls alone --
+  a repository path given as a subdirectory cannot hide the root -- so a journal
+  inside a worktree is never rewritten or locked to record a stop; a boundary
+  that cannot be proved stops the run instead. An existing journal that cannot
+  be read or parsed is not treated as a missing one: whether it records a
+  timeout cannot be proved, so it fails closed before any Git or ``gh`` call.
+
+Nothing here is a sandbox. Worktrees, prompts, path checks and ``--standalone``
+do not restrict OpenCode's configured permissions: V2 can reach the host
+filesystem, shell, network and credentials. Tool-level denials are checked, but
+OS isolation, MCP/plugin channels and model independence are not proven. Only
+the standard library is used.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import signal
+import subprocess
+import tempfile
+
+STATE_VERSION = 4
+TERMINAL_OK = 'PREPARED'
+# A dependency is only satisfied by an integrated result. This prepare-only
+# slice never produces one, so dependent tasks stay PENDING instead of building
+# on a target that does not contain the dependency's change.
+INTEGRATED = ('VERIFIED',)
+ACTIVE = ('RUNNING', 'PREPARED')
+STOPPED = ('FAILED', 'REVIEW_REJECTED', 'BLOCKED', 'UNKNOWN')
+BRANCH_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]*$')
+SHA_RE = re.compile(r'^[0-9a-f]{40}(?:[0-9a-f]{24})?$')
+DIGEST_RE = re.compile(r'^[0-9a-f]{64}$')
+VERDICT_KEYS = {'verdict', 'head', 'base', 'diff_sha256', 'diff_digest', 'task_digest',
+                'paths', 'mode', 'acceptance', 'findings'}
+MAX_DIFF_BYTES = 65536
+MODE = 'prepare-only'
+# The runtime's write-capable tool actions we can name. MCP/plugin channels are
+# not enumerable here, so this gate is never presented as an OS read-only proof.
+MUTATING_ACTIONS = ('edit', 'shell')
+VALID_EDITIONS = ('local', 'github')
+# A declaration is a bullet whose first token is `edition`, with any mix of
+# backticks or Markdown emphasis around it (including nested forms such as
+# **`edition`**). Value parsing is line-exact: [ \t] rather than \s, so a
+# newline cannot carry the value to the next line, and an emphasized, nested or
+# non-colon form still counts as a declaration so a malformed duplicate is
+# rejected instead of silently ignored.
+EDITION_RE = re.compile(
+    r'^[ \t]*[-*+][ \t]+(?P<form>[*_`]*edition[*_`]*)'
+    r'(?=[ \t:：]|$)(?P<rest>[^\n]*)$', re.M)
+# There is no OpenCode artifact that can independently bind a session to the
+# commit it produced. Git history and the journal are writable by the same user,
+# so a recorded head must never be trusted across processes.
+UNPROVABLE_EXECUTION = (
+    'this runtime exposes no independently verifiable execution artifact that binds '
+    'the execution session to the recorded head and diff; Git history and the journal '
+    'are writable, so this attempt cannot be trusted after interruption. Inspect the '
+    'worktree manually and redo the task without resetting or stashing')
+MERGE_REFUSAL = ('automatic merge is not implemented in this slice: it has no authoritative '
+                 'task lock, atomic recovery or independent authorization binding. Run with '
+                 'merge disabled and let the Master review the PREPARED head')
+
+
+class DeliveryError(Exception):
+    """A gate failed; ``status`` is the state the task is left in."""
+
+    def __init__(self, message, status='BLOCKED'):
+        super().__init__(message)
+        self.status = status
+
+
+class SharedGateError(DeliveryError, ValueError):
+    """A shared gate — the project edition or its path authorization — failed.
+
+    ``docs/PROJECT.md`` is one file every task in the run depends on, so a
+    failure there is not scoped to the task that observed it: a later task would
+    prove its worktree and authorization against the same broken declaration.
+    The run therefore has to stop, not merely mark one record. It is recorded
+    once on the task that saw it and no further Git process, Agent session or
+    journal write starts.
+
+    It is also a ``ValueError`` because the failing input is the project config
+    itself: the helpers that read it have always reported a bad or revoked
+    declaration as a value problem to their direct callers, and those callers
+    keep working unchanged while the runtime boundaries gain the shared-gate
+    type they need to stop the whole run.
+    """
+
+
+class RunHaltError(DeliveryError):
+    """A failure that has to stop the whole run, not just the task that saw it.
+
+    A timed-out verification check is the producer: the process tree may still
+    be running on the host and can write to any worktree, so no later task, no
+    closing approval re-check and no profile query or Agent may start. The task
+    that observed the timeout is recorded ``BLOCKED``, and every approval saved
+    in the journal — including one an earlier process saved before it died —
+    loses its support in the same journal write.
+    """
+
+
+def _shared(error, message):
+    """The exception to raise for an edition/authorization failure.
+
+    Callers that already report through ``DeliveryError`` (every runtime
+    boundary) get the shared-gate subclass, so the task loop can tell a
+    run-wide failure from a task-scoped one. Startup callers that raise
+    ``ValueError`` keep their own type.
+    """
+    if isinstance(error, type) and issubclass(error, DeliveryError):
+        return SharedGateError(message)
+    return error(message)
+
+
+# --------------------------------------------------------------------------- git
+
+# Re-proof installed by ``run`` while a task is being processed. Every Git
+# process a runner starts and synchronously waits for is a boundary: a clean
+# filter or a ``core.fsmonitor`` hook runs *inside* it and can switch
+# ``docs/PROJECT.md`` to another valid edition. A call site that reads three
+# Git facts in a row therefore cannot prove the edition once at the start; the
+# proof has to follow each return. ``git`` is the only seam every one of those
+# calls goes through, including the ones inside ``_changes``, ``_prove_staged``
+# and the approval re-check, so the guard lives here.
+_GIT_GUARD = None
+
+
+def git(where, *args):
+    result = subprocess.run(['git', '--no-optional-locks', *args], cwd=where,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, check=True)
+    guard = _GIT_GUARD
+    if guard is not None:
+        guard()
+    return result.stdout
+
+
+def _text(where, *args):
+    return os.fsdecode(git(where, *args)).strip()
+
+
+def _root(path):
+    path = Path(path).resolve(strict=True)
+    if Path(os.fsdecode(git(path, 'rev-parse', '--show-toplevel')).strip()).resolve() != path:
+        raise ValueError('path must be a Git worktree root')
+    return path
+
+
+def _common(path):
+    return Path(os.fsdecode(git(path, 'rev-parse', '--path-format=absolute',
+                                '--git-common-dir')).strip()).resolve()
+
+
+def _head(path):
+    return _text(path, 'rev-parse', 'HEAD')
+
+
+def _branch(path):
+    return _text(path, 'branch', '--show-current')
+
+
+def _status(where):
+    return os.fsdecode(git(where, 'status', '--porcelain', '-z'))
+
+
+def _unstaged(where):
+    """Paths whose worktree content no longer matches the index."""
+    return os.fsdecode(git(where, 'diff', '--no-ext-diff', '--no-renames', '--name-only',
+                           '-z', '--'))
+
+
+def _is_ancestor(ancestor, descendant, where):
+    result = subprocess.run(['git', '--no-optional-locks', 'merge-base', '--is-ancestor',
+                             ancestor, descendant], cwd=where, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return result.returncode == 0
+
+
+# ------------------------------------------------------------------ project config
+
+def project_config(repo):
+    """Read edition and path authorization from the project's own config."""
+    path = Path(repo) / 'docs' / 'PROJECT.md'
+    if not path.is_file():
+        return {'edition': None, 'edition_count': 0, 'edition_values': [],
+                'allowed': None, 'forbidden': [], 'secrets': []}
+    text = path.read_text(encoding='utf-8', errors='replace')
+    values = _edition_values(text)
+    return {'edition': values[0] if len(values) == 1 else None,
+            'edition_count': len(values), 'edition_values': values,
+            'allowed': _policy_paths(text, '允许改动路径'),
+            'forbidden': _policy_paths(text, '禁止改动路径'),
+            'secrets': _secret_patterns(text)}
+
+
+def _edition_values(text):
+    """Every ``edition`` declaration in ``text``, parsed or not."""
+    return [_edition_value(form, rest) for form, rest in EDITION_RE.findall(text)]
+
+
+def _edition_value(form, raw):
+    """Parse the value from one line-exact declaration, or return ``''``.
+
+    A declaration must use ``:`` or ``：`` and one of the plain ``edition``
+    forms. A bullet that starts with ``edition`` but uses another form is still
+    counted as a declaration, so a typo cannot hide a duplicate; it simply has
+    no parseable value and the caller rejects it. Only a value wrapped in a
+    matching pair of backticks is unwrapped. Anything else
+    (``github/invalid``, ``???``, an empty value, a closed backtick followed by
+    prose) stays as-is and is rejected by the callers' exact-value check.
+    """
+    if form not in ('edition', '`edition`'):
+        return ''
+    value = raw.strip()
+    if not value or value[0] not in ':：':
+        return ''
+    value = value[1:].strip()
+    if len(value) >= 2 and value.startswith('`') and value.endswith('`'):
+        value = value[1:-1]
+    return value
+
+
+def _require_edition(config, error=DeliveryError, expected=None):
+    """Fail closed unless the project declares exactly one usable edition.
+
+    The edition is the only authority for the base and it is re-read at every
+    side-effect boundary, so a later invalid, duplicate, empty or ambiguous
+    declaration must block immediately instead of reusing the first check.
+
+    ``expected`` is the edition the run began with. A declaration that changed
+    to a *different valid* edition is not usable either: the run's task
+    authorization and carrier provenance were proved against the starting one,
+    so the switch is refused exactly like an invalid value.
+    """
+    if config.get('edition_count') != 1 or config.get('edition') not in VALID_EDITIONS:
+        values = config.get('edition_values') or []
+        raise _shared(error, 'docs/PROJECT.md must declare exactly one `edition` of `local` or '
+                     f'`github` before any dispatch; found {config.get("edition_count")} '
+                     f'declaration(s), values {values!r} (edition parsed as '
+                     f'{config.get("edition")!r})')
+    if expected is not None and config.get('edition') != expected:
+        raise _shared(error, 'docs/PROJECT.md switched the project edition from '
+                     f'{expected!r} to {config.get("edition")!r} while the run was live; '
+                     'refusing to continue from an edition the run did not begin with')
+
+
+def _require_live_config(context, spec=None):
+    """Re-read the project config and fail closed unless the edition is unchanged.
+
+    Every external operation — profile query, Agent session, session export and
+    each verification command — is bracketed by this call, so a declaration
+    invalidated or switched by any other writer at any point stops the run *at*
+    that call. Nothing external may start or continue after it fails.
+    """
+    fresh = project_config(context.repo)
+    _require_edition(fresh, expected=context.config.get('edition'))
+    if spec is not None:
+        _require_authorized(spec['paths'], fresh)
+    return fresh
+
+
+def _require_authorized(paths, config, error=DeliveryError):
+    """Prove the task paths against the project's own authorization.
+
+    The authorization list is read from the shared ``docs/PROJECT.md``, so a
+    failure here means the *shared* declaration no longer covers this run's
+    tasks: it is reported as a shared gate failure, not as one task's scope
+    error. A task-scoped scope check (an actual changed path that the unchanged
+    authorization does not cover) is still a plain ``DeliveryError``.
+    """
+    try:
+        _authorize_paths(paths, config)
+    except ValueError as exc:
+        raise _shared(error, str(exc)) from None
+
+
+def _index_text(work, rel):
+    """The exact bytes the next commit would record for ``rel``, or ``None``.
+
+    ``git show :path`` reads the index, not the worktree, so a clean filter
+    that rewrote the content while ``git add`` ran is visible here and nowhere
+    else in the tree.
+    """
+    if not git(work, 'ls-files', '-z', '--', rel):
+        return None
+    return os.fsdecode(git(work, 'show', ':' + rel))
+
+
+def _staged_config(work):
+    """The project config exactly as it is staged for the pending commit."""
+    text = _index_text(work, 'docs/PROJECT.md')
+    if text is None:
+        return None
+    values = _edition_values(text)
+    return {'edition': values[0] if len(values) == 1 else None,
+            'edition_count': len(values), 'edition_values': values}
+
+
+def _prove_staged(repo, spec, work, base, expected, *, edition=None):
+    """Re-prove configuration, authorization and scope on what will be committed.
+
+    ``git add`` and ``git commit`` are separate processes, and ``git add`` can
+    run code the runner does not control: a clean filter can rewrite the content
+    that gets staged. The pre-add proof therefore does not describe the commit
+    that is about to happen. This one reads the *index* — the exact blob and
+    path set the commit would record — plus the project authorization again, and
+    it runs while nothing has been committed yet, so a failure leaves staged
+    changes for a human instead of history. The commit process itself is gated
+    separately by ``_prove_commit_is_inert``.
+
+    Every call in the body is a Git process (``ls-files``, ``show :path``,
+    ``diff``), and a clean filter runs inside them. A filter that rewrites the
+    project config there invalidates the edition after the opening read, so the
+    config and the task authorization are proved once more as the **last**
+    action: a plain file read, with no Git call after it, so the caller's
+    ``git commit`` cannot start from a declaration this proof has not seen.
+    ``edition`` is the edition the run began with; a switch to another valid
+    edition fails the first proof rather than being compared only with the
+    staged blob.
+    """
+    fresh = project_config(repo)
+    _require_edition(fresh, expected=edition)
+    _require_authorized(spec['paths'], fresh)
+    staged = _staged_config(work)
+    if staged is None:
+        raise DeliveryError('the staged tree has no docs/PROJECT.md; refusing to commit a '
+                            'change that removes the project configuration')
+    if staged['edition_count'] != 1 or staged['edition'] not in VALID_EDITIONS:
+        raise DeliveryError('the staged docs/PROJECT.md would commit an unusable `edition`: '
+                            f'{staged["edition_count"]} declaration(s), values '
+                            f'{staged["edition_values"]!r}')
+    if staged['edition'] != fresh['edition']:
+        raise DeliveryError('the staged docs/PROJECT.md would commit edition '
+                            f'{staged["edition"]!r}, but the project declares '
+                            f'{fresh["edition"]!r}')
+    if _unstaged(work):
+        raise DeliveryError('the worktree changed while staging; refusing to commit content '
+                            'the proof above did not see')
+    # `_unstaged` is a Git process and can run a clean filter of its own; prove
+    # the config again before the last Git fact read starts.
+    fresh = project_config(repo)
+    _require_edition(fresh, expected=edition)
+    _require_authorized(spec['paths'], fresh)
+    now = _changes(work, base)
+    if now != sorted(expected):
+        raise DeliveryError('the staged path set changed between staging and commit: '
+                            f'{now!r} instead of {sorted(expected)!r}')
+    for name in now:
+        _check_changed_path(work, name, spec['paths'], fresh)
+    # The Git calls above own the index and the worktree for their duration and
+    # can run a clean filter; re-read the project config after they returned.
+    # The staged blob cannot change without another Git write, so comparing it
+    # with this later read also catches a config that changed to a different
+    # *valid* edition while the index was being proved.
+    fresh = project_config(repo)
+    _require_edition(fresh, expected=edition)
+    _require_authorized(spec['paths'], fresh)
+    if staged['edition'] != fresh['edition']:
+        raise DeliveryError('the staged docs/PROJECT.md would commit edition '
+                            f'{staged["edition"]!r}, but the project declares '
+                            f'{fresh["edition"]!r} after the index proof')
+
+
+COMMIT_HOOKS = ('pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit')
+
+
+def _commit_hooks(work):
+    """Every hook ``git commit`` could run for this worktree.
+
+    ``git rev-parse --git-path hooks`` resolves ``core.hooksPath`` (absolute or
+    worktree-relative) and the linked-worktree common dir, so this is the same
+    directory Git itself would execute from. Only existing hooks are listed; any
+    of them can run code before the commit is recorded.
+    """
+    path = Path(os.fsdecode(git(work, 'rev-parse', '--git-path', 'hooks')).strip())
+    if not path.is_absolute():
+        path = Path(work) / path
+    return [name for name in COMMIT_HOOKS if (path / name).is_file()]
+
+
+def _configured_clean_filters(work):
+    """Every configured clean/process filter that could rewrite a staged blob.
+
+    ``git commit`` refreshes the index, which reads worktree content through a
+    clean filter (a process filter included). ``git commit --no-verify
+    --no-status`` still runs it, so porcelain cannot isolate the commit from
+    this. The check is deliberately conservative: any configured driver is
+    enough to refuse.
+
+    Only the configuration *key* is returned. The value is an arbitrary command
+    line, may carry a secret, and is copied into the refusal reason, the journal
+    and the CLI summary, so it must never leave this function.
+
+    ``--get-regexp`` prints each value verbatim, and a value may itself contain a
+    newline: a command line continued on a second line is stored and printed as
+    two physical lines, with no key on the second one. Splitting that output into
+    physical lines would therefore read the continuation as another key — and
+    that continuation is exactly the material that must never be reported. Ask
+    Git for the names only, NUL-separated, so no value is read, printed or
+    mistaken for a key.
+    """
+    result = subprocess.run(
+        ['git', '--no-optional-locks', 'config', '--null', '--name-only',
+         '--get-regexp', r'^filter\..*\.(clean|process)$'], cwd=work,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True)
+    if result.returncode not in (0, 1):
+        # `git config` stderr can quote configuration material; report neither
+        # it nor any value.
+        raise DeliveryError('cannot enumerate Git clean filters before commit')
+    keys = []
+    for key in result.stdout.split('\0'):
+        key = key.strip()
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+# The exact spellings Git documents as boolean false, plus the explicit empty
+# value. Anything else that Git's parser maps to false (a case variant such as
+# ``FALSE``) is not normalized here: the stored bytes are what this proof
+# compares.
+_FSMONITOR_FALSE = ('', 'false', 'no', 'off', '0')
+
+
+def _configured_fsmonitor(work):
+    """The fsmonitor configuration key when Git could run a helper program.
+
+    ``core.fsmonitor`` is not a clean filter or a commit hook, but it is
+    executable code that Git invokes while it refreshes the index inside
+    ``git commit``. Set to a boolean true Git starts its builtin daemon; set to
+    a path it runs that program, which can switch ``docs/PROJECT.md`` after the
+    last proof and before history is written. Only the key is reported, never
+    the configured value.
+
+    Git does not normalize the whitespace inside a configuration value: a value
+    of `` False `` is *not* Git's boolean false. Git's boolean parser rejects
+    it and Git then treats the text as the program to run, resolving it through
+    ``PATH``. Reading ``--get`` and stripping or lowercasing the line would
+    call that value disabled and let ``git commit`` start a helper that runs
+    inside it. The proof therefore compares the stored bytes against Git's
+    exact false spellings and asks Git's own boolean parser to settle the one
+    ambiguous case; anything not proven false — a path, a whitespace-wrapped,
+    case-variant or otherwise unparseable value — fails closed.
+
+    A key with no value at all (``[core]`` followed by ``fsmonitor``) is Git's
+    implicit boolean true. An explicitly empty value (``core.fsmonitor =``)
+    prints the same empty line from ``--get`` but is Git's boolean false, which
+    is why the proof asks the parser after reading the value instead of
+    trusting that line. Only the exact documented spellings (or an explicit
+    empty value) disable the helper here.
+    """
+    stored = subprocess.run(
+        ['git', '--no-optional-locks', 'config', '--null', '--get',
+         'core.fsmonitor'],
+        cwd=work, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True)
+    if stored.returncode == 1:
+        return []
+    if stored.returncode != 0 or not stored.stdout.endswith('\0'):
+        return ['core.fsmonitor']
+    # `--null` makes the stored value unambiguous: drop only the terminator,
+    # never whitespace that is part of the value.
+    value = stored.stdout[:-1]
+    if value not in _FSMONITOR_FALSE:
+        # Not one of the exact false spellings: `true` is the builtin daemon, a
+        # path is the helper program, and a value Git's parser rejects (such as
+        # ` False `) is run as the command. Every one can execute inside the
+        # commit.
+        return ['core.fsmonitor']
+    # An empty value is ambiguous: `--get` prints the same empty line for an
+    # explicit empty value (Git boolean false) and for a valueless key (implicit
+    # true). Ask Git's parser *after* the raw read, so a value that became the
+    # implicit true in between is seen as enabled instead of trusted from the
+    # earlier read.
+    parsed = subprocess.run(
+        ['git', '--no-optional-locks', 'config', '--null', '--type=bool',
+         '--get', 'core.fsmonitor'],
+        cwd=work, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True)
+    if parsed.returncode == 1:
+        return []
+    if parsed.returncode != 0 or parsed.stdout != 'false\0':
+        return ['core.fsmonitor']
+    return []
+
+
+def _prove_commit_is_inert(context, spec, work):
+    """Refuse to start ``git commit`` unless it cannot run code of its own.
+
+    ``git commit`` is a porcelain process that runs clean filters while it
+    refreshes the index and then runs its commit hooks. A configured
+    ``core.fsmonitor`` program runs in that same index refresh. All of it runs
+    *inside* the process, after the index proof, so a filter or fsmonitor hook
+    can switch ``docs/PROJECT.md`` to another valid edition and a commit hook
+    can run before the runner sees the change; by then the commit is already
+    history. Git exposes no switch that keeps the clean filter from running
+    (``--no-verify --no-status`` still runs it), so this is not a second-writer
+    race and another file read cannot close it. The runner therefore proves
+    *before* starting the process that no filter, fsmonitor helper or commit
+    hook can run, and refuses otherwise. That refusal is an unimplemented
+    capability: the staged change is left for a human to commit.
+
+    The other executable helpers a commit could reach are already excluded by
+    the command line: ``--no-gpg-sign`` skips the signing program and ``-m``
+    supplies the message so no editor is started.
+    """
+    hooks = _commit_hooks(work)
+    filters = _configured_clean_filters(work)
+    fsmonitor = _configured_fsmonitor(work)
+    # The probes are Git processes; re-prove the config afterwards as the
+    # last action before the caller starts `git commit`.
+    fresh = project_config(context.repo)
+    _require_edition(fresh, expected=context.config.get('edition'))
+    _require_authorized(spec['paths'], fresh)
+    if hooks or filters or fsmonitor:
+        parts = []
+        if filters:
+            parts.append('configured clean filter(s): ' + ', '.join(filters))
+        if fsmonitor:
+            parts.append('fsmonitor helper(s): ' + ', '.join(fsmonitor))
+        if hooks:
+            parts.append('commit hook(s): ' + ', '.join(hooks))
+        raise DeliveryError(
+            'creating a commit is not implemented while a Git '
+            + ' and '.join(parts) + ' can run inside it: that code runs after the '
+            'last proof and can change docs/PROJECT.md before history is written. '
+            'The staged change is left for a human to commit')
+
+
+def _prove_before_add(context, spec, work, base, expected):
+    """Re-prove configuration, authorization and scope before ``git add``.
+
+    The status call that decides whether there is anything to stage is a Git
+    process of its own, and a clean filter runs inside it. A filter can rewrite
+    the project config after the pre-add proof and before ``git add``, so the
+    config and the task authorization are read from the file again, and the
+    *actual* changed paths are re-derived through Git and checked against that
+    fresh authorization. The last Git call is ``_changes``; the config is read
+    after it, and the path checks that follow only look at the filesystem, so
+    ``git add`` cannot start from a declaration this proof has not seen.
+    """
+    actual = _changes(work, base)
+    if actual != sorted(expected):
+        raise DeliveryError('the worktree changed between the pre-add proof and staging: '
+                            f'{actual!r} instead of {sorted(expected)!r}')
+    fresh = project_config(context.repo)
+    _require_edition(fresh, expected=context.config.get('edition'))
+    _require_authorized(spec['paths'], fresh)
+    for name in actual:
+        _check_changed_path(work, name, spec['paths'], fresh)
+
+
+def _policy_paths(text, needle):
+    for line in text.splitlines():
+        if needle in line:
+            paths = []
+            for token in re.findall(r'`([^`]+)`', line):
+                candidate = token.strip().rstrip('/')
+                try:
+                    paths.append(_safe_rel(candidate))
+                except ValueError:
+                    continue
+            return paths or None
+    return None
+
+
+def _secret_patterns(text):
+    for line in text.splitlines():
+        if '秘密与隐私文件模式' in line:
+            return [token.strip() for token in re.findall(r'`([^`]+)`', line) if token.strip()]
+    return []
+
+
+def _secret_path(name, patterns):
+    import fnmatch
+    basename = name.rsplit('/', 1)[-1]
+    return any(fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(basename, pattern)
+               for pattern in patterns)
+
+
+def _overlaps(left, right):
+    return (left == right or left.startswith(right.rstrip('/') + '/')
+            or right.startswith(left.rstrip('/') + '/'))
+
+
+def _authorize_paths(paths, config):
+    """Refuse a plan outside the project's own written authorization.
+
+    A task path may not sit on, above or below a forbidden path: allowing
+    ``docs`` while ``docs/secret.txt`` is forbidden would authorize the secret
+    file by ancestor.
+    """
+    if config['allowed'] is None:
+        raise ValueError('cannot prove project authorization: docs/PROJECT.md has no '
+                         'backticked 允许改动路径 list')
+    for name in paths:
+        if _secret_path(name, config.get('secrets') or []):
+            raise ValueError(f'path {name!r} matches a project secret/private pattern')
+        for forbidden in config['forbidden']:
+            if _overlaps(name, forbidden):
+                raise ValueError(f'path {name!r} overlaps the forbidden path {forbidden!r} '
+                                 'in docs/PROJECT.md')
+        if not any(name == allowed or name.startswith(allowed + '/')
+                   for allowed in config['allowed']):
+            raise ValueError(f'path {name!r} is not authorized by docs/PROJECT.md')
+
+
+def _authorize_changed(name, allowed_paths, config):
+    """Every actual changed path is checked, not only the declared prefixes."""
+    if _secret_path(name, config.get('secrets') or []):
+        raise DeliveryError(f'privacy boundary: {name} matches a project secret/private '
+                            'pattern and cannot be reviewed or committed')
+    _check_changed_path_lexical(name, allowed_paths)
+    for forbidden in config['forbidden']:
+        if _overlaps(name, forbidden):
+            raise DeliveryError(f'scope violation: {name} overlaps the project-forbidden '
+                                f'path {forbidden}')
+
+
+# ------------------------------------------------------------------- path safety
+
+def _safe_rel(name):
+    """Reject every relative path that is ambiguous across platforms."""
+    if not isinstance(name, str) or not name:
+        raise ValueError('empty path')
+    if '\x00' in name:
+        raise ValueError('path contains a NUL byte')
+    if '\\' in name:
+        raise ValueError(f'path {name!r} contains a backslash separator')
+    if re.match(r'^[A-Za-z]:', name):
+        raise ValueError(f'path {name!r} is an absolute drive path')
+    if name.startswith('/'):
+        raise ValueError(f'path {name!r} is absolute')
+    if ':' in name:
+        raise ValueError(f'path {name!r} contains an ambiguous colon')
+    if any(char.isspace() for char in name):
+        raise ValueError(f'path {name!r} contains whitespace')
+    if any(char in name for char in '*?['):
+        raise ValueError(f'path {name!r} contains a glob character')
+    parts = name.split('/')
+    if any(part in ('', '.', '..') for part in parts):
+        raise ValueError(f'path {name!r} contains an empty, "." or ".." component')
+    if any(part in ('.git', '.orchestration') for part in parts):
+        raise ValueError(f'path {name!r} is a Git or orchestration-state path')
+    return name
+
+
+def _allowed(name, paths):
+    _safe_rel(name)
+    return any(name == allowed or name.startswith(allowed.rstrip('/') + '/')
+               for allowed in paths)
+
+
+def _allowed_paths(values):
+    return [_safe_rel(value.rstrip('/')) for value in values]
+
+
+def _branch_name(value):
+    if not isinstance(value, str) or not BRANCH_RE.match(value):
+        raise ValueError(f'invalid branch name {value!r}')
+    if '..' in value or value.endswith(('.lock', '.', '/')) or value.startswith('/'):
+        raise ValueError(f'invalid branch name {value!r}')
+    return value
+
+
+def _lstat(path):
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+
+
+def _check_changed_path_lexical(name, allowed):
+    _safe_rel(name)
+    if not _allowed(name, allowed):
+        raise DeliveryError(f'scope violation: {name} is outside the task paths')
+
+
+def _check_changed_path(work, name, allowed, config=None):
+    """Reject a changed path that is not an allowed regular file or deletion.
+
+    The project-forbidden rule is evaluated first and for the *actual* path, so
+    a forbidden nested file is reported as forbidden even when a broader task
+    prefix would otherwise allow it.
+    """
+    _safe_rel(name)
+    if config is not None:
+        if _secret_path(name, config.get('secrets') or []):
+            raise DeliveryError(f'privacy boundary: {name} matches a project secret pattern')
+        for forbidden in config['forbidden']:
+            if _overlaps(name, forbidden):
+                raise DeliveryError(f'forbidden path: {name} overlaps the project-forbidden '
+                                    f'path {forbidden}')
+    _check_changed_path_lexical(name, allowed)
+    import stat as _stat
+    current = work
+    for part in PurePosixPath(name).parts:
+        current = current / part
+        info = _lstat(current)
+        if info is None:
+            return  # deletion, or a directory that no longer exists
+        if _stat.S_ISLNK(info.st_mode):
+            raise DeliveryError(f'symlink change cannot be safely checked: {name}')
+        if current != work / name and not _stat.S_ISDIR(info.st_mode):
+            return
+    info = _lstat(work / name)
+    if info is None:
+        return
+    if not (_stat.S_ISREG(info.st_mode) or _stat.S_ISDIR(info.st_mode)):
+        raise DeliveryError(f'changed path is not a regular file: {name}')
+    if config is not None:
+        _authorize_changed(name, allowed, config)
+
+
+def _changes(path, base):
+    tracked = git(path, 'diff', '--no-ext-diff', '--no-renames', '--name-only', '-z', base, '--')
+    tracked += git(path, 'diff', '--cached', '--no-ext-diff', '--no-renames',
+                   '--name-only', '-z', base, '--')
+    untracked = git(path, 'ls-files', '--others', '--exclude-standard', '-z')
+    return sorted(set(os.fsdecode(x) for x in (tracked + untracked).split(b'\0') if x))
+
+
+def _fingerprint(path, base):
+    """Digest of the worktree state vs ``base``: content, type, mode and status."""
+    import stat as _stat
+    digest = hashlib.sha256()
+    digest.update(git(path, 'status', '--porcelain=v1', '-z'))
+    digest.update(git(path, 'diff', '--no-ext-diff', '--binary', '--no-renames', base, '--'))
+    digest.update(git(path, 'diff', '--cached', '--no-ext-diff', '--binary',
+                      '--no-renames', base, '--'))
+    for name in _changes(path, base):
+        file = path / name
+        digest.update(os.fsencode(name) + b'\0')
+        info = _lstat(file)
+        if info is None:
+            digest.update(b'M')
+        elif _stat.S_ISLNK(info.st_mode):
+            digest.update(b'L' + oct(info.st_mode).encode() + b'\0'
+                          + os.fsencode(os.readlink(file)))
+        elif _stat.S_ISREG(info.st_mode):
+            digest.update(b'F' + oct(info.st_mode).encode() + b'\0' + file.read_bytes())
+        else:
+            digest.update(b'X' + oct(info.st_mode).encode())
+    return digest.hexdigest()
+
+
+# ------------------------------------------------------------------- plan input
+
+def _task_spec(raw, known_ids):
+    """Validate one task; return a spec whose ``errors`` are isolated per task."""
+    errors = []
+    if not isinstance(raw, dict):
+        raise ValueError('a task must be a mapping')
+    ident = raw.get('id')
+    if not isinstance(ident, str) or not ident:
+        raise ValueError('task ids must be nonempty strings')
+    worktree, prompt = raw.get('worktree'), raw.get('prompt')
+    paths, verify, depends = raw.get('paths'), raw.get('verify'), raw.get('depends')
+    if not isinstance(worktree, str) or not worktree:
+        errors.append('task worktree required')
+    if not isinstance(prompt, str) or not prompt.strip():
+        errors.append('task prompt required')
+    allowed = []
+    if not isinstance(paths, list) or not paths:
+        errors.append('task paths must be a nonempty list')
+    else:
+        for value in paths:
+            allowed.append(_safe_rel(value.rstrip('/')))
+    commands = []
+    if not isinstance(verify, list) or not verify:
+        errors.append('verification must be a nonempty list of argv lists')
+    else:
+        for command in verify:
+            if (not isinstance(command, list) or not command
+                    or any(not isinstance(token, str) or not token for token in command)):
+                errors.append('verification entries must be nonempty argv lists')
+            else:
+                commands.append(list(command))
+    acceptance = raw.get('acceptance')
+    criteria = []
+    if (not isinstance(acceptance, list) or not acceptance
+            or any(not isinstance(item, str) or not item.strip() for item in acceptance)):
+        errors.append('task acceptance criteria required (nonempty list of strings)')
+    else:
+        criteria = [item.strip() for item in acceptance]
+    if not isinstance(depends, list) or any(not isinstance(dep, str) for dep in depends):
+        errors.append('depends must be a list of task ids')
+        depends = []
+    for dep in depends:
+        if dep not in known_ids or dep == ident:
+            raise ValueError(f'task {ident} has an unknown or self dependency {dep}')
+    return {'id': ident, 'raw': raw, 'worktree': worktree if isinstance(worktree, str) else '',
+            'prompt': prompt if isinstance(prompt, str) else '',
+            'paths': allowed, 'verify': commands, 'depends': depends,
+            'acceptance': criteria, 'errors': errors}
+
+
+def _plan_tasks(plan):
+    if not isinstance(plan, dict):
+        raise ValueError('plan must be a mapping')
+    if plan.get('merge') or plan.get('merge_into'):
+        raise DeliveryError(MERGE_REFUSAL)
+    tasks = plan.get('tasks')
+    if not isinstance(tasks, list) or not tasks:
+        raise ValueError('plan needs a nonempty tasks list')
+    ids = set()
+    for raw in tasks:
+        ident = raw.get('id') if isinstance(raw, dict) else None
+        if not isinstance(ident, str) or not ident or ident in ids:
+            raise ValueError('task ids must be nonempty and unique')
+        ids.add(ident)
+    specs = [_task_spec(raw, ids) for raw in tasks]
+    graph = {spec['id']: list(spec['depends']) for spec in specs}
+    seen, stack = set(), set()
+
+    def visit(node):
+        if node in stack:
+            raise ValueError(f'dependency cycle through {node}')
+        if node in seen:
+            return
+        stack.add(node)
+        for dep in graph[node]:
+            visit(dep)
+        stack.discard(node)
+        seen.add(node)
+
+    for node in graph:
+        visit(node)
+    # A worktree may be named through a symlinked parent, as /var is on macOS.
+    # Two strings that name one directory are one worktree: compare canonical
+    # identities so an alias cannot hide two tasks running in the same place.
+    identities = [_canonical(spec['worktree']) for spec in specs if spec['worktree']]
+    if len(set(identities)) != len(identities):
+        raise ValueError('two tasks share one worktree')
+    return specs
+
+
+def _load_plan_file(path):
+    return json.loads(Path(path).read_text(encoding='utf-8'))
+
+
+def _plan_worktrees(path):
+    """The task worktrees a plan file names, read as data with no Git process.
+
+    The halt boundary has to include every task worktree before the run loads
+    the plan, and the CLI may not query the carrier to learn them. A plan that
+    cannot be read is not treated as naming no worktrees: the caller stops
+    instead of halting on a boundary it cannot prove.
+    """
+    plan = _load_plan_file(path)
+    tasks = plan.get('tasks') if isinstance(plan, dict) else None
+    if not isinstance(tasks, list):
+        raise ValueError('plan needs a nonempty tasks list')
+    return [task.get('worktree') for task in tasks
+            if isinstance(task, dict) and isinstance(task.get('worktree'), str)]
+
+
+def gh_run(argv):
+    """Default GitHub CLI runner: capture output, never a shell."""
+    return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True, timeout=120)
+
+
+def _gh_json(args, runner):
+    result = runner(['gh', *args])
+    if result.returncode != 0:
+        raise DeliveryError(f'gh {" ".join(args)} failed with exit code {result.returncode}')
+    try:
+        data = json.loads(result.stdout)
+    except ValueError as exc:
+        raise DeliveryError(f'gh returned unreadable JSON: {exc}') from exc
+    if not isinstance(data, dict):
+        raise DeliveryError('gh returned an unexpected payload')
+    return data
+
+
+def _section(text, heading):
+    match = re.search(r'^##+\s+' + re.escape(heading) + r'\s*$', text, re.MULTILINE)
+    if not match:
+        return None
+    body = text[match.end():]
+    stop = re.search(r'^##+\s+', body, re.MULTILINE)
+    return body[:stop.start()] if stop else body
+
+
+def load_issue_plan(number, repo, *, worktree, verify, acceptance, allows=(), instruction='',
+                    runner=gh_run):
+    """Build a prepare-only plan from the live Issue, not a hand-copied snapshot."""
+    if not isinstance(number, int) or number < 1:
+        raise ValueError('issue number must be a positive integer')
+    if not acceptance:
+        raise ValueError('--acceptance is required: an issue plan needs stated criteria')
+    data = _gh_json(['issue', 'view', str(number), '--repo', repo,
+                     '--json', 'number,title,body,state,url,labels'], runner)
+    if data.get('state') != 'OPEN':
+        raise DeliveryError(f'carrier issue #{number} is {data.get("state")}, not OPEN')
+    body = data.get('body') or ''
+    section = _section(body, '可改路径')
+    if section is None:
+        raise DeliveryError(f'carrier issue #{number} has no 可改路径 section')
+    candidates = []
+    for token in re.findall(r'`([^`\n]+)`', section):
+        try:
+            candidates.append(_safe_rel(token.strip().rstrip('/')))
+        except ValueError:
+            continue  # prose, commands and idioms are not paths
+    if not candidates:
+        raise DeliveryError(f'carrier issue #{number} lists no usable paths')
+    if allows:
+        narrowed = _allowed_paths(allows)
+        for allow in narrowed:
+            if not any(allow == item or allow.startswith(item.rstrip('/') + '/')
+                       for item in candidates):
+                raise DeliveryError(f'narrowed path {allow} is not inside the issue scope')
+        paths = narrowed
+    else:
+        paths = candidates
+    commands = []
+    for value in verify:
+        command = json.loads(value)
+        if (not isinstance(command, list) or not command
+                or any(not isinstance(token, str) or not token for token in command)):
+            raise ValueError('--verify must be a nonempty JSON argv list')
+        commands.append(command)
+    if not commands:
+        raise ValueError('--verify is required: this tool never invents a check')
+    prompt = f'Issue #{number}: {data.get("title", "")}\n\n{body}'
+    if instruction:
+        prompt += f'\n\nAdditional instruction from the operator:\n{instruction}'
+    carrier = {'kind': 'issue', 'repo': repo, 'number': number,
+               'url': data.get('url'), 'digest': hashlib.sha256(body.encode()).hexdigest(),
+               'labels': sorted(label.get('name', '') for label in data.get('labels') or [])}
+    return {'carrier': carrier, 'merge': False, 'tasks': [{
+        'id': f'issue-{number}', 'worktree': worktree, 'prompt': prompt,
+        'paths': paths, 'verify': commands, 'acceptance': list(acceptance), 'depends': []}]}
+
+
+def verify_carrier(carrier, runner=gh_run):
+    """Re-read the live carrier before work starts; a stale snapshot fails closed."""
+    if not isinstance(carrier, dict) or carrier.get('kind') != 'issue':
+        raise ValueError('carrier must be a mapping of kind "issue"')
+    number, repo = carrier.get('number'), carrier.get('repo')
+    digest = carrier.get('digest')
+    if not isinstance(number, int) or not isinstance(repo, str) or not repo:
+        raise ValueError('carrier needs an integer number and a repo')
+    if not isinstance(digest, str) or not DIGEST_RE.match(digest):
+        raise ValueError('carrier digest must be a sha256 hex digest')
+    data = _gh_json(['issue', 'view', str(number), '--repo', repo,
+                     '--json', 'state,body,url'], runner)
+    if data.get('state') != 'OPEN':
+        raise DeliveryError(f'carrier issue #{number} is not open')
+    if hashlib.sha256((data.get('body') or '').encode()).hexdigest() != digest:
+        raise DeliveryError('carrier issue changed after the plan was written')
+    return data.get('url')
+
+
+# ------------------------------------------------------------------- journal I/O
+
+def _save(path, state):
+    fd, tmp = tempfile.mkstemp(prefix='.delivery-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            json.dump(state, handle, ensure_ascii=False, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _lock(path):
+    """Exclusive non-blocking lock; lazy import keeps Windows importable."""
+    handle = open(path, 'a+b')
+    try:
+        try:
+            import fcntl
+        except ImportError:
+            try:
+                import msvcrt
+            except ImportError:
+                raise DeliveryError('no cross-process file lock on this platform; '
+                                    'refusing to run') from None
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        raise DeliveryError(f'resource is locked by another runner: {exc}') from None
+    except DeliveryError:
+        handle.close()
+        raise
+    return handle
+
+
+def _journal_lock_path(state_path):
+    """The journal's own lock file, derived from its path; no Git process."""
+    journal = _canonical(state_path)
+    return journal.parent / (
+        '.agentorch-delivery-' + hashlib.sha256(str(journal).encode()).hexdigest()[:24]
+        + '.lock')
+
+
+def _journal_path(state_path):
+    """The validated absolute journal path; starts no Git or carrier process."""
+    path = Path(state_path).absolute()
+    if path.is_symlink() or not path.parent.is_dir():
+        raise ValueError('state must be a regular file path in an existing directory')
+    return path.resolve()
+
+
+# A Git location override makes the `.git` entry a filesystem walk relies on
+# irrelevant: Git may resolve a different directory, or a worktree whose root
+# carries no `.git` entry at all. Any of these makes the location unprovable
+# without starting Git, which the halt path must never do.
+_GIT_LOCATION_OVERRIDES = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR')
+
+# Git's worktree root is the directory holding the `.git` entry unless
+# `core.worktree` moves it. That value is honored only from the repository
+# config and, with `extensions.worktreeConfig`, from the per-worktree
+# `config.worktree`; the global config, `-c`, `GIT_CONFIG_*` and included files
+# do not move the root during Git's worktree setup. The files below are
+# therefore the ones a filesystem proof has to read, and anything it cannot
+# interpret with confidence fails closed instead of assuming "no relocation".
+# That includes a value written with Git's quoting or escape syntax: this
+# reader does not implement `parse_value`, so such a value is refused rather
+# than approximated.
+_GIT_CONFIG_INCLUDE_SECTIONS = ('include', 'includeif')
+_GIT_CONFIG_NAME = re.compile(r'[a-z0-9][a-z0-9-]*\Z')
+
+
+def _unprovable_boundary(detail):
+    return ValueError(
+        'cannot prove the journal is outside the repository and every task '
+        f'worktree from the filesystem: {detail}; starting Git to ask would run '
+        'the very helpers this proof must precede, so nothing may start')
+
+
+def _locate_git_entry(path):
+    """The nearest ancestor holding a `.git` entry, as ``(root, entry)``.
+
+    A main worktree carries a `.git` directory, a linked one or a submodule a
+    `.git` file naming its git directory; either way the enclosing directory is
+    the root Git reports unless the repository config relocates it. A dangling
+    or unreadable entry is not "no entry": it fails closed, because Git might
+    still resolve a root this walk cannot see. ``(None, None)`` means no
+    ancestor carries an entry at all.
+    """
+    current = Path(path).resolve()
+    for candidate in (current, *current.parents):
+        entry = candidate / '.git'
+        if entry.is_symlink() or entry.exists():
+            return candidate, entry
+    return None, None
+
+
+def _resolve_gitdir(entry):
+    """The Git directory the ``.git`` entry names, read as data.
+
+    A directory is the git directory itself; a file must hold a ``gitdir:``
+    pointer (relative to the entry). A malformed or unreadable entry fails
+    closed: without its git directory there is no config file to inspect.
+    """
+    if entry.is_dir():
+        return entry.resolve()
+    if not entry.is_file():
+        raise _unprovable_boundary(
+            f'the Git entry {entry} is neither a directory nor a gitfile')
+    try:
+        text = entry.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _unprovable_boundary(
+            f'the Git entry {entry} cannot be read ({exc})') from None
+    lines = text.splitlines()
+    if len(lines) != 1:
+        raise _unprovable_boundary(
+            f'the Git entry {entry} does not hold a single gitdir pointer')
+    line = lines[0].strip()
+    if not line.startswith('gitdir:'):
+        raise _unprovable_boundary(f'the Git entry {entry} is not a gitdir pointer')
+    target = line[len('gitdir:'):].strip()
+    if not target:
+        raise _unprovable_boundary(f'the Git entry {entry} names no git directory')
+    path = Path(target)
+    if not path.is_absolute():
+        path = entry.parent / path
+    return path.resolve()
+
+
+def _git_config_continuation(current, path):
+    """Whether ``current``'s odd trailing backslash continues the next line.
+
+    Git joins physical lines only while its value parser reads them: one
+    backslash immediately before the newline continues the value, but a
+    backslash sitting in a comment is comment text and the newline ends both
+    the comment and the line. A section header or a key name never continues;
+    Git reports such a file as a bad config. So the trailing backslash is a
+    continuation only in a value, and the value case is the only one this
+    reader proves here. A comment (at the start of a line, after a section
+    header, or inline after a value) ends the line, while any other context is
+    refused rather than guessed at.
+    """
+    trailing = len(current) - len(current.rstrip('\\'))
+    body = current[:len(current) - trailing]
+    section = quoted = escaped = comment = value = after_section = False
+    only_space = True
+    for char in body:
+        if comment:
+            continue
+        if escaped:
+            escaped = False
+            only_space = after_section = False
+            continue
+        if quoted:
+            if char == '\\':
+                escaped = True
+            elif char == '"':
+                quoted = False
+            continue
+        if char == '\\':
+            escaped = True
+            only_space = after_section = False
+            continue
+        if char in ' \t':
+            continue
+        if char == '"':
+            quoted = True
+            only_space = after_section = False
+            continue
+        if section:
+            only_space = False
+            if char == ']':
+                section, after_section = False, True
+            continue
+        if char in '#;':
+            if only_space or value or after_section:
+                comment = True
+                continue
+            raise _unprovable_boundary(
+                f'the Git config {path} has a comment where Git expects a '
+                'variable, so the line a trailing backslash continues is '
+                'unknown')
+        if char == '[' and only_space:
+            section = True
+            only_space = after_section = False
+            continue
+        if char == '=':
+            value = True
+        only_space = after_section = False
+    if comment:
+        return False
+    if section:
+        raise _unprovable_boundary(
+            f'the Git config {path} continues a section header across a line, '
+            'which Git rejects')
+    if not value:
+        raise _unprovable_boundary(
+            f'the Git config {path} continues a line outside a value, which '
+            'Git rejects')
+    return True
+
+
+def _git_config_logical_lines(raw, path):
+    """Decode a Git config file and join its backslash continuations.
+
+    A line ends at ``\\n`` and one ``\\r`` before it is dropped, which is how
+    Git's own reader splits the file. Every other character that
+    ``str.splitlines`` would treat as a line break stays inside the line here,
+    so it is decoded as the whitespace Git decodes it as (or refused), instead
+    of starting a new variable and silently shortening the value above it.
+
+    A backslash only continues a line when Git's value parser would join it;
+    a trailing backslash in a comment is comment text, and joining it would
+    drop the following line into the comment. ``_git_config_continuation``
+    decides that context and refuses what cannot be proved.
+    """
+    try:
+        text = raw.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise _unprovable_boundary(
+            f'the Git config {path} is not UTF-8 ({exc})') from None
+    logical, current = [], ''
+    pieces = text.split('\n')
+    for index, piece in enumerate(pieces):
+        if index < len(pieces) - 1 and piece.endswith('\r'):
+            piece = piece[:-1]
+        current += piece
+        if (len(current) - len(current.rstrip('\\'))) % 2:
+            if _git_config_continuation(current, path):
+                current = current[:-1]
+                continue
+        logical.append(current)
+        current = ''
+    if current:
+        raise _unprovable_boundary(f'the Git config {path} ends inside a continued line')
+    return logical
+
+
+def _git_config_section(line, path):
+    """The section name, its subsection, and any remainder after the ``]``.
+
+    Git accepts a variable on the same line as its section header
+    (``[core] worktree = ...``), so the remainder is returned to be parsed as
+    one instead of being dropped. The subsection is returned separately
+    because it is part of the key: ``[core "unused"] worktree`` is
+    ``core.unused.worktree``, which is not ``core.worktree``. Only its
+    presence is used; a header whose subsection this reader cannot delimit
+    exactly (an escape inside it, or the deprecated ``[section.subsection]``
+    spelling this reader rejects as a section name) fails closed.
+    """
+    quoted, end = False, None
+    for index in range(1, len(line)):
+        char = line[index]
+        if char == '"':
+            quoted = not quoted
+        elif char == ']' and not quoted:
+            end = index
+            break
+    if end is None:
+        raise _unprovable_boundary(f'the Git config {path} has an unterminated section')
+    inner = line[1:end].strip()
+    name, separator, rest = inner.partition('"')
+    name = name.strip()
+    if not _GIT_CONFIG_NAME.match(name):
+        raise _unprovable_boundary(
+            f'the Git config {path} has a section name this reader cannot '
+            f'interpret: {name!r}')
+    subsection = None
+    if separator:
+        if '\\' in inner or not rest.endswith('"') or '"' in rest[:-1]:
+            raise _unprovable_boundary(
+                f'the Git config {path} has a subsection this reader cannot '
+                'interpret')
+        subsection = rest[:-1]
+    return name, subsection, line[end + 1:]
+
+
+def _git_config_value(text, path, key):
+    """The value of a key the proof has to act on, or a refusal.
+
+    Git's ``parse_value`` is a grammar this reader does not implement: it
+    resolves quotes and backslash escapes and decides for itself which
+    whitespace belongs to the value. Reading a path with a partial imitation is
+    how one gets mis-resolved -- ``"/path/root "`` keeps a trailing space a
+    trim would drop, and ``/path/\\\\root`` decodes to fewer characters than the
+    file shows -- so the boundary could end up comparing the journal with a
+    directory that is not the worktree. Only an unquoted token with no internal
+    whitespace, quote or backslash is taken as written; every other value fails
+    closed instead of being approximated.
+    """
+    cut = len(text)
+    for index, char in enumerate(text):
+        if char in '#;':
+            cut = index
+            break
+    body = text[:cut]
+    if '"' in body or '\\' in body:
+        raise _unprovable_boundary(
+            f'the Git config {path} sets {key} with a quote or escape this '
+            'reader does not decode, so the exact path it names is unknown')
+    body = body.strip(' \t')
+    if any(char.isspace() for char in body):
+        raise _unprovable_boundary(
+            f'the Git config {path} sets {key} with whitespace this reader does '
+            'not decode, so the exact path it names is unknown')
+    return body
+
+
+def _git_config_entries(path):
+    """The ordered ``(section, subsection, name, raw value)`` entries of one file.
+
+    ``subsection`` is ``None`` for a plain section and the subsection text
+    otherwise, so a caller matching a key never confuses ``core.worktree`` with
+    ``core.unused.worktree``. ``path`` may be missing, which contributes
+    nothing. A value is kept as the raw text after ``=`` and only decoded when
+    a call site acts on it, because that decode refuses what it cannot
+    reproduce exactly while unrelated keys (`user.name`, a remote URL) must not
+    make the whole config unreadable. Parsing itself raises ``ValueError`` for
+    anything this reader cannot interpret: Git accepts more syntax than it
+    does, and "not understood" must never be treated as "no relocation".
+    """
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise _unprovable_boundary(
+            f'the Git config {path} cannot be read ({exc})') from None
+    entries, section, subsection = [], None, None
+    for line in _git_config_logical_lines(raw, path):
+        stripped = line.lstrip(' \t')
+        if not stripped or stripped[0] in '#;':
+            continue
+        if stripped[0] == '[':
+            section, subsection, remainder = _git_config_section(stripped, path)
+            stripped = remainder.lstrip(' \t')
+            if not stripped or stripped[0] in '#;':
+                continue
+        name, separator, remainder = stripped.partition('=')
+        name = name.strip().lower()
+        if not name:
+            raise _unprovable_boundary(f'the Git config {path} has an unnamed variable')
+        if section is None:
+            section_name, _, variable = name.partition('.')
+            if not variable:
+                raise _unprovable_boundary(
+                    f'the Git config {path} has an unrecognized top-level '
+                    f'variable {name!r}')
+        else:
+            section_name, variable = section, name
+        if not (_GIT_CONFIG_NAME.match(section_name)
+                and _GIT_CONFIG_NAME.match(variable)):
+            raise _unprovable_boundary(
+                f'the Git config {path} has a variable this reader cannot '
+                f'interpret: {name!r}')
+        value = remainder if separator else 'true'
+        entries.append((section_name, subsection, variable, value))
+    return entries
+
+
+def _config_value(entries, section, variable):
+    """The last raw value Git would use for a plain-section key, or ``None``.
+
+    A key under a subsection is a different key, so those entries never match:
+    `[core "unused"] worktree` cannot move the root `[core] worktree` names.
+    """
+    value = None
+    for entry_section, entry_subsection, entry_variable, entry_value in entries:
+        if (entry_section == section and entry_subsection is None
+                and entry_variable == variable):
+            value = entry_value
+    return value
+
+
+def _config_bool(value, path, key):
+    lowered = _git_config_value(value, path, key).lower()
+    if lowered in ('true', 'yes', 'on', '1', ''):
+        return True
+    if lowered in ('false', 'no', 'off', '0'):
+        return False
+    raise _unprovable_boundary(
+        f'the Git config {path} sets {key} to a value this reader cannot '
+        f'interpret: {value!r}')
+
+
+def _resolve_core_worktree(gitdir_, value, source):
+    """The root ``core.worktree`` relocates to, relative to the git directory."""
+    if not value:
+        raise _unprovable_boundary(f'{source} sets core.worktree to an empty path')
+    path = Path(value)
+    if not path.is_absolute():
+        path = gitdir_ / path
+    return path.resolve()
+
+
+def _git_worktree_roots(root, entry):
+    """Every filesystem root Git may report as ``root``'s worktree, as data.
+
+    The directory holding the ``.git`` entry is one; a ``core.worktree`` the
+    repository config honors is another. The value is honored for a main
+    worktree from the common config (``$GIT_DIR/config``) and for any worktree
+    from ``$GIT_DIR/config.worktree`` once ``extensions.worktreeConfig`` is on.
+    A linked worktree ignores the common config's value, whose relative path
+    would resolve against the wrong directory. Only the plain `core` and
+    `extensions` sections carry these keys: the same name under a subsection is
+    a different key (`core.unused.worktree`), so it moves nothing. A value
+    spelled with Git's quoting or escape syntax is not decoded here and fails
+    closed. Every file this depends on is read directly -- never through Git --
+    and anything it cannot interpret fails closed.
+    """
+    roots = [root]
+    gitdir_ = _resolve_gitdir(entry)
+    if not gitdir_.is_dir():
+        raise _unprovable_boundary(f'the Git directory {gitdir_} does not exist')
+    common = gitdir_
+    pointer = gitdir_ / 'commondir'
+    if pointer.exists():
+        try:
+            text = pointer.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError) as exc:
+            raise _unprovable_boundary(
+                f'the Git common-directory pointer {pointer} cannot be read '
+                f'({exc})') from None
+        lines = text.splitlines()
+        if len(lines) != 1 or not lines[0].strip():
+            raise _unprovable_boundary(
+                f'the Git common-directory pointer {pointer} does not hold a '
+                'single path')
+        common = Path(lines[0].strip())
+        if not common.is_absolute():
+            common = gitdir_ / common
+        common = common.resolve()
+        if not common.is_dir():
+            raise _unprovable_boundary(
+                f'the Git common directory {common} does not exist')
+    config = common / 'config'
+    entries = _git_config_entries(config)
+    for section, _, _, _ in entries:
+        if section in _GIT_CONFIG_INCLUDE_SECTIONS:
+            raise _unprovable_boundary(
+                f'the Git config {config} includes another file, whose conditions '
+                'cannot be evaluated without Git')
+    if common == gitdir_:
+        relocated = _config_value(entries, 'core', 'worktree')
+        if relocated is not None:
+            roots.append(_resolve_core_worktree(
+                gitdir_,
+                _git_config_value(relocated, config, 'core.worktree'),
+                config))
+    extension = _config_value(entries, 'extensions', 'worktreeconfig')
+    if extension is not None and _config_bool(
+            extension, config, 'extensions.worktreeConfig'):
+        local = gitdir_ / 'config.worktree'
+        local_entries = _git_config_entries(local)
+        for section, _, _, _ in local_entries:
+            if section in _GIT_CONFIG_INCLUDE_SECTIONS:
+                raise _unprovable_boundary(
+                    f'the Git config {local} includes another file, whose '
+                    'conditions cannot be evaluated without Git')
+        relocated = _config_value(local_entries, 'core', 'worktree')
+        if relocated is not None:
+            roots.append(_resolve_core_worktree(
+                gitdir_,
+                _git_config_value(relocated, local, 'core.worktree'),
+                local))
+    return roots
+
+
+def _worktree_boundary(path, *, strict):
+    """The resolved path plus every root Git may treat as its worktree."""
+    resolved = Path(path).resolve(strict=strict)
+    boundary = [resolved]
+    root, entry = _locate_git_entry(resolved)
+    if root is not None:
+        boundary.extend(_git_worktree_roots(root, entry))
+    return boundary
+
+
+def _prove_journal_outside(state_path, repo, worktrees=()):
+    """Refuse a journal inside the repository or a task worktree, without Git.
+
+    ``run`` is given a repository path that may be a subdirectory of the
+    worktree, and the task-worktree boundary used to be checked only after a
+    halt write. Each boundary is therefore the resolved path itself *and* every
+    root Git may report for it, found from the filesystem so no Git process
+    (and no ``core.fsmonitor`` helper inside it) starts. The root is the
+    directory holding the ``.git`` entry unless that repository's own config
+    relocates it with ``core.worktree``; that value is read from the two config
+    files Git honors for worktree setup, and any part of the metadata or config
+    this reader cannot interpret fails closed rather than being assumed absent.
+
+    With ``GIT_DIR``/``GIT_WORK_TREE``/``GIT_COMMON_DIR`` set, the ``.git``
+    entry the walk depends on is not authoritative at all: Git may resolve a
+    separate metadata directory, and a worktree root can then carry no ``.git``
+    entry. That is unprovable from the filesystem, so it fails closed here.
+    """
+    overrides = [name for name in _GIT_LOCATION_OVERRIDES if os.environ.get(name)]
+    if overrides:
+        raise ValueError(
+            'cannot prove the journal is outside the repository and every task '
+            f'worktree from the filesystem while {", ".join(overrides)} is set: a '
+            'separate Git directory hides the worktree root, so unset it and run '
+            'again')
+    journal = Path(state_path).resolve()
+    if any(journal.is_relative_to(path)
+           for path in _worktree_boundary(repo, strict=True)):
+        raise ValueError('state must be outside the repository')
+    for worktree in worktrees:
+        if not worktree:
+            continue
+        if any(journal.is_relative_to(path)
+               for path in _worktree_boundary(worktree, strict=False)):
+            raise ValueError('state must be outside every task worktree')
+
+
+def _journal_shape_error(detail):
+    return RunHaltError(
+        f'the state journal {detail}; whether it records a timed-out check cannot '
+        'be proved, so nothing may start until it is inspected manually')
+
+
+def _journal_timeout(state):
+    """The first saved record whose verification recorded a timeout, or ``None``.
+
+    This reads the journal as data. It starts no Git process, no Agent, no
+    profile query and no carrier query, so it can run before any of them. A
+    structure it cannot scan reliably is not treated as "no timeout": a journal
+    with a task list instead of a mapping, or a non-mapping record or check, is
+    exactly the case where a recorded timeout could be hidden from the scan.
+    It therefore fails closed before any external call can start.
+    """
+    if not isinstance(state, dict):
+        raise _journal_shape_error('is not a JSON object')
+    tasks = state.get('tasks')
+    if not isinstance(tasks, dict):
+        raise _journal_shape_error('does not hold a task mapping')
+    for ident in sorted(tasks):
+        record = tasks[ident]
+        if not isinstance(record, dict):
+            raise _journal_shape_error(f'holds a non-mapping record for task {ident}')
+        checks = record.get('verification')
+        if checks is None:
+            continue
+        if not isinstance(checks, list):
+            raise _journal_shape_error(
+                f'holds a non-list verification for task {ident}')
+        for check in checks:
+            if not isinstance(check, dict):
+                raise _journal_shape_error(
+                    f'holds a non-mapping verification check for task {ident}')
+            if check.get('timeout'):
+                return ident, record
+    return None
+
+
+def _timeout_halt_reason(ident):
+    return (f'the journal records that a verification check for task {ident} timed '
+            'out; its process tree may still be running, so the run cannot resume or '
+            'continue')
+
+
+def _halt_saved_approvals(state, reason):
+    """Block every approval saved in the journal, not only this process's.
+
+    A journal-level stop can be the first thing a new process sees: the runner
+    that recorded the timeout may have died before writing the halted-run
+    state, so an approval saved by that process is on disk but absent from this
+    one's ``approved`` set. The same write invalidates both, because the failure
+    that stopped the run makes re-proving any of them impossible without the
+    Git reads, profile queries and Agents the stop forbids.
+    """
+    for ident in sorted(state['tasks']):
+        record = state['tasks'][ident]
+        if not isinstance(record, dict) or record.get('status') != TERMINAL_OK:
+            continue
+        record.update(status='BLOCKED', reason=reason(ident))
+
+
+def _halt_timeout_records(state, ident, record, exc):
+    message = str(exc)
+    _halt_saved_approvals(
+        state,
+        lambda other: (f'the run stopped when task {ident} timed out: {message}; a '
+                       'surviving process tree may have changed any worktree, so the '
+                       'approval is no longer supportable'))
+    record.update(status=exc.status, reason=message)
+
+
+def _halt_shared_records(state, ident, record, exc):
+    message = str(exc)
+    _halt_saved_approvals(
+        state,
+        lambda other: (f'the shared project gate failed while task {ident} was being '
+                       f'processed: {message}; every live approval depends on that gate'))
+    record.update(status=exc.status, reason=message)
+
+
+def _halt_saved_timeout(state_path, task_ids=(), *, repo, worktrees=()):
+    """Stop before anything external when the journal already records a timeout.
+
+    The check has to precede ``_root``, ``_status``, the carrier query, every
+    worktree probe and lock acquisition: each of them is a Git or ``gh`` process
+    that can run a configured ``core.fsmonitor`` helper, and a process tree left
+    behind by the timed-out check may still write any worktree. Only the journal
+    file and its own lock are touched, and the boundary is proved before either:
+    the journal is never rewritten or locked while it sits inside the repository
+    or a task worktree, and a boundary that cannot be proved stops the run
+    instead of being written around. That proof is made before the journal is
+    even read, so it does not depend on whether the journal holds a recognizable
+    timeout: a caller's next step is an external call either way. An existing
+    journal that cannot be read or parsed is not the same as a missing one --
+    whether it records a timeout cannot be proved -- so it fails closed before
+    any Git or ``gh`` call. The journal is re-read under the lock so a concurrent
+    writer's state is what gets halted, and the halted state is saved before
+    returning. ``None`` means no record carries a timeout, so the caller may
+    continue.
+    """
+    path = Path(state_path)
+    _prove_journal_outside(path, repo, worktrees)
+    try:
+        peek = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise RunHaltError(
+            f'the state journal at {path} exists but cannot be read as state '
+            f'({exc}); whether it records a timed-out check cannot be proved, so '
+            'nothing may start until it is inspected manually') from None
+    if _journal_timeout(peek) is None:
+        return None
+    try:
+        handle = _lock(_journal_lock_path(path))
+    except DeliveryError as exc:
+        raise RunHaltError(
+            'the journal may record a timed-out verification check and is locked by '
+            f'another runner ({exc}); nothing may start until the host is inspected '
+            'manually') from None
+    try:
+        try:
+            state = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            state = None
+        found = _journal_timeout(state) if state is not None else None
+        if found is None:
+            # The journal changed between the two reads, so there is no record
+            # left to halt. The timeout may still have a live tree, so fail
+            # closed instead of continuing on a journal that moved.
+            raise RunHaltError(
+                'the journal changed while its recorded timeout was being halted; '
+                'inspect the host manually before running again')
+        ident, record = found
+        for task in task_ids:
+            state['tasks'].setdefault(task, {'status': 'PENDING'})
+        exc = RunHaltError(_timeout_halt_reason(ident))
+        _halt_timeout_records(state, ident, record, exc)
+        try:
+            _save(path, state)
+        except OSError as write_error:
+            raise RunHaltError(
+                f'{exc}; the journal could not be written ({write_error}), so it is '
+                'not reliably persisted and the run is stopped') from None
+        return state
+    finally:
+        handle.close()
+
+
+def _lock_dir(repo):
+    """Stable per-repository lock directory, independent of TMPDIR."""
+    directory = _common(repo) / 'agentorch-delivery-locks'
+    directory.mkdir(exist_ok=True)
+    return directory
+
+
+def _canonical(path):
+    """Resolve aliases (including a symlinked parent) to one lock identity."""
+    return Path(path).resolve()
+
+
+def lock_targets(repo, state_path, specs):
+    """Every worktree and journal the run writes must be exclusively ours."""
+    directory = _lock_dir(repo)
+    targets = {'repo', 'journal'}
+    for spec in specs:
+        if spec.get('worktree'):
+            targets.add(str(_canonical(spec['worktree'])))
+    return directory, sorted(targets)
+
+
+def acquire_locks(repo, state_path, specs):
+    directory, targets = lock_targets(repo, state_path, specs)
+    journal_lock = _journal_lock_path(state_path)
+    keys = [('repo', str(_common(repo)))]
+    for value in targets:
+        if value not in ('repo', 'journal'):
+            keys.append(('worktree', value))
+    handles = []
+    try:
+        paths = [journal_lock]
+        for kind, value in sorted(keys):
+            key = hashlib.sha256((kind + '\0' + value).encode()).hexdigest()[:24]
+            paths.append(directory / f'{key}.lock')
+        for path in sorted(set(paths)):
+            handles.append(_lock(path))
+    except BaseException:
+        for handle in handles:
+            handle.close()
+        raise
+    return handles
+
+
+def _pid_alive_windows(pid):
+    """Ask Windows whether the recorded process object is still running.
+
+    ``os.kill(pid, 0)`` is not a liveness probe on Windows: any signal other
+    than a console event calls ``TerminateProcess``, so it would kill the very
+    process the resume gate is asking about. Read the process object instead.
+    A handle that Windows cannot open is reported dead only for the exact
+    "no such process" error; access denied (the process exists but belongs to
+    someone else) and every unexpected result stay ``None`` so the caller keeps
+    refusing to resume. A process object that is still open but already exited
+    is signalled, and one whose PID was reused by an unrelated live process is
+    reported alive — refusing the resume is the safe reading of both.
+    """
+    import ctypes
+
+    ERROR_INVALID_PARAMETER = 87
+    SYNCHRONIZE = 0x00100000
+    WAIT_OBJECT_0 = 0
+    WAIT_TIMEOUT = 258
+    try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.OpenProcess(SYNCHRONIZE, 0, pid)
+        if not handle:
+            # A PID that names no process object is the only answer that may let
+            # a later process resume; everything else is "possibly alive".
+            return False if ctypes.get_last_error() == ERROR_INVALID_PARAMETER else None
+        try:
+            state = kernel32.WaitForSingleObject(handle, 0)
+        finally:
+            kernel32.CloseHandle(handle)
+    except (AttributeError, OSError, ValueError):
+        # A ctypes binding that does not work here proves nothing about the
+        # process, so it must not authorize a resume.
+        return None
+    if state == WAIT_TIMEOUT:
+        return True
+    if state == WAIT_OBJECT_0:
+        return False
+    return None
+
+
+def _pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    if os.name == 'nt':  # os.kill would terminate the process on Windows
+        return _pid_alive_windows(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+# ---------------------------------------------------------------- OpenCode run
+
+def _classify_stream(returncode, output):
+    """Accept only a single-session stream that ends with a clean stop.
+
+    Real tool-using runs contain several steps: an intermediate step_finish
+    carries ``tool-calls`` and is followed by another step_start. Only a
+    ``stop`` finish is terminal, and nothing may follow it.
+    """
+    unknown = {'exit_code': None, 'session_id': None, 'text': '',
+               'detail': 'stream is not a completed single-session run'}
+    if returncode != 0:
+        return dict(unknown, detail=f'OpenCode exit code {returncode}')
+    if not output.strip():
+        return dict(unknown, detail='OpenCode produced no events')
+    session, text = None, []
+    started = terminal = False
+    in_step = False
+    try:
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if not isinstance(event, dict) or terminal:
+                return dict(unknown, detail='event after the terminal stop')
+            sid = event.get('sessionID')
+            if not isinstance(sid, str) or not sid.startswith('ses_'):
+                return dict(unknown, detail='event without a usable session id')
+            if session is not None and session != sid:
+                return dict(unknown, detail='more than one session in the stream')
+            session = sid
+            part = event.get('part')
+            if part is not None and not isinstance(part, dict):
+                return dict(unknown, detail='event part is not an object')
+            part = part or {}
+            if part.get('sessionID') not in (None, sid):
+                return dict(unknown, detail='event part names another session')
+            kind = event.get('type')
+            if kind == 'step_start':
+                if in_step:
+                    return dict(unknown, detail='step_start inside a running step')
+                in_step, started = True, True
+            elif kind in ('text', 'tool_use', 'tool'):
+                if not in_step:
+                    return dict(unknown, detail='output event outside a step')
+                if kind == 'text':
+                    text.append(part.get('text') or '')
+            elif kind == 'step_finish':
+                if not in_step:
+                    return dict(unknown, detail='step_finish without a running step')
+                in_step = False
+                reason = part.get('reason')
+                if reason == 'stop':
+                    terminal = True
+                elif reason not in ('tool-calls', 'tool_calls'):
+                    return dict(unknown, detail=f'unrecognized finish reason {reason!r}')
+            else:
+                return dict(unknown, detail=f'unexpected event type {kind!r}')
+    except (ValueError, TypeError, AttributeError):
+        return dict(unknown, detail='stream is not readable JSON events')
+    if not started:
+        return dict(unknown, detail='stream never started a step')
+    if in_step:
+        return dict(unknown, detail='stream ended inside a step')
+    if not terminal:
+        return dict(unknown, detail='stream ended without a stop finish')
+    return {'exit_code': returncode, 'session_id': session, 'text': ''.join(text),
+            'detail': 'ok'}
+
+
+KILL_GRACE = 30
+
+
+def _kill_group(process):
+    """Attempt to stop the check's process group; return ``(issued, pgid)``.
+
+    This is the **attempt**, not the proof. ``issued`` only says a termination
+    was sent: on POSIX a ``SIGKILL`` reached the process group (``pgid`` is that
+    group id); on Windows ``taskkill /T`` reported success and the direct child
+    was killed as well (``pgid`` is ``None``). Neither value says the tree is
+    gone — ``_prove_group_stopped`` performs that separate check.
+    """
+    if os.name == 'nt':
+        # Windows has no process group a plain ``Popen`` can signal: killing the
+        # direct child leaves the children it started running. ``taskkill /T``
+        # walks the live tree of that PID, which is how the whole check is
+        # stopped without a job object. Killing the direct child afterwards is a
+        # no-op when the tree kill already took it. A zero exit reports that the
+        # command succeeded, not that every descendant is gone; a failed or
+        # missing ``taskkill`` (access denied, PID reused, no such command)
+        # leaves even the attempt unproven.
+        issued = False
+        try:
+            result = subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, check=False)
+            issued = result.returncode == 0
+        except OSError:
+            pass
+        try:
+            process.kill()
+        except OSError:
+            pass
+        return issued, None
+    try:
+        pgid = os.getpgid(process.pid)
+        os.killpg(pgid, signal.SIGKILL)
+    except (OSError, AttributeError):
+        return False, None
+    return True, pgid
+
+
+def _prove_group_stopped(process, issued, pgid):
+    """Prove the timed-out check's process group is gone; True only then.
+
+    ``communicate`` returning means the direct child was reaped within the
+    grace period; a second timeout means it is not, so the tree cannot be shown
+    to be gone. On POSIX the group itself is then probed with signal 0: only
+    ``ESRCH`` shows no member is left. Windows has no group probe and
+    ``taskkill``'s zero exit is not that proof, so a Windows tree is never
+    claimed as terminated.
+    """
+    try:
+        process.communicate(timeout=KILL_GRACE)
+    except subprocess.TimeoutExpired:
+        return False
+    if not issued or os.name == 'nt' or pgid is None:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _stop_timed_out(process):
+    """Attempt to stop a timed-out check and return an honest detail string.
+
+    The attempt and the proof stay separate: a signal that was sent is only
+    called a kill once the group probe shows nothing is left.
+    """
+    issued, pgid = _kill_group(process)
+    if _prove_group_stopped(process, issued, pgid):
+        return 'timed out; process group killed'
+    return 'timed out; could not prove the process group was terminated'
+
+
+def _popen(argv, **kwargs):
+    return subprocess.Popen(argv, **kwargs)
+
+
+def opencode(worktree, prompt, role, *, agent_name=None, timeout=1800):
+    """Invoke one real session; no --auto, no session continuation."""
+    argv = ['opencode', 'run', '--standalone', '--format', 'json']
+    if agent_name:
+        argv += ['--agent', agent_name]
+    argv.append(prompt)
+    environment = dict(os.environ, PWD=str(worktree))
+    try:
+        process = _popen(argv, cwd=worktree, stdin=subprocess.DEVNULL, env=environment,
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                         start_new_session=(os.name == 'posix'))
+    except OSError:
+        return {'exit_code': None, 'session_id': None, 'text': '', 'detail': 'spawn failed'}
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {'exit_code': None, 'session_id': None, 'text': '', 'timeout': True,
+                'detail': _stop_timed_out(process)}
+    return _classify_stream(process.returncode, output or '')
+
+
+def session_export(session_id, worktree, timeout=120):
+    """Read a session's own terminal record; this is identity, not success proof.
+
+    The export is not sanitized because sanitizing redacts the working directory
+    and the assistant text, which are the identity and verdict facts this gate
+    needs. Only metadata is persisted; the transcript stays in memory.
+    """
+    argv = ['opencode', 'session', 'export', session_id]
+    try:
+        result = subprocess.run(argv, cwd=worktree, stdin=subprocess.DEVNULL,
+                                env=dict(os.environ, PWD=str(worktree)),
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {'ok': False, 'reason': f'session export unavailable: {exc}'}
+    if result.returncode != 0:
+        return {'ok': False, 'reason': f'session export exit code {result.returncode}'}
+    try:
+        data = json.loads(result.stdout)
+        info = data['info']
+        messages = data['messages']
+    except (ValueError, KeyError, TypeError):
+        return {'ok': False, 'reason': 'session export is not readable JSON'}
+    if not isinstance(info, dict) or not isinstance(messages, list):
+        return {'ok': False, 'reason': 'session export has an unexpected shape'}
+    assistants = [message for message in messages
+                  if isinstance(message, dict) and message.get('type') == 'assistant']
+    texts = []
+    for message in assistants:
+        for part in message.get('content') or []:
+            if isinstance(part, dict) and part.get('type') == 'text':
+                texts.append(part.get('text') or '')
+    directory = (info.get('location') or {}).get('directory')
+    return {'ok': True, 'session': info.get('id'), 'outcome': info.get('outcome'),
+            'directory': directory,
+            'user_messages': sum(1 for message in messages
+                                 if isinstance(message, dict) and message.get('type') == 'user'),
+            'assistant_messages': len(assistants),
+            'agents': [message.get('agent') for message in assistants],
+            'finishes': [message.get('finish') for message in assistants],
+            'models': [message.get('model') or {} for message in assistants],
+            'texts': texts}
+
+
+def agent_profiles(worktree, timeout=120):
+    argv = ['opencode', 'debug', 'agents']
+    try:
+        result = subprocess.run(argv, cwd=worktree, stdin=subprocess.DEVNULL,
+                                env=dict(os.environ, PWD=str(worktree)),
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DeliveryError(f'agent profiles unavailable: {exc}') from None
+    if result.returncode != 0:
+        raise DeliveryError(f'agent profile query exit code {result.returncode}')
+    try:
+        data = json.loads(result.stdout)
+    except ValueError as exc:
+        raise DeliveryError(f'agent profile query is not JSON: {exc}') from None
+    if not isinstance(data, list):
+        raise DeliveryError('agent profile query returned an unexpected shape')
+    return {item.get('id'): item for item in data if isinstance(item, dict)}
+
+
+def _rule_matches(rule, action):
+    """OpenCode matches action patterns as globs; '*' and 's*' both cover shell."""
+    import fnmatch
+    pattern = rule.get('action')
+    if not isinstance(pattern, str):
+        return False
+    return pattern == '*' or fnmatch.fnmatchcase(action, pattern) or pattern == action
+
+
+def _covers_mutating(rule):
+    return any(_rule_matches(rule, action) for action in MUTATING_ACTIONS)
+
+
+def profile_gate(profile):
+    """Fail-closed tool-level read-only check for a reviewer profile.
+
+    Rules are evaluated in order with the runtime's last-match semantics for the
+    wildcard resource. Any allow rule for a mutating action on a scoped resource
+    (even if an earlier wildcard deny exists) is unproven, because this runner
+    cannot enumerate the resources that rule can reach.
+    """
+    rules = (profile or {}).get('permissions') or []
+    if not isinstance(rules, list):
+        return {'ready': False, 'missing': ['permissions'], 'scoped_allows': [],
+                'effective': {}, 'reasons': ['profile permissions are not a list']}
+    effective, scoped_allows = {}, []
+    for action in MUTATING_ACTIONS:
+        effect = None
+        for rule in rules:
+            if isinstance(rule, dict) and _rule_matches(rule, action) \
+                    and rule.get('resource') == '*':
+                effect = rule.get('effect')
+        effective[action] = effect
+    for rule in rules:
+        if not isinstance(rule, dict) or rule.get('effect') != 'allow':
+            continue
+        resource = rule.get('resource')
+        if resource in (None, '*'):
+            continue
+        # Any allow for a pattern that *could* cover edit/shell is unproven. A
+        # later identical-scope deny does not make it safe: the runner cannot
+        # enumerate what the glob reaches.
+        if _covers_mutating(rule):
+            scoped_allows.append({'action': rule.get('action'), 'resource': resource})
+    missing = [action for action in MUTATING_ACTIONS if effective.get(action) != 'deny']
+    reasons = []
+    if missing:
+        reasons.append('effective rule does not deny ' + ', '.join(missing))
+    if scoped_allows:
+        reasons.append('scoped allow rules cannot be proven read-only: '
+                       + ', '.join(f"{item['action']}:{item['resource']}"
+                                   for item in scoped_allows))
+    return {'ready': not reasons, 'missing': missing, 'scoped_allows': scoped_allows,
+            'effective': effective, 'reasons': reasons}
+
+
+# ------------------------------------------------------------------ review gate
+
+def _verdict(text):
+    """Last ```json block with the exact verdict shape, or ``None``."""
+    blocks = re.findall(r'```json\s*\n(.*?)```', text or '', re.DOTALL)
+    for block in reversed(blocks):
+        try:
+            data = json.loads(block)
+        except ValueError:
+            continue
+        if isinstance(data, dict) and VERDICT_KEYS.issubset(data):
+            return data
+    return None
+
+
+def _acceptance_ok(verdict, criteria):
+    entries = verdict.get('acceptance')
+    expected_ids = [f'AC-{index}' for index in range(1, len(criteria) + 1)]
+    if not isinstance(entries, list) or len(entries) != len(criteria):
+        return False, 'acceptance verdict does not cover every criterion'
+    ids = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return False, 'acceptance verdict entry is malformed'
+        ident, state = entry.get('id'), entry.get('status')
+        if ident not in expected_ids or ident in ids:
+            return False, f'acceptance verdict names an unknown or repeated criterion {ident!r}'
+        ids.add(ident)
+        if entry.get('criterion') != criteria[int(ident.split('-')[1]) - 1]:
+            return False, f'{ident} does not quote the criterion text it was given'
+        if state != 'PASS':
+            return False, f'{ident} is {state!r}, not PASS'
+        if not str(entry.get('evidence') or '').strip():
+            return False, f'{ident} has no evidence'
+    return True, ''
+
+
+def _verdict_matches(verdict, record, spec, context):
+    if verdict.get('verdict') != 'APPROVE':
+        return f'review verdict is {verdict.get("verdict")!r}, not APPROVE'
+    if verdict.get('head') != record['head'] or verdict.get('base') != record.get('base'):
+        return 'review verdict binds a different base or head'
+    if verdict.get('diff_sha256') != record['diff_sha256']:
+        return 'review verdict binds a different worktree diff'
+    if verdict.get('diff_digest') != record.get('diff_digest'):
+        return 'review verdict binds a different reviewed diff'
+    if verdict.get('task_digest') != _task_digest(context, spec, record):
+        return 'review verdict binds a different task packet'
+    if verdict.get('mode') != MODE:
+        return f'review verdict mode is {verdict.get("mode")!r}, not {MODE!r}'
+    if sorted(verdict.get('paths') or []) != sorted(spec['paths']):
+        return 'review verdict binds a different allowed-path set'
+    if verdict.get('findings'):
+        return 'review approved while listing findings'
+    accepted, why = _acceptance_ok(verdict, spec['acceptance'])
+    if not accepted:
+        return f'review did not pass every acceptance criterion: {why}'
+    return None
+
+
+# --------------------------------------------------------------------- runner
+
+class _Context:
+    def __init__(self, repo, plan, specs, state, agent, session_probe, profiles,
+                 state_saver, config, state_path):
+        self.repo = repo
+        self.state_path = state_path
+        self.plan = plan
+        self.specs = specs
+        self.state = state
+        self.agent = agent
+        self.session_probe = session_probe
+        self.profiles = profiles
+        self.save = state_saver
+        self.config = config
+        self.approved = set()
+        self.order = {spec['id']: index for index, spec in enumerate(specs)}
+
+    def record(self, ident):
+        return self.state['tasks'][ident]
+
+    def spec(self, ident):
+        return next(spec for spec in self.specs if spec['id'] == ident)
+
+    def reviewer_gate(self, work):
+        """Query the runtime afresh at every side-effect boundary.
+
+        The profiles are runtime state and may change while a task runs, so a
+        cached gate could authorize a later command or session with a profile
+        the caller never saw. If the query fails or returns an unexpected
+        shape, the DeliveryError propagates and the caller fails closed.
+        """
+        profiles = self.profiles(work)
+        if not isinstance(profiles, dict):
+            raise DeliveryError('agent profile query returned an unexpected shape')
+        profile = profiles.get(self.plan['reviewer_agent']) or {}
+        if not isinstance(profile, dict):
+            raise DeliveryError('agent profile is not a mapping')
+        return profile_gate(profile)
+
+
+def _check_probe(probe, work, expected_agent, role, status='BLOCKED', require_text=False,
+                 session=None):
+    def fail(message):
+        raise DeliveryError(message, status)
+
+    if not expected_agent:
+        fail(f'{role} agent identity is not defined by the current plan')
+    if not probe.get('ok'):
+        fail(f'{role} session is unverifiable: {probe.get("reason")}')
+    if session is not None and probe.get('session') != session:
+        fail(f'{role} export did not return the requested session id')
+    if probe.get('outcome') != 'succeeded':
+        fail(f'{role} session outcome is {probe.get("outcome")!r}, not succeeded')
+    directory = probe.get('directory')
+    if not directory or os.path.realpath(directory) != os.path.realpath(work):
+        fail(f'{role} session ran in {directory!r}, not in the task worktree')
+    if probe.get('user_messages', 0) < 1 or probe.get('assistant_messages', 0) < 1:
+        fail(f'{role} session has no user/assistant turn')
+    if 'stop' not in (probe.get('finishes') or []):
+        fail(f'{role} session has no completed assistant turn')
+    agents = probe.get('agents') or []
+    if not agents:
+        fail(f'{role} session export does not name an agent')
+    if any(name != expected_agent for name in agents):
+        fail(f'{role} session used agent(s) {agents}, not the declared {expected_agent}')
+    if require_text and not ''.join(probe.get('texts') or []).strip():
+        fail(f'{role} session transcript has no assistant text')
+
+
+def _run_check(command, work, timeout):
+    """Run one check in its own process group; a timeout kills the whole tree."""
+    entry = {'program': command[0], 'argv_sha256':
+             hashlib.sha256(json.dumps(command).encode()).hexdigest()}
+    try:
+        process = _popen(command, cwd=work, stdin=subprocess.DEVNULL,
+                         env=dict(os.environ, PWD=str(work)),
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                         start_new_session=(os.name == 'posix'))
+    except OSError as exc:
+        entry.update(exit_code=None, output_tail=f'not run: {exc}')
+        return entry
+    try:
+        output, _ = process.communicate(timeout=timeout)
+        entry.update(exit_code=process.returncode, output_tail=(output or '')[-1000:])
+    except subprocess.TimeoutExpired:
+        entry.update(exit_code=None, timeout=True, output_tail=_stop_timed_out(process))
+    return entry
+
+
+def _run_checks(commands, work, timeout):
+    return [_run_check(command, work, timeout) for command in commands]
+
+
+def _timed_out(record):
+    return any(check.get('timeout') for check in (record.get('verification') or []))
+
+
+def _all_zero(checks):
+    return bool(checks) and all(check.get('exit_code') == 0 for check in checks)
+
+
+def _criteria_prompt(spec):
+    return '\n'.join(f'- AC-{index}: {text}'
+                     for index, text in enumerate(spec['acceptance'], 1))
+
+
+def _resolve_task(context, spec):
+    """The one identity gate every phase, resume, retry and auth path must pass."""
+    if spec['errors'] and not spec['worktree']:
+        raise DeliveryError('task configuration is invalid: ' + '; '.join(spec['errors']))
+    work = _root(spec['worktree'])
+    if work == context.repo:
+        raise DeliveryError('task worktree is the repository worktree itself; refusing to '
+                            'operate on it')
+    if _common(work) != _common(context.repo):
+        raise DeliveryError('task worktree does not belong to the run repository')
+    branch = _branch(work)
+    if not branch or branch in ('main', 'master'):
+        raise DeliveryError('task worktree must be on a non-main branch')
+    if branch == _branch(context.repo):
+        raise DeliveryError('task worktree is on the repository worktree branch; refusing to '
+                            'commit there')
+    if context.state_path.resolve().is_relative_to(work):
+        raise DeliveryError('state journal is inside the task worktree')
+    return work
+
+
+def _reviewer_gate(context, spec, work, record):
+    """Bracket the runtime profile query with an edition re-proof.
+
+    The profiles are runtime state and may change while a task runs, so a
+    cached gate could authorize a later command or session with a profile the
+    caller never saw. The project config is re-read *before* the query so an
+    already invalid declaration starts no external call, and again *after* it so
+    a change made while the runtime answered blocks before the answer is used or
+    another call is made.
+    """
+    _require_live_config(context, spec)
+    gate = context.reviewer_gate(work)
+    fresh = _require_live_config(context, spec)
+    record['reviewer_profile'] = {'agent': context.plan['reviewer_agent'],
+                                  'effective': gate['effective'],
+                                  'missing_denies': gate['missing'],
+                                  'scoped_allows': gate['scoped_allows'],
+                                  'unknown_channels_unproven': True,
+                                  'tool_gate_passed': gate['ready']}
+    if not gate['ready']:
+        raise DeliveryError('reviewer agent profile is not provably read-only: '
+                            + '; '.join(gate['reasons']))
+    return fresh
+
+
+def _prove_session(context, spec, session, work):
+    """Export a session only while the project config still authorizes it.
+
+    The export is an external call of its own, so it is bracketed the same way
+    as a profile query: nothing is read back, and no later action starts, once
+    the declaration has gone bad.
+    """
+    _require_live_config(context, spec)
+    probe = context.session_probe(session, work)
+    _require_live_config(context, spec)
+    return probe
+
+
+def _prove_before_side_effect(context, spec, record, work, require_evidence):
+    """The one re-proof shared by execute, verify, review, resume, retry and auth.
+
+    It runs before any command or agent starts, so a failure stops the task with
+    no verification or session side effect: the edition and task authorization
+    are re-read, the reviewer profile is re-queried (itself bracketed by another
+    config proof), and — once an attempt has produced a head — every *actual*
+    changed path and the execution session's own Agent/directory/terminal state
+    are re-proven. Each external call is guarded on both sides, so a config that
+    goes bad while the runtime answers cannot be followed by one more call. The
+    session metadata is an identity check, not proof that the session produced
+    the recorded commit: there is no independently verifiable execution
+    artifact, so cross-process trust of a recorded head is refused separately.
+
+    The Git facts this proof needs — ``status``, each ``diff``/``ls-files`` and
+    the session export — are external processes of their own, and a Git clean
+    filter runs *inside* ``status``/``diff``. A filter that rewrites the project
+    config therefore invalidates the edition while this function is running, so
+    the config and the task authorization are proved once more *after* those
+    calls and before the caller starts an agent or a command. That closing proof
+    is the last action here: nothing external runs between it and the caller's
+    side effect.
+    """
+    # Config first, then the external profile query, then config again: a
+    # change made while the runtime answers the query is seen before its answer
+    # is used and before the agent or command it would gate can start.
+    fresh = _reviewer_gate(context, spec, work, record)
+    if _status(work):
+        raise DeliveryError('worktree is not clean; refusing to continue')
+    changed = []
+    if require_evidence:
+        base, head = record.get('base'), record.get('head')
+        if not isinstance(base, str) or not base or not isinstance(head, str) or not head:
+            raise DeliveryError('recorded state has no proven base/head')
+        # `status` is a Git process and can run a clean filter; prove the config
+        # again before the next Git fact read starts.
+        _require_live_config(context, spec)
+        changed = _changes(work, base)
+        if changed != sorted(record.get('changed_paths') or []):
+            raise DeliveryError('actual changed paths do not match the recorded set')
+    if require_evidence:
+        session = record.get('execution_session')
+        if not session:
+            raise DeliveryError('recorded state has no execution session')
+        probe = _prove_session(context, spec, session, work)
+        _check_probe(probe, work, context.plan['executor_agent'], 'execution',
+                     session=session)
+    # Every call above ran external code the runner does not control, so the
+    # config (edition and authorization) is re-proved from the file now. The
+    # changed paths are checked against *this* proof, not the earlier one. Only
+    # a second *writer* can still change the config between this read and the
+    # caller's side effect; no call this function makes can reopen the window.
+    # The reviewer profile is not re-queried here because it gates no session of
+    # its own: `_verify` and `_review` query it again after this proof and
+    # immediately before the command or review session they gate, and the
+    # execution agent this proof precedes is the write-capable executor.
+    fresh = _require_live_config(context, spec)
+    for name in changed:
+        _check_changed_path(work, name, spec['paths'], fresh)
+    return changed
+
+
+def _execute(context, spec, record):
+    work = _resolve_task(context, spec)
+    if _status(work):
+        raise DeliveryError('task worktree is not clean')
+    base = _head(work)
+    # `_resolve_task` and `_status` are Git processes of their own; a clean
+    # filter runs inside `status`. Prove the starting edition and authorization
+    # before the journal is written or the execution agent is started.
+    _require_live_config(context, spec)
+    record.update(base=base, branch=_branch(work), worktree=str(work), pid=os.getpid(),
+                  phase='execute', execution_session=None, head=None, diff_sha256=None,
+                  changed_paths=[])
+    context.save()
+    _prove_before_side_effect(context, spec, record, work, require_evidence=False)
+    packet = ('You are an execution agent. Work only inside this task worktree and only '
+              'within these repository-relative paths: ' + json.dumps(spec['paths'])
+              + '. Do not push, merge, approve, change permissions, or modify any other '
+              'repository. Leave the worktree clean of unrelated changes.\n'
+              'Acceptance criteria:\n' + _criteria_prompt(spec)
+              + '\n\n' + spec['prompt'])
+    execution = context.agent(work, packet, 'execution')
+    # The agent session is an external call and the export below is another
+    # one: re-prove the declaration before reading anything back, so a config
+    # invalidated while the agent ran stops the run here.
+    _require_live_config(context, spec)
+    record['execution_session'] = execution.get('session_id')
+    record['execution_detail'] = execution.get('detail')
+    if execution.get('exit_code') != 0 or not execution.get('session_id'):
+        raise DeliveryError('execution failed or its terminal state is unknown: '
+                            + str(execution.get('detail') or 'no detail'), 'FAILED')
+    probe = _prove_session(context, spec, execution['session_id'], work)
+    _check_probe(probe, work, context.plan['executor_agent'], 'execution', 'FAILED',
+                 session=execution['session_id'])
+    record['execution_evidence'] = {
+        'session': execution['session_id'], 'outcome': probe.get('outcome'),
+        'directory': probe.get('directory'), 'agents': probe.get('agents'),
+        'models': probe.get('models')}
+    changed = _changes(work, base)
+    if not changed:
+        raise DeliveryError('execution produced no changes', 'FAILED')
+    # Re-read the project's authorization and edition immediately before
+    # committing: either may have changed while the agent was running.
+    fresh = project_config(context.repo)
+    _require_edition(fresh, expected=context.config.get('edition'))
+    _require_authorized(spec['paths'], fresh)
+    for name in changed:
+        _check_changed_path(work, name, spec['paths'], fresh)
+    dirty = bool(_status(work))
+    # `status` is a Git process of its own and a clean filter runs inside it,
+    # so the proof above may already be stale. Prove the edition from the file
+    # *now* — before another Git process (`diff`, `ls-files`) reads the tree, so
+    # an invalid or switched declaration starts no further Git call — and only
+    # then decide whether staging is needed.
+    _require_live_config(context, spec)
+    if dirty:
+        # Configuration, authorization and the actual scope are re-proved after
+        # the pre-add proof's own Git reads; an invalid or out-of-scope state
+        # must not reach `git add`.
+        _prove_before_add(context, spec, work, base, changed)
+        try:
+            subprocess.run(['git', '--no-optional-locks', 'add', '-A', '--', '.'],
+                           cwd=work, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        except (OSError, subprocess.SubprocessError):
+            # A clean filter runs inside `add` and can switch the shared
+            # edition before the process returns — including when the add
+            # itself fails. Re-prove the config here, on the failure path,
+            # before this exception is treated as a task-scoped problem: a
+            # shared-gate failure has to stop the whole run instead of letting
+            # the next task start its own Git calls.
+            _require_live_config(context, spec)
+            raise
+        # `add` and `commit` are separate processes, so the proof above (which
+        # ran before `add`) does not describe what `commit` would record. A
+        # clean filter can rewrite the staged blob while `add` runs, so the
+        # index itself is re-proved here — before the second process starts,
+        # not after history exists. That proof opens by reading the project
+        # config from the file, so a switch that landed inside a *successful*
+        # `add` starts no Git call before it is seen.
+        _prove_staged(context.repo, spec, work, base, changed,
+                      edition=context.config.get('edition'))
+        # `_prove_staged` reads the index and the worktree through Git and ends
+        # with a config proof. The commit process itself then runs its clean
+        # filters and commit hooks, after that proof and inside the process, so
+        # prove *before* starting `git commit` that it cannot run code of its
+        # own. When it can, this refuses and leaves the staged change for a
+        # human instead of creating history after an unobservable switch.
+        _prove_commit_is_inert(context, spec, work)
+        message = spec['raw'].get('message') or f'{spec["id"]}: autonomous delivery'
+        subprocess.run(['git', '--no-optional-locks', 'commit', '--no-gpg-sign',
+                        '-m', str(message)], cwd=work, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+        # The commit process is a synchronous Git call of its own. `git`'s guard
+        # cannot see this direct invocation, so re-prove the edition and the
+        # authorization before the next Git call (`status`) starts.
+        _require_live_config(context, spec)
+    if _status(work):
+        raise DeliveryError('task worktree still has uncommitted changes after commit')
+    head = _head(work)
+    if head == base:
+        raise DeliveryError('execution committed nothing', 'FAILED')
+    committed = _changes(work, base)
+    fresh = project_config(context.repo)
+    _require_edition(fresh, expected=context.config.get('edition'))
+    _require_authorized(spec['paths'], fresh)
+    for name in committed:
+        _check_changed_path(work, name, spec['paths'], fresh)
+    digest = _fingerprint(work, base)
+    record.update(head=head, changed_paths=committed, phase='verify')
+    record['diff_sha256'] = digest
+    context.save()
+
+
+def _verify(context, spec, record):
+    work = _resolve_task(context, spec)
+    if _head(work) != record['head'] or _fingerprint(work, record['base']) != record['diff_sha256']:
+        raise DeliveryError('head or diff changed before verification')
+    _prove_before_side_effect(context, spec, record, work, require_evidence=True)
+    checks = []
+    for command in spec['verify']:
+        # Each check is its own external side effect, and a trusted command can
+        # change the runtime profiles as well as the project config. The whole
+        # gate — config, profile query, config again — is re-proved before the
+        # check starts, so a profile that the previous check widened cannot
+        # authorize the next one.
+        _reviewer_gate(context, spec, work, record)
+        check = _run_check(command, work, spec['raw'].get('timeout', 1800))
+        checks.append(check)
+        record['verification'] = list(checks)
+        if check.get('timeout'):
+            # A timed-out check may still have live descendants writing to any
+            # worktree, and the kill that was attempted may not be proven. This
+            # is a run-wide failure: no later task, closing approval re-check,
+            # verification command, profile query, Agent or Git write may
+            # start, and the run is not retryable automatically.
+            #
+            # The result must reach the journal before the run stops, but the
+            # caller's generic error path retries the save and then starts the
+            # next task, so a failed write here cannot be allowed to fall
+            # through to it. Stop the run instead; the halt write below may
+            # still succeed and record the timeout.
+            try:
+                context.save()
+            except OSError as exc:
+                raise RunHaltError(
+                    'a verification check timed out and the journal write that '
+                    f'records it failed ({exc}); the run stops here rather than '
+                    'continuing on a journal that may not be persisted') from None
+            raise RunHaltError('a verification process tree may still be running; '
+                               'refusing to continue or retry automatically')
+        context.save()
+        _require_live_config(context, spec)
+    if not _all_zero(checks):
+        raise DeliveryError('verification failed', 'FAILED')
+    if _head(work) != record['head'] or _fingerprint(work, record['base']) != record['diff_sha256']:
+        raise DeliveryError('head or diff changed during verification')
+    record['phase'] = 'review'
+    context.save()
+
+
+def _task_digest(context, spec, record):
+    payload = {
+        'id': spec['id'], 'prompt': spec['prompt'], 'paths': list(spec['paths']),
+        'acceptance': list(spec['acceptance']),
+        'verify': [hashlib.sha256(json.dumps(command).encode()).hexdigest()
+                   for command in spec['verify']],
+        'base': record.get('base'), 'head': record.get('head'),
+        'diff_sha256': record.get('diff_sha256'), 'diff_digest': record.get('diff_digest'),
+        'changed_paths': sorted(record.get('changed_paths') or []),
+        'mode': MODE,
+        'executor_agent': context.plan['executor_agent'],
+        'reviewer_agent': context.plan['reviewer_agent'],
+        'carrier_digest': (context.plan.get('carrier') or {}).get('digest'),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _review_diff(work, base, head, changed):
+    """The complete textual diff a reviewer needs, or a fail-closed error."""
+    if not changed:
+        raise DeliveryError('there is no changed path to review')
+    numstat = os.fsdecode(git(work, 'diff', '--numstat', '--no-renames', base, head, '--',
+                              *changed))
+    for line in numstat.splitlines():
+        parts = line.split('\t')
+        if len(parts) >= 2 and ('-' in parts[0] or '-' in parts[1]):
+            raise DeliveryError('binary change cannot be presented completely; refusing to '
+                                'start a review that could not see it')
+    patch = os.fsdecode(git(work, 'diff', '--no-ext-diff', '--no-color', '--no-renames',
+                            '--unified=3', base, head, '--', *changed))
+    if 'Binary files' in patch:
+        raise DeliveryError('binary change cannot be presented completely; refusing to review')
+    if len(patch.encode()) > MAX_DIFF_BYTES:
+        raise DeliveryError(f'diff is larger than {MAX_DIFF_BYTES} bytes; refusing to review '
+                            'a change the reviewer cannot see completely')
+    if not patch.strip():
+        raise DeliveryError('the reviewed diff is empty; refusing to review')
+    return patch, hashlib.sha256(patch.encode()).hexdigest()
+
+
+def _review_prompt(spec, record, patch):
+    return ('You are an independent reviewer in a new session. Do not modify, create or '
+            'delete any file, do not commit, do not run commands that change the worktree, '
+            'do not approve or merge anything, and do not push. Review the change described '
+            'below against each acceptance criterion and answer with exactly one fenced '
+            '```json block and nothing else inside it: {"verdict": "APPROVE" or "REJECT", '
+            '"head": "<40-char head sha>", "base": "<40-char base sha>", '
+            '"diff_sha256": "<64-char worktree digest>", "diff_digest": "<64-char digest of '
+            'the shown diff>", "task_digest": "<64-char task binding>", '
+            '"mode": "prepare-only", "paths": [<the exact allowed path list>], '
+            '"acceptance": [{"id": "AC-1", "criterion": "<the exact criterion text>", '
+            '"status": "PASS" or "FAIL" or "NOT_RUN", "evidence": "what you checked"}], '
+            '"findings": []}.\n\n'
+            'BASE_SHA=' + record['base'] + '\nHEAD_SHA=' + record['head']
+            + '\nDIFF_SHA256=' + record['diff_sha256']
+            + '\nDIFF_DIGEST=' + record['diff_digest']
+            + '\nTASK_DIGEST=' + record['task_digest']
+            + '\nMODE=' + MODE + '\nAllowed paths: ' + json.dumps(spec['paths'])
+            + '\nChanged paths: ' + json.dumps(record.get('changed_paths') or [])
+            + '\n\nThe complete diff produced by Git is below; review it directly.\n'
+            '--- BEGIN DIFF ---\n' + patch + '\n--- END DIFF ---\n'
+            + '\nAcceptance criteria:\n' + _criteria_prompt(spec)
+            + '\n\nThe verdict must quote the allowed path list and every criterion text '
+            'exactly and echo BASE_SHA, HEAD_SHA, DIFF_SHA256, DIFF_DIGEST and TASK_DIGEST. '
+            'findings must be an empty list for APPROVE: put any non-defect note inside the '
+            'acceptance evidence instead. Task:\n' + spec['prompt'])
+
+
+def _review(context, spec, record):
+    work = _resolve_task(context, spec)
+    _prove_before_side_effect(context, spec, record, work, require_evidence=True)
+    changed = _changes(work, record['base'])
+    if changed != sorted(record.get('changed_paths') or []):
+        raise DeliveryError('changed paths moved before review; refusing to review')
+    patch, diff_digest = _review_diff(work, record['base'], record['head'], changed)
+    record['changed_paths'] = changed
+    record['diff_digest'] = diff_digest
+    record['task_digest'] = _task_digest(context, spec, record)
+    context.save()
+    # The execution-session export above is an external call of its own, and
+    # the profile that gated this phase was read before it. Query the runtime
+    # again immediately before the reviewer starts, so a profile widened while
+    # that export was answered cannot start a write-capable review session.
+    _reviewer_gate(context, spec, work, record)
+    review = context.agent(work, _review_prompt(spec, record, patch), 'review')
+    # The review session is an external call and the export below is another:
+    # re-prove the declaration before reading the verdict back.
+    _require_live_config(context, spec)
+    session = review.get('session_id')
+    record['review_detail'] = review.get('detail')
+    if review.get('exit_code') != 0 or not session:
+        raise DeliveryError('review session failed or its terminal state is unknown: '
+                            + str(review.get('detail') or 'no detail'), 'REVIEW_REJECTED')
+    if session == record.get('execution_session'):
+        raise DeliveryError('review session equals execution session; independence is not '
+                            'established', 'REVIEW_REJECTED')
+    probe = _prove_session(context, spec, session, work)
+    _check_probe(probe, work, context.plan['reviewer_agent'], 'review', 'REVIEW_REJECTED',
+                 require_text=True, session=session)
+    record['review_session'] = session
+    record['review_evidence'] = {
+        'session': session, 'outcome': probe.get('outcome'),
+        'directory': probe.get('directory'), 'agents': probe.get('agents'),
+        'models': probe.get('models')}
+    context.save()
+    transcript = ''.join(probe.get('texts') or [])
+    verdict = _verdict(transcript)
+    if verdict is None:
+        raise DeliveryError('review transcript has no machine-readable verdict',
+                            'REVIEW_REJECTED')
+    streamed = _verdict(review.get('text'))
+    if streamed is None:
+        raise DeliveryError('review stream has no machine-readable verdict',
+                            'REVIEW_REJECTED')
+    if json.dumps(streamed, sort_keys=True) != json.dumps(verdict, sort_keys=True):
+        raise DeliveryError('review stream and session transcript disagree; refusing the '
+                            'verdict', 'REVIEW_REJECTED')
+    problem = _verdict_matches(verdict, record, spec, context)
+    if problem:
+        raise DeliveryError(problem, 'REVIEW_REJECTED')
+    # Accepting the review is a trust decision taken after two external calls
+    # (the review session and its export), so the project config is re-proved
+    # before the verdict is accepted rather than reused from before them.
+    _require_live_config(context, spec)
+    if _status(work) or _head(work) != record['head'] \
+            or _fingerprint(work, record['base']) != record['diff_sha256']:
+        raise DeliveryError('review session changed the worktree or its head/diff',
+                            'REVIEW_REJECTED')
+    # ... and once more immediately before the record is called PREPARED, so a
+    # declaration invalidated in between never yields a prepared approval.
+    _require_live_config(context, spec)
+    record['review_verdict'] = verdict
+    record['status'] = 'PREPARED'
+    record['phase'] = 'done'
+    context.approved.add(spec['id'])
+    context.save()
+
+
+def _facts_match(record, work):
+    if _status(work):
+        return False, 'worktree is not clean'
+    if _head(work) != record.get('head'):
+        return False, 'head differs from the recorded head'
+    if _fingerprint(work, record['base']) != record.get('diff_sha256'):
+        return False, 'diff differs from the recorded digest'
+    return True, ''
+
+
+def _recheck_approved(context):
+    """Re-prove every approval that is live in this process before the summary.
+
+    A trusted verification command from a later task, or any other writable
+    channel, can change an earlier task's worktree after it reached
+    ``PREPARED``. Nothing re-reads that record on the normal path, so the
+    summary would otherwise report stale approvals. This check re-reads the
+    project config (edition, authorization) as well as Git state, and it
+    re-queries the reviewer profile: the profile is shared runtime state a later
+    trusted command can widen, and an approval that was reviewed under a
+    read-only profile is not supportable once that profile allows writes. It
+    never re-runs a verification command, starts an agent or writes to a
+    worktree. An invalid project config or an unproven profile therefore blocks
+    every approval instead of being reported as prepared.
+
+    The Git facts are external reads of their own, so the config is re-proved
+    before them, and the full gate — config, profile query, config again — runs
+    *after* them, so a change made while those reads were answered is seen
+    before the approval is kept. A failure of one worktree's facts blocks only
+    that approval; the project config and the reviewer profile are shared, so
+    the first shared-gate failure stops every later query and blocks every
+    still-live approval, including those this round already checked as safe. A
+    second pass over every approval that is still live runs before the journal
+    is saved, so a shared gate that only goes bad after this round cannot leave
+    an approval ``PREPARED``; when that pass observes the shared
+    config/profile gate fail, it voids every live approval, not only the one
+    whose query failed.
+    """
+    shared_failure = None
+    for ident in sorted(context.approved):
+        record = context.record(ident)
+        if record.get('status') != 'PREPARED':
+            continue
+        spec = context.spec(ident)
+        # The project config is shared state. Once it fails, no further query
+        # may start and every live approval — including the ones already checked
+        # against the old config — loses its support.
+        try:
+            _require_live_config(context, spec)
+        except (DeliveryError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+            record.update(status='BLOCKED', reason=str(exc))
+            shared_failure = (ident, exc)
+            break
+        # The facts of one worktree are task-specific: this approval is blocked
+        # and the next one is still checked.
+        try:
+            work = _resolve_task(context, spec)
+            ok, why = _facts_match(record, work)
+            if not ok:
+                raise DeliveryError(f'approved task {ident} no longer matches its approval: '
+                                    f'{why}')
+            changed = _changes(work, record['base'])
+            if changed != sorted(record.get('changed_paths') or []):
+                raise DeliveryError(f'approved task {ident} no longer has its reviewed paths')
+            if record.get('diff_digest'):
+                _, digest = _review_diff(work, record['base'], record['head'], changed)
+                if digest != record['diff_digest']:
+                    raise DeliveryError(f'approved task {ident} no longer has its reviewed diff')
+        except (DeliveryError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+            record.update(status='BLOCKED', reason=str(exc))
+            continue
+        # The reviewer profile is shared runtime state and the gate query is the
+        # last external call for this approval. Its first failure stops the
+        # round: a later query could answer safe again and revive an approval
+        # the shared state no longer supports.
+        try:
+            _reviewer_gate(context, spec, work, record)
+        except (DeliveryError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+            record.update(status='BLOCKED', reason=str(exc))
+            shared_failure = (ident, exc)
+            break
+    if shared_failure is not None:
+        source, cause = shared_failure
+        for ident in sorted(context.approved):
+            record = context.record(ident)
+            if record.get('status') != 'PREPARED':
+                continue
+            record.update(status='BLOCKED', reason=(
+                f'the shared reviewer/config gate failed while checking {source}: {cause}; '
+                'every live approval depends on that gate'))
+    _void_stale_approvals(context)
+    context.save()
+
+
+def _void_stale_approvals(context):
+    """A last gate over every approval still live, before the journal is saved.
+
+    An approval can be checked before the config or the reviewer profile goes
+    bad and never be looked at again, so the per-approval check alone would
+    leave it ``PREPARED``. This pass runs after all of them and blocks every
+    approval the current config or profile no longer authorizes, not only the
+    one whose check saw the change.
+
+    The config and the reviewer profile are *shared* state: the profile query
+    for one approval can be the call that widens the profile another approval
+    was already checked against. A pass that only blocked the failing approval
+    would therefore keep an earlier ``PREPARED`` that no later query supports.
+    The gate is evaluated for the live approvals in turn, and the first shared
+    failure stops the pass: no further query starts, and every approval that is
+    still live — including the ones whose own query returned the safe profile —
+    is blocked and the journal is saved. An approval whose worktree cannot be
+    resolved is task-specific and blocks only itself.
+
+    It is **not atomic**: the project config is a file another process can
+    write between this read and the save or console output that follows, and
+    the same is true of any Git fact read earlier. Nothing here removes that
+    window; it only makes an approval depend on a proof as close to the
+    decision as this runner can place one, and it stops before reporting rather
+    than reporting an approval whose own config read or profile query failed.
+    ``_resolve_task`` runs before the gate, so the gate's query is the last
+    external call for that approval.
+    """
+    live = []
+    for ident in sorted(context.approved):
+        record = context.record(ident)
+        if record.get('status') != 'PREPARED':
+            continue
+        try:
+            spec = context.spec(ident)
+            work = _resolve_task(context, spec)
+        except (DeliveryError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+            record.update(status='BLOCKED', reason=str(exc))
+            continue
+        live.append((ident, spec, work))
+    shared_failure = None
+    for ident, spec, work in live:
+        record = context.record(ident)
+        try:
+            _reviewer_gate(context, spec, work, record)
+        except (DeliveryError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+            shared_failure = (ident, exc)
+            record.update(status='BLOCKED', reason=str(exc))
+            break
+    if shared_failure is not None:
+        source, cause = shared_failure
+        for ident, _spec, _work in live:
+            record = context.record(ident)
+            if record.get('status') != 'PREPARED':
+                continue
+            record.update(status='BLOCKED', reason=(
+                f'the shared reviewer/config gate failed while checking {source}: {cause}; '
+                'every live approval depends on that gate'))
+        context.save()
+
+
+def _require_supported_state(record):
+    if record.get('status') in ('MERGED', 'VERIFIED') or record.get('phase') in (
+            'merge', 'post_verify', 'approved'):
+        raise DeliveryError('this journal records a merge; automatic merge is not '
+                            'implemented in this slice, so the record is not trusted')
+
+
+def _prove_common(context, spec, record, work):
+    """Everything that must hold before any side effect on a recorded approval."""
+    work = _resolve_task(context, spec)
+    ok, why = _facts_match(record, work)
+    if not ok:
+        raise DeliveryError(f'recorded state cannot be proven: {why}')
+    changed = _prove_before_side_effect(context, spec, record, work,
+                                        require_evidence=True)
+    patch, diff_digest = _review_diff(work, record['base'], record['head'], changed)
+    if diff_digest != record.get('diff_digest'):
+        raise DeliveryError('the reviewed diff no longer matches the worktree')
+    if _task_digest(context, spec, record) != record.get('task_digest'):
+        raise DeliveryError('the current task packet no longer matches the reviewed one')
+    session = record.get('execution_session')
+    review = record.get('review_session')
+    if not review or review == session:
+        raise DeliveryError('recorded state has no independent review session')
+    review_probe = _prove_session(context, spec, review, work)
+    _check_probe(review_probe, work, context.plan['reviewer_agent'], 'review',
+                 require_text=True, session=review)
+    verdict = _verdict(''.join(review_probe.get('texts') or []))
+    if verdict is None:
+        raise DeliveryError('review transcript has no machine-readable verdict')
+    problem = _verdict_matches(verdict, record, spec, context)
+    if problem:
+        raise DeliveryError('review transcript no longer supports the approval: ' + problem)
+    recorded = record.get('review_verdict')
+    if recorded is not None and json.dumps(recorded, sort_keys=True) != json.dumps(
+            verdict, sort_keys=True):
+        raise DeliveryError('recorded verdict does not match the session transcript')
+    return changed
+
+
+def _authenticate(record, context, spec):
+    """Refuse an approval that was not produced live by this process.
+
+    A ``PREPARED`` record read from a journal in a later process is only a set
+    of writable fields. Git history, the journal, the execution session's
+    metadata and the reviewer transcript can be made mutually consistent by the
+    same user, but none of them proves that a live execution session produced
+    the recorded head or that a live, independent reviewer approved it. The
+    non-executing identity and scope checks still run so a wrong worktree,
+    session or profile reports its own reason alongside the refusal — an
+    unavailable runtime cannot mask it — but the approval is then refused.
+    No verification command, Agent or target write happens here.
+    """
+    _require_supported_state(record)
+    if record.get('status') != 'PREPARED':
+        return
+    if spec['id'] in context.approved:
+        return
+    head, digest = record.get('head'), record.get('diff_sha256')
+    if not isinstance(head, str) or not SHA_RE.match(head):
+        raise DeliveryError('recorded approval has no usable head')
+    if not isinstance(digest, str) or not DIGEST_RE.match(digest):
+        raise DeliveryError('recorded approval has no diff digest')
+    work = _resolve_task(context, spec)
+    # Non-executing proof first: identity, scope, sessions and transcript.
+    # Its diagnostics are worth reporting — a wrong worktree, session or
+    # transcript names its own cause — but the verdict below does not depend on
+    # them. A runtime the proof cannot query (no usable ``opencode``, a profile
+    # query that fails) must not replace the unconditional refusal with its own
+    # availability error, so the proof's message is reported *alongside* the
+    # refusal instead of in place of it. A shared gate still stops the whole
+    # run, exactly as it does on every other path.
+    try:
+        _prove_common(context, spec, record, work)
+    except SharedGateError:
+        raise
+    except DeliveryError as exc:
+        raise DeliveryError(f'{UNPROVABLE_EXECUTION}. Its non-executing proof also '
+                            f'failed: {exc}') from None
+    # Mutually consistent writable fields are still not execution provenance or
+    # independent review, so a cross-process approval is never trusted.
+    raise DeliveryError(UNPROVABLE_EXECUTION)
+
+
+def _reconcile(context, spec, record):
+    """Continue an interrupted task only after re-proving every provable gate."""
+    if _timed_out(record):
+        # A journal can carry a timeout from a runner that died before the
+        # halted-run write. The tree may still be alive, so this is not a
+        # task-scoped refusal: nothing else in this run may start. It is
+        # checked before every task-scoped refusal so none can mask it.
+        raise RunHaltError('the journal records a timed-out verification check; its '
+                           'process tree may still be running, so the run cannot resume '
+                           'or continue')
+    _require_supported_state(record)
+    if _pid_alive(record.get('pid')) is not False:
+        raise DeliveryError('previous runner process may still be alive; refusing to resume')
+    work = _resolve_task(context, spec)
+    phase = record.get('phase')
+    if phase in (None, 'execute'):
+        if _status(work):
+            raise DeliveryError('interrupted execution left uncommitted changes; inspect them '
+                                'manually (this runner will not reset or stash)')
+        if record.get('base') and _head(work) != record['base']:
+            raise DeliveryError('interrupted execution left commits behind; inspect them '
+                                'manually (this runner will not reset or stash)')
+        _prove_before_side_effect(context, spec, record, work, require_evidence=False)
+        record.update(status='PENDING', phase='execute', reason=None,
+                      attempt=(record.get('attempt') or 1) + 1)
+        return
+    if phase not in ('verify', 'review'):
+        raise DeliveryError(f'interrupted phase {phase!r} cannot be resumed: automatic merge '
+                            'is not implemented and there is no merge checkpoint')
+    if not record.get('base'):
+        raise DeliveryError('interrupted record has no recorded baseline')
+    ok, why = _facts_match(record, work)
+    if not ok:
+        raise DeliveryError(f'interrupted state cannot be proven: {why}')
+    # Run every check that does not depend on trusting the recorded head first,
+    # so a wrong session, out-of-scope path or unsafe profile reports its own
+    # reason. Then fail closed on the artifact this runtime cannot provide.
+    _prove_before_side_effect(context, spec, record, work, require_evidence=True)
+    raise DeliveryError(UNPROVABLE_EXECUTION)
+
+
+def _configure(context, spec, record):
+    work = _resolve_task(context, spec)
+    branch = _branch(work)
+    if not branch or branch in ('main', 'master'):
+        raise DeliveryError('task worktree must be on a non-main branch')
+    baseline = _head(context.repo)
+    if _head(work) != baseline:
+        # Fail closed. Moving a branch with `reset` can overwrite ignored or
+        # untracked user data, so this runner never does it.
+        raise DeliveryError('task worktree is not exactly at the target baseline; refusing '
+                            'to move it (this runner never resets or stashes)')
+    if _status(work):
+        raise DeliveryError('task worktree is not clean')
+    record.update(worktree=str(work), branch=branch, base=baseline, target_base=None,
+                  executor_agent=context.plan['executor_agent'],
+                  reviewer_agent=context.plan['reviewer_agent'])
+
+
+def _process(context, spec, record):
+    if spec['errors']:
+        raise DeliveryError('task configuration is invalid: ' + '; '.join(spec['errors']))
+    status = record.get('status')
+    if status == 'CANCELLED':
+        return False
+    _require_supported_state(record)
+    if status in ('PENDING', 'RUNNING', 'PREPARED'):
+        _resolve_task(context, spec)
+    if status == 'PREPARED':
+        _authenticate(record, context, spec)
+        return False
+    if status in STOPPED:
+        return False
+    if status in ('PENDING', 'RUNNING'):
+        for dep in spec['depends']:
+            dependency = context.record(dep)
+            if dependency.get('status') not in INTEGRATED:
+                return False
+            _authenticate(dependency, context, context.spec(dep))
+        for index, other in enumerate(context.specs):
+            if other['id'] == spec['id'] or index >= context.order[spec['id']]:
+                continue
+            if _overlap(spec['paths'], other['paths']) and \
+                    context.record(other['id']).get('status') != TERMINAL_OK:
+                raise DeliveryError(f'path conflict with earlier task {other["id"]}: '
+                                    'overlapping paths must be serialized')
+    if record.get('status') not in ACTIVE:
+        _configure(context, spec, record)
+        work = _root(record['worktree'])
+        _reviewer_gate(context, spec, work, record)
+        record.update(status='RUNNING', phase='execute',
+                      attempt=record.get('attempt') or 1,
+                      reason=None, history=record.get('history') or [])
+        context.save()
+    if record.get('phase') == 'execute':
+        _execute(context, spec, record)
+    if record.get('phase') == 'verify':
+        _verify(context, spec, record)
+    if record.get('phase') == 'review':
+        _review(context, spec, record)
+    return True
+
+
+def _overlap(left, right):
+    return any(a == b or a.startswith(b.rstrip('/') + '/') or b.startswith(a.rstrip('/') + '/')
+               for a in left for b in right)
+
+
+def _attempt_retry(context, spec, record):
+    """Re-run work only when nothing the user owns can be touched."""
+    if spec['errors']:
+        raise DeliveryError('task configuration is invalid: ' + '; '.join(spec['errors']))
+    if _timed_out(record):
+        # A recorded timeout is run-wide: its tree may still be alive, so even
+        # an explicit retry cannot let another task start. This check comes
+        # before every task-scoped refusal below (an unsupported state, a phase
+        # that cannot retry, a still-live recorded PID), so none of them can
+        # mask the timeout.
+        raise RunHaltError('retry refused: a verification check timed out and its process '
+                           'tree may still be running; inspect the host manually')
+    _require_supported_state(record)
+    if record.get('status') not in STOPPED:
+        raise DeliveryError(f'task {spec["id"]} is {record.get("status")}, not retryable')
+    if record.get('phase') not in ('execute', 'verify', 'review'):
+        raise DeliveryError(f'task {spec["id"]} cannot be retried from phase '
+                            f'{record.get("phase")!r}')
+    if record.get('status') == 'UNKNOWN' and _pid_alive(record.get('pid')) is not False:
+        raise DeliveryError('retry refused: the previous runner process may still be alive')
+    work = _resolve_task(context, spec)
+    if _status(work):
+        raise DeliveryError('retry refused: the worktree has uncommitted changes. Inspect them '
+                            'and clean up manually; this runner never stashes or resets')
+    phase = record.get('phase')
+    if phase in ('verify', 'review'):
+        if _head(work) != record.get('head'):
+            raise DeliveryError('retry refused: the worktree head is not the failed attempt')
+    elif record.get('base') and _head(work) != record['base']:
+        raise DeliveryError('retry refused: the worktree has commits from the failed attempt. '
+                            'Inspect them and reset manually; this runner never resets')
+    # Every retry re-proves identity, scope, every actual changed path, the
+    # reviewer profile, authorization and the execution session's metadata
+    # before it can run a check or start a session.
+    _prove_before_side_effect(context, spec, record, work,
+                              require_evidence=phase in ('verify', 'review'))
+    if phase in ('verify', 'review'):
+        # A committed attempt cannot be traced to the session that produced it,
+        # so retrying it would trust writable Git/journal fields as proof.
+        raise DeliveryError(UNPROVABLE_EXECUTION)
+    attempt = int(record.get('attempt') or 1)
+    history = record.get('history') or []
+    history.append({'attempt': attempt, 'status': record.get('status'),
+                    'phase': record.get('phase'), 'reason': record.get('reason'),
+                    'head': record.get('head')})
+    if phase == 'execute':
+        record.update(history=history, status='PENDING', phase='execute', attempt=attempt + 1,
+                      reason=None, head=None, diff_sha256=None, changed_paths=[],
+                      verification=None, review_verdict=None, review_session=None,
+                      execution_session=None)
+    else:
+        record.update(history=history, status='RUNNING', phase='verify', attempt=attempt + 1,
+                      reason=None, verification=None, review_verdict=None,
+                      review_session=None, review_evidence=None, review_detail=None)
+    context.save()
+
+
+def run(repo, plan, state_path, *, agent=None, session_probe=session_export,
+        profiles=agent_profiles, gh=gh_run, resume=False, retry=(),
+        executor_agent=None, reviewer_agent=None, timeout=1800,
+        expected_edition=None):
+    if plan.get('merge') or plan.get('merge_into'):
+        raise DeliveryError(MERGE_REFUSAL)
+    # Everything up to the timeout check is local: validating the plan and the
+    # journal path starts no Git, Agent, profile or carrier query. A journal
+    # that already records a timeout therefore stops the run before `_root`,
+    # `_status`, `gh` or a lock can start a process a surviving tree, a clean
+    # filter or a `core.fsmonitor` helper could run inside.
+    specs = _plan_tasks(plan)
+    state_path = _journal_path(state_path)
+    # The enclosing repository and every task worktree are located without Git,
+    # so the journal is proved outside them before this run writes to it. The
+    # repository path may be a subdirectory, which the old comparison against
+    # that path alone mistook for "outside".
+    worktrees = [spec['worktree'] for spec in specs if spec['worktree']]
+    _prove_journal_outside(state_path, repo, worktrees)
+    halted = _halt_saved_timeout(state_path, [spec['id'] for spec in specs],
+                                 repo=repo, worktrees=worktrees)
+    if halted is not None:
+        # Nothing external started, and the halt write already blocked every
+        # approval saved in the journal.
+        return halted
+    repo = _root(repo)
+
+    executor_agent = executor_agent or plan.get('executor_agent') or 'build'
+    reviewer_agent = reviewer_agent or plan.get('reviewer_agent') or 'scout'
+    if reviewer_agent == executor_agent:
+        raise ValueError('reviewer agent must differ from the executor agent')
+
+    config = project_config(repo)
+    # `expected_edition` is the edition the CLI already proved before its Issue
+    # query; a switch while that external call ran must be refused here.
+    _require_edition(config, ValueError, expected=expected_edition)
+    edition = config['edition']
+
+    def reprove(error=ValueError):
+        """Re-proof the starting edition and task authorization, fail closed.
+
+        ``gh`` and every Git fact read are external processes a clean filter can
+        run inside, so the config is read again after each of them before the
+        next Git, lock, journal or Agent. Each call is the *last* action before
+        the caller's next step; a switch to another valid edition fails exactly
+        like an invalid one.
+        """
+        fresh = project_config(repo)
+        _require_edition(fresh, error, expected=edition)
+        for spec in specs:
+            if spec['errors']:
+                continue
+            _require_authorized(spec['paths'], fresh, error)
+        return fresh
+
+    if _status(repo):
+        raise ValueError('repository worktree is not clean')
+    # `_status` is a Git process of its own and a clean filter runs inside it,
+    # so the config read above may already be stale. Prove the edition and the
+    # task authorization again after it returns, before the carrier query or
+    # any Agent starts; an invalid declaration must not reach either.
+    config = reprove(ValueError)
+
+    carrier_url = verify_carrier(plan['carrier'], gh) if plan.get('carrier') else None
+    # `gh` is an external process and a clean filter can run in the Git calls
+    # that follow it. Prove the starting edition and authorization again before
+    # the journal read, any Git call, lock or Agent starts.
+    reprove(DeliveryError)
+    peek = {}
+    if state_path.exists():
+        try:
+            peek = json.loads(state_path.read_text(encoding='utf-8'))
+        except ValueError as exc:
+            raise ValueError(f'state journal is not readable JSON: {exc}') from None
+        peek = peek.get('tasks') if isinstance(peek, dict) else None
+        if not isinstance(peek, dict):
+            raise ValueError('state journal has an unsupported shape; reconcile manually')
+    for spec in specs:
+        if spec['errors']:
+            continue
+        if (peek.get(spec['id']) or {}).get('status') not in (None, 'PENDING', 'UNKNOWN'):
+            continue
+        try:
+            work = _root(spec['worktree'])
+        except SharedGateError:
+            # The project config is shared state: a re-proof that failed while
+            # this worktree was resolved stops the whole run, and must not be
+            # recorded as this worktree's own problem.
+            raise
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            spec['errors'].append(f'task worktree is not usable: {exc}')
+            continue
+        # `_root` is a Git process of its own; re-prove before the next one.
+        reprove(DeliveryError)
+        if state_path.resolve().is_relative_to(work):
+            raise ValueError('state must be outside every task worktree')
+        try:
+            if work == repo:
+                raise ValueError('task worktree is the repository worktree itself')
+            common_work = _common(work)
+            # Each consecutive Git call is a synchronous return boundary: prove
+            # the edition before the next one starts.
+            reprove(DeliveryError)
+            common_repo = _common(repo)
+            reprove(DeliveryError)
+            if common_work != common_repo:
+                raise ValueError('worktree does not belong to the repository')
+            branch = _branch(work)
+            reprove(DeliveryError)
+            if not branch or branch in ('main', 'master'):
+                raise ValueError('worktree must be on a non-main branch')
+            if _status(work):
+                raise ValueError('worktree is not clean')
+        except SharedGateError:
+            # A consecutive re-proof failed inside this block: the edition or the
+            # authorization it proves is shared, so this is not a per-worktree
+            # error and must stop the run before the next task is looked at.
+            raise
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            spec['errors'].append(f'task worktree is not usable: {exc}')
+        # `_status` above may have run a clean filter; prove the edition before
+        # the journal or the next worktree is touched.
+        reprove(DeliveryError)
+
+    plan = dict(plan, executor_agent=executor_agent, reviewer_agent=reviewer_agent)
+    plan_hash = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
+    carrier_digest = (plan.get('carrier') or {}).get('digest')
+
+    global _GIT_GUARD
+    locks = []
+    try:
+        # From here on every Git call is followed by the same proof before the
+        # next Git, Agent or write starts. A clean filter or a `core.fsmonitor`
+        # hook runs inside each synchronous Git process, so proving once before
+        # a sequence (such as `_changes`' `diff`, `diff --cached` and
+        # `ls-files`) is not enough: the switch can land in the first call and
+        # the sequence would continue on an edition the run did not begin with.
+        # Installing the guard before lock acquisition also covers the Git call
+        # that resolves the common directory and the lock files written after it.
+        _GIT_GUARD = lambda: reprove(DeliveryError)
+        locks = acquire_locks(repo, state_path, specs)
+        # Lock acquisition ran Git calls of its own, each followed by the guard;
+        # prove the edition and the task authorization once more before the
+        # journal is read or written.
+        reprove(DeliveryError)
+        if state_path.exists():
+            state = json.loads(state_path.read_text(encoding='utf-8'))
+            if (not isinstance(state, dict) or state.get('version') != STATE_VERSION
+                    or not isinstance(state.get('tasks'), dict)):
+                raise ValueError('state journal has an unsupported shape; reconcile manually')
+            if state.get('plan_hash') != plan_hash:
+                raise ValueError('plan changed since the journal was written; reconcile '
+                                 'manually instead of reusing its state')
+            if state.get('carrier_digest') != carrier_digest:
+                raise ValueError('carrier changed since the journal was written; reconcile '
+                                 'manually')
+        else:
+            state = {'version': STATE_VERSION, 'tasks': {}, 'plan_hash': plan_hash,
+                     'carrier_digest': carrier_digest, 'carrier_url': carrier_url}
+        state['plan_hash'] = plan_hash
+        state['carrier_digest'] = carrier_digest
+        state['carrier_url'] = carrier_url
+        state['project_edition'] = config.get('edition')
+        state['mode'] = MODE
+
+        if agent is None:
+            def agent(work, prompt, role):
+                name = reviewer_agent if role == 'review' else executor_agent
+                return opencode(work, prompt, role, agent_name=name, timeout=timeout)
+
+        def saver():
+            _save(state_path, state)
+
+        context = _Context(repo, plan, specs, state, agent, session_probe, profiles,
+                           saver, config, state_path)
+        for spec in specs:
+            state['tasks'].setdefault(spec['id'], {'status': 'PENDING'})
+
+        # A run-wide failure is not scoped to the task that observed it. A
+        # shared-gate failure means the one ``docs/PROJECT.md`` every task
+        # proves itself against is no longer valid, so a later task would start
+        # its own `_root`/`rev-parse` (or Agent, or journal write) on a
+        # declaration the run did not begin with. A timed-out verification
+        # check means a process tree may still be alive and can write to any
+        # worktree. Either is recorded once, on that task, and then the run
+        # stops: nothing else starts, including the closing approval re-check,
+        # which reads Git and queries the runtime profiles.
+        halt = []
+
+        def halt_on_shared(ident, record, exc):
+            """Persist the reason the run stopped; this is the last write.
+
+            Every approval saved in the journal loses its support at the same
+            moment: it was proved against the declaration that just failed (or
+            was saved by an earlier process whose memory is gone), and
+            re-proving it would need the Git reads and profile queries this
+            halt forbids. Closing them here is part of the same single journal
+            write, so the run never reports an approval the shared gate no
+            longer supports.
+            """
+            _halt_shared_records(state, ident, record, exc)
+            try:
+                saver()
+            except OSError as write_error:
+                # The run is already stopping, so this is the only chance to
+                # report that the journal itself is now suspect. Raising keeps
+                # the caller from returning a summary built from state that may
+                # not have reached disk.
+                raise RunHaltError(
+                    f'{exc}; the journal could not be written ({write_error}), so it is '
+                    'not reliably persisted and the run is stopped') from None
+            halt.append(exc)
+
+        def halt_run(ident, record, exc):
+            """Persist a run-wide failure that is not the shared project gate.
+
+            A timed-out check is the only producer: its process tree may still
+            be running and can write to any worktree. No later task, closing
+            approval re-check, profile query or Agent starts. Every approval
+            saved on disk loses its support in this same write because its
+            worktree can no longer be shown to match what was reviewed; the
+            set read here is the journal, not just this process's memory, so a
+            previous process's approval cannot survive the stop.
+            """
+            _halt_timeout_records(state, ident, record, exc)
+            try:
+                saver()
+            except OSError as write_error:
+                raise RunHaltError(
+                    f'{exc}; the journal could not be written ({write_error}), so it is '
+                    'not reliably persisted and the run is stopped') from None
+            halt.append(exc)
+
+        # A recorded timeout is run-wide, not task-scoped: its process tree may
+        # still be alive and can write to any worktree. The journal read under
+        # these locks is checked before any task is processed, so a task-scoped
+        # refusal on another record -- an already-BLOCKED timeout, a still-live
+        # recorded PID, a worktree that is not retryable -- cannot mask it and
+        # let the next task start in this process. `_halt_saved_timeout` made
+        # the same check before any Git, `gh` or lock call started; this read
+        # catches a timeout another runner saved in between.
+        for ident in sorted(state['tasks']):
+            record = state['tasks'][ident]
+            if not isinstance(record, dict) or not _timed_out(record):
+                continue
+            halt_run(ident, record, RunHaltError(_timeout_halt_reason(ident)))
+            break
+
+        for spec in specs:
+            if halt:
+                break
+            record = context.record(spec['id'])
+            try:
+                _require_supported_state(record)
+            except DeliveryError as exc:
+                record.update(status=exc.status, reason=str(exc))
+                saver()
+                continue
+            if record.get('status') not in ('RUNNING', 'UNKNOWN'):
+                continue
+            if not resume:
+                if record.get('status') == 'RUNNING':
+                    record.update(status='UNKNOWN', reason='interrupted; rerun with --resume '
+                                                          'to reconcile')
+                    saver()
+                continue
+            try:
+                _reconcile(context, spec, record)
+                saver()
+            except SharedGateError as exc:
+                halt_on_shared(spec['id'], record, exc)
+                break
+            except RunHaltError as exc:
+                halt_run(spec['id'], record, exc)
+                break
+            except DeliveryError as exc:
+                record.update(status=exc.status, reason=str(exc))
+                saver()
+            except (OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+                record.update(status='BLOCKED', reason=str(exc))
+                saver()
+        for ident in retry:
+            if halt:
+                break
+            spec = next((spec for spec in specs if spec['id'] == ident), None)
+            if spec is None:
+                raise ValueError(f'--retry names an unknown task {ident!r}')
+            try:
+                _attempt_retry(context, spec, context.record(ident))
+            except SharedGateError as exc:
+                halt_on_shared(ident, context.record(ident), exc)
+                break
+            except RunHaltError as exc:
+                halt_run(ident, context.record(ident), exc)
+                break
+            except DeliveryError as exc:
+                context.record(ident).update(status=exc.status, reason=str(exc))
+                saver()
+
+        progress = True
+        while progress and not halt:
+            progress = False
+            for spec in specs:
+                if halt:
+                    break
+                record = state['tasks'][spec['id']]
+                try:
+                    progress = _process(context, spec, record) or progress
+                except SharedGateError as exc:
+                    halt_on_shared(spec['id'], record, exc)
+                    break
+                except RunHaltError as exc:
+                    halt_run(spec['id'], record, exc)
+                    break
+                except DeliveryError as exc:
+                    record.update(status=exc.status, reason=str(exc))
+                    saver()
+                except (OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+                    record.update(status='BLOCKED', reason=str(exc))
+                    saver()
+        if not halt:
+            _recheck_approved(context)
+        return state
+    finally:
+        _GIT_GUARD = None
+        for handle in locks:
+            handle.close()
+
+
+# ------------------------------------------------------------------------ CLI
+
+def _summary(state):
+    tasks = {}
+    for ident, record in sorted((state.get('tasks') or {}).items()):
+        verdict = record.get('review_verdict') or {}
+        safe_verdict = ({'verdict': verdict.get('verdict'), 'head': verdict.get('head'),
+                         'base': verdict.get('base'), 'diff_digest': verdict.get('diff_digest'),
+                         'task_digest': verdict.get('task_digest'),
+                         'paths': verdict.get('paths'), 'mode': verdict.get('mode'),
+                         'acceptance': [{'id': item.get('id'), 'status': item.get('status')}
+                                        for item in verdict.get('acceptance') or []]}
+                        if verdict else None)
+        tasks[ident] = {
+            'status': record.get('status'), 'phase': record.get('phase'),
+            'attempt': record.get('attempt'), 'head': record.get('head'),
+            'diff_sha256': record.get('diff_sha256'), 'changed_paths': record.get('changed_paths'),
+            'execution_session': record.get('execution_session'),
+            'review_session': record.get('review_session'),
+            'review_verdict': safe_verdict,
+            'reviewer_profile': record.get('reviewer_profile'),
+            'verification': [{'program': check.get('program'),
+                              'argv_sha256': check.get('argv_sha256'),
+                              'exit_code': check.get('exit_code')}
+                             for check in record.get('verification') or []],
+            'reason': record.get('reason')}
+    return {'tasks': tasks, 'carrier_url': state.get('carrier_url'),
+            'project_edition': state.get('project_edition'), 'mode': state.get('mode')}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--repo', required=True, help='authorized repository worktree')
+    parser.add_argument('--plan', help='trusted JSON plan path')
+    parser.add_argument('--issue', type=int, help='GitHub Issue number as the plan source')
+    parser.add_argument('--issue-repo', help='owner/name of the issue repository')
+    parser.add_argument('--worktree', help='task worktree when planning from an issue')
+    parser.add_argument('--merge-into', help='refused: automatic merge is not implemented')
+    parser.add_argument('--verify', action='append', default=[],
+                        help='JSON argv list for an issue plan (repeatable)')
+    parser.add_argument('--acceptance', action='append', default=[],
+                        help='acceptance criterion for an issue plan (repeatable)')
+    parser.add_argument('--allow', action='append', default=[],
+                        help='narrow the issue scope to these paths (repeatable)')
+    parser.add_argument('--instruction', default='', help='operator note for an issue plan')
+    parser.add_argument('--state', required=True)
+    parser.add_argument('--execute', action='store_true', help='explicitly opt into execution')
+    parser.add_argument('--resume', action='store_true',
+                        help='reconcile interrupted or unknown tasks from re-proven facts')
+    parser.add_argument('--retry', action='append', default=[], metavar='ID')
+    parser.add_argument('--executor-agent', default=None)
+    parser.add_argument('--reviewer-agent', default=None)
+    parser.add_argument('--timeout', type=int, default=1800)
+    args = parser.parse_args(argv)
+    if not args.execute:
+        parser.error('explicit --execute is required')
+    if bool(args.plan) == bool(args.issue):
+        parser.error('provide exactly one of --plan or --issue')
+    if args.merge_into:
+        parser.exit(2, MERGE_REFUSAL + '\n')
+    try:
+        state_path = _journal_path(args.state)
+        # `--issue` queries the carrier with `gh issue view`, and `run` makes
+        # Git calls of its own. A timeout already recorded in the journal is
+        # run-wide: it stops the run before either can start, and the halt
+        # write blocks every saved approval on the way out. The task worktrees
+        # are known without Git -- `--issue` has the single `--worktree`, and a
+        # plan file is read as data -- so the halt write and the journal lock
+        # are proved outside them first.
+        worktrees = [args.worktree] if args.worktree else []
+        if args.plan:
+            worktrees += _plan_worktrees(args.plan)
+        halted = _halt_saved_timeout(state_path, repo=args.repo, worktrees=worktrees)
+        if halted is not None:
+            ident, _ = _journal_timeout(halted)
+            raise RunHaltError(_timeout_halt_reason(ident))
+        edition = None
+        if args.issue is not None:
+            if not args.issue_repo or not args.worktree:
+                parser.error('--issue needs --issue-repo and --worktree')
+            # The project edition is the authority for the base and it must be
+            # proved before the carrier query starts: `gh issue view` is the
+            # first external call of this mode. `load_issue_plan` is that query,
+            # so re-prove the starting edition from the file (no Git call)
+            # before `run` makes its first Git call.
+            root = _root(args.repo)
+            config = project_config(root)
+            _require_edition(config, ValueError)
+            edition = config['edition']
+            plan = load_issue_plan(args.issue, args.issue_repo, worktree=args.worktree,
+                                   verify=args.verify, acceptance=args.acceptance,
+                                   allows=args.allow, instruction=args.instruction)
+            _require_edition(project_config(root), ValueError, expected=edition)
+        else:
+            plan = _load_plan_file(args.plan)
+        state = run(args.repo, plan, args.state, resume=args.resume, retry=args.retry,
+                    executor_agent=args.executor_agent, reviewer_agent=args.reviewer_agent,
+                    timeout=args.timeout, expected_edition=edition)
+    except (ValueError, OSError, subprocess.SubprocessError, DeliveryError) as exc:
+        parser.exit(2, f'{exc}\n')
+    print(json.dumps(_summary(state), ensure_ascii=False, indent=2, sort_keys=True))
+    specs = _plan_tasks(plan)
+    return 0 if all(state['tasks'].get(spec['id'], {}).get('status') == TERMINAL_OK
+                    for spec in specs) else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
