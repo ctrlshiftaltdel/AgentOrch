@@ -2,8 +2,10 @@
 
 This slice deliberately has **no automatic merge**. It runs one real OpenCode
 execution session per task, verifies the diff with the plan's commands, starts a
-different session with an agent that cannot edit for review, and leaves the
-task in ``PREPARED`` for a human or the Master to review and merge. Every write path is
+different session whose ``edit`` tool is denied for review, and leaves the
+task in ``PREPARED`` for a human or the Master to review and merge. Denying the
+``edit`` tool does not stop the reviewer from writing through ``shell``; the
+gate is not a read-only proof. Every write path is
 fail-closed:
 
 * a plan may not ask for a merge; ``merge``/``--merge-into`` is refused before
@@ -2667,7 +2669,8 @@ def _review(context, spec, record):
     # The execution-session export above is an external call of its own, and
     # the profile that gated this phase was read before it. Query the runtime
     # again immediately before the reviewer starts, so a profile widened while
-    # that export was answered cannot start a review session that can edit.
+    # that export was answered cannot start a review session whose ``edit``
+    # tool gate fails. Shell may still write; this is not a read-only proof.
     _reviewer_gate(context, spec, work, record)
     review = context.agent(work, _review_prompt(spec, record, patch), 'review')
     # The review session is an external call and the export below is another:
@@ -2743,8 +2746,8 @@ def _recheck_approved(context):
     project config (edition, authorization) as well as Git state, and it
     re-queries the reviewer profile: the profile is shared runtime state a later
     trusted command can widen, and an approval is not supportable once that
-    profile can edit again. Shell access is not that proof: the gate does not
-    claim the review session is read-only. The check
+    profile no longer passes the ``edit`` tool gate. Shell may still write
+    files; the gate does not claim the review session is read-only. The check
     never re-runs a verification command, starts an agent or writes to a
     worktree. An invalid project config or an unproven profile therefore blocks
     every approval instead of being reported as prepared.
