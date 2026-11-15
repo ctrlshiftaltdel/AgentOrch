@@ -40,7 +40,7 @@
 
 自检内置在 `scripts/build_release.py`，随构建自动执行，任何一项失败即非零退出并逐条列出原因；**没有跳过自检的开关**。
 
-自检 a–l 与命名模式无关：脚本把本次命名决定的顶层目录（`AgentOrch-1.6/` 或 `agentorch-YYYYMMDD/`）传给全部自检，`MANIFEST.json` 的路径解析、包内 `validate_kit.py` 与 `unittest` 都在该目录下进行。命名模式不改变自检项、不删除任何检查，也不降低强度。
+自检 a–m 与命名模式无关：脚本把本次命名决定的顶层目录（`AgentOrch-1.6/` 或 `agentorch-YYYYMMDD/`）传给全部自检，`MANIFEST.json` 的路径解析、包内 `validate_kit.py` 与 `unittest` 都在该目录下进行。命名模式不改变自检项、不删除任何检查，也不降低强度。
 
 - a. 包内容文件集合 == `REQUIRED` + `MANIFEST.json`（数量与名称一致）；解压后 `MANIFEST.json` 必须能解析每条 `path`、`sha256` 与 `size` 与实际文件一致、`category` 只用合法分类，且清单列出的路径集合与 `REQUIRED` 完全一致。
 - b. 解压到临时目录后，`scripts/validate_kit.py` 退出码为 0。
@@ -73,7 +73,7 @@
 - **包内自检在 `full=true` 时于三个平台真实执行**：`uv run python scripts/build_release.py` 在每个运行的 job 上各跑一次，脚本用 `sys.executable`（不是裸 `python`）在解压目录里执行 `validate_kit.py` 与 `unittest discover -s tests`（自检 b、d），所以"这一平台 / Python 版本拿到的包是否可用"是实机验证的，不是从 Linux 推断的。
 - **失败即红**：没有 `continue-on-error`、`|| true`、`paths-ignore` 或跳过开关；风险分类失败会让必需 context 变红，不会出现缺省通过；产物只写到 runner 的 `release/`（`.gitignore` 已忽略），不提交、不上传、不使用密钥。
 - **行尾与可复现性**：Windows 检出不会破坏可复现性 —— 仓库 `.gitattributes` 统一 `eol=lf`，打包前还会把文本文件归一为 LF，自检 f 断言包内文本不含 CRLF；场景沙箱里的 git 仓库也固定 `core.autocrlf=false` / `core.eol=lf`，不依赖 runner 的全局 git 配置。
-- **CI 证明什么**：包能在该平台构建，且内置自检 a–l 在该平台 / Python 版本上通过 —— 覆盖"打包内容集合 / 包内结构校验 / 发布扫描 / 可复现归档 / 包内合成回归与指标口径"这类回归。这只在 `L2` / `L3`、push 到 `main` 与手动运行上成立。
+- **CI 证明什么**：包能在该平台构建，且内置自检 a–m 在该平台 / Python 版本上通过 —— 覆盖"打包内容集合 / 包内结构校验 / 发布扫描 / 可复现归档 / 包内合成回归与指标口径 / 随包批次能力冒烟"这类回归。这只在 `L2` / `L3`、push 到 `main` 与手动运行上成立。
 - **CI 不证明什么**：**不证明发布本身**。CI 不校验发布命名（`AgentOrch-<X.Y>.zip` 或 `agentorch-{YYYYMMDD}.zip`）、不生成 GitHub Release、不写发布记录，也不覆盖真实安装器与用户桌面环境（这些平台承诺仍标 `UNKNOWN`）。发布仍按第 4 节由 Master 执行并逐项留证；CI 绿灯不能替代第 4 节的审查记录。
 
 ### 3.2 包内自检在三种树下的行为
@@ -99,7 +99,7 @@
 1. 在任务载体登记发布任务（唯一 ID、单一目标、允许路径与验收）。
 2. 从最新主分支创建独立分支 / Worktree；不在共享工作区直接构建。
 3. 构建：正式 Release 用 `uv run python scripts/build_release.py --release-version 1.6` 生成 `release/AgentOrch-1.6.zip`（补丁发行写全版本号，如 `--release-version 1.6.1` → `release/AgentOrch-1.6.1.zip`）；日期构建仍用 `uv run python scripts/build_release.py`（或 `--date YYYYMMDD`）生成 `release/agentorch-{YYYYMMDD}.zip`。
-4. 自检：确认脚本内置 a–l 全部通过并记录退出码；产物路径、字节数与校验和一并留证。CI 在 `full=true` 的运行（`L2` / `L3`、push 到 `main`、手动触发）上已跑过同一自检（见 3.1），`L0` / `L1` 的 PR 不跑打包自检；发布时仍须在本分支上重跑并在发布记录里写入实际输出，不能用 CI 绿灯代替。
+4. 自检：确认脚本内置 a–m 全部通过并记录退出码；产物路径、字节数与校验和一并留证。CI 在 `full=true` 的运行（`L2` / `L3`、push 到 `main`、手动触发）上已跑过同一自检（见 3.1），`L0` / `L1` 的 PR 不跑打包自检；发布时仍须在本分支上重跑并在发布记录里写入实际输出，不能用 CI 绿灯代替。
 5. 可复现性：用同一命令再构建一次到另一个输出目录（例如 `--output-dir /tmp/release-b`），比对两份 zip 的 SHA256 一致。
 6. Master 独立审查（逐条对照本文件的自检清单与验收标准）。
 7. 合并到主分支；合并后重新运行验证并记录结果。
@@ -250,6 +250,8 @@
 - **1.6.1 / 1.6.2 / 1.6.3 是补丁发行，不属于 Format 变更**：Format 仍为 `1.6`，见 5.1.1 / 5.1.2 / 5.1.3；本节只记录真正的格式版本升级。其中 1.6.3 在 Format 1.6 内新增了 `REQUIRED` 文件（见 5.1.3），但包格式、`MANIFEST.json` schema 与 `format_version` 未变，仍不是 Format 变更。
 
 - **2.0.0 候选（准备中，未发布）是 Release 的 MAJOR，但不是 Format 变更**：`Format version` 保持 `1.7`，只升 `Release version`；包内文件集合仍为 131 个（130 `REQUIRED` + `MANIFEST.json`），`MANIFEST.json` schema 与 `format_version` 不变。Release 号与 Format 解耦后，`v2.0.0` + `1.7` 不被历史 `VERSION_MATCH` 接受，在版本匹配层只能由声明支持 Format `1.7` 的新更新器通过；破坏性变化与旧客户端迁移见 5.1.6。
+
+> **2026-11-16 后续 HEAD 注记（不是新的已发布记录）**：2.0.0 之后新增 3 个随包文件（`scripts/batch_delivery.py`、`scripts/delivery_risk.py`、`templates/batch-delivery.md`），当前 `REQUIRED` 为 133 个，下一次构建的包内集合为 133 + `MANIFEST.json`。`tests/test_batch_delivery.py` 与 `tests/test_delivery_risk.py` 仍为仓库专属，不随包发布；`Format version` 未变，尚未发布新 Release。
 
 - **1.7.1 是 Format 1.7 内的桥接 / 补丁发行，不属于 Format 变更**：`Format version` 保持 `1.7`，只升 `Release version`；包内文件集合从 118 个（117 `REQUIRED` + `MANIFEST.json`）变为 131 个（130 + 1），新增文件与桥接修复见 5.1.5。包格式、`MANIFEST.json` schema 与 `format_version` 不变。
 
