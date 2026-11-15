@@ -1123,26 +1123,304 @@ def _journal_path(state_path):
 # without starting Git, which the halt path must never do.
 _GIT_LOCATION_OVERRIDES = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR')
 
+# Git's worktree root is the directory holding the `.git` entry unless
+# `core.worktree` moves it. That value is honored only from the repository
+# config and, with `extensions.worktreeConfig`, from the per-worktree
+# `config.worktree`; the global config, `-c`, `GIT_CONFIG_*` and included files
+# do not move the root during Git's worktree setup. The files below are
+# therefore the ones a filesystem proof has to read, and anything it cannot
+# interpret with confidence fails closed instead of assuming "no relocation".
+_GIT_CONFIG_INCLUDE_SECTIONS = ('include', 'includeif')
+_GIT_CONFIG_NAME = re.compile(r'[a-z0-9][a-z0-9-]*\Z')
+_GIT_CONFIG_ESCAPES = {'n': '\n', 't': '\t', 'b': '\b', '\\': '\\', '"': '"'}
 
-def _enclosing_worktree(path):
-    """The nearest enclosing Git worktree root of ``path``, without Git.
 
-    A worktree root carries a ``.git`` entry -- a directory in a main worktree,
-    a file in a linked one -- so walking up from ``path`` to the nearest
-    ancestor that holds one locates the root with filesystem calls only. That
-    matters here: this proof gates a halt write and the journal lock, and the
-    very reason it exists is that a timed-out check's surviving tree, or a
-    helper run inside a Git process, must not influence it. A path given as a
-    subdirectory of the worktree therefore still resolves to the root.
-    ``None`` means no ancestor carries a ``.git`` entry, which is only
-    trustworthy while no Git location override is active (see
-    ``_prove_journal_outside``).
+def _unprovable_boundary(detail):
+    return ValueError(
+        'cannot prove the journal is outside the repository and every task '
+        f'worktree from the filesystem: {detail}; starting Git to ask would run '
+        'the very helpers this proof must precede, so nothing may start')
+
+
+def _locate_git_entry(path):
+    """The nearest ancestor holding a `.git` entry, as ``(root, entry)``.
+
+    A main worktree carries a `.git` directory, a linked one or a submodule a
+    `.git` file naming its git directory; either way the enclosing directory is
+    the root Git reports unless the repository config relocates it. A dangling
+    or unreadable entry is not "no entry": it fails closed, because Git might
+    still resolve a root this walk cannot see. ``(None, None)`` means no
+    ancestor carries an entry at all.
     """
     current = Path(path).resolve()
     for candidate in (current, *current.parents):
-        if (candidate / '.git').exists():
-            return candidate
-    return None
+        entry = candidate / '.git'
+        if entry.is_symlink() or entry.exists():
+            return candidate, entry
+    return None, None
+
+
+def _resolve_gitdir(entry):
+    """The Git directory the ``.git`` entry names, read as data.
+
+    A directory is the git directory itself; a file must hold a ``gitdir:``
+    pointer (relative to the entry). A malformed or unreadable entry fails
+    closed: without its git directory there is no config file to inspect.
+    """
+    if entry.is_dir():
+        return entry.resolve()
+    if not entry.is_file():
+        raise _unprovable_boundary(
+            f'the Git entry {entry} is neither a directory nor a gitfile')
+    try:
+        text = entry.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _unprovable_boundary(
+            f'the Git entry {entry} cannot be read ({exc})') from None
+    lines = text.splitlines()
+    if len(lines) != 1:
+        raise _unprovable_boundary(
+            f'the Git entry {entry} does not hold a single gitdir pointer')
+    line = lines[0].strip()
+    if not line.startswith('gitdir:'):
+        raise _unprovable_boundary(f'the Git entry {entry} is not a gitdir pointer')
+    target = line[len('gitdir:'):].strip()
+    if not target:
+        raise _unprovable_boundary(f'the Git entry {entry} names no git directory')
+    path = Path(target)
+    if not path.is_absolute():
+        path = entry.parent / path
+    return path.resolve()
+
+
+def _git_config_logical_lines(raw, path):
+    """Decode a Git config file and join its backslash continuations."""
+    try:
+        text = raw.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise _unprovable_boundary(
+            f'the Git config {path} is not UTF-8 ({exc})') from None
+    logical, current = [], ''
+    for line in text.splitlines():
+        current += line
+        if (len(current) - len(current.rstrip('\\'))) % 2:
+            current = current[:-1]
+            continue
+        logical.append(current)
+        current = ''
+    if current:
+        raise _unprovable_boundary(f'the Git config {path} ends inside a continued line')
+    return logical
+
+
+def _git_config_section(line, path):
+    """The lowercased section name and any remainder after the ``]`` header.
+
+    Git accepts a variable on the same line as its section header
+    (``[core] worktree = ...``), so the remainder is returned to be parsed as
+    one instead of being dropped.
+    """
+    quoted, end = False, None
+    for index in range(1, len(line)):
+        char = line[index]
+        if char == '"':
+            quoted = not quoted
+        elif char == ']' and not quoted:
+            end = index
+            break
+    if end is None:
+        raise _unprovable_boundary(f'the Git config {path} has an unterminated section')
+    inner = line[1:end].strip()
+    name = inner.split('"', 1)[0].strip()
+    if '"' in inner and not inner.split('"', 1)[1].rstrip().endswith('"'):
+        raise _unprovable_boundary(
+            f'the Git config {path} has a malformed quoted subsection')
+    if not _GIT_CONFIG_NAME.match(name):
+        raise _unprovable_boundary(
+            f'the Git config {path} has a section name this reader cannot '
+            f'interpret: {name!r}')
+    return name, line[end + 1:]
+
+
+def _git_config_value(text, path):
+    """A Git config value with quotes, escapes and comments resolved."""
+    text = text.lstrip(' \t')
+    out, quoted, index = [], False, 0
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            quoted = not quoted
+            index += 1
+        elif char == '\\' and quoted:
+            index += 1
+            if index >= len(text):
+                raise _unprovable_boundary(
+                    f'the Git config {path} ends inside an escape')
+            escaped = text[index]
+            if escaped not in _GIT_CONFIG_ESCAPES:
+                raise _unprovable_boundary(
+                    f'the Git config {path} uses an escape this reader cannot '
+                    f'interpret: \\{escaped}')
+            out.append(_GIT_CONFIG_ESCAPES[escaped])
+            index += 1
+        elif not quoted and char in '#;':
+            break
+        else:
+            out.append(char)
+            index += 1
+    if quoted:
+        raise _unprovable_boundary(f'the Git config {path} ends inside a quote')
+    return ''.join(out).rstrip(' \t')
+
+
+def _git_config_entries(path):
+    """The ordered ``(section, name, value)`` entries of one Git config file.
+
+    ``path`` may be missing, which contributes nothing. Anything this reader
+    cannot interpret raises ``ValueError``: Git accepts more syntax than it
+    does, and the callers must not treat "not understood" as "no relocation".
+    """
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise _unprovable_boundary(
+            f'the Git config {path} cannot be read ({exc})') from None
+    entries, section = [], None
+    for line in _git_config_logical_lines(raw, path):
+        stripped = line.lstrip(' \t')
+        if not stripped or stripped[0] in '#;':
+            continue
+        if stripped[0] == '[':
+            section, remainder = _git_config_section(stripped, path)
+            stripped = remainder.lstrip(' \t')
+            if not stripped or stripped[0] in '#;':
+                continue
+        name, separator, remainder = stripped.partition('=')
+        name = name.strip().lower()
+        if not name:
+            raise _unprovable_boundary(f'the Git config {path} has an unnamed variable')
+        if section is None:
+            section_name, _, variable = name.partition('.')
+            if not variable:
+                raise _unprovable_boundary(
+                    f'the Git config {path} has an unrecognized top-level '
+                    f'variable {name!r}')
+        else:
+            section_name, variable = section, name
+        if not (_GIT_CONFIG_NAME.match(section_name)
+                and _GIT_CONFIG_NAME.match(variable)):
+            raise _unprovable_boundary(
+                f'the Git config {path} has a variable this reader cannot '
+                f'interpret: {name!r}')
+        value = _git_config_value(remainder, path) if separator else 'true'
+        entries.append((section_name, variable, value))
+    return entries
+
+
+def _config_value(entries, section, variable):
+    """The last value Git would use for one key, or ``None`` when absent."""
+    value = None
+    for entry_section, entry_variable, entry_value in entries:
+        if entry_section == section and entry_variable == variable:
+            value = entry_value
+    return value
+
+
+def _config_bool(value, path, key):
+    lowered = value.strip().lower()
+    if lowered in ('true', 'yes', 'on', '1', ''):
+        return True
+    if lowered in ('false', 'no', 'off', '0'):
+        return False
+    raise _unprovable_boundary(
+        f'the Git config {path} sets {key} to a value this reader cannot '
+        f'interpret: {value!r}')
+
+
+def _resolve_core_worktree(gitdir_, value, source):
+    """The root ``core.worktree`` relocates to, relative to the git directory."""
+    if not value:
+        raise _unprovable_boundary(f'{source} sets core.worktree to an empty path')
+    path = Path(value)
+    if not path.is_absolute():
+        path = gitdir_ / path
+    return path.resolve()
+
+
+def _git_worktree_roots(root, entry):
+    """Every filesystem root Git may report as ``root``'s worktree, as data.
+
+    The directory holding the ``.git`` entry is one; a ``core.worktree`` the
+    repository config honors is another. The value is honored for a main
+    worktree from the common config (``$GIT_DIR/config``) and for any worktree
+    from ``$GIT_DIR/config.worktree`` once ``extensions.worktreeConfig`` is on.
+    A linked worktree ignores the common config's value, whose relative path
+    would resolve against the wrong directory. Every file this depends on is
+    read directly -- never through Git -- and anything it cannot interpret
+    fails closed.
+    """
+    roots = [root]
+    gitdir_ = _resolve_gitdir(entry)
+    if not gitdir_.is_dir():
+        raise _unprovable_boundary(f'the Git directory {gitdir_} does not exist')
+    common = gitdir_
+    pointer = gitdir_ / 'commondir'
+    if pointer.exists():
+        try:
+            text = pointer.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError) as exc:
+            raise _unprovable_boundary(
+                f'the Git common-directory pointer {pointer} cannot be read '
+                f'({exc})') from None
+        lines = text.splitlines()
+        if len(lines) != 1 or not lines[0].strip():
+            raise _unprovable_boundary(
+                f'the Git common-directory pointer {pointer} does not hold a '
+                'single path')
+        common = Path(lines[0].strip())
+        if not common.is_absolute():
+            common = gitdir_ / common
+        common = common.resolve()
+        if not common.is_dir():
+            raise _unprovable_boundary(
+                f'the Git common directory {common} does not exist')
+    config = common / 'config'
+    entries = _git_config_entries(config)
+    for section, _, _ in entries:
+        if section in _GIT_CONFIG_INCLUDE_SECTIONS:
+            raise _unprovable_boundary(
+                f'the Git config {config} includes another file, whose conditions '
+                'cannot be evaluated without Git')
+    if common == gitdir_:
+        relocated = _config_value(entries, 'core', 'worktree')
+        if relocated is not None:
+            roots.append(_resolve_core_worktree(gitdir_, relocated, config))
+    extension = _config_value(entries, 'extensions', 'worktreeconfig')
+    if extension is not None and _config_bool(
+            extension, config, 'extensions.worktreeConfig'):
+        local = gitdir_ / 'config.worktree'
+        local_entries = _git_config_entries(local)
+        for section, _, _ in local_entries:
+            if section in _GIT_CONFIG_INCLUDE_SECTIONS:
+                raise _unprovable_boundary(
+                    f'the Git config {local} includes another file, whose '
+                    'conditions cannot be evaluated without Git')
+        relocated = _config_value(local_entries, 'core', 'worktree')
+        if relocated is not None:
+            roots.append(_resolve_core_worktree(gitdir_, relocated, local))
+    return roots
+
+
+def _worktree_boundary(path, *, strict):
+    """The resolved path plus every root Git may treat as its worktree."""
+    resolved = Path(path).resolve(strict=strict)
+    boundary = [resolved]
+    root, entry = _locate_git_entry(resolved)
+    if root is not None:
+        boundary.extend(_git_worktree_roots(root, entry))
+    return boundary
 
 
 def _prove_journal_outside(state_path, repo, worktrees=()):
@@ -1150,18 +1428,18 @@ def _prove_journal_outside(state_path, repo, worktrees=()):
 
     ``run`` is given a repository path that may be a subdirectory of the
     worktree, and the task-worktree boundary used to be checked only after a
-    halt write. Each boundary is therefore the resolved path itself *and* its
-    enclosing worktree, found from the filesystem so no Git process (and no
-    ``core.fsmonitor`` helper inside it) starts. This runs before the halt
-    write and before the journal lock is created: a journal that is inside a
-    worktree is never rewritten to record a stop, and a repository path that
-    cannot be resolved is reported instead of being written around.
+    halt write. Each boundary is therefore the resolved path itself *and* every
+    root Git may report for it, found from the filesystem so no Git process
+    (and no ``core.fsmonitor`` helper inside it) starts. The root is the
+    directory holding the ``.git`` entry unless that repository's own config
+    relocates it with ``core.worktree``; that value is read from the two config
+    files Git honors for worktree setup, and any part of the metadata or config
+    this reader cannot interpret fails closed rather than being assumed absent.
 
     With ``GIT_DIR``/``GIT_WORK_TREE``/``GIT_COMMON_DIR`` set, the ``.git``
-    entry the walk depends on is not authoritative: Git may resolve a separate
-    metadata directory, and a worktree root can then carry no ``.git`` entry at
-    all. The boundary is then unprovable from the filesystem alone, so it fails
-    closed here instead of comparing only the path that was passed in.
+    entry the walk depends on is not authoritative at all: Git may resolve a
+    separate metadata directory, and a worktree root can then carry no ``.git``
+    entry. That is unprovable from the filesystem, so it fails closed here.
     """
     overrides = [name for name in _GIT_LOCATION_OVERRIDES if os.environ.get(name)]
     if overrides:
@@ -1171,20 +1449,14 @@ def _prove_journal_outside(state_path, repo, worktrees=()):
             'separate Git directory hides the worktree root, so unset it and run '
             'again')
     journal = Path(state_path).resolve()
-    boundary = [Path(repo).resolve(strict=True)]
-    enclosing = _enclosing_worktree(boundary[0])
-    if enclosing is not None:
-        boundary.append(enclosing)
-    if any(journal.is_relative_to(path) for path in boundary):
+    if any(journal.is_relative_to(path)
+           for path in _worktree_boundary(repo, strict=True)):
         raise ValueError('state must be outside the repository')
     for worktree in worktrees:
         if not worktree:
             continue
-        boundary = [Path(worktree).resolve()]
-        enclosing = _enclosing_worktree(boundary[0])
-        if enclosing is not None:
-            boundary.append(enclosing)
-        if any(journal.is_relative_to(path) for path in boundary):
+        if any(journal.is_relative_to(path)
+               for path in _worktree_boundary(worktree, strict=False)):
             raise ValueError('state must be outside every task worktree')
 
 

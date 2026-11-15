@@ -2668,6 +2668,60 @@ class TimeoutTests(DeliveryCase):
                          self.repo.resolve())
         return environment, scope
 
+    def _relocate_core_worktree(self):
+        """A real worktree whose root moves without any Git environment variable.
+
+        ``core.worktree`` in the repository config makes real Git report a
+        sibling directory as the worktree root even though ``.git`` stays where
+        it is, and that directory carries no ``.git`` entry of its own. The
+        filesystem walk therefore found the old root, and a journal at the new
+        one looked outside: the halt rewrote it and created its lock inside the
+        real worktree. The ``rev-parse`` below is the fixture's evidence, not
+        the proof under test.
+        """
+        relocated = self.root / 'relocated-worktree'
+        relocated.mkdir()
+        _git(self.repo, 'config', 'core.worktree', str(relocated))
+        result = _git(self.repo / 'docs', 'rev-parse', '--show-toplevel')
+        self.assertEqual(Path(result.stdout.decode().strip()).resolve(),
+                         relocated.resolve())
+        self.assertFalse((relocated / '.git').exists())
+        return relocated, self.repo / 'docs'
+
+    def _relocate_worktree_config(self):
+        """The same relocation through ``extensions.worktreeConfig`` instead.
+
+        ``core.worktree`` in ``$GIT_DIR/config.worktree`` is honored once
+        ``extensions.worktreeConfig`` is true, so the metadata walk has to read
+        that second file too; otherwise the root looks unchanged.
+        """
+        relocated = self.root / 'config-worktree-root'
+        relocated.mkdir()
+        _git(self.repo, 'config', 'extensions.worktreeConfig', 'true')
+        (self.repo / '.git' / 'config.worktree').write_text(
+            f'[core]\n\tworktree = {relocated}\n')
+        result = _git(self.repo / 'docs', 'rev-parse', '--show-toplevel')
+        self.assertEqual(Path(result.stdout.decode().strip()).resolve(),
+                         relocated.resolve())
+        self.assertFalse((relocated / '.git').exists())
+        return relocated, self.repo / 'docs'
+
+    def _relocate_core_worktree_on_section_line(self):
+        """The same relocation with the key on the section-header line.
+
+        Git reads ``[core] worktree = <path>`` as a variable in that section,
+        so a proof that stops at the closing ``]`` would miss the relocation.
+        """
+        relocated = self.root / 'same-line-root'
+        relocated.mkdir()
+        with (self.repo / '.git' / 'config').open('a', encoding='utf-8') as handle:
+            handle.write(f'\n[core] worktree = {relocated}\n')
+        result = _git(self.repo / 'docs', 'rev-parse', '--show-toplevel')
+        self.assertEqual(Path(result.stdout.decode().strip()).resolve(),
+                         relocated.resolve())
+        self.assertFalse((relocated / '.git').exists())
+        return relocated, self.repo / 'docs'
+
     def test_a_journal_inside_the_repository_is_never_rewritten_by_a_halt(self):
         # `run` only compared the journal with the repository path it was given.
         # A journal at the repository root, with a subdirectory passed as the
@@ -2736,6 +2790,98 @@ class TimeoutTests(DeliveryCase):
         self.assertEqual(calls, [])
         self.assertEqual(journal.read_text(), before)
         self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_a_halt_never_writes_inside_a_core_worktree_relocation(self):
+        # No Git location variable is set. `core.worktree` in the repository
+        # config moves the worktree root real Git reports to a directory with
+        # no `.git` entry, so the filesystem walk still found the old root and
+        # a timeout journal at the real root looked outside: the halt rewrote
+        # it and created its lock inside the worktree. The relocation has to be
+        # proved -- without starting Git -- before either.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        relocated, scope = self._relocate_core_worktree()
+        journal = relocated / 'state.json'
+        self._seed_timeout(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        with probe:
+            with self.assertRaises(ValueError) as caught:
+                delivery.run(scope, plan, journal, agent=FakeAgents(self),
+                             session_probe=self.default_probe, profiles=self.profiles,
+                             reviewer_agent='scout')
+        self.assertIn('outside the repository', str(caught.exception))
+        self.assertEqual(calls, [])
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_a_halt_never_writes_inside_a_worktree_config_relocation(self):
+        # `extensions.worktreeConfig` plus `core.worktree` in
+        # `$GIT_DIR/config.worktree` relocates the root the same way. The proof
+        # must resolve that second config file as data, not start Git.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        relocated, scope = self._relocate_worktree_config()
+        journal = relocated / 'state.json'
+        self._seed_timeout(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        with probe:
+            with self.assertRaises(ValueError) as caught:
+                delivery.run(scope, plan, journal, agent=FakeAgents(self),
+                             session_probe=self.default_probe, profiles=self.profiles,
+                             reviewer_agent='scout')
+        self.assertIn('outside the repository', str(caught.exception))
+        self.assertEqual(calls, [])
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_a_halt_never_writes_inside_a_same_line_core_worktree_relocation(self):
+        # Git reads a variable placed after its section header on the same
+        # line. Stopping at the closing `]` would hide `core.worktree` and
+        # write the halt into the relocated worktree.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        relocated, scope = self._relocate_core_worktree_on_section_line()
+        journal = relocated / 'state.json'
+        self._seed_timeout(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        with probe:
+            with self.assertRaises(ValueError) as caught:
+                delivery.run(scope, plan, journal, agent=FakeAgents(self),
+                             session_probe=self.default_probe, profiles=self.profiles,
+                             reviewer_agent='scout')
+        self.assertIn('outside the repository', str(caught.exception))
+        self.assertEqual(calls, [])
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_a_git_config_this_reader_cannot_evaluate_fails_closed(self):
+        # The proof now reads the config as data. An include's conditions are
+        # Git's to evaluate, so a config with one is not "no relocation": the
+        # halt has to refuse before writing even while the journal looks
+        # outside, or an unread construct could hide the worktree it lands in.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        self._seed_timeout(plan, self.state)
+        before = self.state.read_text()
+        with (self.repo / '.git' / 'config').open('a', encoding='utf-8') as handle:
+            handle.write('\n[includeIf "gitdir:/tmp/"]\n\tpath = other.cfg\n')
+        calls, probe = self._git_probe()
+        with probe:
+            with self.assertRaises(ValueError) as caught:
+                delivery.run(self.repo, plan, self.state, agent=FakeAgents(self),
+                             session_probe=self.default_probe, profiles=self.profiles,
+                             reviewer_agent='scout')
+        self.assertIn('cannot prove', str(caught.exception))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.state.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(self.state).exists())
 
     def test_an_unscannable_journal_shape_stops_a_run_before_any_git(self):
         # Valid JSON with a task list instead of a task mapping hid every
@@ -2849,6 +2995,36 @@ class TimeoutTests(DeliveryCase):
         self.assertEqual(journal.read_text(), before)
         self.assertFalse(delivery._journal_lock_path(journal).exists())
 
+    def test_the_cli_plan_resume_never_writes_inside_a_core_worktree_relocation(
+            self):
+        # `--plan --resume` halts on a recorded timeout by writing the journal
+        # and creating its lock. With `core.worktree` set and no Git location
+        # variable, the real worktree root carried no `.git` entry, so the old
+        # proof compared only the subdirectory passed as `--repo` and wrote
+        # inside the real worktree. The relocation must stop the CLI first.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        planfile = self.root / 'plan.json'
+        planfile.write_text(json.dumps(plan))
+        relocated, scope = self._relocate_core_worktree()
+        journal = relocated / 'state.json'
+        self._seed_timeout(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        errors = io.StringIO()
+        args = ['delivery', '--repo', str(scope), '--plan', str(planfile),
+                '--state', str(journal), '--execute', '--resume']
+        with probe, mock.patch('sys.argv', args), contextlib.redirect_stderr(errors), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                delivery.main()
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn('outside the repository', errors.getvalue())
+        self.assertEqual(calls, [])
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
     def test_the_cli_proves_the_shape_before_the_issue_query(self):
         # `{"tasks": [...]}` is valid JSON, but the scan cannot read a task list
         # as a mapping and used to call it "no timeout". `--issue --resume`
@@ -2907,6 +3083,32 @@ class TimeoutTests(DeliveryCase):
         with probe:
             code, errors, loader, gh = self._run_cli(
                 self._cli_issue_args(journal, repo=self.repo / 'docs', worktree=work))
+        self.assertEqual(code, 2)
+        self.assertIn('outside the repository', errors)
+        self.assertEqual(calls, [])
+        loader.assert_not_called()
+        gh.assert_not_called()
+        self.assertEqual(journal.read_text(), before)
+        self.assertFalse(delivery._journal_lock_path(journal).exists())
+
+    def test_the_cli_issue_resume_proves_a_core_worktree_relocation_before_git(
+            self):
+        # A journal with no timeout let `--issue --resume` start
+        # `git rev-parse` and `gh issue view` before any boundary proof. With
+        # `core.worktree` moving the real root and no Git location variable,
+        # that first Git call ran inside the worktree. The relocation has to be
+        # proved before either external call, timeout or not.
+        work = self.root / 'work-one'
+        work.mkdir()
+        plan = self.plan([self.task('one', work, ['a.txt'])])
+        relocated, scope = self._relocate_core_worktree()
+        journal = relocated / 'state.json'
+        self._seed_plain(plan, journal)
+        before = journal.read_text()
+        calls, probe = self._git_probe()
+        with probe:
+            code, errors, loader, gh = self._run_cli(
+                self._cli_issue_args(journal, repo=scope, worktree=work))
         self.assertEqual(code, 2)
         self.assertIn('outside the repository', errors)
         self.assertEqual(calls, [])
