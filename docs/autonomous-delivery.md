@@ -139,7 +139,7 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 
 - 权威派发先于执行：`github` 在 Agent 启动前写 `mode: batch` 的 Issue 登记块，`local` 先完成 `task ready` / `task dispatch`；载体缺失或派发失败时阻塞，不以本地报告替代权威状态。
 - 门禁使用真实载体：最终 PR 的实际必需 contexts 由平台查询，计划列出的检查只能是其子集；合并使用审查过的精确 SHA；合并后验证不得改变 HEAD 或工作树，否则只记 `merged_but_post_verify_failed` 并进入恢复。
-- `L0` 免第二模型审查，但必须有逐条 AC 的机器证据（`acceptance_checks`）或独立审查；两者都缺时阻塞，不把“文档改动”当成免验收。
+- `L0` 免第二模型审查，但必须有逐条 AC 的机器证据（`acceptance_checks`）**和** Master 的逐条决定（`acceptance_decisions`），或独立审查；两者都缺时阻塞，不把“文档改动”当成免验收。
 
 它的限制与本文相同，不因进入批次而消失：
 
