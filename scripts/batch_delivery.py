@@ -77,6 +77,9 @@ PHASES = ('tasks', 'review', 'pr', 'merge', 'post_merge', 'verified', 'blocked')
 CHAIN = ('PLANNED', 'READY', 'DISPATCHED', 'IN_PROGRESS', 'REVIEW_READY',
          'MASTER_REVIEW', 'APPROVED', 'MERGED', 'VERIFIED')
 FAILED_CHECKS = ('FAILURE', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'ERROR')
+ACTIVE_REGISTRY_STATUSES = ('DISPATCHED', 'IN_PROGRESS', 'REVIEW_READY',
+                            'MASTER_REVIEW', 'APPROVED', 'BLOCKED',
+                            'NEEDS_HUMAN_DECISION', 'FAILED')
 MERGE_METHODS = ('merge', 'squash', 'rebase')
 VALID_EDITIONS = ('local', 'github')
 SECRET_PATTERNS = ('.env', '.env.*', '*secret*', '*token*', '*.pem', '*.key',
@@ -315,38 +318,57 @@ def _norm_argv(argv):
 
 
 def _project_verification(text):
-    """Commands declared in `docs/PROJECT.md` under `## 验证命令`, normalized.
+    """Staged commands declared in `docs/PROJECT.md` under `## 验证命令`.
 
     Only the canonical command labels are read. The section also carries
     explanatory prose with backticked placeholders (for example a
     ``verification_profile`` command with ``--evidence <json>``); treating every
     backtick as a required command would make the plan impossible to satisfy.
+    A labeled line whose commands cannot be interpreted fails closed.
     """
     section = _section_text(text, '验证命令')
     if section is None:
         return None
-    labels = ('快速测试', '完整回归', '静态检查', '合并后必须执行')
-    commands = []
+    stages = (('快速测试', 'either'), ('完整回归', 'post'),
+              ('静态检查', 'either'), ('合并后必须执行', 'post'))
     known = ('python', 'python3', 'uv', 'pytest', 'npm', 'yarn', 'pnpm', 'go',
              'cargo', 'make', 'bash', 'sh', 'dotnet')
+    requirements = []
     for raw_line in section.splitlines():
         line = raw_line.strip()
         if line.startswith(('- ', '* ')):
             line = line[2:].strip()
-        if not line.startswith(labels):
+        stage = None
+        for label, candidate in stages:
+            if line.startswith(label):
+                stage = candidate
+                break
+        if stage is None:
             continue
+        commands = []
         for token in re.findall(r'`([^`]+)`', line):
+            if '<' in token or '>' in token:
+                continue  # placeholder, not a runnable command
             try:
                 argv = shlex.split(token)
-            except ValueError:
-                continue
+            except ValueError as exc:
+                raise InputError(
+                    f'docs/PROJECT.md verification line for {line.split("：", 1)[0]} '
+                    f'has an uninterpretable command {token!r}: {exc}') from None
             if not argv:
                 continue
-            if len(argv) == 1 and os.path.basename(argv[0]) not in known:
+            first = os.path.basename(argv[0])
+            if (first not in known and argv[0] != sys.executable
+                    and not first.endswith(('.py', '.sh'))):
                 continue
             commands.append(_norm_argv(argv))
-            break
-    return commands
+        if not commands:
+            raise InputError(
+                'docs/PROJECT.md verification line for '
+                f'{line.split("：", 1)[0]} declares no interpretable command; '
+                'refusing to silently drop an ambiguous requirement')
+        requirements.extend((stage, command) for command in commands)
+    return requirements
 
 
 def _edition_value(form, raw):
@@ -624,14 +646,22 @@ def validate_plan(raw, repo_override=None):
     declared = config.get('verification')
     project_verification = 'absent' if declared is None else 'bound'
     if declared is not None:
-        planned = {_norm_argv(command) for command in verify + post_verify}
-        missing = [command for command in declared if command not in planned]
+        verify_set = {_norm_argv(command) for command in verify}
+        post_set = {_norm_argv(command) for command in post_verify}
+        missing = []
+        for stage, command in declared:
+            pool = post_set if stage == 'post' else verify_set | post_set
+            if command not in pool:
+                missing.append((stage, command))
         if missing:
-            rendered = ', '.join(' '.join(command) for command in missing)
+            rendered = ', '.join(
+                f'{"post-merge" if stage == "post" else "pre/post"}: '
+                + ' '.join(command) for stage, command in missing)
             raise InputError(
-                'docs/PROJECT.md declares project verification command(s) that '
-                f'neither finalize.verify nor finalize.post_merge_verify contains: '
-                f'{rendered}. Add the exact command to the plan')
+                'docs/PROJECT.md declares staged project verification command(s) '
+                f'that the plan does not cover: {rendered}. 完整回归 and '
+                '合并后必须执行 commands must be in finalize.post_merge_verify; '
+                '快速测试 and 静态检查 may be in verify or post_merge_verify')
     checks = finalize_raw.get('required_checks') or []
     if not isinstance(checks, list) or any(not isinstance(name, str) or not name
                                            for name in checks):
@@ -1203,11 +1233,16 @@ def _gh_json(args, cwd, *, input_text=None, timeout=300):
 def _open_pr_conflicts(plan, batch_branch):
     if plan['edition'] != 'github':
         return {}
+    repo = plan['batch']['repo']
     payload = _gh_json(['pr', 'list', '--state', 'open', '--limit', '1000',
-                        '--json', 'number,headRefName,files'],
-                       plan['batch']['repo'])
+                        '--json', 'number,headRefName,files'], repo)
     if not isinstance(payload, list):
         raise BatchError('gh pr list returned an unexpected payload')
+    if len(payload) >= 1000:
+        raise BatchError('the open PR enumeration reached its 1000-item limit; '
+                         'the active lock set cannot be proven complete',
+                         status='BLOCKED')
+    union = {name for spec in plan['tasks'] for name in spec['paths']}
     conflicts = {}
     for item in payload:
         if not isinstance(item, dict):
@@ -1227,6 +1262,47 @@ def _open_pr_conflicts(plan, batch_branch):
                     conflicts[spec['id']] = (f'open PR #{item.get("number")} '
                                              f'({head}) touches {name}')
                     break
+    issues = _gh_json(['issue', 'list', '--state', 'open', '--limit', '1000',
+                       '--json', 'number,body'], repo)
+    if not isinstance(issues, list):
+        raise BatchError('gh issue list returned an unexpected payload')
+    if len(issues) >= 1000:
+        raise BatchError('the active Issue enumeration reached its 1000-item '
+                         'limit; the registry lock set cannot be proven complete',
+                         status='BLOCKED')
+    current_issue = plan['batch'].get('issue')
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        number = issue.get('number')
+        if current_issue is not None and number == current_issue:
+            continue
+        blocks = _registry_blocks(issue.get('body') or '')
+        if not blocks:
+            continue
+        if len(blocks) != 1:
+            conflicts[f'issue-{number}'] = (
+                f'issue #{number} has {len(blocks)} ORCH-TASK-REGISTRY blocks; '
+                'the active lock state is ambiguous')
+            continue
+        inner = blocks[0]
+        status = _registry_value(inner, 'status')
+        locked_raw = _registry_value(inner, 'locked_paths')
+        if not status or locked_raw is None:
+            conflicts[f'issue-{number}'] = (
+                f'issue #{number} has an unreadable ORCH-TASK-REGISTRY block; '
+                'the active lock state cannot be proven')
+            continue
+        if status not in ACTIVE_REGISTRY_STATUSES:
+            continue
+        locked = [item.strip().rstrip('/') for item in locked_raw.split(',')
+                  if item.strip() and item.strip() != '(none)']
+        overlap = sorted({one for one in union for two in locked
+                          if _overlaps(one, two)})
+        if overlap:
+            conflicts[f'issue-{number}'] = (
+                f'active issue #{number} registry locks overlap the batch: '
+                + ', '.join(overlap))
     return conflicts
 
 
@@ -1333,10 +1409,11 @@ def _dispatch_local(plan, state, journal):
         if internal:
             raise BatchError(
                 f'task {ident} records in-batch dependency {", ".join(internal)} in '
-                'the local task library. The local CLI requires a dependency to be '
-                'VERIFIED, but batch-internal dependencies are satisfied at '
-                'INTEGRATED. Keep batch-internal dependencies only in the batch plan '
-                'DAG and leave the task library with external dependencies only',
+                'the local task library. This coordinator does not support local '
+                'batch-internal dependencies recorded in the task library. Keep the '
+                'task record intact; deliver the dependent task through a '
+                'single-task/manual workflow or wait for a batch-aware local '
+                'dispatch. The plan DAG does not replace task records',
                 status='BLOCKED')
         if (record['status'] in ('VERIFIED', 'MERGED', 'CANCELED')
                 and (state['tasks'].get(ident) or {}).get('status') != 'VERIFIED'):
@@ -1765,9 +1842,15 @@ def command_run(args):
             if reasons:
                 raise BatchError('refusing to run while Git can execute code during '
                                  'commit: ' + '; '.join(reasons))
-            conflicts = _open_pr_conflicts(plan, plan['batch']['branch'])
+            try:
+                conflicts = _open_pr_conflicts(plan, plan['batch']['branch'])
+            except BatchError as exc:
+                for spec in plan['tasks']:
+                    state['tasks'][spec['id']].update(status='BLOCKED',
+                                                      error=str(exc))
+                raise
             if conflicts:
-                detail = ('open pull request path conflict blocks the whole batch: '
+                detail = ('active lock conflict blocks the whole batch: '
                           + '; '.join(f'{ident}: {reason}'
                                       for ident, reason in sorted(conflicts.items())))
                 for spec in plan['tasks']:
@@ -1996,27 +2079,51 @@ def _acceptance_evidence(plan, state, work, head, digest, timeout):
     return evidence
 
 
-def _require_decisions(plan, state, head, digest):
+def _load_attestation(path, plan, head, digest):
+    """Validate a post-execution Master attestation bound to the reviewed diff."""
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
+        raise BatchError(f'cannot read the acceptance attestation: {exc}',
+                         status='BLOCKED') from None
+    try:
+        data = json.loads(raw.decode('utf-8'))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise BatchError(f'the acceptance attestation is not JSON: {exc}',
+                         status='BLOCKED') from None
+    if not isinstance(data, dict) or data.get('schema') != 'batch-acceptance/1':
+        raise BatchError('the acceptance attestation schema must be '
+                         'batch-acceptance/1', status='BLOCKED')
+    if data.get('head') != head:
+        raise BatchError('the acceptance attestation binds a different head',
+                         status='REVIEW_REJECTED')
+    if data.get('diff_sha256') != digest:
+        raise BatchError('the acceptance attestation binds a different diff',
+                         status='REVIEW_REJECTED')
+    tasks = data.get('tasks')
+    expected = {spec['id'] for spec in plan['tasks']}
+    if not isinstance(tasks, dict) or set(tasks) != expected:
+        raise BatchError('the acceptance attestation does not cover exactly the '
+                         'batch task set', status='REVIEW_REJECTED')
     decisions = {}
     for spec in plan['tasks']:
-        entries = spec.get('acceptance_decisions')
-        if not entries:
-            raise BatchError(f'task {spec["id"]} has no acceptance_decisions',
-                             status='BLOCKED')
+        entries = tasks.get(spec['id'])
+        if not isinstance(entries, list) or len(entries) != len(spec['acceptance']):
+            raise BatchError(f'the acceptance attestation for {spec["id"]} does not '
+                             'cover every criterion', status='REVIEW_REJECTED')
         for index, item in enumerate(entries, start=1):
-            if (item.get('status') != 'PASS'
-                    or not str(item.get('evidence') or '').strip()):
-                state['review'] = {
-                    'head': head, 'diff_sha256': digest, 'risk': 'L0',
-                    'verdict': 'REJECT', 'session': None, 'reviewer_agent': None,
-                    'reason': f'{spec["id"]} AC-{index} Master decision is not PASS',
-                    'acceptance_decisions': decisions}
-                raise BatchError(
-                    f'L0 requires a PASS Master decision with evidence for '
-                    f'{spec["id"]} AC-{index}; the batch cannot merge',
-                    status='REVIEW_REJECTED')
+            if not isinstance(item, dict) or item.get('id') != f'AC-{index}':
+                raise BatchError(f'the acceptance attestation for {spec["id"]} '
+                                 f'AC-{index} is malformed', status='REVIEW_REJECTED')
+            if item.get('status') != 'PASS':
+                raise BatchError(f'the acceptance attestation for {spec["id"]} '
+                                 f'AC-{index} is not PASS', status='REVIEW_REJECTED')
+            if not str(item.get('evidence') or '').strip():
+                raise BatchError(f'the acceptance attestation for {spec["id"]} '
+                                 f'AC-{index} has no evidence',
+                                 status='REVIEW_REJECTED')
         decisions[spec['id']] = entries
-    return decisions
+    return decisions, hashlib.sha256(raw).hexdigest()
 
 
 def _review(plan, state, journal, args, base, head, digest, risk):
@@ -2031,28 +2138,37 @@ def _review(plan, state, journal, args, base, head, digest, risk):
                          'invalid. Reconcile the branch and review again.',
                          status='BLOCKED')
     if risk['level'] == 'L0':
-        complete = all(spec.get('acceptance_checks')
-                       and spec.get('acceptance_decisions')
-                       for spec in plan['tasks'])
-        if complete:
+        checks_complete = all(spec.get('acceptance_checks')
+                              for spec in plan['tasks'])
+        attestation = getattr(args, 'acceptance_attestation', None)
+        if checks_complete and attestation:
             work = Path(plan['batch']['worktree'])
             evidence = _acceptance_evidence(plan, state, work, head, digest,
                                             args.timeout)
-            decisions = _require_decisions(plan, state, head, digest)
+            decisions, attestation_digest = _load_attestation(
+                attestation, plan, head, digest)
+            plan_decisions = {spec['id']: spec.get('acceptance_decisions')
+                              for spec in plan['tasks']
+                              if spec.get('acceptance_decisions')}
             record = {'head': head, 'diff_sha256': digest, 'risk': risk['level'],
                       'verdict': 'NOT_REQUIRED_L0', 'session': None,
                       'reviewer_agent': None,
-                      'reason': 'docs-only diff with per-AC checks and Master '
-                                'decisions',
+                      'reason': 'docs-only diff with per-AC checks and a '
+                                'post-execution Master attestation',
                       'acceptance_evidence': evidence,
-                      'acceptance_decisions': decisions}
+                      'acceptance_decisions': decisions,
+                      'acceptance_attestation_sha256': attestation_digest,
+                      'at': _now()}
+            if plan_decisions:
+                record['plan_acceptance_decisions'] = plan_decisions
             state['review'] = record
             return record
         if not args.review:
             raise BatchError(
-                'L0 needs complete acceptance_checks and acceptance_decisions for '
-                'every task, or an independent review; neither is present, so the '
-                'batch cannot be auto-merged', status='BLOCKED')
+                'L0 needs complete acceptance_checks and a matching '
+                '--acceptance-attestation for every task/AC, or an independent '
+                'review; neither gate is present, so the batch cannot be '
+                'auto-merged', status='BLOCKED')
         # Fall through to the independent reviewer below.
     if risk['level'] == 'L3':
         state['review'] = {'head': head, 'diff_sha256': digest,
@@ -2310,9 +2426,14 @@ def _replace_registry(body, block):
     return (body[:index] + block + body[index:]).strip('\n') + '\n'
 
 
+def _registry_blocks(body):
+    return ([match.group('inner') for match in _HTML_REGISTRY.finditer(body or '')]
+            + [match.group('inner') for match in _FENCED_REGISTRY.finditer(body or '')])
+
+
 def _registry_inner(body):
-    match = _HTML_REGISTRY.search(body or '') or _FENCED_REGISTRY.search(body or '')
-    return match.group('inner') if match else ''
+    blocks = _registry_blocks(body)
+    return blocks[0] if blocks else ''
 
 
 def _update_registry(body, state, plan, merge_commit):
@@ -2517,51 +2638,48 @@ def _github_pr(plan, state, head):
     return _pr_from_item(plan, payload[0], head)
 
 
-def _authoritative_checks(plan, pr):
-    """Required contexts from repository rulesets, never from observed runs."""
+def _authoritative_checks(plan):
+    """Required contexts and app identities from effective branch rules."""
     batch = plan['batch']
     if not batch.get('issue_repo'):
-        raise BatchError('cannot read repository rulesets without batch.issue_repo',
+        raise BatchError('cannot read repository rules without batch.issue_repo',
                          status='BLOCKED')
     repo = plan['batch']['repo']
     slug = batch['issue_repo']
-    payload = _gh_json(['api', '--paginate', '--slurp',
-                        f'repos/{slug}/rulesets'], repo)
-    pages = payload if isinstance(payload, list) else []
-    summaries = []
-    for page in pages:
-        if isinstance(page, list):
-            summaries.extend(item for item in page if isinstance(item, dict))
-        elif isinstance(page, dict):
-            summaries.append(page)
-    contexts = set()
-    for summary in summaries:
-        ident = summary.get('id')
-        if ident is None:
+    payload = _gh_json(['api',
+                        f'repos/{slug}/rules/branches/{batch["base"]}'], repo)
+    if not isinstance(payload, list) or not payload:
+        raise BatchError('the effective branch rules are empty or unreadable; '
+                         'refusing to invent a required-check gate',
+                         status='BLOCKED')
+    required = {}
+    for rule in payload:
+        if not isinstance(rule, dict) or rule.get('type') != 'required_status_checks':
             continue
-        detail = _gh_json(['api', f'repos/{slug}/rulesets/{ident}'], repo)
-        if not isinstance(detail, dict):
-            raise BatchError('a ruleset detail is not a JSON object',
-                             status='BLOCKED')
-        for rule in detail.get('rules') or []:
-            if not isinstance(rule, dict) or rule.get('type') != 'required_status_checks':
+        params = rule.get('parameters') or {}
+        for check in params.get('required_status_checks') or []:
+            if not isinstance(check, dict):
                 continue
-            params = rule.get('parameters') or {}
-            for check in params.get('required_status_checks') or []:
-                if isinstance(check, dict):
-                    context = check.get('context')
-                    if isinstance(context, str) and context:
-                        contexts.add(context)
-    if not contexts:
-        raise BatchError('the repository ruleset configuration yields no required '
-                         'status contexts; refusing to treat an empty set as pass',
+            context = check.get('context')
+            if not isinstance(context, str) or not context:
+                continue
+            app = check.get('integration_id')
+            if context in required and required[context] != app:
+                raise BatchError(
+                    f'effective rules require context {context!r} with conflicting '
+                    'app identities; refusing an ambiguous gate', status='BLOCKED')
+            required[context] = app
+    if not required:
+        raise BatchError('the effective branch rules yield no required status '
+                         'contexts; refusing to treat an empty set as pass',
                          status='BLOCKED')
     planned = set(plan['finalize']['required_checks'])
-    missing = sorted(planned - contexts)
+    missing = sorted(planned - set(required))
     if missing:
-        raise BatchError('the plan lists required check(s) the repository ruleset '
-                         'does not require: ' + ', '.join(missing), status='BLOCKED')
-    return sorted(contexts)
+        raise BatchError('the plan lists required check(s) the effective rules do '
+                         'not require: ' + ', '.join(missing), status='BLOCKED')
+    return [{'context': context, 'integration_id': required[context]}
+            for context in sorted(required)]
 
 
 def _recheck_pr(plan, pr, head):
@@ -2584,28 +2702,62 @@ def _recheck_pr(plan, pr, head):
 
 def _wait_checks(plan, state, pr, head, timeout, required):
     repo = plan['batch']['repo']
+    slug = plan['batch']['issue_repo']
     deadline = time.monotonic() + timeout
     while True:
-        payload = _gh_json(['pr', 'checks', str(pr['number']), '--json',
-                            'name,state,link'], repo)
-        if not isinstance(payload, list):
-            raise BatchError('gh pr checks returned an unexpected payload')
-        states = {}
-        for item in payload:
-            if isinstance(item, dict) and isinstance(item.get('name'), str):
-                states[item['name']] = item.get('state')
-        failed = [name for name in required if states.get(name) in FAILED_CHECKS]
-        if failed:
-            raise BatchError('required checks failed: ' + ', '.join(
-                f'{name}={states.get(name)}' for name in failed))
-        if all(states.get(name) == 'SUCCESS' for name in required):
+        payload = _gh_json(['api',
+                            f'repos/{slug}/commits/{head}/check-runs?per_page=100'],
+                           repo)
+        if not isinstance(payload, dict):
+            raise BatchError('the check-run response is not a JSON object',
+                             status='BLOCKED')
+        runs = payload.get('check_runs')
+        total = payload.get('total_count')
+        if not isinstance(runs, list) or not isinstance(total, int):
+            raise BatchError('the check-run response is unreadable',
+                             status='BLOCKED')
+        if total > len(runs):
+            raise BatchError(
+                f'the check-run list is truncated ({len(runs)} of {total}); '
+                'refusing to guess about missing required contexts',
+                status='BLOCKED')
+        by_name = {}
+        for run in runs:
+            if isinstance(run, dict) and isinstance(run.get('name'), str):
+                by_name[run['name']] = run
+        missing = []
+        pending = []
+        for item in required:
+            context = item['context']
+            run = by_name.get(context)
+            if run is None:
+                missing.append(context)
+                continue
+            app = run.get('app') if isinstance(run.get('app'), dict) else {}
+            app_id = app.get('id')
+            expected_app = item.get('integration_id')
+            if expected_app is not None and app_id != expected_app:
+                raise BatchError(
+                    f'required check {context!r} ran under app {app_id!r}, not the '
+                    f'configured integration {expected_app!r}', status='BLOCKED')
+            if run.get('status') != 'completed':
+                pending.append(context)
+                continue
+            if run.get('conclusion') != 'success':
+                raise BatchError(
+                    f'required check {context!r} concluded '
+                    f'{run.get("conclusion")!r}, not success', status='BLOCKED')
+        if not missing and not pending:
             break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            missing = [name for name in required if name not in states]
-            detail = ('missing required check(s): ' + ', '.join(missing)
-                      if missing else 'required checks did not succeed in time')
-            raise BatchError(detail + ' (NOT_RUN is never treated as pass)')
+            if missing:
+                raise BatchError('missing required check run(s): '
+                                 + ', '.join(missing)
+                                 + ' (NOT_RUN is never treated as pass)',
+                                 status='BLOCKED')
+            raise BatchError('required check run(s) did not complete in time: '
+                             + ', '.join(pending), status='BLOCKED')
         time.sleep(min(10, remaining))
     _recheck_pr(plan, pr, head)
 
@@ -2797,7 +2949,7 @@ def _github_flow(plan, state, journal, args, base, head, digest, risk):
     state['pr'] = pr
     state['phase'] = 'pr'
     _atomic_json(journal, state)
-    required = _authoritative_checks(plan, pr)
+    required = _authoritative_checks(plan)
     _wait_checks(plan, state, pr, head, args.checks_timeout, required)
     if not args.merge:
         state['phase'] = 'pr'
@@ -3121,6 +3273,7 @@ def _parser():
     finalize.add_argument('--journal')
     finalize.add_argument('--repo')
     finalize.add_argument('--review', action='store_true')
+    finalize.add_argument('--acceptance-attestation', default=None)
     finalize.add_argument('--push', action='store_true')
     finalize.add_argument('--merge', action='store_true')
     finalize.add_argument('--authorization', default=None)

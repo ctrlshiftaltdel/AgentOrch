@@ -30,6 +30,13 @@ CHECKS = ['checks (Python 3.12)', 'checks (Python 3.13)']
 CHECK_SUCCESS = [{'name': name, 'state': 'SUCCESS', 'link': 'https://ci.invalid/1'}
                  for name in CHECKS]
 
+
+def check_runs(conclusions=None, app_id=123, status='completed'):
+    conclusions = conclusions or {name: 'success' for name in CHECKS}
+    return [{'name': name, 'app': {'id': app_id}, 'status': status,
+             'conclusion': conclusion}
+            for name, conclusion in conclusions.items()]
+
 OPENCODE = r'''#!{python}
 import json
 import os
@@ -267,40 +274,44 @@ if args[:1] == ['api']:
     for token in args[1:]:
         if not token.startswith('--'):
             path = token
-    contexts = os.environ.get('FAKE_GH_RULESET_CONTEXTS')
-    contexts = json.loads(contexts) if contexts is not None else {ruleset_default!r}
-    if path.endswith('/rulesets'):
-        pages = [[{{'id': 1}}]]
-        out(pages if '--slurp' in args else pages[0])
+    app_id = int(os.environ.get('FAKE_GH_RULE_APP_ID', '123'))
+    if '/rules/branches/' in path:
+        contexts = os.environ.get('FAKE_GH_RULE_CONTEXTS')
+        contexts = json.loads(contexts) if contexts is not None else {check_names!r}
+        out([{{'type': 'required_status_checks',
+              'parameters': {{'required_status_checks': [
+                  {{'context': name, 'integration_id': app_id}}
+                  for name in contexts]}}}}])
         raise SystemExit(0)
-    if '/rulesets/' in path:
-        ident = int(path.rsplit('/', 1)[-1])
-        out({{'id': ident, 'rules': [{{'type': 'required_status_checks',
-                                      'parameters': {{
-                                          'required_status_checks': [
-                                              {{'context': name}}
-                                              for name in contexts]}}}}]}})
+    if '/check-runs' in path:
+        if os.environ.get('FAKE_GH_ADVANCE_ON_CHECKS') == '1':
+            marker = STATE.parent / 'base-advanced'
+            if not marker.exists():
+                marker.write_text('1')
+                git('fetch', 'origin', 'main')
+                directory = tempfile.mkdtemp(prefix='gh-advance-',
+                                             dir=str(STATE.parent))
+                git('worktree', 'add', '--detach', directory, 'origin/main')
+                git('-C', directory, 'commit', '--allow-empty', '-m',
+                    'advance base')
+                git('-C', directory, 'push', 'origin', 'HEAD:refs/heads/main')
+                git('worktree', 'remove', '--force', directory)
+                shutil.rmtree(directory, ignore_errors=True)
+        raw_runs = os.environ.get('FAKE_GH_CHECK_RUNS')
+        if raw_runs is not None:
+            runs = json.loads(raw_runs)
+        else:
+            runs = [{{'name': name, 'app': {{'id': app_id}},
+                      'status': 'completed', 'conclusion': 'success'}}
+                    for name in {check_names!r}]
+        total = os.environ.get('FAKE_GH_CHECK_RUNS_TOTAL')
+        out({{'total_count': int(total) if total is not None else len(runs),
+              'check_runs': runs}})
         raise SystemExit(0)
     print('unsupported gh api path', file=sys.stderr)
     raise SystemExit(2)
 
 if args[:2] == ['pr', 'checks']:
-    if os.environ.get('FAKE_GH_ADVANCE_ON_CHECKS') == '1':
-        marker = STATE.parent / 'base-advanced'
-        if not marker.exists():
-            marker.write_text('1')
-            git('fetch', 'origin', 'main')
-            directory = tempfile.mkdtemp(prefix='gh-advance-', dir=str(STATE.parent))
-            git('worktree', 'add', '--detach', directory, 'origin/main')
-            git('-C', directory, 'commit', '--allow-empty', '-m', 'advance base')
-            git('-C', directory, 'push', 'origin', 'HEAD:refs/heads/main')
-            git('worktree', 'remove', '--force', directory)
-            shutil.rmtree(directory, ignore_errors=True)
-    if '--required' in args:
-        required = os.environ.get('FAKE_GH_REQUIRED')
-        names = json.loads(required) if required else {required_default!r}
-        out([{{'name': name}} for name in names])
-        raise SystemExit(0)
     checks = os.environ.get('FAKE_GH_CHECKS')
     out(json.loads(checks) if checks else {checks!r})
     raise SystemExit(0)
@@ -363,6 +374,16 @@ if args[:2] == ['pr', 'merge']:
     print('not found', file=sys.stderr)
     raise SystemExit(1)
 
+if args[:2] == ['issue', 'list']:
+    state = load()
+    issues = state.get('issues')
+    if issues is None:
+        issues = [state.get('issue', {{}})]
+    out([{{'number': item.get('number'), 'body': item.get('body') or ''}}
+         for item in issues
+         if str(item.get('state', 'OPEN')).upper() == 'OPEN'])
+    raise SystemExit(0)
+
 if args[:2] == ['issue', 'view']:
     state = load()
     out(state.get('issue', {{}}))
@@ -388,8 +409,7 @@ if args[:2] == ['issue', 'edit']:
 
 print('unsupported gh invocation', file=sys.stderr)
 raise SystemExit(2)
-'''.format(python=PY, checks=CHECK_SUCCESS, required_default=CHECKS,
-           ruleset_default=CHECKS)
+'''.format(python=PY, checks=CHECK_SUCCESS, check_names=CHECKS)
 
 ORCHESTRATOR = r'''#!{python}
 import json
@@ -669,6 +689,25 @@ class BatchCase(unittest.TestCase):
         digest = hashlib.sha256(str(resolved).encode()).hexdigest()[:24]
         return resolved.parent / f'.batch-delivery-{digest}.lock'
 
+    def write_attestation(self, plan, head=None, digest=None, status='PASS',
+                          tasks=None):
+        state = self.journal_data()
+        real_head = self.head(self.root / 'wt-batch')
+        head = head or real_head
+        digest = digest or delivery._diff_for_review(
+            self.repo, state['base_sha'], real_head)[1]
+        if tasks is None:
+            tasks = {}
+            for spec in plan['tasks']:
+                tasks[spec['id']] = [
+                    {'id': f'AC-{index}', 'status': status,
+                     'evidence': f'{spec["id"]} AC-{index} evidence'}
+                    for index in range(1, len(spec['acceptance']) + 1)]
+        path = self.root / 'attestation.json'
+        path.write_text(json.dumps({'schema': 'batch-acceptance/1', 'head': head,
+                                    'diff_sha256': digest, 'tasks': tasks}))
+        return path
+
     def review_fails(self, extra, needle):
         plan = self.plan([self.task('T1', 'a.txt')])
         self.assertEqual(self.run_batch(plan).returncode, 0)
@@ -862,12 +901,12 @@ class GitHubBatchTests(BatchCase):
     def test_l0_batch_needs_no_second_model(self):
         check = 'import pathlib; assert pathlib.Path("docs/note.md").exists()'
         plan = self.plan([self.task(
-            'T1', 'docs/note.md', acceptance_checks=[[PY, '-c', check]],
-            acceptance_decisions=[{'id': 'AC-1', 'status': 'PASS',
-                                   'evidence': 'docs/note.md present in diff'}])])
+            'T1', 'docs/note.md', acceptance_checks=[[PY, '-c', check]])])
         self.assertEqual(self.run_batch(plan).returncode, 0)
-        done = self.finalize(plan, None, '--push', '--merge', '--authorization',
-                             AUTH, '--checks-timeout', '5')
+        attestation = self.write_attestation(plan)
+        done = self.finalize(plan, None, '--acceptance-attestation',
+                             str(attestation), '--push', '--merge',
+                             '--authorization', AUTH, '--checks-timeout', '5')
         self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
         state = self.journal_data()
         self.assertEqual(state['review']['verdict'], 'NOT_REQUIRED_L0')
@@ -877,7 +916,62 @@ class GitHubBatchTests(BatchCase):
                          'PASS')
         self.assertEqual(
             state['review']['acceptance_decisions']['T1'][0]['status'], 'PASS')
+        self.assertTrue(state['review']['acceptance_attestation_sha256'])
         self.assertEqual(state['phase'], 'verified')
+
+    def test_l0_plan_decisions_alone_block(self):
+        plan = self.plan([self.task(
+            'T1', 'docs/note.md',
+            acceptance_checks=[[PY, '-c', 'pass']],
+            acceptance_decisions=[{'id': 'AC-1', 'status': 'PASS',
+                                   'evidence': 'pre-run decision'}])])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        done = self.finalize(plan, None, '--push', '--merge',
+                             '--authorization', AUTH, '--checks-timeout', '5')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('--acceptance-attestation', done.stderr)
+        self.assertFalse(any('pr create' in call for call in self.gh_calls()))
+
+    def test_l0_wrong_head_attestation_blocks(self):
+        plan = self.plan([self.task(
+            'T1', 'docs/note.md',
+            acceptance_checks=[[PY, '-c', 'pass']])])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        attestation = self.write_attestation(plan, head='0' * 40)
+        done = self.finalize(plan, None, '--acceptance-attestation',
+                             str(attestation), '--push', '--merge',
+                             '--authorization', AUTH, '--checks-timeout', '5')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('different head', done.stderr)
+        self.assertFalse(any('pr create' in call for call in self.gh_calls()))
+
+    def test_l0_wrong_diff_attestation_blocks(self):
+        plan = self.plan([self.task(
+            'T1', 'docs/note.md',
+            acceptance_checks=[[PY, '-c', 'pass']])])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        attestation = self.write_attestation(plan, digest='f' * 64)
+        done = self.finalize(plan, None, '--acceptance-attestation',
+                             str(attestation), '--push', '--merge',
+                             '--authorization', AUTH, '--checks-timeout', '5')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('different diff', done.stderr)
+        self.assertFalse(any('pr create' in call for call in self.gh_calls()))
+
+    def test_l0_attestation_with_unrelated_tasks_blocks(self):
+        plan = self.plan([self.task(
+            'T1', 'docs/note.md',
+            acceptance_checks=[[PY, '-c', 'pass']])])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        attestation = self.write_attestation(
+            plan, tasks={'T9': [{'id': 'AC-1', 'status': 'PASS',
+                                 'evidence': 'unrelated'}]})
+        done = self.finalize(plan, None, '--acceptance-attestation',
+                             str(attestation), '--push', '--merge',
+                             '--authorization', AUTH, '--checks-timeout', '5')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('exactly the batch task set', done.stderr)
+        self.assertFalse(any('pr create' in call for call in self.gh_calls()))
 
     def test_l0_without_acceptance_checks_is_blocked(self):
         plan = self.plan([self.task('T1', 'docs/note.md')])
@@ -885,23 +979,22 @@ class GitHubBatchTests(BatchCase):
         done = self.finalize(plan, None, '--push', '--merge', '--authorization',
                              AUTH, '--checks-timeout', '5')
         self.assertEqual(done.returncode, 1)
-        self.assertIn('L0 needs complete acceptance_checks and '
-                      'acceptance_decisions', done.stderr)
+        self.assertIn('acceptance_checks and a matching --acceptance-attestation',
+                      done.stderr)
         self.assertFalse(any('pr create' in call for call in self.gh_calls()))
 
     def test_l0_failed_master_decision_blocks_the_merge(self):
         plan = self.plan([self.task(
             'T1', 'docs/note.md',
-            acceptance_checks=[[PY, '-c', 'pass']],
-            acceptance_decisions=[{'id': 'AC-1', 'status': 'FAIL',
-                                   'evidence': 'reviewer says the AC is unmet'}])])
+            acceptance_checks=[[PY, '-c', 'pass']])])
         self.assertEqual(self.run_batch(plan).returncode, 0)
-        done = self.finalize(plan, None, '--push', '--merge', '--authorization',
-                             AUTH, '--checks-timeout', '5')
+        attestation = self.write_attestation(plan, status='FAIL')
+        done = self.finalize(plan, None, '--acceptance-attestation',
+                             str(attestation), '--push', '--merge',
+                             '--authorization', AUTH, '--checks-timeout', '5')
         self.assertEqual(done.returncode, 1)
-        self.assertIn('PASS Master decision', done.stderr)
+        self.assertIn('is not PASS', done.stderr)
         self.assertFalse(any('pr create' in call for call in self.gh_calls()))
-        self.assertEqual(self.journal_data()['review']['verdict'], 'REJECT')
 
     def test_l0_without_checks_can_use_reviewer(self):
         plan = self.plan([self.task('T1', 'docs/note.md')])
@@ -916,12 +1009,12 @@ class GitHubBatchTests(BatchCase):
     def test_l0_failed_acceptance_check_blocks_the_merge(self):
         check = 'import pathlib; assert pathlib.Path("docs/note.md").read_text().strip() == "42"'
         plan = self.plan([self.task(
-            'T1', 'docs/note.md', acceptance_checks=[[PY, '-c', check]],
-            acceptance_decisions=[{'id': 'AC-1', 'status': 'PASS',
-                                   'evidence': 'decision says PASS'}])])
+            'T1', 'docs/note.md', acceptance_checks=[[PY, '-c', check]])])
         self.assertEqual(self.run_batch(plan).returncode, 0)
-        done = self.finalize(plan, None, '--push', '--merge', '--authorization',
-                             AUTH, '--checks-timeout', '5')
+        attestation = self.write_attestation(plan)
+        done = self.finalize(plan, None, '--acceptance-attestation',
+                             str(attestation), '--push', '--merge',
+                             '--authorization', AUTH, '--checks-timeout', '5')
         self.assertEqual(done.returncode, 1)
         self.assertIn('acceptance check T1 AC-1 failed', done.stderr)
         self.assertFalse(any('pr create' in call for call in self.gh_calls()))
@@ -1035,25 +1128,48 @@ class GitHubBatchTests(BatchCase):
     def test_failed_required_check_blocks_merge(self):
         plan = self.plan([self.task('T1', 'a.txt')])
         self.assertEqual(self.run_batch(plan).returncode, 0)
-        checks = [{'name': CHECKS[0], 'state': 'FAILURE'},
-                  {'name': CHECKS[1], 'state': 'SUCCESS'}]
-        done = self.finalize(plan, {'FAKE_GH_CHECKS': json.dumps(checks)},
+        runs = check_runs({CHECKS[0]: 'failure', CHECKS[1]: 'success'})
+        done = self.finalize(plan, {'FAKE_GH_CHECK_RUNS': json.dumps(runs)},
                              '--review', '--push', '--merge', '--authorization',
                              AUTH, '--checks-timeout', '5')
         self.assertEqual(done.returncode, 1)
-        self.assertIn('required checks failed', done.stderr)
+        self.assertIn('not success', done.stderr)
         self.assertFalse(any('pr merge' in call for call in self.gh_calls()))
         self.assertEqual(self.journal_data()['phase'], 'blocked')
 
     def test_missing_required_check_is_not_a_pass(self):
         plan = self.plan([self.task('T1', 'a.txt')])
         self.assertEqual(self.run_batch(plan).returncode, 0)
-        checks = [{'name': CHECKS[0], 'state': 'SUCCESS'}]
-        done = self.finalize(plan, {'FAKE_GH_CHECKS': json.dumps(checks)},
+        runs = check_runs({CHECKS[0]: 'success'})
+        done = self.finalize(plan, {'FAKE_GH_CHECK_RUNS': json.dumps(runs)},
                              '--review', '--push', '--merge', '--authorization',
                              AUTH, '--checks-timeout', '1')
         self.assertEqual(done.returncode, 1)
-        self.assertIn('NOT_RUN', done.stderr)
+        self.assertIn('missing required check run', done.stderr)
+        self.assertFalse(any('pr merge' in call for call in self.gh_calls()))
+
+    def test_wrong_check_app_id_blocks(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        runs = check_runs(app_id=999)
+        done = self.finalize(plan, {'FAKE_GH_CHECK_RUNS': json.dumps(runs)},
+                             '--review', '--push', '--merge', '--authorization',
+                             AUTH, '--checks-timeout', '5')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('configured integration', done.stderr)
+        self.assertFalse(any('pr merge' in call for call in self.gh_calls()))
+
+    def test_truncated_check_run_list_blocks(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        runs = check_runs({CHECKS[0]: 'success'})
+        done = self.finalize(
+            plan, {'FAKE_GH_CHECK_RUNS': json.dumps(runs),
+                   'FAKE_GH_CHECK_RUNS_TOTAL': '2'},
+            '--review', '--push', '--merge', '--authorization', AUTH,
+            '--checks-timeout', '5')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('truncated', done.stderr)
         self.assertFalse(any('pr merge' in call for call in self.gh_calls()))
 
     def test_retry_of_an_integrated_task_is_refused(self):
@@ -1297,9 +1413,8 @@ class GitHubBatchTests(BatchCase):
     def test_authoritative_extra_check_still_gates_merge(self):
         plan = self.plan([self.task('T1', 'a.txt')], risk_checks=[CHECKS[0]])
         self.assertEqual(self.run_batch(plan).returncode, 0)
-        checks = [{'name': CHECKS[0], 'state': 'SUCCESS'},
-                  {'name': CHECKS[1], 'state': 'FAILURE'}]
-        done = self.finalize(plan, {'FAKE_GH_CHECKS': json.dumps(checks)},
+        runs = check_runs({CHECKS[0]: 'success', CHECKS[1]: 'failure'})
+        done = self.finalize(plan, {'FAKE_GH_CHECK_RUNS': json.dumps(runs)},
                              '--review', '--push', '--merge', '--authorization',
                              AUTH, '--checks-timeout', '5')
         self.assertEqual(done.returncode, 1)
@@ -1309,11 +1424,11 @@ class GitHubBatchTests(BatchCase):
     def test_empty_authoritative_checks_fail_closed(self):
         plan = self.plan([self.task('T1', 'a.txt')])
         self.assertEqual(self.run_batch(plan).returncode, 0)
-        done = self.finalize(plan, {'FAKE_GH_RULESET_CONTEXTS': '[]'}, '--review',
+        done = self.finalize(plan, {'FAKE_GH_RULE_CONTEXTS': '[]'}, '--review',
                              '--push', '--merge', '--authorization', AUTH,
                              '--checks-timeout', '5')
         self.assertEqual(done.returncode, 1)
-        self.assertIn('yields no required', done.stderr)
+        self.assertIn('yield no required status contexts', done.stderr)
 
     def test_project_config_change_blocks_resume(self):
         plan = self.plan([self.task('T1', 'a.txt')])
@@ -1325,6 +1440,73 @@ class GitHubBatchTests(BatchCase):
         self.assertEqual(resumed.returncode, 2)
         self.assertIn('docs/PROJECT.md changed', resumed.stderr)
 
+
+    def test_truncated_pr_enumeration_blocks(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        prs = [{'number': 2000 + index, 'url': 'https://x/pr',
+                'base': 'main', 'headRefName': f'other-{index}',
+                'state': 'OPEN', 'mergeCommit': None, 'files': [], 'body': ''}
+               for index in range(1000)]
+        self.gh_state.write_text(json.dumps({
+            'calls': [], 'prs': prs,
+            'issue': {'number': 250, 'body': '', 'comments': [], 'state': 'OPEN'}}))
+        run = self.run_batch(plan)
+        self.assertEqual(run.returncode, 1)
+        self.assertIn('PR enumeration reached its 1000-item limit', run.stderr)
+        self.assertEqual(self.opencode_calls(), [])
+
+    def test_multiple_registry_blocks_in_an_issue_block(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        body = ('<!-- ORCH-TASK-REGISTRY\nstatus: DISPATCHED\n'
+                'locked_paths: other.txt\nbranch: task/a\n-->\n'
+                '<!-- ORCH-TASK-REGISTRY\nstatus: DISPATCHED\n'
+                'locked_paths: other2.txt\nbranch: task/b\n-->\n')
+        self.gh_state.write_text(json.dumps({
+            'calls': [], 'prs': [],
+            'issue': {'number': 250, 'body': '', 'comments': [], 'state': 'OPEN'},
+            'issues': [{'number': 250, 'body': '', 'state': 'OPEN'},
+                       {'number': 998, 'body': body, 'state': 'OPEN'}]}))
+        run = self.run_batch(plan)
+        self.assertEqual(run.returncode, 1)
+        self.assertIn('ambiguous', run.stderr)
+        self.assertEqual(self.opencode_calls(), [])
+
+    def test_active_issue_registry_overlap_blocks_without_prs(self):
+        plan = self.plan([self.task('T1', 'a.txt'), self.task('T2', 'b.txt')])
+        self.gh_state.write_text(json.dumps({
+            'calls': [], 'prs': [],
+            'issue': {'number': 250, 'body': '', 'comments': [],
+                      'state': 'OPEN'},
+            'issues': [
+                {'number': 250, 'body': '', 'state': 'OPEN'},
+                {'number': 999, 'state': 'OPEN',
+                 'body': '<!-- ORCH-TASK-REGISTRY\nstatus: DISPATCHED\n'
+                         'mode: batch\nlocked_paths: a.txt\n'
+                         'branch: task/other\n-->\n'}]}))
+        run = self.run_batch(plan)
+        self.assertEqual(run.returncode, 1)
+        self.assertIn('active lock conflict', run.stderr)
+        self.assertEqual({record['status']
+                          for record in self.journal_data()['tasks'].values()},
+                         {'BLOCKED'})
+        self.assertEqual(self.opencode_calls(), [])
+        self.assertFalse(any('issue edit' in call for call in self.gh_calls()))
+
+    def test_truncated_issue_enumeration_blocks(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        issues = [{'number': index, 'body': '', 'state': 'OPEN'}
+                  for index in range(1, 1001)]
+        self.gh_state.write_text(json.dumps({
+            'calls': [], 'prs': [],
+            'issue': {'number': 250, 'body': '', 'comments': [], 'state': 'OPEN'},
+            'issues': issues}))
+        run = self.run_batch(plan)
+        self.assertEqual(run.returncode, 1)
+        self.assertIn('Issue enumeration reached its 1000-item limit', run.stderr)
+        self.assertEqual({record['status']
+                          for record in self.journal_data()['tasks'].values()},
+                         {'BLOCKED'})
+        self.assertEqual(self.opencode_calls(), [])
 
     def test_many_open_prs_one_conflict_blocks_the_whole_batch(self):
         plan = self.plan([self.task('T1', 'a.txt'), self.task('T2', 'b.txt')])
@@ -1361,8 +1543,8 @@ class GitHubBatchTests(BatchCase):
     def test_configured_context_without_a_check_result_blocks(self):
         plan = self.plan([self.task('T1', 'a.txt')])
         self.assertEqual(self.run_batch(plan).returncode, 0)
-        checks = [{'name': CHECKS[0], 'state': 'SUCCESS'}]
-        done = self.finalize(plan, {'FAKE_GH_CHECKS': json.dumps(checks)},
+        runs = check_runs({CHECKS[0]: 'success'})
+        done = self.finalize(plan, {'FAKE_GH_CHECK_RUNS': json.dumps(runs)},
                              '--review', '--push', '--merge', '--authorization',
                              AUTH, '--checks-timeout', '1')
         self.assertEqual(done.returncode, 1)
@@ -1391,7 +1573,7 @@ class InputErrorTests(BatchCase):
         plan = self.plan([self.task('T1', 'a.txt')])
         check = self.cli('check', '--plan', str(self.write_plan(plan)))
         self.assertEqual(check.returncode, 2)
-        self.assertIn('declares project verification command', check.stderr)
+        self.assertIn('declares staged project verification command', check.stderr)
 
     def test_project_verification_python_names_are_normalized(self):
         self.append_project('## 验证命令\n\n'
@@ -1407,7 +1589,49 @@ class InputErrorTests(BatchCase):
                 '- 说明：`python scripts/verification_profile.py '
                 '--evidence <json>`\n')
         commands = delivery._project_verification(text)
-        self.assertEqual(commands, [('<python>', 'scripts/validate_kit.py')])
+        self.assertEqual(commands,
+                         [('either', ('<python>', 'scripts/validate_kit.py'))])
+
+    def test_post_only_command_placed_in_verify_blocks(self):
+        self.append_project(
+            '## 验证命令\n\n'
+            '- 完整回归：`python -m unittest discover -s tests`\n')
+        plan = self.plan([self.task('T1', 'a.txt')])
+        plan['finalize']['verify'] = [[PY, '-m', 'unittest', 'discover',
+                                       '-s', 'tests']]
+        check = self.cli('check', '--plan', str(self.write_plan(plan)))
+        self.assertEqual(check.returncode, 2)
+        self.assertIn('post-merge', check.stderr)
+
+    def test_multiple_commands_on_merge_line_are_all_required(self):
+        self.append_project(
+            '## 验证命令\n\n'
+            '- 合并后必须执行：`python a.py` + `python b.py`\n')
+        plan = self.plan([self.task('T1', 'a.txt')])
+        plan['finalize']['post_merge_verify'] = [[PY, 'a.py']]
+        check = self.cli('check', '--plan', str(self.write_plan(plan)))
+        self.assertEqual(check.returncode, 2)
+        self.assertIn('b.py', check.stderr)
+
+    def test_ambiguous_verification_line_blocks(self):
+        self.append_project('## 验证命令\n\n- 快速测试：见上文\n')
+        plan = self.plan([self.task('T1', 'a.txt')])
+        check = self.cli('check', '--plan', str(self.write_plan(plan)))
+        self.assertEqual(check.returncode, 2)
+        self.assertIn('no interpretable command', check.stderr)
+
+    def test_repository_verification_stages_are_parsed(self):
+        text = (Path('docs/PROJECT.md').read_text(encoding='utf-8'))
+        commands = delivery._project_verification(text)
+        self.assertIn(('either', ('<python>', 'scripts/validate_kit.py')),
+                      commands)
+        self.assertIn(('post', ('<python>', '-m', 'unittest', 'discover', '-s',
+                                'tests')), commands)
+        self.assertIn(('either', ('<python>', '-m', 'py_compile',
+                                  'scripts/orchestrator.py',
+                                  'scripts/validate_kit.py')), commands)
+        self.assertIn(('post', ('<python>', 'scripts/orchestrator.py', 'backup')),
+                      commands)
 
     def test_project_config_path_is_refused_in_a_batch(self):
         plan = self.plan([self.task('T1', 'docs/PROJECT.md')])
@@ -1517,7 +1741,8 @@ class LocalBatchTests(BatchCase):
                       acceptance_decisions=self.decisions())])
         run = self.run_batch(plan)
         self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
-        done = self.finalize(plan, None, '--merge', '--authorization', AUTH)
+        done = self.finalize(plan, None, '--review', '--merge',
+                             '--authorization', AUTH)
         self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
         state = self.journal_data()
         self.assertEqual(state['phase'], 'verified')
@@ -1598,11 +1823,18 @@ class LocalBatchTests(BatchCase):
     def test_local_in_batch_dependency_is_unsupported(self):
         plan = self.plan([self.task('T1', 'docs/one.md'),
                           self.task('T2', 'docs/two.md', depends=['T1'])])
+        path = self.write_plan(plan)
+        before = path.read_text()
         run = self.run_batch(plan, {'FAKE_ORCH_DEPS': '{"T2": ["T1"]}'})
         self.assertEqual(run.returncode, 1)
-        self.assertIn('batch-internal dependencies are satisfied at '
-                      'INTEGRATED', run.stderr)
+        self.assertIn('does not support local batch-internal dependencies',
+                      run.stderr)
+        self.assertEqual(path.read_text(), before)
         self.assertEqual(self.opencode_calls(), [])
+        calls = [json.loads(line) for line in self.orch_log.read_text().splitlines()]
+        self.assertFalse(any(call[:2] in (['task', 'ready'],
+                                          ['task', 'dispatch']) for call in calls))
+        self.assertIsNone(self.journal_data()['dispatch'])
 
     def test_local_ready_task_is_dispatched(self):
         plan = self.plan([self.task('T1', 'docs/one.md')])
@@ -1619,7 +1851,8 @@ class LocalBatchTests(BatchCase):
             acceptance_decisions=self.decisions())])
         self.assertEqual(self.run_batch(plan).returncode, 0)
         _git(self.repo, 'commit', '--allow-empty', '-m', 'move base')
-        done = self.finalize(plan, None, '--merge', '--authorization', AUTH)
+        done = self.finalize(plan, None, '--review', '--merge',
+                             '--authorization', AUTH)
         self.assertEqual(done.returncode, 1)
         self.assertIn('base moved', done.stderr)
         self.assertNotEqual(self.journal_data()['merge']['state'], 'merged')
