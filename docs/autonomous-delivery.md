@@ -148,4 +148,24 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 - 仓库存在 clean / process filter、`core.fsmonitor` 或 commit hook 时拒绝自动提交（见 §7）；批次工具同样不得绕过。
 - 未获单独授权的真实第三方项目变更、实质扩大安全权限与不可逆迁移仍不得执行；`L3` 必须先取得人工授权。
 
-本章只描述能力边界与用法，**不提供实测结果**：本仓库当前 head 上未真实运行的批次、命令与结论保持 `UNKNOWN` / 未验证，不得写成已通过。
+### 实测结果（2026-11-16）
+
+以下结果来自真实运行；原始日志在本机受保护目录，未入库，引用时只保留可定位的提交 / SHA 与运行编号。**已完成的证据**与**仍待完成的 GitHub / 下游工作**分开列出，后者不得读成已通过。
+
+**已完成的实测证据**
+
+- **实现批次 PR `#251`**：最终 head `7af0bb35a20680917d294c987d12a29d3b3b74d1`，独立审查 `APPROVE`；合并提交 `a3cec4cbaf3545437b389fb39723039cd4e53ea6`（`a3cec4cb`）。
+- **实现批次 CI**：运行 [`43791632465`](https://github.com/ctrlshiftaltdel/AgentOrch/actions/runs/43791632465)，risk 与 Ubuntu 3.12 / Ubuntu 3.13 / macOS 3.13 / Windows 3.13 全绿；合并后主分支 push 的运行见该仓库 Actions。
+- **全量测试**：合并后主分支 `2328` tests OK（`postmerge-full.log`）；专题 124 tests OK；最终 head 的 CI 在 Ubuntu / macOS / Windows 全绿。
+- **发行包**：`134` 个文件（133 REQUIRED + MANIFEST），自检 a–m 通过，包 SHA256 `9bc8aadd1c044809148e261108c60bb53c1b20f963cb5407cac6790896e57cbf`（`9bc8aadd`）。
+- **本地真实批次 1（`local` 底座，3 任务）**：T1→T2→T3，`L2` 审查 `APPROVE`，合并 `97a85551487ab575cc0cfdfd92acc231d016bee7`，SQLite 任务库中 T1 / T2 / T3 均为 `VERIFIED`。
+- **负向真实审查（`REVIEW_REJECTED`）**：README 任务被 `reviewer-terra-xhigh` 拒绝（AC-2 命令不一致），批次进入 blocked，没有合并——证明审查门会真实阻断，而不是记录后放行。
+- **恢复批次 2b**：修正后 `APPROVE`，合并 `0119a02bd0c3bfa921cdd2ea7679e913c119ca76`，T4B `VERIFIED`。
+- **修复后批次 3**：派发先于执行（00:01:59Z），T5→T6 的依赖以 `INTEGRATED` 满足，`L1` 审查 `APPROVE`，合并 `48812eb7a35c6f378abf9215f0ca90790727cb19`，T5 / T6 `VERIFIED`。
+- **`L0` 批次 `sample-batch-5`**：派发先于执行（00:56:48Z），`acceptance_checks` 的 AC-1 `PASS`，执行后生成 Master attestation（SHA `8766a5c8…`），合并 `5b6afc8b50423849ab79eee0c6e296eda968dbef`，T8 `VERIFIED`，无第二模型审查——`L0` 免的是第二模型审查，不是逐条 AC 证据。
+- **`L0` CI 探针**：PR `#252`（docs-only，已关闭不合并）；运行 [`43794705010`](https://github.com/ctrlshiftaltdel/AgentOrch/actions/runs/43794705010) 跳过 macOS / Windows 与发行打包，只剩 risk 与两个必需 Ubuntu 检查，三者通过时的**单个 job 时长**分别是 risk 7 秒、Ubuntu 3.12 15 秒、Ubuntu 3.13 17 秒。这些数字是各 job 自身的执行时长，**不是端到端等待时间**；该运行从排队到结束的总时长没有被记录，因此不能据此宣称整体等待变快。此前 doc-only PR 的「4 个 job / ~21 分钟」是墙钟时间（wall time），与上面的单个 job 时长**不直接可比**，二者不能互相换算或相减。
+
+**仍待完成（不得写成已通过）**
+
+- **GitHub 端到端批次**：Issue #250 已记录批次派发登记块（`mode: batch`，`DISPATCHED`），但真实 PR CI、合并与合并后验证仍是 `PENDING`：本批 T9 / T10 的 PR 号尚未记录，三者的运行结果都还没有可引用的证据，`AC4` / `AC6` / `AC7` 仍未完成。
+- **正式下游发行**：`PENDING`。`134` 文件与 SHA256 只是本地包自检的结果，不是已发布的下游版本；发布动作与发布后的验证未执行。本章其余未真实运行的批次、命令与结论保持 `UNKNOWN` / 未验证。
