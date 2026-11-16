@@ -135,7 +135,7 @@
 | "把 config show 和 task list 的完整输出给我看" | `uv run python scripts/orchestrator.py config show`、`task list` | 退出码 0；`edition = local`；任务库为空 |
 | "登记 ID 为 TASK-0001 的示例任务…" | `uv run python scripts/orchestrator.py task add --id TASK-0001 --title "建立项目骨架" --paths src/ --acceptance "最小入口可运行" "验证命令退出码为 0"` | 输出 `TASK-0001: created in PLANNED` |
 | "置为 READY 再 DISPATCH" | `uv run python scripts/orchestrator.py task ready TASK-0001`、`task dispatch TASK-0001` | 退出码 0；`DISPATCHED; locks acquired for src`；任务包生成并展示 |
-| "运行结构自检并告诉我退出码" | `uv run python scripts/validate_kit.py` | 退出码 0；`Kit validation passed (130 required files checked; …)` |
+| "运行结构自检并告诉我退出码" | `uv run python scripts/validate_kit.py` | 退出码 0；`Kit validation passed (133 required files checked; …)` |
 | "把示例任务置为 CANCELED" | `uv run python scripts/orchestrator.py task status TASK-0001 CANCELED --note "冒烟结束"` | 退出码 0；路径锁释放 |
 
 ### 3.1 放入套件
@@ -401,7 +401,7 @@ uv run python scripts/report_metrics.py --gold-sample --since 2026-01-01 --until
 
 `validate_kit.py` 检查：
 
-- **130 项必需文件**是否齐全（`REQUIRED` 列表同时是发布包清单，只有一份来源）。
+- **133 项必需文件**是否齐全（`REQUIRED` 列表同时是发布包清单，只有一份来源）。
 - **合约模板是否仍问对问题**：`templates/design.md`、`templates/milestone-audit.md`、`templates/contract-decision-log.md` 的必备章节缺一即失败，模板内的相对链接断链也失败（章节缺失会被静默当成“不需要回答”，因此单列一项检查）。
 - **能力登记与指标模板是否仍问对问题**：`templates/runtime-capability.md` 的身份 / 能力矩阵 / 扩展边界 / `UNKNOWN` 与重测 / 权限范围 / 证据与限制，以及 `templates/metrics.md` 的阅读规则 / 公共定义 / 指标定义 / 缺失与覆盖率 / 报告契约 / 金样本 / 限制，缺章节同样失败。
 - **发行包清单是否自洽**：根目录存在 `MANIFEST.json`（发行包内）时，校验其结构、分类、路径可解析与 `REQUIRED` 集合一致；SHA-256 与大小在纯净包与上游 checkout 严格比较，在下游项目只校验结构（见下方“三种树”）。仓库根目录没有该文件，检查自动跳过，不误报。
@@ -434,25 +434,32 @@ uv run python scripts/report_metrics.py --gold-sample --since 2026-01-01 --until
 仓库自带一条 GitHub Actions 工作流 `.github/workflows/ci.yml`（仅本仓库使用，不随发行包发布），把登记检查与发布打包自检放到平台上执行：
 
 - **触发**：`pull_request` 目标 `main`、`push` 到 `main`、以及手动 `workflow_dispatch`。
-- **环境（三个操作系统）**：
-  - `checks`：`ubuntu-latest`，Python 矩阵 `3.12` / `3.13`；
+- **风险分层（`risk` 作业）**：`risk (delivery classifier)` 用本次运行真实构建的 Git 范围调用 `scripts/delivery_risk.py`，输出 `level`（`L0`–`L3`）与 `full`。PR 取 `pull_request.base.sha` / `head.sha`；push 与手动运行取运行本身的提交范围。分类只读 Git 范围，不读标签、提交信息、分支名或调用者输入。`L2` / `L3`、push 到 `main`、`workflow_dispatch` 以及任何分类失败都令 `full=true`；只有分类成功的 `L0` / `L1` PR 运行才可能是 `full=false`。
+- **环境与必需检查**：
+  - 平台强制的必需 context 仍是 Ubuntu 上的 `checks (Python 3.12)` 与 `checks (Python 3.13)`，作业名与矩阵标签不得改；
+  - `checks`：`ubuntu-latest`，Python 矩阵 `3.12` / `3.13`，始终运行；
   - `checks-macos`：`macos-latest`（真实 macOS runner），Python `3.13`；
-  - `checks-windows`：`windows-latest`（真实 Windows runner，默认 shell 是 pwsh），Python `3.13`。
+  - `checks-windows`：`windows-latest`（真实 Windows runner，默认 shell 是 pwsh），Python `3.13`。后两者只在 `full=true`（`L2` / `L3`、push 到 `main`、手动运行）时运行；`L0` / `L1` 的 PR 上它们是可选作业，其绿由契约 G4 与审查要求覆盖，不由分支保护强制。
 
-  三个 job 共用同一份步骤定义（workflow 内的 YAML anchor），所以不存在"某个平台少跑一步"的漂移；任一 job 的任一档失败即整体失败（矩阵 `fail-fast: false`，其余档继续跑并各自留证）。macOS / Windows 只跑 `3.13`，是**为了验证平台，而不是扩大 Python 版本承诺**：`3.12` / `3.13` 的版本覆盖仍由 Linux 矩阵承担。
-- **步骤**：按顺序执行且不跳过失败步骤 —— `uv run python scripts/validate_kit.py`、`uv run python scripts/architecture/check.py --project . --json`（无契约项目应为只读诊断并退出 0）、`uv run python -m unittest discover -s tests`、`uv run python scripts/run_delivery_scenarios.py --json --output "${{ runner.temp }}/delivery-scenarios.json"`、`uv run python scripts/report_metrics.py --gold-sample --since 2026-01-01 --until 2026-02-01 --json`、跨平台语法检查、`uv run python scripts/build_release.py`。
+  三个 job 共用同一份步骤定义（workflow 内的 YAML anchor），所以同一档位内不存在"某个平台少跑一步"的漂移；矩阵 `fail-fast: false`，失败档不会掩盖其余档的证据。macOS / Windows 只跑 `3.13`，是**为了验证平台，而不是扩大 Python 版本承诺**：`3.12` / `3.13` 的版本覆盖仍由 Linux 矩阵承担。
+- **步骤（按风险档）**：
+  - **所有档都执行**：`uv run python scripts/validate_kit.py`、`git diff --check`（对 `risk` 解析出的 base 到 HEAD；base 不可解析即失败，不静默放过）、`uv run python scripts/architecture/check.py --project . --json`（无契约项目应为只读诊断并退出 0）、跨平台语法检查。
+  - **`L0`**（仅文档等低风险路径）：另跑定向结构测试 `uv run python -m unittest tests.test_validate_kit tests.test_check_scope`；不跑完整 `unittest`、合成场景、指标自检与发布打包。
+  - **`L1`**：跑完整 `uv run python -m unittest discover -s tests`、`uv run python scripts/run_delivery_scenarios.py --json --output "${{ runner.temp }}/delivery-scenarios.json"`、`uv run python scripts/report_metrics.py --gold-sample --since 2026-01-01 --until 2026-02-01 --json`；不跑发布打包。
+  - **`L2` / `L3`、push 到 `main`、`workflow_dispatch`**：在 Ubuntu 上跑完整检查 + `uv run python scripts/build_release.py`，并在 macOS / Windows 上跑同一套步骤。
   - **报告路径用 `${{ runner.temp }}`**：不依赖 shell 的 `$RUNNER_TEMP`，同一行在 bash 与 pwsh 下都能解析；报告只写到 runner 临时目录，不进仓库。
   - **语法检查不依赖 shell 通配符**：核心脚本用显式文件列表，`scripts/update_agentorch/*.py` 与 `scripts/self_improvement/*.py` 由 Python `glob` 展开。Windows runner 的默认 shell 是 pwsh，不会像 bash 那样展开 `*.py`，原写法会让这两个目录在 Windows 上被静默跳过。
   - **统一 UTF-8**：工作流级设置 `PYTHONUTF8=1` 与 `PYTHONIOENCODING=utf-8`。不设置时 Windows runner 的 Python 子进程会沿用旧代码页，套件里的中文诊断信息会在写出或读回时失败，而同样的命令在 Linux 上是通过的。这是 runner 环境设置，不改变产品行为。
-- **打包自检**：最后一步是发布构建本身。它失败即 job 失败 —— 没有 `continue-on-error`、没有 `|| true`、没有跳过开关，因此"少打包一个文件、包里断链、清单哈希对不上、包内出现禁止路径、包内场景或指标回归"这类回归会在 PR 上直接变红，而不是等 Master 手工构建才发现。
-  - **每个平台都跑的原因**：自检会在解压目录里执行随包发布的 `validate_kit.py` 与 `unittest`（a–l 中的 b、d），即真正检验"这一平台 / Python 版本拿到的包是否可用"；三个 job 各自证明一次，无 `if:` 条件，也就不会出现"某档静默跳过打包步骤"。
+- **打包自检**：发布构建只在 `full=true` 的档位执行。它失败即 job 失败 —— 没有 `continue-on-error`、没有 `|| true`、没有跳过开关，因此"少打包一个文件、包里断链、清单哈希对不上、包内出现禁止路径、包内场景或指标回归"这类回归会在 `L2` / `L3`、push 到 `main` 与手动运行上直接变红，而不是等 Master 手工构建才发现。`L0` / `L1` 的 PR 不重复跑打包自检，它们只证明该档位需要的增量检查。
+  - **每个平台都跑的原因**：自检会在解压目录里执行随包发布的 `validate_kit.py` 与 `unittest`（a–m 中的 b、d），即真正检验"这一平台 / Python 版本拿到的包是否可用"；`full=true` 时三个 job 各证明一次。
   - **行尾与可复现性**：仓库 `.gitattributes` 统一 `eol=lf`，打包前还会把文本文件归一为 LF，自检 f 断言包内文本不含 CRLF，因此 Windows 检出无法把 CRLF 带进发行包；场景沙箱里的 git 仓库也把 `core.autocrlf` / `core.eol` 固定为 LF 行为，不依赖 runner 的全局 git 配置。
   - **产物处理**：zip 写到 runner 的 `release/`（`.gitignore` 已忽略 `release/*.zip`），不提交、不上传 artifact、不使用任何密钥。
-  - **覆盖边界**：CI 只证明"包能在该平台构建且内置自检 a–l 通过"，**不证明发布本身** —— 不校验发布命名（`--release-version` 资产名或日期构建名）、不生成 GitHub Release、不核对发布记录。发布仍需按 `release/README.md` 第 4 节由 Master 执行并留证。
+  - **覆盖边界**：CI 只证明"包能在该平台构建且内置自检 a–m 通过"，**不证明发布本身** —— 不校验发布命名（`--release-version` 资产名或日期构建名）、不生成 GitHub Release、不核对发布记录。发布仍需按 `release/README.md` 第 4 节由 Master 执行并留证。
+- **失败关闭**：没有 `continue-on-error`、没有 `|| true`、没有 `paths-ignore`；`risk` 无法给出可解析结果时，必需 context 会通过工作流最后一步显式失败变红，不出现"缺省即通过"的空绿。
 - **仍未覆盖（继续标 `UNKNOWN`）**：真实安装器与用户桌面环境、Windows 交互式 PowerShell / Git Bash 会话中的手工命令、macOS 大小写不敏感卷上的极端路径场景、以及下游项目的平台承诺。CI 只覆盖 GitHub-hosted 的 `ubuntu-latest` / `macos-latest` / `windows-latest`，不外推到其他发行版或自托管环境。
 - **边界**：`permissions: contents: read`，不使用 `pull_request_target`，不引入第三方依赖、密钥或 `pip install`；新增的 runner 用量（`macos-latest` / `windows-latest`）已由项目所有者授权。
 
-**证据地位**：`github` 底座下，G4 以**当前 head SHA** 上的 CI 运行全绿为准 —— 本地四条命令（含打包自检）仍是可复现的补充证据，不能替代 CI；反过来，CI 绿灯也只覆盖这四条命令，不能代替 G1 的逐条验收，也不能代替对发布标准的逐条审查。head 变化后旧 head 的绿灯失效，必须在新 head 上重新运行。
+**证据地位**：`github` 底座下，G4 以**当前 head SHA** 上的必需检查全绿为准 —— 本地四条命令（含打包自检）仍是可复现的补充证据，不能替代 CI；反过来，CI 绿灯也只覆盖该档位实际执行的检查，不能代替 G1 的逐条验收，也不能代替对发布标准的逐条审查。`L0` / `L1` 的 PR 运行是增量检查，**不得**被描述成"全套通过"；`L2` / `L3` 与合并后验证仍保留完整回归。head 变化后旧 head 的绿灯失效，必须在新 head 上重新运行。
 
 **查看方式**：
 
@@ -504,10 +511,10 @@ uv run python scripts/run_delivery_scenarios.py --json --output "$TEMP/delivery-
 - **构建（两种命名，互不组合）**：日期构建用 `uv run python scripts/build_release.py`（今天）或 `--date YYYYMMDD`，产出 `release/agentorch-{YYYYMMDD}.zip`，顶层目录 `agentorch-{YYYYMMDD}/`；正式 Release 用 `--release-version 1.7.0`，产出 `release/AgentOrch-1.7.0.zip`，顶层目录 `AgentOrch-1.7.0/`。zip 名与顶层目录名始终相同；两个命名参数同时给出会直接报错。无论用哪种命名，包内文件集合 == `validate_kit.py` 的 `REQUIRED` 列表 + 构建时生成的 `MANIFEST.json`，`MANIFEST.json` 的 `format_version` 只由 `VERSION.md` 的 `Format version:` 行决定（当前 `1.7`）。
 - **Release 版本 ≠ Format 版本**：`AgentOrch-1.7.0.zip` 是**发行号**（tag `v1.7.0`），`Format version` 是格式契约版本；当前 Release 为 `1.7.0`、Format 为 `1.7`，两者 major.minor 相同但仍是两条序列（1.6.x 时代 Release `1.6.3` 与 Format `1.6` 已说明这一点）。`MANIFEST.json` 的 `format_version` 由 `Format version:` 行生成（`1.7`），`Release version` 行只作记录、不参与 `check_drift.py` 的解析。更新引擎的 `VERSION_MATCH` 比较 tag 的 major.minor 与 `format_version`，因此 `v1.7.0` 匹配 Format `1.7`。
 - **机器可读清单**：`MANIFEST.json` 记录 `schema_version`（清单格式版本）、`suite`、`format_version`（套件格式版本）与 `files[]`；每个条目含 `path`、`category`、`sha256`、`size`。清单**不含时间戳**、条目按路径排序，分类规则只有一处实现（`scripts/check_drift.py`，构建脚本导入它），因此同一工作树两次构建得到完全相同的清单与 zip SHA256。
-- **产物不入库、自检强制**：`release/*.zip` 已被忽略；构建后自动执行 a–l 自检，失败会删除未通过自检的产物，没有跳过开关。自检 a 现在校验「包内文件集合 == `REQUIRED` + `MANIFEST.json`」、清单中每条路径可解析、SHA-256 与大小和实际文件一致、分类合法且清单路径与 `REQUIRED` 完全一致。
+- **产物不入库、自检强制**：`release/*.zip` 已被忽略；构建后自动执行 a–m 自检，失败会删除未通过自检的产物，没有跳过开关。自检 a 现在校验「包内文件集合 == `REQUIRED` + `MANIFEST.json`」、清单中每条路径可解析、SHA-256 与大小和实际文件一致、分类合法且清单路径与 `REQUIRED` 完全一致。
 - **可复现**：归档时间戳固定、文本文件按 LF 归一后打包，清单哈希同样按归一后的字节计算；同一仓库状态重建应得到同一 SHA256，Windows 上 `core.autocrlf=true` 的检出也不会改变结果。
 
-命名、包内容、自检清单、发布流程与发布清单以 `release/README.md` 为准；该文件与本节一致（包内容 == `REQUIRED` + `MANIFEST.json`，自检 a 同时校验文件集合与清单条目）。该自检现由 CI 在每个 PR 上执行（见 7.1 节），因此打包回归不再依赖手工构建才发现。
+命名、包内容、自检清单、发布流程与发布清单以 `release/README.md` 为准；该文件与本节一致（包内容 == `REQUIRED` + `MANIFEST.json`，自检 a 同时校验文件集合与清单条目）。该自检在 `L2` / `L3`、push 到 `main` 与手动运行时由 CI 执行（见 7.1 节），`L0` / `L1` PR 不重复跑打包自检；发布流程仍要求真实构建，不能用 CI 绿灯代替第 4 节的构建与留证。
 
 ### 8.2 下游只读诊断：`check_drift.py`
 
@@ -541,6 +548,8 @@ uv run python scripts/check_drift.py <项目根> --json   # stdout 只有 JSON�
 哈希差异只表示文件字节不同，不表示契约冲突；工具只报告差异与建议，是否对齐由项目所有者决定。
 
 ## 9. 版本与兼容
+
+> **2026-11-16 注记**：本节下方的版本记录保持原样；其中"CI 在 macOS / Windows 上运行"与"在每个 PR 上跑打包自检"的描述属于**变更前**的历史口径。自 2026-11-16 起 `.github/workflows/ci.yml` 为风险分层：`risk` 作业按真实 Diff 给出 `L0`–`L3`，`L0` 只跑定向结构检查，`L1` 跑完整 Ubuntu 检查但不跑发布打包，`L2` / `L3`、push 到 `main` 与 `workflow_dispatch` 才跑发布打包自检与 macOS / Windows；必需 context 仍是 `checks (Python 3.12)` 与 `checks (Python 3.13)`（见 7.1 节）。同一后续 HEAD 在已发布 2.0.0 之外新增 3 个随包文件（`scripts/batch_delivery.py`、`scripts/delivery_risk.py`、`templates/batch-delivery.md`），当前 `REQUIRED` 为 133 个；`tests/test_batch_delivery.py` 与 `tests/test_delivery_risk.py` 仍为仓库专属、不随包发布。尚未发布新 Release；2.0.0 的 131 个包内文件记录只描述那个已发布 tag。
 
 - [VERSION.md](../VERSION.md) 记录套件名、支持底座、**Format version**（当前 `1.7`）与**对外 Release 版本**（当前候选 `2.0.0`，未发布；仅作记录）；格式变更时同步更新模板与校验清单。
 - **Format 版本与 Release 版本是两条序列，不要混读**：最新已发布的是 Release `1.7.1`（tag `v1.7.1`、资产 `AgentOrch-1.7.1.zip`），它是给已发布 v1.7.0 更新器的桥接发行，契约仍在 `kit/orchestration.md`。当前候选是 **Release `2.0.0`（未发布）**，`Format version` 仍为 `1.7`：`tag_matches_format('v2.0.0', '1.7')` 为假，所以已发布的 v1.7.0 更新器会拒绝它；只有带显式兼容矩阵 `DECLARED_SUPPORTED_FORMATS = ('1.7',)` 的新更新器（含已发布的 v1.7.1）可通过 `VERSION_MATCH`。`VERSION_MATCH` 通过不等于安装或升级成功。`v1.7.1` 只是版本匹配层的必要桥接候选：已发布的 v1.7.1 CLI 与「更新 AgentOrch」入口固定请求 `/releases/latest`，CLI 没有 tag 参数，一旦 `v2.0.0` 成为 latest 就无法用它选择 `v1.7.1`；因此 ≤1.7.0 的实际迁移方案尚未验证，不得用未经验证的手工覆盖代替。真实 `v1.7.1 → 2.0.0` 升级为 `NOT_RUN`。这一 MAJOR 的破坏性变化：`scripts/self_improvement/orchestration.py` 的 `restore_state()` 现在要求 `base_sha`（v1.7.1 可省略），LOW/READY 自动路径停用（提案停在 `BLOCKED` / `NEEDS_EVIDENCE` 或 `NEEDS_HUMAN_DECISION`）。包内文件集合与 v1.7.1 相同（131 个 = 130 `REQUIRED` + `MANIFEST.json`），`format_version` 仍为 `1.7`。上一个已发布版本是 Release `1.7.0`（tag `v1.7.0`、资产 `AgentOrch-1.7.0.zip`）。`1.7.0` 是 **Phase D 的功能发行**，同时把 `Format version` 从 `1.6` 升到 `1.7`：更新引擎的 `VERSION_MATCH` 要求 tag 的 major.minor 等于清单 `format_version`，`v1.7.0` 必须配 Format `1.7` 才会被接受；包内 118 个文件（117 `REQUIRED` + `MANIFEST.json`）。上一个正式发布是 Release `1.6.3`（tag `v1.6.3`、资产 `AgentOrch-1.6.3.zip`），它是 `1.6.2` 的补丁发行，包含 #99–#104 的路径冲突记账、`task amend --paths`、`check_scope.py` 与文档口径修复，Format 仍为 `1.6`；再往前是 Release `1.6.2`（tag `v1.6.2`、资产 `AgentOrch-1.6.2.zip`），它是 `1.6.1` 的补丁发行（#93 重复多值选项修复）；更早是 Release `1.6.1`（tag `v1.6.1`、资产 `AgentOrch-1.6.1.zip`），它是 `1.6.0` 的补丁发行（#85 下游包修复）；最早是 Release `1.6`（tag `v1.6`、资产 `AgentOrch-1.6.zip`），它同时把 `Format version` 从 `1.5` 升到 `1.6`（新增自我完善 / 安全更新资产，见 `release/README.md` §5.2）。`MANIFEST.json` 的 `format_version` 只由 `Format version:` 一行生成（`1.7`），`Release version` 行不参与解析；下游判断兼容性看 `format_version`。

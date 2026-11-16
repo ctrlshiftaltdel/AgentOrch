@@ -180,6 +180,8 @@ git rev-parse 953c194:templates/metrics.md          # dee47b6b717270b2d112ffa3bf
 | 项目验证命令（**两个底座都适用**） | 配置原文：`python scripts/validate_kit.py`、`python -m unittest discover -s tests`、`python -m py_compile scripts/orchestrator.py scripts/validate_kit.py`；本环境实跑：`uv run python scripts/validate_kit.py`、`uv run python -m unittest discover -s tests`、`python3 -m py_compile scripts/orchestrator.py scripts/validate_kit.py`（解释器前缀差异，见下方口径）；**合并到主分支后必须执行**：快速测试 + 完整回归 + `python scripts/orchestrator.py backup` + 静态检查 | [docs/PROJECT.md](PROJECT.md)「验证命令」及其中的「合并后必须执行」一条；`docs/orchestration.md`「门禁之后」第 4 条（「合并后运行 `docs/PROJECT.md` 指定的验证命令，保存日志与退出码；全部通过后转 `VERIFIED`」，edition-neutral） | 任务交付时；`MERGED` → `VERIFIED` 之前 | 两个底座都适用；`github` 底座另有「当前 head 的 CI」门（上一行 + G4），二者不能互相替代 |
 | 设计目标层验收清单 | `validate_kit`、`unittest`、`py_compile`、`build_release` 自检、证据条目、两个底座当前 head 全绿、计划分层可判定 | [docs/PLAN.md](PLAN.md) §6「可度量的全局验收」 | 阶段 / 设计目标验收 | 设计目标权威，不是平台门 |
 
+> **2026-11-16 变更注记**：`.github/workflows/ci.yml` 自本日起为风险分层（新增 `risk` 作业，按真实 Diff 给出 `L0`–`L3`）：`L0` 只跑定向结构检查，`L1` 跑完整 Ubuntu 检查但不跑发布打包，`L2` / `L3`、push 到 `main` 与 `workflow_dispatch` 才跑发布打包自检与 macOS / Windows；必需 context 仍是 `checks (Python 3.12)` 与 `checks (Python 3.13)`。上表“4 个作业 / 每个作业 7 个步骤”与后续 §7.4 的 job-minutes 数字都是**变更前**的测量基线，**不得**当作当前工作流说明；本节不臆造变更后的测量值。
+
 **项目验证命令的复现口径**：`docs/PROJECT.md`「验证命令」的原文使用 `python`，并注明「Python 路径按机器调整；文档中以 `python` 指代」。本环境实跑前两条用 `uv run python …`、第三条用 `python3 -m py_compile …`；这是同一组命令的解释器前缀差异，**不是逐项逐字相同**。交付报告与证据矩阵记录的是本环境实跑的命令、输出与退出码。
 
 测量时观察到的两处**文档与配置不一致**（只登记，不在本任务修改）：

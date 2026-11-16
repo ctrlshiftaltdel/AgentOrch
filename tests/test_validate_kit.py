@@ -2454,5 +2454,35 @@ class BridgeRegistryReadBoundaryTests(unittest.TestCase):
         self.assert_canary_unread(reads, canary)
 
 
+class BatchDependencyContractConsistencyTests(unittest.TestCase):
+    @unittest.skipUnless(UPSTREAM_CHECKOUT,
+                         'repository-only contract consistency check')
+    def test_local_batch_dependency_limitation_keeps_the_task_record(self):
+        names = ('AGENTS.md', 'kit/orchestration.md', 'editions/local/master.md',
+                 'templates/batch-delivery.md')
+        texts = {name: (ROOT / name).read_text(encoding='utf-8') for name in names}
+        for name in names:
+            self.assertTrue(texts[name].strip(), name)
+            lowered = texts[name].lower()
+            for forbidden in (
+                    '删除任务记录中的依赖',
+                    '从任务记录中删除依赖',
+                    'remove the batch-internal dependency from the task record',
+                    'omit the batch-internal dependency from the task record'):
+                self.assertNotIn(forbidden.lower(), lowered, name)
+        for name in ('kit/orchestration.md', 'editions/local/master.md',
+                     'templates/batch-delivery.md'):
+            text = texts[name]
+            self.assertIn('批内依赖', text, name)
+            self.assertTrue('保持' in text and '记录' in text, name)
+            self.assertTrue('单任务' in text or '人工' in text, name)
+            self.assertTrue('批次感知' in text or 'batch-aware' in text.lower(),
+                            name)
+        # AGENTS.md is the core contract and may not repeat every limitation,
+        # but it must not instruct anyone to remove a real dependency.
+        self.assertNotRegex(texts['AGENTS.md'],
+                            r'(?i)(remove|delete|omit).{0,40}dependenc')
+
+
 if __name__ == '__main__':
     unittest.main()

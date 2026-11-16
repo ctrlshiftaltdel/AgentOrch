@@ -37,6 +37,16 @@
 - 实现完成、CI 在当前 head 全绿后把 PR 转为 **Ready for review**，状态进入 `REVIEW_READY`。
 - PR 时间线、评审评论与 CI 运行记录共同构成状态证据；不要只在聊天里说“已完成”。
 
+## 交付批次（Batch）
+
+- 相关任务可以组成一个**交付批次**：批次内每个任务仍有自己的任务 ID、验收标准与证据；批次只改变交付与审查的单位。
+- 一个批次用一个集成分支交付，并在批次结束时只开**一个最终 PR**、只做一次合并。逐任务 Draft PR 可选；`mode: batch` 登记块写在批次 Issue 上，它的 `locked_paths` 是批次任务路径的并集，`pr` 指向那个最终 PR（仅含一个任务的批次按单一任务流程交付，不额外建立批次层）。
+- 本文件其余章节中的逐任务 Draft PR / 逐任务登记块要求只适用于单任务交付；批次内的任务描述可以在批次 Issue 或各自的 Issue 里，但批次锁只在批次 Issue 上维护一处。
+- 批次内部使用 `INTEGRATED` 作为内部里程碑：任务进入集成分支后可作为同批次后续任务的依赖；它不是 `VERIFIED`，也不能用来解锁外部依赖。旧工具输出的 `PREPARED` 同样只是过渡态。
+- 在任何 Agent 启动前，批次协调器先在批次 Issue 写入 `mode: batch` 的 `ORCH-TASK-REGISTRY`（`status: DISPATCHED`，`locked_paths` 为并集），并完成开放 PR 冲突检查；载体缺失或派发失败时阻塞，不以本地报告代替。
+- 最终 PR 的门禁使用平台**实际必需 contexts**（`gh pr checks --required`），计划列出的检查只能是其子集；合并使用审查过的精确 head SHA，合并后验证通过且状态载体更新完成后才逐任务标 `VERIFIED`。
+- 状态机、锁、G1–G6 与证据矩阵仍以 `kit/orchestration.md` 为准（批次阶段见 2.2 节，风险分层见 4.2 节），本节只说明 `github` 底座的操作方式。`L0` 免第二模型审查，但必须有逐 AC 的机器证据和审查 head 上事后生成的 Master attestation，或独立审查；缺证据时不得自动合并。
+
 ## 证据
 
 - CI 运行结果，必须对应当前 head SHA。
@@ -99,10 +109,10 @@
 
 1. 将需求变成单一目标任务：目标、允许 / 禁止路径、依赖、逐条验收、验证命令、风险和回退方式。
 2. 创建 Issue：`gh issue create --title "..." --body-file <按 ISSUE-TEMPLATE 填写的文件>`，并打上状态与类型标签。
-3. 检查依赖并标记 `READY`：所有依赖 Issue 必须已 `VERIFIED`；在 Issue 评论记录依赖核对结果。
+3. 检查依赖并标记 `READY`：依赖 Issue 必须已 `VERIFIED`（批次内依赖可以由 `INTEGRATED` 满足，跨批次 / 外部依赖仍必须 `VERIFIED`）；在 Issue 评论记录依赖核对结果。
 4. 派发前在 Issue 写入 `ORCH-TASK-REGISTRY` 登记块，列出所有开放 PR 并检查 `locked_paths` 冲突；两者都通过才把任务包交给执行实例。派发动作以 Issue 评论记录，不靠口头交接。
-5. 执行实例推送分支后创建 **Draft PR**（`PR_OPEN`），回链 Issue；实现完成后转 Ready for review（`REVIEW_READY`）。Master 自己不实现，也不替执行者修 PR。
-6. 独立审查：按 G1–G6 逐门检查，证据取自 PR Diff、CI 运行记录、PR 评论与 head SHA。CI 绿灯不能替代逐条验收。
+5. 执行实例推送分支后创建 **Draft PR**（`PR_OPEN`），回链 Issue；实现完成后转 Ready for review（`REVIEW_READY`）。Master 自己不实现，也不替执行者修 PR。**批次交付例外**：除单任务批次外，默认不为每个任务单独开 PR；执行者在自己的任务分支 / Worktree 完成并汇报，批次结束时由批次集成负责人开一个最终 PR（见「交付批次（Batch）」）。
+6. 独立审查：按 G1–G6 逐门检查，证据取自 PR Diff、CI 运行记录、PR 评论与 head SHA。CI 绿灯不能替代逐条验收。批次交付时审查对象是集成后的最终 Diff，并逐条核对每个任务的验收标准与证据；审查深度按 `kit/orchestration.md` 4.2 节的风险等级执行（`L0` 不要求第二模型审查但仍需自动结构 / 范围检查；`L1` 对最终 Diff 做一次独立审查；`L2` / `L3` 必须独立审查并执行完整 / 高风险验证）。
 7. 审查结论用**四行格式**发布为 PR 评论：结论 / 用户可感知变化 / 验收结果 / 风险与下一步。退回时写明缺失门、证据与修复要求；默认最多 3 轮。
 8. 通过后将 `APPROVED` 绑定 PR 最新 commit SHA。合并**只由 Master 执行**（按项目配置使用平台合并按钮或 `gh pr merge`）；合并后删除远端分支，并在主分支重新运行验证，通过后才标记 `VERIFIED`。
 9. 每阶段末核对开放 Issue / PR 数量、存活时间与冲突情况；积压时降低并行度并拆分任务。
@@ -137,6 +147,7 @@ python -m scripts.update_agentorch.entry --project . --request "<用户原话>" 
 ## 合并纪律
 
 - 合并前确认：PR 的 base 为最新主分支、CI 在当前 head 全绿、PR 为可合并状态。
+- 批次合并：只在该批次最终 head 的必需检查全部通过、且批次审查（按风险等级）完成后合并；合并后执行合并后验证，并逐任务更新状态为 `VERIFIED`。不得把 `INTEGRATED` 或 `PREPARED` 写成 `VERIFIED`，也不得在缺失必需检查时合并。
 - 不得使用管理员权限绕过必需检查，不得为了赶进度关闭失败的 CI。
 - 合并后删除远端分支；分支删除失败单独记录，不能触发重复合并。
 - 合并成功与 Issue 关闭分开确认：Issue 在 `VERIFIED` 后关闭，关闭评论附主分支验证结果。
