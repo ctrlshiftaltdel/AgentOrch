@@ -755,6 +755,13 @@ class _Lock:
         try:
             if os.name == 'nt':  # pragma: no cover - POSIX CI path
                 import msvcrt
+                # msvcrt.locking locks a byte range; a zero-length file has no
+                # byte 0 to lock and Windows raises EACCES. Seed the file first.
+                self.handle.seek(0, os.SEEK_END)
+                if self.handle.tell() == 0:
+                    self.handle.write('\0')
+                    self.handle.flush()
+                self.handle.seek(0)
                 msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
             else:
                 import fcntl
