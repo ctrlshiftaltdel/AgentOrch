@@ -877,12 +877,35 @@ def _task_record(spec, executor_agent):
 
 # ------------------------------------------------------------------- process I/O
 
+def _binary_argv(env, default):
+    """Resolve an executable override to an argv prefix.
+
+    ``BATCH_OPENCODE`` / ``BATCH_GH`` accept either one executable path or a
+    JSON argv list. The list form keeps the test suite portable to platforms
+    whose process launcher cannot execute a shebang script directly (Windows
+    uses the interpreter plus script path), without enabling a shell.
+    """
+    raw = os.environ.get(env)
+    if not raw:
+        return [default]
+    if raw.lstrip().startswith('['):
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            raise BatchError(f'{env} is not a readable JSON argv list') from None
+        if (not isinstance(value, list) or not value
+                or any(not isinstance(token, str) or not token for token in value)):
+            raise BatchError(f'{env} must be a nonempty JSON argv list')
+        return value
+    return [raw]
+
+
 def _opencode_binary():
-    return os.environ.get('BATCH_OPENCODE') or 'opencode'
+    return _binary_argv('BATCH_OPENCODE', 'opencode')
 
 
 def _gh_binary():
-    return os.environ.get('BATCH_GH') or 'gh'
+    return _binary_argv('BATCH_GH', 'gh')
 
 
 def _classify_stream(returncode, output):
@@ -1027,7 +1050,7 @@ def _run_process(argv, cwd, timeout, *, env=None, input_text=None):
 
 
 def _agent(work, prompt, agent_name, timeout, *, title=None):
-    argv = [_opencode_binary(), 'run', '--standalone', '--format', 'json']
+    argv = [*_opencode_binary(), 'run', '--standalone', '--format', 'json']
     if agent_name:
         argv += ['--agent', agent_name]
     if title:
@@ -1054,7 +1077,7 @@ def _agent(work, prompt, agent_name, timeout, *, title=None):
 def _session_export(session, work, timeout=120):
     try:
         full = subprocess.run(
-            [_opencode_binary(), 'session', 'export', session], cwd=str(work),
+            [*_opencode_binary(), 'session', 'export', session], cwd=str(work),
             stdin=subprocess.DEVNULL, env=dict(os.environ, PWD=str(work)),
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
             timeout=timeout)
@@ -1084,7 +1107,7 @@ def _session_export(session, work, timeout=120):
 
 def _agent_profiles(work, timeout=120):
     try:
-        result = subprocess.run([_opencode_binary(), 'debug', 'agents'], cwd=str(work),
+        result = subprocess.run([*_opencode_binary(), 'debug', 'agents'], cwd=str(work),
                                 stdin=subprocess.DEVNULL,
                                 env=dict(os.environ, PWD=str(work)),
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -1202,7 +1225,7 @@ def _prepare_batch_worktree(plan, base_sha, execute):
 
 
 def _gh(args, cwd, *, input_text=None, timeout=300):
-    argv = [_gh_binary(), *args]
+    argv = [*_gh_binary(), *args]
     kwargs = {
         'cwd': str(cwd),
         'env': dict(os.environ, GIT_TERMINAL_PROMPT='0'),

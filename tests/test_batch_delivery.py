@@ -537,8 +537,8 @@ class BatchCase(unittest.TestCase):
             'GIT_CONFIG_GLOBAL': os.devnull,
             'GIT_CONFIG_SYSTEM': os.devnull,
             'HOME': str(self.home),
-            'BATCH_OPENCODE': str(self.opencode),
-            'BATCH_GH': str(self.gh),
+            'BATCH_OPENCODE': json.dumps([PY, '-S', str(self.opencode)]),
+            'BATCH_GH': json.dumps([PY, '-S', str(self.gh)]),
             'FAKE_OPENCODE_STATE': str(self.fake_state),
             'FAKE_GH_STATE': str(self.gh_state),
             'FAKE_ORCH_LOG': str(self.orch_log),
@@ -549,11 +549,11 @@ class BatchCase(unittest.TestCase):
 
     # -- fixtures ---------------------------------------------------------
     def _executable(self, name, text):
-        path = self.bin / name
-        # The fakes are launched once per gate; -S keeps interpreter startup
-        # from dominating the suite. The standard library still works.
-        path.write_text(text.replace(f'#!{PY}\n', f'#!{PY} -S\n', 1))
-        path.chmod(0o755)
+        path = self.bin / f'{name}.py'
+        # The overrides below pass an explicit interpreter argv, so the fake
+        # never needs a shebang or an executable bit. -S keeps interpreter
+        # startup from dominating the suite; the standard library still works.
+        path.write_text(text.replace(f'#!{PY}\n', '', 1))
         return path
 
     def _repository(self):
