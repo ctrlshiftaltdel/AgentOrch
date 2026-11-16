@@ -167,6 +167,12 @@ class ClassificationTests(RiskCase):
         data = self.result()
         self.assertEqual(data['level'], 'L3')
 
+    def test_backslash_secret_path_stays_l3(self):
+        self.branch()
+        self.commit([('foo\\bar/.env', 'TOKEN=x\n')])
+        data = self.result()
+        self.assertEqual(data['level'], 'L3')
+
     def test_non_ascii_source_is_l1(self):
         self.branch()
         self.commit([('src/é.py', 'print(1)\n')])

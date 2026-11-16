@@ -262,7 +262,40 @@ if args[:2] == ['pr', 'create']:
     print(pr['url'])
     raise SystemExit(0)
 
+if args[:1] == ['api']:
+    path = ''
+    for token in args[1:]:
+        if not token.startswith('--'):
+            path = token
+    contexts = os.environ.get('FAKE_GH_RULESET_CONTEXTS')
+    contexts = json.loads(contexts) if contexts is not None else {ruleset_default!r}
+    if path.endswith('/rulesets'):
+        pages = [[{{'id': 1}}]]
+        out(pages if '--slurp' in args else pages[0])
+        raise SystemExit(0)
+    if '/rulesets/' in path:
+        ident = int(path.rsplit('/', 1)[-1])
+        out({{'id': ident, 'rules': [{{'type': 'required_status_checks',
+                                      'parameters': {{
+                                          'required_status_checks': [
+                                              {{'context': name}}
+                                              for name in contexts]}}}}]}})
+        raise SystemExit(0)
+    print('unsupported gh api path', file=sys.stderr)
+    raise SystemExit(2)
+
 if args[:2] == ['pr', 'checks']:
+    if os.environ.get('FAKE_GH_ADVANCE_ON_CHECKS') == '1':
+        marker = STATE.parent / 'base-advanced'
+        if not marker.exists():
+            marker.write_text('1')
+            git('fetch', 'origin', 'main')
+            directory = tempfile.mkdtemp(prefix='gh-advance-', dir=str(STATE.parent))
+            git('worktree', 'add', '--detach', directory, 'origin/main')
+            git('-C', directory, 'commit', '--allow-empty', '-m', 'advance base')
+            git('-C', directory, 'push', 'origin', 'HEAD:refs/heads/main')
+            git('worktree', 'remove', '--force', directory)
+            shutil.rmtree(directory, ignore_errors=True)
     if '--required' in args:
         required = os.environ.get('FAKE_GH_REQUIRED')
         names = json.loads(required) if required else {required_default!r}
@@ -355,27 +388,84 @@ if args[:2] == ['issue', 'edit']:
 
 print('unsupported gh invocation', file=sys.stderr)
 raise SystemExit(2)
-'''.format(python=PY, checks=CHECK_SUCCESS, required_default=CHECKS)
+'''.format(python=PY, checks=CHECK_SUCCESS, required_default=CHECKS,
+           ruleset_default=CHECKS)
 
 ORCHESTRATOR = r'''#!{python}
 import json
 import os
 import sys
 
+
+def env_json(name, default):
+    raw = os.environ.get(name)
+    return json.loads(raw) if raw else default
+
+
 with open(os.environ['FAKE_ORCH_LOG'], 'a') as log:
     log.write(json.dumps(sys.argv[1:]) + '\n')
 
+tasks = env_json('FAKE_ORCH_TASKS', {{}})
 missing = {{name.strip() for name in os.environ.get('FAKE_ORCH_MISSING', '').split(',')
           if name.strip()}}
-status = os.environ.get('FAKE_ORCH_STATUS', 'DISPATCHED')
+default_status = os.environ.get('FAKE_ORCH_STATUS', 'DISPATCHED')
+status_map = env_json('FAKE_ORCH_STATUS_MAP', {{}})
+paths_map = env_json('FAKE_ORCH_PATHS', {{}})
+acceptance_map = env_json('FAKE_ORCH_ACCEPTANCE', {{}})
+deps_map = env_json('FAKE_ORCH_DEPS', {{}})
+locks_map = env_json('FAKE_ORCH_LOCKS', {{}})
+
+
+def status_of(ident):
+    return status_map.get(ident, default_status)
+
+
+def paths_of(ident):
+    return paths_map.get(
+        ident, tasks.get(ident, {{}}).get('paths', []))
+
+
+def acceptance_of(ident):
+    return acceptance_map.get(
+        ident, tasks.get(ident, {{}}).get('acceptance', []))
+
+
+def deps_of(ident):
+    return deps_map.get(
+        ident, tasks.get(ident, {{}}).get('dependencies', []))
+
 
 if sys.argv[1:3] == ['task', 'show']:
     ident = sys.argv[3]
-    if ident in missing:
+    if ident in missing or (tasks and ident not in tasks):
         print('no such task', file=sys.stderr)
         raise SystemExit(1)
-    print(f"# {{ident}} — test task\n\nStatus: {{status}}\n")
+    print(f"# {{ident}} — test task")
+    print()
+    print(f"Status: {{status_of(ident)}}")
+    print('Description: synthetic')
+    print('Allowed paths:')
+    paths = paths_of(ident)
+    for path in paths or ['(none)']:
+        print(f'- {{path}}')
+    print()
+    print('Dependencies:')
+    for dependency in deps_of(ident) or ['None']:
+        print(f'- {{dependency}}')
+    print()
+    print('Acceptance criteria:')
+    for criterion in acceptance_of(ident) or ['(none)']:
+        print(f'- [ ] {{criterion}}')
     raise SystemExit(0)
+
+if sys.argv[1:3] == ['task', 'list']:
+    for ident in tasks:
+        print(f"{{ident}}\t{{status_of(ident)}}\ttest task")
+        print('  paths: ' + ', '.join(paths_of(ident)))
+        print('  locks: ' + ', '.join(locks_map.get(ident, paths_of(ident))))
+        print('  retries: 0')
+    raise SystemExit(0)
+
 if sys.argv[1:3] in (['task', 'ready'], ['task', 'dispatch']):
     if os.environ.get('FAKE_ORCH_FAIL_TRANSITION') == '1':
         print('transition refused', file=sys.stderr)
@@ -473,7 +563,7 @@ class BatchCase(unittest.TestCase):
                       'state': 'OPEN'}}))
 
     def task(self, ident, name, depends=(), verify=None, title=None,
-             acceptance_checks=None):
+             acceptance_checks=None, acceptance_decisions=None):
         task = {
             'id': ident,
             'title': title or f'{ident} changes {name}',
@@ -487,6 +577,8 @@ class BatchCase(unittest.TestCase):
         }
         if acceptance_checks is not None:
             task['acceptance_checks'] = acceptance_checks
+        if acceptance_decisions is not None:
+            task['acceptance_decisions'] = acceptance_decisions
         return task
 
     def plan(self, tasks, *, risk_checks=None, next_plan=None):
@@ -508,10 +600,23 @@ class BatchCase(unittest.TestCase):
     def write_plan(self, plan):
         path = self.root / 'plan.json'
         path.write_text(json.dumps(plan))
+        self._plan_for_env = plan
         return path
+
+    def _task_env(self):
+        plan = getattr(self, '_plan_for_env', None)
+        if not plan or plan.get('edition') == 'local' or 'tasks' not in plan:
+            return {}
+        mapping = {}
+        for task in plan.get('tasks') or []:
+            mapping[task['id']] = {'paths': task.get('paths') or [],
+                                   'acceptance': task.get('acceptance') or [],
+                                   'dependencies': []}
+        return {'FAKE_ORCH_TASKS': json.dumps(mapping)}
 
     def cli(self, *args, extra=None):
         env = dict(self.env)
+        env.update(self._task_env())
         if extra:
             env.update(extra)
         return subprocess.run([PY, str(SCRIPT), *args], cwd=self.root, env=env,
@@ -588,6 +693,7 @@ class GitHubBatchTests(BatchCase):
         run = self.run_batch(plan)
         self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
         state = self.journal_data()
+        self.assertEqual(state['project_verification'], 'absent')
         for ident in ('T1', 'T2', 'T3'):
             self.assertEqual(state['tasks'][ident]['status'], 'INTEGRATED')
         self.assertEqual(state['tasks']['T2']['base'],
@@ -755,8 +861,10 @@ class GitHubBatchTests(BatchCase):
 
     def test_l0_batch_needs_no_second_model(self):
         check = 'import pathlib; assert pathlib.Path("docs/note.md").exists()'
-        plan = self.plan([self.task('T1', 'docs/note.md',
-                                    acceptance_checks=[[PY, '-c', check]])])
+        plan = self.plan([self.task(
+            'T1', 'docs/note.md', acceptance_checks=[[PY, '-c', check]],
+            acceptance_decisions=[{'id': 'AC-1', 'status': 'PASS',
+                                   'evidence': 'docs/note.md present in diff'}])])
         self.assertEqual(self.run_batch(plan).returncode, 0)
         done = self.finalize(plan, None, '--push', '--merge', '--authorization',
                              AUTH, '--checks-timeout', '5')
@@ -767,6 +875,8 @@ class GitHubBatchTests(BatchCase):
         self.assertEqual(self.session_files('rev'), [])
         self.assertEqual(state['review']['acceptance_evidence']['T1'][0]['status'],
                          'PASS')
+        self.assertEqual(
+            state['review']['acceptance_decisions']['T1'][0]['status'], 'PASS')
         self.assertEqual(state['phase'], 'verified')
 
     def test_l0_without_acceptance_checks_is_blocked(self):
@@ -775,8 +885,23 @@ class GitHubBatchTests(BatchCase):
         done = self.finalize(plan, None, '--push', '--merge', '--authorization',
                              AUTH, '--checks-timeout', '5')
         self.assertEqual(done.returncode, 1)
-        self.assertIn('L0 needs acceptance_checks', done.stderr)
+        self.assertIn('L0 needs complete acceptance_checks and '
+                      'acceptance_decisions', done.stderr)
         self.assertFalse(any('pr create' in call for call in self.gh_calls()))
+
+    def test_l0_failed_master_decision_blocks_the_merge(self):
+        plan = self.plan([self.task(
+            'T1', 'docs/note.md',
+            acceptance_checks=[[PY, '-c', 'pass']],
+            acceptance_decisions=[{'id': 'AC-1', 'status': 'FAIL',
+                                   'evidence': 'reviewer says the AC is unmet'}])])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        done = self.finalize(plan, None, '--push', '--merge', '--authorization',
+                             AUTH, '--checks-timeout', '5')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('PASS Master decision', done.stderr)
+        self.assertFalse(any('pr create' in call for call in self.gh_calls()))
+        self.assertEqual(self.journal_data()['review']['verdict'], 'REJECT')
 
     def test_l0_without_checks_can_use_reviewer(self):
         plan = self.plan([self.task('T1', 'docs/note.md')])
@@ -790,8 +915,10 @@ class GitHubBatchTests(BatchCase):
 
     def test_l0_failed_acceptance_check_blocks_the_merge(self):
         check = 'import pathlib; assert pathlib.Path("docs/note.md").read_text().strip() == "42"'
-        plan = self.plan([self.task('T1', 'docs/note.md',
-                                    acceptance_checks=[[PY, '-c', check]])])
+        plan = self.plan([self.task(
+            'T1', 'docs/note.md', acceptance_checks=[[PY, '-c', check]],
+            acceptance_decisions=[{'id': 'AC-1', 'status': 'PASS',
+                                   'evidence': 'decision says PASS'}])])
         self.assertEqual(self.run_batch(plan).returncode, 0)
         done = self.finalize(plan, None, '--push', '--merge', '--authorization',
                              AUTH, '--checks-timeout', '5')
@@ -1182,11 +1309,11 @@ class GitHubBatchTests(BatchCase):
     def test_empty_authoritative_checks_fail_closed(self):
         plan = self.plan([self.task('T1', 'a.txt')])
         self.assertEqual(self.run_batch(plan).returncode, 0)
-        done = self.finalize(plan, {'FAKE_GH_REQUIRED': '[]'}, '--review',
+        done = self.finalize(plan, {'FAKE_GH_RULESET_CONTEXTS': '[]'}, '--review',
                              '--push', '--merge', '--authorization', AUTH,
                              '--checks-timeout', '5')
         self.assertEqual(done.returncode, 1)
-        self.assertIn('no authoritative required', done.stderr)
+        self.assertIn('yields no required', done.stderr)
 
     def test_project_config_change_blocks_resume(self):
         plan = self.plan([self.task('T1', 'a.txt')])
@@ -1199,7 +1326,95 @@ class GitHubBatchTests(BatchCase):
         self.assertIn('docs/PROJECT.md changed', resumed.stderr)
 
 
+    def test_many_open_prs_one_conflict_blocks_the_whole_batch(self):
+        plan = self.plan([self.task('T1', 'a.txt'), self.task('T2', 'b.txt')])
+        prs = []
+        for index in range(35):
+            files = ['a.txt'] if index == 31 else []
+            prs.append({'number': 100 + index, 'url': f'https://x/pr/{index}',
+                        'base': 'main', 'headRefName': f'other-{index}',
+                        'state': 'OPEN', 'mergeCommit': None, 'files': files,
+                        'body': ''})
+        self.gh_state.write_text(json.dumps({
+            'calls': [], 'prs': prs,
+            'issue': {'number': 250, 'body': '', 'comments': [], 'state': 'OPEN'}}))
+        run = self.run_batch(plan)
+        self.assertEqual(run.returncode, 1)
+        self.assertIn('blocks the whole batch', run.stderr)
+        state = self.journal_data()
+        self.assertEqual({record['status'] for record in state['tasks'].values()},
+                         {'BLOCKED'})
+        self.assertEqual(self.opencode_calls(), [])
+        self.assertFalse(any('issue edit' in call for call in self.gh_calls()))
+
+    def test_same_branch_registry_with_wrong_paths_blocks(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        self.seed_issue(
+            '<!-- ORCH-TASK-REGISTRY\nstatus: DISPATCHED\nmode: batch\n'
+            'locked_paths: other.txt\nbranch: task/batch-250\n'
+            'dispatched_at: 2026-01-01T00:00:00Z\n-->\n')
+        run = self.run_batch(plan)
+        self.assertEqual(run.returncode, 1)
+        self.assertIn('registry locks do not match the batch plan', run.stderr)
+        self.assertEqual(self.opencode_calls(), [])
+
+    def test_configured_context_without_a_check_result_blocks(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        checks = [{'name': CHECKS[0], 'state': 'SUCCESS'}]
+        done = self.finalize(plan, {'FAKE_GH_CHECKS': json.dumps(checks)},
+                             '--review', '--push', '--merge', '--authorization',
+                             AUTH, '--checks-timeout', '1')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn(CHECKS[1], done.stderr)
+        self.assertFalse(any('pr merge' in call for call in self.gh_calls()))
+
+    def test_base_advanced_while_waiting_blocks_merge(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        done = self.finalize(plan, {'FAKE_GH_ADVANCE_ON_CHECKS': '1'},
+                             '--review', '--push', '--merge',
+                             '--authorization', AUTH, '--checks-timeout', '5')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('base branch advanced', done.stderr)
+        self.assertFalse(any('pr merge' in call for call in self.gh_calls()))
+
+
 class InputErrorTests(BatchCase):
+    def append_project(self, text):
+        path = self.repo / 'docs' / 'PROJECT.md'
+        path.write_text(path.read_text() + '\n' + text)
+
+    def test_declared_project_verification_command_is_required(self):
+        self.append_project('## 验证命令\n\n'
+                            '- 快速测试：`python scripts/validate_kit.py`\n')
+        plan = self.plan([self.task('T1', 'a.txt')])
+        check = self.cli('check', '--plan', str(self.write_plan(plan)))
+        self.assertEqual(check.returncode, 2)
+        self.assertIn('declares project verification command', check.stderr)
+
+    def test_project_verification_python_names_are_normalized(self):
+        self.append_project('## 验证命令\n\n'
+                            '- 快速测试：`python scripts/validate_kit.py`\n')
+        plan = self.plan([self.task('T1', 'a.txt')])
+        plan['finalize']['verify'] = [[sys.executable, 'scripts/validate_kit.py']]
+        check = self.cli('check', '--plan', str(self.write_plan(plan)))
+        self.assertEqual(check.returncode, 0, check.stderr)
+
+    def test_project_verification_ignores_placeholder_backticks(self):
+        text = ('# p\n\n## 验证命令\n\n'
+                '- 快速测试：`python scripts/validate_kit.py`\n'
+                '- 说明：`python scripts/verification_profile.py '
+                '--evidence <json>`\n')
+        commands = delivery._project_verification(text)
+        self.assertEqual(commands, [('<python>', 'scripts/validate_kit.py')])
+
+    def test_project_config_path_is_refused_in_a_batch(self):
+        plan = self.plan([self.task('T1', 'docs/PROJECT.md')])
+        check = self.cli('check', '--plan', str(self.write_plan(plan)))
+        self.assertEqual(check.returncode, 2)
+        self.assertIn('may not do', check.stderr)
+
     def test_journal_inside_repository_is_refused(self):
         plan = self.plan([self.task('T1', 'a.txt')])
         path = self.write_plan(plan)
@@ -1285,14 +1500,21 @@ class LocalBatchTests(BatchCase):
     edition = 'local'
     orchestrator = True
 
+    @staticmethod
+    def decisions(count=1):
+        return [{'id': f'AC-{index}', 'status': 'PASS',
+                 'evidence': 'local test decision'} for index in range(1, count + 1)]
+
     def test_local_merge_post_verify_and_carrier_chain(self):
         def checks(name):
             return [[PY, '-c',
                      f'import pathlib; assert pathlib.Path("{name}").exists()']]
         plan = self.plan([
-            self.task('T1', 'docs/one.md', acceptance_checks=checks('docs/one.md')),
+            self.task('T1', 'docs/one.md', acceptance_checks=checks('docs/one.md'),
+                      acceptance_decisions=self.decisions()),
             self.task('T2', 'docs/two.md', depends=['T1'],
-                      acceptance_checks=checks('docs/two.md'))])
+                      acceptance_checks=checks('docs/two.md'),
+                      acceptance_decisions=self.decisions())])
         run = self.run_batch(plan)
         self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
         done = self.finalize(plan, None, '--merge', '--authorization', AUTH)
@@ -1344,6 +1566,44 @@ class LocalBatchTests(BatchCase):
         self.assertIn('local task library', run.stderr)
         self.assertEqual(self.opencode_calls(), [])
 
+    def test_local_registered_paths_mismatch_blocks(self):
+        plan = self.plan([self.task('T1', 'docs/one.md')])
+        run = self.run_batch(plan, {'FAKE_ORCH_PATHS': '{"T1": ["other.md"]}'})
+        self.assertEqual(run.returncode, 1)
+        self.assertIn('registered allowed paths', run.stderr)
+        self.assertEqual(self.opencode_calls(), [])
+
+    def test_local_registered_acceptance_mismatch_blocks(self):
+        plan = self.plan([self.task('T1', 'docs/one.md')])
+        run = self.run_batch(
+            plan, {'FAKE_ORCH_ACCEPTANCE': '{"T1": ["different criterion"]}'})
+        self.assertEqual(run.returncode, 1)
+        self.assertIn('acceptance criteria do not match', run.stderr)
+        self.assertEqual(self.opencode_calls(), [])
+
+    def test_local_released_lock_blocks(self):
+        plan = self.plan([self.task('T1', 'docs/one.md')])
+        run = self.run_batch(plan, {'FAKE_ORCH_LOCKS': '{"T1": []}'})
+        self.assertEqual(run.returncode, 1)
+        self.assertIn('currently holds locks', run.stderr)
+        self.assertEqual(self.opencode_calls(), [])
+
+    def test_local_terminal_task_with_pending_journal_blocks(self):
+        plan = self.plan([self.task('T1', 'docs/one.md')])
+        run = self.run_batch(plan, {'FAKE_ORCH_STATUS_MAP': '{"T1": "VERIFIED"}'})
+        self.assertEqual(run.returncode, 1)
+        self.assertIn('terminal task as dispatchable', run.stderr)
+        self.assertEqual(self.opencode_calls(), [])
+
+    def test_local_in_batch_dependency_is_unsupported(self):
+        plan = self.plan([self.task('T1', 'docs/one.md'),
+                          self.task('T2', 'docs/two.md', depends=['T1'])])
+        run = self.run_batch(plan, {'FAKE_ORCH_DEPS': '{"T2": ["T1"]}'})
+        self.assertEqual(run.returncode, 1)
+        self.assertIn('batch-internal dependencies are satisfied at '
+                      'INTEGRATED', run.stderr)
+        self.assertEqual(self.opencode_calls(), [])
+
     def test_local_ready_task_is_dispatched(self):
         plan = self.plan([self.task('T1', 'docs/one.md')])
         run = self.run_batch(plan, {'FAKE_ORCH_STATUS': 'READY'})
@@ -1355,7 +1615,8 @@ class LocalBatchTests(BatchCase):
         plan = self.plan([self.task(
             'T1', 'docs/one.md',
             acceptance_checks=[[PY, '-c',
-                                'import pathlib; assert pathlib.Path("docs/one.md").exists()']])])
+                                'import pathlib; assert pathlib.Path("docs/one.md").exists()']],
+            acceptance_decisions=self.decisions())])
         self.assertEqual(self.run_batch(plan).returncode, 0)
         _git(self.repo, 'commit', '--allow-empty', '-m', 'move base')
         done = self.finalize(plan, None, '--merge', '--authorization', AUTH)
@@ -1419,7 +1680,8 @@ class LocalBatchTests(BatchCase):
         plan = self.plan([self.task(
             'T1', 'docs/one.md',
             acceptance_checks=[[PY, '-c',
-                                'import pathlib; assert pathlib.Path("docs/one.md").exists()']])])
+                                'import pathlib; assert pathlib.Path("docs/one.md").exists()']],
+            acceptance_decisions=self.decisions())])
         self.assertEqual(self.run_batch(plan).returncode, 0)
         missing = self.finalize(plan, None, '--merge')
         self.assertEqual(missing.returncode, 2)

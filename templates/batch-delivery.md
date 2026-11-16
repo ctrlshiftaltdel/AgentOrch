@@ -59,6 +59,8 @@ python scripts/batch_delivery.py status   --journal JOURNAL [--json]
       "paths": ["src/app.py", "tests/test_app.py"],
       "acceptance": ["AC text, one result per item"],
       "acceptance_checks": [["python", "-c", "assert result_is_present()"]],
+      "acceptance_decisions": [{"id": "AC-1", "status": "PASS",
+                                "evidence": "locatable evidence for AC-1"}],
       "verify": [["python", "-m", "unittest", "tests.test_app"]],
       "depends": []
     }
@@ -81,7 +83,9 @@ python scripts/batch_delivery.py status   --journal JOURNAL [--json]
 - `paths` 是相对 POSIX 路径；不接受绝对路径、`..`、反斜杠、通配符、`.git`、`.orchestration`、`.local`。任务之间不得有路径前缀重叠。
 - 依赖只能指向批次中更早的任务，依赖由 `INTEGRATED` 满足，而不是 `VERIFIED`。
 - 每个任务必须有非空 `acceptance` 与 `verify`；`finalize.verify` 与 `finalize.post_merge_verify` 也必须非空。
-- `acceptance_checks`（可选）是逐条验收标准对应的 argv 列表，长度必须与 `acceptance` 相同。`L0` 批次只有在每个任务都有完整 `acceptance_checks` 时才可能自动合并；否则需要独立审查或直接阻塞。检查在已审查的 head 上执行，任一 AC 失败即拒绝合并。
+- `acceptance_checks`（可选）是逐条验收标准对应的 argv 列表，长度必须与 `acceptance` 相同。`acceptance_decisions`（可选）是逐条 Master 决策，格式 `{"id":"AC-n","status":"PASS","evidence":"..."}`，长度也必须相同。`L0` 批次只有在每个任务都同时具备完整 `acceptance_checks` 与 `acceptance_decisions` 时才可能自动合并；检查必须全部 PASS，决策也必须是 PASS 且有可定位证据。否则需要独立审查或直接阻塞。
+- 任务路径不得覆盖 `docs/PROJECT.md`：项目配置在 journal 中以 SHA-256 绑定，批次内修改会让恢复失效。请把配置变更作为单任务或批次外工作交付。
+- `docs/PROJECT.md` 的 `## 验证命令` 若声明了 `快速测试` / `完整回归` / `静态检查` / `合并后必须执行` 命令，计划必须在 `finalize.verify` 或 `finalize.post_merge_verify` 中包含同一命令；`python`、`python3`、`sys.executable` 视为同一程序，前导 `uv run` 会被忽略。该节不存在时 journal 记录 `project_verification: absent`。
 - 授权载体是必需的：`github` 批次必须有 `batch.issue` 与 `batch.issue_repo`，并在任何 Agent 启动前写入 `ORCH-TASK-REGISTRY`（`status: DISPATCHED`）；`local` 批次必须有 `scripts/orchestrator.py` 与每个任务的记录，并在任何 Agent 启动前完成 `READY` / `DISPATCHED`。载体缺失时批次阻塞，不会以 `not_applicable` 假装交付。
 - 密钥形态的路径（如 `.env`、`*.pem`、`*token*`）在预检阶段直接拒绝。
 - `merge_method` 取 `merge`、`squash` 或 `rebase`。

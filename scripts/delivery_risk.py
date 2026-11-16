@@ -236,9 +236,13 @@ def _diff(repo, base, head):
         try:
             name = _safe_name(raw)
         except RiskError as exc:
-            # Git produced something this classifier cannot normalize; fail
-            # closed at the highest automated level instead of exiting 0.
-            changed.append((raw, 'L2', f'invalid changed path: {exc}'))
+            # Git produced something this classifier cannot normalize. A path
+            # that could still be secret-shaped is never downgraded to L2 just
+            # because a backslash made it invalid.
+            if _secret(raw) or _secret(raw.replace('\\', '/')):
+                changed.append((raw, 'L3', f'secret-shaped path: {raw}'))
+            else:
+                changed.append((raw, 'L2', f'invalid changed path: {exc}'))
             continue
         changed.append((name, *_classify_one(name, status)))
     changed.sort()
