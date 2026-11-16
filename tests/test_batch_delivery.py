@@ -1172,6 +1172,61 @@ class GitHubBatchTests(BatchCase):
         self.assertIn('truncated', done.stderr)
         self.assertFalse(any('pr merge' in call for call in self.gh_calls()))
 
+    def test_failure_then_success_same_context_blocks(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        runs = [
+            {'name': CHECKS[0], 'app': {'id': 123}, 'status': 'completed',
+             'conclusion': 'failure', 'id': 1,
+             'completed_at': '2026-01-01T00:00:00Z'},
+            {'name': CHECKS[0], 'app': {'id': 123}, 'status': 'completed',
+             'conclusion': 'success', 'id': 2,
+             'completed_at': '2026-01-01T00:01:00Z'},
+            check_runs({CHECKS[1]: 'success'})[0],
+        ]
+        done = self.finalize(plan, {'FAKE_GH_CHECK_RUNS': json.dumps(runs)},
+                             '--review', '--push', '--merge', '--authorization',
+                             AUTH, '--checks-timeout', '5')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('completed run with conclusion', done.stderr)
+        self.assertFalse(any('pr merge' in call for call in self.gh_calls()))
+
+    def test_success_then_failure_same_context_blocks(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        runs = [
+            {'name': CHECKS[0], 'app': {'id': 123}, 'status': 'completed',
+             'conclusion': 'success', 'id': 1,
+             'completed_at': '2026-01-01T00:01:00Z'},
+            {'name': CHECKS[0], 'app': {'id': 123}, 'status': 'completed',
+             'conclusion': 'failure', 'id': 2,
+             'completed_at': '2026-01-01T00:00:00Z'},
+            check_runs({CHECKS[1]: 'success'})[0],
+        ]
+        done = self.finalize(plan, {'FAKE_GH_CHECK_RUNS': json.dumps(runs)},
+                             '--review', '--push', '--merge', '--authorization',
+                             AUTH, '--checks-timeout', '5')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('completed run with conclusion', done.stderr)
+        self.assertFalse(any('pr merge' in call for call in self.gh_calls()))
+
+    def test_same_name_foreign_app_run_blocks(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        runs = [
+            {'name': CHECKS[0], 'app': {'id': 123}, 'status': 'completed',
+             'conclusion': 'success', 'id': 1},
+            {'name': CHECKS[0], 'app': {'id': 999}, 'status': 'completed',
+             'conclusion': 'success', 'id': 2},
+            check_runs({CHECKS[1]: 'success'})[0],
+        ]
+        done = self.finalize(plan, {'FAKE_GH_CHECK_RUNS': json.dumps(runs)},
+                             '--review', '--push', '--merge', '--authorization',
+                             AUTH, '--checks-timeout', '5')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('run identity is ambiguous', done.stderr)
+        self.assertFalse(any('pr merge' in call for call in self.gh_calls()))
+
     def test_retry_of_an_integrated_task_is_refused(self):
         plan = self.plan([self.task('T1', 'a.txt')])
         self.assertEqual(self.run_batch(plan).returncode, 0)
@@ -1471,6 +1526,40 @@ class GitHubBatchTests(BatchCase):
         self.assertIn('ambiguous', run.stderr)
         self.assertEqual(self.opencode_calls(), [])
 
+    def _registry_status_run(self, status):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        self.gh_state.write_text(json.dumps({
+            'calls': [], 'prs': [],
+            'issue': {'number': 250, 'body': '', 'comments': [], 'state': 'OPEN'},
+            'issues': [
+                {'number': 250, 'body': '', 'state': 'OPEN'},
+                {'number': 997, 'state': 'OPEN',
+                 'body': f'<!-- ORCH-TASK-REGISTRY\nstatus: {status}\n'
+                         'mode: batch\nlocked_paths: a.txt\n'
+                         'branch: task/other\n-->\n'}]}))
+        return self.run_batch(plan)
+
+    def test_registry_lock_retaining_statuses_block(self):
+        for status in ('PR_OPEN', 'MERGED', 'NOT_A_REGISTRY_STATUS'):
+            with self.subTest(status=status):
+                self.setUp()
+                run = self._registry_status_run(status)
+                self.assertEqual(run.returncode, 1, run.stderr)
+                if status == 'NOT_A_REGISTRY_STATUS':
+                    self.assertIn('unknown ORCH-TASK-REGISTRY status', run.stderr)
+                else:
+                    self.assertIn('active lock conflict', run.stderr)
+                self.assertEqual(self.opencode_calls(), [])
+
+    def test_registry_released_statuses_do_not_block(self):
+        for status in ('VERIFIED', 'CANCELED'):
+            with self.subTest(status=status):
+                self.setUp()
+                run = self._registry_status_run(status)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(
+                    self.journal_data()['tasks']['T1']['status'], 'INTEGRATED')
+
     def test_active_issue_registry_overlap_blocks_without_prs(self):
         plan = self.plan([self.task('T1', 'a.txt'), self.task('T2', 'b.txt')])
         self.gh_state.write_text(json.dumps({
@@ -1579,9 +1668,19 @@ class InputErrorTests(BatchCase):
         self.append_project('## 验证命令\n\n'
                             '- 快速测试：`python scripts/validate_kit.py`\n')
         plan = self.plan([self.task('T1', 'a.txt')])
-        plan['finalize']['verify'] = [[sys.executable, 'scripts/validate_kit.py']]
+        plan['finalize']['post_merge_verify'] = [
+            [sys.executable, 'scripts/validate_kit.py']]
         check = self.cli('check', '--plan', str(self.write_plan(plan)))
         self.assertEqual(check.returncode, 0, check.stderr)
+
+    def test_quick_command_only_in_verify_blocks(self):
+        self.append_project('## 验证命令\n\n'
+                            '- 快速测试：`python scripts/validate_kit.py`\n')
+        plan = self.plan([self.task('T1', 'a.txt')])
+        plan['finalize']['verify'] = [[PY, 'scripts/validate_kit.py']]
+        check = self.cli('check', '--plan', str(self.write_plan(plan)))
+        self.assertEqual(check.returncode, 2)
+        self.assertIn('post-merge', check.stderr)
 
     def test_project_verification_ignores_placeholder_backticks(self):
         text = ('# p\n\n## 验证命令\n\n'
@@ -1590,7 +1689,7 @@ class InputErrorTests(BatchCase):
                 '--evidence <json>`\n')
         commands = delivery._project_verification(text)
         self.assertEqual(commands,
-                         [('either', ('<python>', 'scripts/validate_kit.py'))])
+                         [('post', ('<python>', 'scripts/validate_kit.py'))])
 
     def test_post_only_command_placed_in_verify_blocks(self):
         self.append_project(
@@ -1623,15 +1722,32 @@ class InputErrorTests(BatchCase):
     def test_repository_verification_stages_are_parsed(self):
         text = (Path('docs/PROJECT.md').read_text(encoding='utf-8'))
         commands = delivery._project_verification(text)
-        self.assertIn(('either', ('<python>', 'scripts/validate_kit.py')),
+        self.assertIn(('post', ('<python>', 'scripts/validate_kit.py')),
                       commands)
         self.assertIn(('post', ('<python>', '-m', 'unittest', 'discover', '-s',
                                 'tests')), commands)
-        self.assertIn(('either', ('<python>', '-m', 'py_compile',
-                                  'scripts/orchestrator.py',
-                                  'scripts/validate_kit.py')), commands)
+        self.assertIn(('post', ('<python>', '-m', 'py_compile',
+                                'scripts/orchestrator.py',
+                                'scripts/validate_kit.py')), commands)
         self.assertIn(('post', ('<python>', 'scripts/orchestrator.py', 'backup')),
                       commands)
+        self.assertTrue(all(stage == 'post' for stage, _ in commands))
+
+    def test_all_four_default_commands_in_post_merge_passes(self):
+        self.append_project(
+            '## 验证命令\n\n'
+            '- 快速测试：`python scripts/validate_kit.py`\n'
+            '- 完整回归：`python -m unittest discover -s tests`\n'
+            '- 静态检查：`python -m py_compile a.py b.py`\n'
+            '- 合并后必须执行：`python scripts/orchestrator.py backup`\n')
+        plan = self.plan([self.task('T1', 'a.txt')])
+        plan['finalize']['post_merge_verify'] = [
+            [PY, 'scripts/validate_kit.py'],
+            [PY, '-m', 'unittest', 'discover', '-s', 'tests'],
+            [PY, '-m', 'py_compile', 'a.py', 'b.py'],
+            [PY, 'scripts/orchestrator.py', 'backup']]
+        check = self.cli('check', '--plan', str(self.write_plan(plan)))
+        self.assertEqual(check.returncode, 0, check.stderr)
 
     def test_project_config_path_is_refused_in_a_batch(self):
         plan = self.plan([self.task('T1', 'docs/PROJECT.md')])

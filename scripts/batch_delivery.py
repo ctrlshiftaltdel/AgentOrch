@@ -77,9 +77,11 @@ PHASES = ('tasks', 'review', 'pr', 'merge', 'post_merge', 'verified', 'blocked')
 CHAIN = ('PLANNED', 'READY', 'DISPATCHED', 'IN_PROGRESS', 'REVIEW_READY',
          'MASTER_REVIEW', 'APPROVED', 'MERGED', 'VERIFIED')
 FAILED_CHECKS = ('FAILURE', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'ERROR')
-ACTIVE_REGISTRY_STATUSES = ('DISPATCHED', 'IN_PROGRESS', 'REVIEW_READY',
-                            'MASTER_REVIEW', 'APPROVED', 'BLOCKED',
-                            'NEEDS_HUMAN_DECISION', 'FAILED')
+REGISTRY_STATUSES = ('READY', 'DISPATCHED', 'IN_PROGRESS', 'PR_OPEN',
+                     'REVIEW_READY', 'MASTER_REVIEW', 'APPROVED', 'MERGED',
+                     'VERIFIED', 'BLOCKED', 'NEEDS_HUMAN_DECISION', 'FAILED',
+                     'CANCELED')
+RELEASED_REGISTRY_STATUSES = ('VERIFIED', 'CANCELED')
 MERGE_METHODS = ('merge', 'squash', 'rebase')
 VALID_EDITIONS = ('local', 'github')
 SECRET_PATTERNS = ('.env', '.env.*', '*secret*', '*token*', '*.pem', '*.key',
@@ -329,8 +331,8 @@ def _project_verification(text):
     section = _section_text(text, '验证命令')
     if section is None:
         return None
-    stages = (('快速测试', 'either'), ('完整回归', 'post'),
-              ('静态检查', 'either'), ('合并后必须执行', 'post'))
+    stages = (('快速测试', 'post'), ('完整回归', 'post'),
+              ('静态检查', 'post'), ('合并后必须执行', 'post'))
     known = ('python', 'python3', 'uv', 'pytest', 'npm', 'yarn', 'pnpm', 'go',
              'cargo', 'make', 'bash', 'sh', 'dotnet')
     requirements = []
@@ -659,9 +661,9 @@ def validate_plan(raw, repo_override=None):
                 + ' '.join(command) for stage, command in missing)
             raise InputError(
                 'docs/PROJECT.md declares staged project verification command(s) '
-                f'that the plan does not cover: {rendered}. 完整回归 and '
-                '合并后必须执行 commands must be in finalize.post_merge_verify; '
-                '快速测试 and 静态检查 may be in verify or post_merge_verify')
+                f'that the plan does not cover: {rendered}. Every declared '
+                'quick/static/full-regression/merge-after command must be in '
+                'finalize.post_merge_verify; it may also appear in verify')
     checks = finalize_raw.get('required_checks') or []
     if not isinstance(checks, list) or any(not isinstance(name, str) or not name
                                            for name in checks):
@@ -1293,7 +1295,12 @@ def _open_pr_conflicts(plan, batch_branch):
                 f'issue #{number} has an unreadable ORCH-TASK-REGISTRY block; '
                 'the active lock state cannot be proven')
             continue
-        if status not in ACTIVE_REGISTRY_STATUSES:
+        if status not in REGISTRY_STATUSES:
+            conflicts[f'issue-{number}'] = (
+                f'issue #{number} has unknown ORCH-TASK-REGISTRY status '
+                f'{status!r}; the active lock state is ambiguous')
+            continue
+        if status in RELEASED_REGISTRY_STATUSES:
             continue
         locked = [item.strip().rstrip('/') for item in locked_raw.split(',')
                   if item.strip() and item.strip() != '(none)']
@@ -2700,6 +2707,15 @@ def _recheck_pr(plan, pr, head):
     return view
 
 
+def _check_run_order_key(run):
+    timestamp = run.get('completed_at') or run.get('started_at') or ''
+    ident = run.get('id')
+    if not timestamp and not isinstance(ident, int):
+        return None
+    return (timestamp if isinstance(timestamp, str) else '',
+            ident if isinstance(ident, int) else -1)
+
+
 def _wait_checks(plan, state, pr, head, timeout, required):
     repo = plan['batch']['repo']
     slug = plan['batch']['issue_repo']
@@ -2721,32 +2737,55 @@ def _wait_checks(plan, state, pr, head, timeout, required):
                 f'the check-run list is truncated ({len(runs)} of {total}); '
                 'refusing to guess about missing required contexts',
                 status='BLOCKED')
-        by_name = {}
+        grouped = {}
         for run in runs:
             if isinstance(run, dict) and isinstance(run.get('name'), str):
-                by_name[run['name']] = run
+                grouped.setdefault(run['name'], []).append(run)
         missing = []
         pending = []
         for item in required:
             context = item['context']
-            run = by_name.get(context)
-            if run is None:
+            candidates = grouped.get(context) or []
+            if not candidates:
                 missing.append(context)
                 continue
-            app = run.get('app') if isinstance(run.get('app'), dict) else {}
-            app_id = app.get('id')
             expected_app = item.get('integration_id')
-            if expected_app is not None and app_id != expected_app:
-                raise BatchError(
-                    f'required check {context!r} ran under app {app_id!r}, not the '
-                    f'configured integration {expected_app!r}', status='BLOCKED')
-            if run.get('status') != 'completed':
+            completed_success = []
+            context_pending = False
+            for run in candidates:
+                app = run.get('app') if isinstance(run.get('app'), dict) else {}
+                app_id = app.get('id')
+                if expected_app is not None and app_id != expected_app:
+                    raise BatchError(
+                        f'required check {context!r} has a run under app '
+                        f'{app_id!r}, not the configured integration '
+                        f'{expected_app!r}; the run identity is ambiguous',
+                        status='BLOCKED')
+                if run.get('status') != 'completed':
+                    context_pending = True
+                    continue
+                if run.get('conclusion') != 'success':
+                    raise BatchError(
+                        f'required check {context!r} has a completed run with '
+                        f'conclusion {run.get("conclusion")!r}, not success',
+                        status='BLOCKED')
+                completed_success.append(run)
+            if context_pending:
                 pending.append(context)
                 continue
-            if run.get('conclusion') != 'success':
-                raise BatchError(
-                    f'required check {context!r} concluded '
-                    f'{run.get("conclusion")!r}, not success', status='BLOCKED')
+            if len(completed_success) > 1:
+                keys = [_check_run_order_key(run) for run in completed_success]
+                if any(key is None for key in keys):
+                    raise BatchError(
+                        f'required check {context!r} has multiple successful runs '
+                        'that cannot be ordered unambiguously', status='BLOCKED')
+                if len(set(keys)) != len(keys):
+                    raise BatchError(
+                        f'required check {context!r} has duplicate successful runs '
+                        'with the same ordering identity; refusing to choose',
+                        status='BLOCKED')
+                _authoritative = max(zip(keys, completed_success),
+                                     key=lambda pair: pair[0])
         if not missing and not pending:
             break
         remaining = deadline - time.monotonic()
