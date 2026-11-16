@@ -2049,16 +2049,17 @@ class LocalBatchTests(BatchCase):
 class ReviewDiffTests(BatchCase):
     def test_review_prompt_exposes_exact_verify_commands(self):
         plan = self.plan([self.task(
-            'T1', 'a.txt',
-            verify=[[PY, '-c', 'print("TOKEN_VERIFY_XYZ")']])])
+            'T1', 'a.txt', verify=[[PY, '-c', 'pass']])])
         self.assertEqual(self.run_batch(plan).returncode, 0)
         prompt_file = self.root / 'review-prompt.txt'
         done = self.finalize(plan, {'FAKE_PROMPT_FILE': str(prompt_file)},
                              '--review')
         self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
         prompt = prompt_file.read_text(encoding='utf-8')
-        self.assertIn('verify_commands', prompt)
-        self.assertIn('TOKEN_VERIFY_XYZ', prompt)
+        line = next(line for line in prompt.splitlines()
+                    if line.startswith('TASKS_JSON='))
+        tasks = json.loads(line.split('=', 1)[1])
+        self.assertEqual(tasks[0]['verify_commands'], [[PY, '-c', 'pass']])
 
     def test_review_diff_uses_the_merge_base(self):
         _git(self.repo, 'checkout', '-q', '-b', 'head')
