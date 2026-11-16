@@ -118,7 +118,7 @@ python scripts/batch_delivery.py status   --journal JOURNAL [--json]
 
 ## 6. 审查要求
 
-- `L0`：不启动第二模型；journal 记录 `NOT_REQUIRED_L0`、diff 哈希和原因，批次验证仍要全部通过。
+- `L0`：不启动第二模型；每个任务必须有覆盖全部 AC 的 `acceptance_checks`，在已审查的 head 上逐条执行并记录 PASS/FAIL。缺 `acceptance_checks` 时必须有独立审查，二者都缺则阻塞；journal 记录 `NOT_REQUIRED_L0`、diff 哈希和逐 AC 证据。
 - `L1`：一次独立批次审查。
 - `L2` / `L3`：独立审查；`L3` 在审查前就要求人工授权。
 - 审查会话必须使用与执行不同的 Agent，且该 Agent 的有效 `edit` 规则为 `deny`；查询失败或规则不是 deny 一律阻塞。

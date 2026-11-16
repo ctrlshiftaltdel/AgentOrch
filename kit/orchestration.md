@@ -374,6 +374,10 @@ python3 scripts/delivery_risk.py --repo PATH --base REF --head REF [--json]
 - 退出码：`0` 成功；`1` 部分成功 / 失败 / 阻塞；`2` 输入或前置检查非法（未开始写入）。`1` 与 `2` 都不得当作通过。
 - `--journal` 是本地恢复记录，不是任务库、Issue 登记块或证据矩阵的替代，也不得写在仓库或任务 Worktree 内。恢复判断以 Git 与权威载体为准，journal 只能帮助定位，不能单独证明交付。
 - `--merge` 要求 `--authorization` 与计划中的授权文本逐字一致；合并后仍必须在主分支执行合并后验证，通过后才转 `VERIFIED`（2.2 节）。
+- `run` 在任何 Agent 启动前完成权威派发：`github` 写入 `mode: batch` 的 `ORCH-TASK-REGISTRY`（`status: DISPATCHED`），`local` 通过 `task ready` / `task dispatch` 取得路径锁。载体缺失、任务记录缺失或派发失败时阻塞，不以 `not_applicable` 代替；已取得的锁按 3.1 节保留。
+- `finalize` 以 PR 的**实际必需 contexts**（`gh pr checks --required`）为门禁，计划中的 `required_checks` 只能是其子集；查询失败或集合为空时阻塞，不得用计划自报代替平台必需检查。
+- `L0` 自动合并不启动第二模型，但必须有逐条 AC 的机器证据（计划的 `acceptance_checks`）或独立审查；两者都缺时阻塞。`L1` / `L2` 的审查提示包含逐任务 AC、验证命令与记录，审查者仍须逐条判定。
+- 审查后的 head 在验证、推送或合并前发生变化即失效；合并使用审查过的精确 SHA；合并后验证不得改变 HEAD、分支或工作树，否则不得产生 `VERIFIED`，只能记录 `merged_but_post_verify_failed` 并进入恢复。
 - 命令形式以参考实现为准。当前 head 上未真实执行的命令只能标为待探测（未验证），不得写成已验证；计划格式、恢复语义与限制见随包的 `templates/batch-delivery.md`。
 
 ## 5. 运行时能力契约 C1–C4
