@@ -378,7 +378,7 @@ python3 scripts/delivery_risk.py --repo PATH --base REF --head REF [--json]
 - `finalize` 以**生效分支规则**（`repos/{owner}/{repo}/rules/branches/{base}`）得到实际必需 contexts 与集成身份，并用审查 head 上的 check-runs 核对名称、app identity、完成状态与 success；计划中的 `required_checks` 只能是实际集合的子集。规则不可读、集合为空、check-run 缺失/失败/身份不符或列表被截断时阻塞，不得用计划自报或 `gh pr checks` 的观测结果代替平台配置。
 - `L0` 自动合并不启动第二模型，但必须有逐条 AC 的机器证据（计划的 `acceptance_checks`）和在**审查 head 上事后生成**的 Master attestation（`--acceptance-attestation`，绑定 head 与 diff、逐条 PASS 且有可定位证据），或独立审查；缺任一项时阻塞。`L1` / `L2` 的审查提示包含逐任务 AC、验证命令与记录，审查者仍须逐条判定。
 - 计划不得修改 `docs/PROJECT.md`：项目配置在 journal 中以 SHA-256 绑定；配置变更作为单任务或批次外工作交付，避免合并后恢复读到不同配置。
-- `docs/PROJECT.md` 的“验证命令”按阶段解析：`完整回归`与`合并后必须执行`的命令必须在 `post_merge_verify`；`快速测试` / `静态检查`可在 `verify` 或 `post_merge_verify`。`python` / `python3` / `sys.executable` 等价；缺命令或声明无法安全解析时阻塞。
+- `docs/PROJECT.md` 的“验证命令”按阶段解析：所有声明的快速测试、静态检查、完整回归与合并后命令都必须在 `post_merge_verify`；它们也可以同时出现在 `verify`。`python` / `python3` / `sys.executable` 等价；缺命令或声明无法安全解析时阻塞。
 - `local` 的任务库依赖仍由 CLI 要求 `VERIFIED`，本参考实现不支持在任务库中登记批内依赖：遇到这种组合会保持任务记录不变并阻塞，要求改用单任务/人工流程或等待批次感知的本地派发。`github` 与计划 DAG 的批内 `INTEGRATED` 例外不受影响。
 - 审查后的 head 在验证、推送或合并前发生变化即失效；合并使用审查过的精确 SHA；合并后验证不得改变 HEAD、分支或工作树，否则不得产生 `VERIFIED`，只能记录 `merged_but_post_verify_failed` 并进入恢复。
 - 审查后的 head 在验证、推送或合并前发生变化即失效；合并使用审查过的精确 SHA；合并后验证不得改变 HEAD、分支或工作树，否则不得产生 `VERIFIED`，只能记录 `merged_but_post_verify_failed` 并进入恢复。
