@@ -779,3 +779,5 @@ uv run python -m scripts.update_agentorch.entry --project . \
 | [templates/runtime-capability.md](../templates/runtime-capability.md) | 换运行时 / 版本 / 底座 / 执行模式后，或要向子代理派发之前 | 一份可追溯的能力记录：C1–C4 与更细边界的逐条结论、探测时间、证据与限制；未探测项为 `UNKNOWN` |
 | [templates/metrics.md](../templates/metrics.md) / [`scripts/report_metrics.py`](../scripts/report_metrics.py) | 解释交付瓶颈、阶段收口要数字、或声明“哪些指标还算不出来”时 | 七项指标的口径与只读报告（带样本量、窗口、缺失率），空数据输出 `no data` |
 | `release/README.md` | 准备发布分发包之前 | 按发布标准构建、自检、登记清单 |
+
+<!-- ci-probe-l0-2026-11-16: temporary docs-only change; PR will be closed without merge -->
