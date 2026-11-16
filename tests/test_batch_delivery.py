@@ -560,6 +560,8 @@ class BatchCase(unittest.TestCase):
         _git(self.root, 'init', '-q', '--bare', '-b', 'main', str(self.origin))
         self.repo.mkdir()
         _git(self.repo, 'init', '-q', '-b', 'main')
+        _git(self.repo, 'config', 'core.autocrlf', 'false')
+        _git(self.repo, 'config', 'core.eol', 'lf')
         _git(self.repo, 'config', 'user.email', 'test@example.invalid')
         _git(self.repo, 'config', 'user.name', 'Test')
         (self.repo / 'docs').mkdir()
