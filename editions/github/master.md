@@ -45,7 +45,7 @@
 - 批次内部使用 `INTEGRATED` 作为内部里程碑：任务进入集成分支后可作为同批次后续任务的依赖；它不是 `VERIFIED`，也不能用来解锁外部依赖。旧工具输出的 `PREPARED` 同样只是过渡态。
 - 在任何 Agent 启动前，批次协调器先在批次 Issue 写入 `mode: batch` 的 `ORCH-TASK-REGISTRY`（`status: DISPATCHED`，`locked_paths` 为并集），并完成开放 PR 冲突检查；载体缺失或派发失败时阻塞，不以本地报告代替。
 - 最终 PR 的门禁使用平台**实际必需 contexts**（`gh pr checks --required`），计划列出的检查只能是其子集；合并使用审查过的精确 head SHA，合并后验证通过且状态载体更新完成后才逐任务标 `VERIFIED`。
-- 状态机、锁、G1–G6 与证据矩阵仍以 `kit/orchestration.md` 为准（批次阶段见 2.2 节，风险分层见 4.2 节），本节只说明 `github` 底座的操作方式。`L0` 免第二模型审查，但必须有逐 AC 的机器证据和 Master 逐条 PASS 决定，或独立审查；缺证据时不得自动合并。
+- 状态机、锁、G1–G6 与证据矩阵仍以 `kit/orchestration.md` 为准（批次阶段见 2.2 节，风险分层见 4.2 节），本节只说明 `github` 底座的操作方式。`L0` 免第二模型审查，但必须有逐 AC 的机器证据和审查 head 上事后生成的 Master attestation，或独立审查；缺证据时不得自动合并。
 
 ## 证据
 

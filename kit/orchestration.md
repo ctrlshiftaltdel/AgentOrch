@@ -214,7 +214,7 @@ PLANNED → READY → DISPATCHED/IN_PROGRESS → TASK_VERIFIED → INTEGRATED �
 ### 3.2 依赖与并行
 
 - 依赖应构成有向无环图。依赖必须达到 `VERIFIED`，不能仅因为代码已提交、已合并或 PR 已批准就派发下游任务。
-- **批次内例外**：同一批次内的依赖可以由 `INTEGRATED`（内部里程碑，见 2.2 节）满足；跨批次 / 外部依赖仍必须达到 `VERIFIED`。不得用批内里程碑满足外部依赖，也不得据此提前标记 `VERIFIED`。
+- **批次内例外**：同一批次内的依赖可以由 `INTEGRATED`（内部里程碑，见 2.2 节）满足；跨批次 / 外部依赖仍必须达到 `VERIFIED`。不得用批内里程碑满足外部依赖，也不得据此提前标记 `VERIFIED`。`local` 的 `task dispatch` 仍要求任务库依赖为 `VERIFIED`；因此 `local` 批次不得把批内依赖登记在任务库（否则参考实现会阻塞并保持记录不变），批内依赖由计划 DAG 表达；需要任务库级批内依赖时另立批次感知派发任务。
 - 单个任务失败或被阻塞时，无依赖且路径不冲突的任务继续推进；依赖它的任务保持未开始并记录原因。
 - 同一文件或目录前缀冲突的任务串行；不冲突且无依赖的任务可以并行。
 - 并行度按机器余量决定，不写固定数字。派发前观察 CPU / 内存 / 磁盘 / 测试资源争用，有余量即可并行；同一 Worktree 同一时刻只允许一个测试进程。
@@ -374,11 +374,13 @@ python3 scripts/delivery_risk.py --repo PATH --base REF --head REF [--json]
 - 退出码：`0` 成功；`1` 部分成功 / 失败 / 阻塞；`2` 输入或前置检查非法（未开始写入）。`1` 与 `2` 都不得当作通过。
 - `--journal` 是本地恢复记录，不是任务库、Issue 登记块或证据矩阵的替代，也不得写在仓库或任务 Worktree 内。恢复判断以 Git 与权威载体为准，journal 只能帮助定位，不能单独证明交付。
 - `--merge` 要求 `--authorization` 与计划中的授权文本逐字一致；合并后仍必须在主分支执行合并后验证，通过后才转 `VERIFIED`（2.2 节）。
-- `run` 在任何 Agent 启动前完成权威派发：`github` 写入 `mode: batch` 的 `ORCH-TASK-REGISTRY`（`status: DISPATCHED`），`local` 通过 `task ready` / `task dispatch` 取得路径锁。载体缺失、任务记录缺失或派发失败时阻塞，不以 `not_applicable` 代替；已取得的锁按 3.1 节保留。
-- `finalize` 以 PR 的**实际必需 contexts**（`gh pr checks --required`）为门禁，计划中的 `required_checks` 只能是其子集；查询失败或集合为空时阻塞，不得用计划自报代替平台必需检查。
-- `L0` 自动合并不启动第二模型，但必须有逐条 AC 的机器证据（计划的 `acceptance_checks`）**和** Master 的逐条决定（`acceptance_decisions`，PASS 且有可定位证据），或独立审查；缺任一项时阻塞。`L1` / `L2` 的审查提示包含逐任务 AC、验证命令与记录，审查者仍须逐条判定。
+- `run` 在任何 Agent 启动前完成权威派发：`github` 枚举开放 PR、其他活动 Issue 登记块并写入本批次 `mode: batch` 的 `ORCH-TASK-REGISTRY`（`status: DISPATCHED`），`local` 通过 `task ready` / `task dispatch` 取得路径锁并核对任务库的路径、AC 与当前锁。载体缺失、任务记录不一致、枚举截断或派发失败时阻塞，不以 `not_applicable` 代替；已取得的锁按 3.1 节保留。
+- `finalize` 以**生效分支规则**（`repos/{owner}/{repo}/rules/branches/{base}`）得到实际必需 contexts 与集成身份，并用审查 head 上的 check-runs 核对名称、app identity、完成状态与 success；计划中的 `required_checks` 只能是实际集合的子集。规则不可读、集合为空、check-run 缺失/失败/身份不符或列表被截断时阻塞，不得用计划自报或 `gh pr checks` 的观测结果代替平台配置。
+- `L0` 自动合并不启动第二模型，但必须有逐条 AC 的机器证据（计划的 `acceptance_checks`）和在**审查 head 上事后生成**的 Master attestation（`--acceptance-attestation`，绑定 head 与 diff、逐条 PASS 且有可定位证据），或独立审查；缺任一项时阻塞。`L1` / `L2` 的审查提示包含逐任务 AC、验证命令与记录，审查者仍须逐条判定。
 - 计划不得修改 `docs/PROJECT.md`：项目配置在 journal 中以 SHA-256 绑定；配置变更作为单任务或批次外工作交付，避免合并后恢复读到不同配置。
-- `docs/PROJECT.md` 的“验证命令”若声明命令，计划必须在 `verify` / `post_merge_verify` 中包含同一命令（`python` / `python3` / `sys.executable` 等价）；缺命令时阻塞。
+- `docs/PROJECT.md` 的“验证命令”按阶段解析：`完整回归`与`合并后必须执行`的命令必须在 `post_merge_verify`；`快速测试` / `静态检查`可在 `verify` 或 `post_merge_verify`。`python` / `python3` / `sys.executable` 等价；缺命令或声明无法安全解析时阻塞。
+- `local` 的任务库依赖仍由 CLI 要求 `VERIFIED`，本参考实现不支持在任务库中登记批内依赖：遇到这种组合会保持任务记录不变并阻塞，要求改用单任务/人工流程或等待批次感知的本地派发。`github` 与计划 DAG 的批内 `INTEGRATED` 例外不受影响。
+- 审查后的 head 在验证、推送或合并前发生变化即失效；合并使用审查过的精确 SHA；合并后验证不得改变 HEAD、分支或工作树，否则不得产生 `VERIFIED`，只能记录 `merged_but_post_verify_failed` 并进入恢复。
 - 审查后的 head 在验证、推送或合并前发生变化即失效；合并使用审查过的精确 SHA；合并后验证不得改变 HEAD、分支或工作树，否则不得产生 `VERIFIED`，只能记录 `merged_but_post_verify_failed` 并进入恢复。
 - 命令形式以参考实现为准。当前 head 上未真实执行的命令只能标为待探测（未验证），不得写成已验证；计划格式、恢复语义与限制见随包的 `templates/batch-delivery.md`。
 
