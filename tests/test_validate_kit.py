@@ -2454,6 +2454,50 @@ class BridgeRegistryReadBoundaryTests(unittest.TestCase):
         self.assert_canary_unread(reads, canary)
 
 
+class BatchCapabilityAssetTests(unittest.TestCase):
+    """The batch coordinator ships; its two test modules stay repository-only.
+
+    The release package runs `unittest discover` over the *shipped* tests, so an
+    unconditional presence assertion for a test file that is deliberately not
+    packaged would break the release self-check inside the very package it
+    checks. Presence of the two repository-only modules is therefore asserted
+    only in an upstream checkout (where they exist by definition). Downstream
+    trees are not asserted to lack them: a downstream project may vendor or add
+    those files, and the cleaned extracted-package self-check in
+    `scripts/build_release.py` already proves the archive omits them. Shipping a
+    batch *module* is different: those files are in REQUIRED and must resolve in
+    both trees.
+    """
+
+    SHIPPED = (
+        'scripts/batch_delivery.py',
+        'scripts/delivery_risk.py',
+        'templates/batch-delivery.md',
+    )
+    REPOSITORY_ONLY = (
+        'tests/test_batch_delivery.py',
+        'tests/test_delivery_risk.py',
+    )
+
+    def test_shipped_batch_assets_are_required_and_present(self):
+        for rel in self.SHIPPED:
+            with self.subTest(rel=rel):
+                self.assertIn(rel, validate.REQUIRED)
+                self.assertTrue((ROOT / rel).is_file(), f'{rel} is missing')
+
+    def test_batch_tests_stay_repository_only(self):
+        for rel in self.REPOSITORY_ONLY:
+            with self.subTest(rel=rel):
+                self.assertNotIn(rel, validate.REQUIRED)
+
+    @unittest.skipUnless(UPSTREAM_CHECKOUT,
+                         'repository-only tests are only checked in an upstream checkout')
+    def test_batch_tests_are_present_in_an_upstream_checkout(self):
+        for rel in self.REPOSITORY_ONLY:
+            with self.subTest(rel=rel):
+                self.assertTrue((ROOT / rel).is_file(), f'{rel} is missing')
+
+
 class BatchDependencyContractConsistencyTests(unittest.TestCase):
     @unittest.skipUnless(UPSTREAM_CHECKOUT,
                          'repository-only contract consistency check')
