@@ -1992,6 +1992,7 @@ def _review_prompt(plan, state, base, head, digest, risk, diff):
                       'acceptance_checks': spec.get('acceptance_checks'),
                       'acceptance_decisions': spec.get('acceptance_decisions'),
                       'paths': spec['paths'],
+                      'verify_commands': spec['verify'],
                       'verify': record.get('verify') or []})
     lines = [
         'ROLE=reviewer',
@@ -2003,10 +2004,10 @@ def _review_prompt(plan, state, base, head, digest, risk, diff):
         f'RISK_REASONS_JSON={json.dumps(risk["reasons"])}',
         f'TASKS_JSON={json.dumps(tasks)}',
         '',
-        'Each task entry carries its acceptance_checks (argv lists) and the '
-        'already-recorded verify argv hashes, exits and tails. Judge whether the '
-        'diff and evidence actually satisfy every criterion; do not infer a PASS '
-        'from a command name alone.',
+        'Each task entry carries its acceptance_checks (argv lists), verify_commands '
+        '(the exact argv that was executed) and the already-recorded verify argv '
+        'hashes, exits and tails. Judge whether the diff and evidence actually '
+        'satisfy every criterion; do not infer a PASS from a command name alone.',
         'Review the complete diff below. Answer with exactly one fenced ```json '
         'block using this shape:',
         '{"verdict":"APPROVE|REJECT","base":"<sha>","head":"<sha>",'
