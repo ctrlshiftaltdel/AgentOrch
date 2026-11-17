@@ -107,6 +107,10 @@ python scripts/batch_delivery.py status   --journal JOURNAL [--json]
 
 未识别的路径按 `L2` 处理，而不是 `L0`：不知道就是更严格。混合等级取最大值；空 diff 为 `L0`。
 
+密钥形态路径的判定在 `delivery_risk.py` 的 `_secret` 中：匹配时**大小写不敏感**（完整路径与 basename 都先 casefold，再分别按模式匹配），所以 `.ENV`、`.Env`、`Credentials.JSON`、`KEY.PEM` 这些大小写变体与对应的小写拼写同等处理，都归为 `L3`。唯一的豁免是**精确**的 `.env.example`：它按原始 basename 逐字比较，因此 `.ENV.EXAMPLE` 这类仿写仍是密钥形态，仍是 `L3`。`L3` 会阻止自动合并，并要求人工授权。
+
+**已知限制（运行时预检与风险分类器不等价）。** 上面的判定是最终风险分类器的行为，但批次执行期做改动范围检查时走的是另一条路径：`batch_delivery.py` 的 `_scope_check` 调用 `_secret_path`，后者使用 `fnmatch.fnmatch`：在 POSIX 上**大小写敏感**，在 Windows 上按 `normcase` 归一化，表现为大小写不敏感；并且当项目在 `docs/PROJECT.md` 声明了「秘密与隐私文件模式」时，它**只使用项目声明的那组模式**来替代内置模式，而不是把两者取并集。计划预检则把两类检查分开做：先按内置模式检查任务 `paths`，项目声明了模式时再按项目模式检查一次。因此不要把最终 `L3` 分类器的覆盖范围当作运行期预检的覆盖范围——在 POSIX 上，大小写变体（如 `.ENV`）可能不被运行期范围检查拦下；Windows 上，只有当实际使用的项目模式（或未声明项目模式时的内置模式）本身覆盖该名称时，`fnmatch` 的 `normcase` 才能捕获相应大小写变体；项目模式不包含相应模式时仍会漏检。无论哪种平台，最终分类器仍会把它判为 `L3`、拦在自动合并之外；两者不是同一道门。
+
 ## 4. 阶段与状态
 
 - `run --execute` 先完成权威派发：`github` 写 Issue 的 `ORCH-TASK-REGISTRY`（保留首次 `dispatched_at`），`local` 走 `task ready` / `task dispatch`；随后才创建/校验任务 Worktree。派发失败时任何 Agent 都不会启动，已取得的锁仍按契约保留并需人工核对。
@@ -136,8 +140,8 @@ python scripts/batch_delivery.py status   --journal JOURNAL [--json]
 journal 是 JSON（`batch-delivery-journal/1`），在仓库与每个 Worktree 之外，原子写入，旁边有进程锁。
 
 - 恢复时先核对 `plan_sha256`；计划变了直接报“plan changed; reconcile manually”，不猜测。
-- 中断在提交之前（`RUNNING` 且没有记录 head）：只有 `--resume` 才会重跑。
-- 中断在提交之后（`RUNNING` 且有 head）：不自动重跑，标 `BLOCKED`，需要人工检查后显式 `--retry`。
+- 中断在提交之前（`RUNNING` 且没有记录 head）：只有 `--resume` 才会重跑；否则标 `BLOCKED`。
+- 中断在提交之后（`RUNNING` 且有 head）：标 `BLOCKED`，**不自动重试**。这是**已知限制**：当前参考实现的 `--retry` 只接受没有 `integration_sha` 的 `FAILED` 任务，`BLOCKED` 记录不在接受范围内。这类任务必须人工检查后处理——核对分支与 journal 的差异，再决定是手工收敛还是改用单任务流程；重复调用 `--retry` 不会自动接续。
 - `--retry` 只接受没有 `integration_sha` 的 `FAILED` 任务；分支上有 journal 未记录的提交时拒绝。
 - 锁以操作系统文件锁为准；持锁进程死亡后锁自动释放。锁文件里的 PID 只用于报告，不替代 OS 锁。
 - 重复 `finalize` 会先查 PR 状态或 base 祖先关系；已合并就采纳该事实，不再合并第二次。

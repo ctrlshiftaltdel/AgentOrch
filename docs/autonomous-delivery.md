@@ -156,7 +156,10 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 
 - **实现批次 PR `#251`**：最终 head `7af0bb35a20680917d294c987d12a29d3b3b74d1`，独立审查 `APPROVE`；合并提交 `a3cec4cbaf3545437b389fb39723039cd4e53ea6`（`a3cec4cb`）。
 - **实现批次 CI**：运行 [`43791632465`](https://github.com/ctrlshiftaltdel/AgentOrch/actions/runs/43791632465)，risk 与 Ubuntu 3.12 / Ubuntu 3.13 / macOS 3.13 / Windows 3.13 全绿；合并后主分支 push 的运行见该仓库 Actions。
-- **全量测试**：合并后主分支 `2328` tests OK（`postmerge-full.log`）；专题 124 tests OK；最终 head 的 CI 在 Ubuntu / macOS / Windows 全绿。
+- **全量测试**：PR `#251` 合并后的主分支运行记录 `2328` tests OK（`postmerge-full.log`）；主分支推进到 `6bbf06a` 后单独记录 `2332` tests OK。这两个数字来自不同运行，不能互相替代或合并计算；专题 124 tests OK；最终 head 的 CI 在 Ubuntu / macOS / Windows 全绿。
+- **后续实现批次 PR `#253`**：PR head `313f9603e880ce7073cc67322f2011590ced34fd`（`313f960`）；合并提交 `704dddbc781206bdeade7e69b484d933bad5c387`（`704dddb`）；`L1` CI 运行 `43801042528` 在该 PR head 上通过。
+- **后续实现批次 PR `#254`**：合并提交 `6bbf06a`。
+- **提取发行（extracted-release）的 `L0` 批次**：合并提交 `6e63dac2`，T9 `VERIFIED`。
 - **发行包**：`134` 个文件（133 REQUIRED + MANIFEST），自检 a–m 通过，包 SHA256 `9bc8aadd1c044809148e261108c60bb53c1b20f963cb5407cac6790896e57cbf`（`9bc8aadd`）。
 - **本地真实批次 1（`local` 底座，3 任务）**：T1→T2→T3，`L2` 审查 `APPROVE`，合并 `97a85551487ab575cc0cfdfd92acc231d016bee7`，SQLite 任务库中 T1 / T2 / T3 均为 `VERIFIED`。
 - **负向真实审查（`REVIEW_REJECTED`）**：README 任务被 `reviewer-terra-xhigh` 拒绝（AC-2 命令不一致），批次进入 blocked，没有合并——证明审查门会真实阻断，而不是记录后放行。
@@ -167,5 +170,14 @@ python3 scripts/autonomous_delivery.py --repo <仓库worktree> --issue 230 \
 
 **仍待完成（不得写成已通过）**
 
-- **GitHub 端到端批次**：Issue #250 已记录批次派发登记块（`mode: batch`，`DISPATCHED`），但真实 PR CI、合并与合并后验证仍是 `PENDING`：本批 T9 / T10 的 PR 号尚未记录，三者的运行结果都还没有可引用的证据，`AC4` / `AC6` / `AC7` 仍未完成。
+- **GitHub 端到端批次**：Issue #250 的批次派发登记块（`mode: batch`，`DISPATCHED`）之后，PR `#251` / `#253` / `#254` 已合并（合并提交见上）；进行中的批次状态以 Issue 登记块与 PR 时间线为准，本文件不预先判定其结果，也不把已合并批次当成当前批次已合并。
+- **外部真实项目验证**：`NOT_RUN`。上述结果全部产生在 AgentOrch 本仓库，没有在外部真实项目上执行过。
+- **成本与加速样本**：样本很小，不具统计显著性；除上文明确记录的单 job 时长外，不能据此给出普遍的成本或加速结论。
 - **正式下游发行**：`PENDING`。`134` 文件与 SHA256 只是本地包自检的结果，不是已发布的下游版本；发布动作与发布后的验证未执行。本章其余未真实运行的批次、命令与结论保持 `UNKNOWN` / 未验证。
+
+**已取消、不计入交付证据的尝试（2026-11-16）**
+
+- `#255` 与 `#256`：被独立审查拒绝后取消，没有创建 PR，也没有合并，不构成交付证据。
+- `#257`：经项目所有者授权的第四轮审查仍被拒绝，随后取消；没有 PR，也没有合并，同样没有产生可引用的合并或合并后验证结果。
+- `#258`：在其第三轮审查被拒绝后取消；同样没有 PR、没有合并，不构成交付证据。
+- 这些尝试都不改变上面的已完成证据，也不能被读成任何进行中批次的结论。
