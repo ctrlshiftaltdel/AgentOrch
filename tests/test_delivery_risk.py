@@ -139,6 +139,48 @@ class ClassificationTests(RiskCase):
         self.assertEqual(data['level'], 'L2')
         self.assertIn('unclassified path: .env.example', data['reasons'])
 
+    def test_case_variant_secret_paths_are_l3(self):
+        # A mixed-case spelling of a secret path is the same secret: casing is
+        # a platform detail, not a security boundary.
+        for name in ('.ENV', '.Env', '.ENV.PRODUCTION', 'Credentials.JSON',
+                     'docs/TOKEN.md', 'deploy/Secret/x.txt', 'KEY.PEM'):
+            with self.subTest(name=name):
+                self.setUp()
+                self.branch()
+                self.commit([(name, 'TOKEN=x\n')])
+                data = self.result()
+                self.assertEqual(data['level'], 'L3', data)
+                self.assertTrue(data['full_validation'])
+                self.assertEqual(data['independent_review'], 'required')
+                self.assertIn(f'secret-shaped path: {name}', data['reasons'])
+
+    def test_uppercase_env_example_is_secret(self):
+        # Only the exact `.env.example` template is exempt; a look-alike does
+        # not inherit the exemption.
+        self.branch()
+        self.commit([('.ENV.EXAMPLE', 'TOKEN=\n')])
+        data = self.result()
+        self.assertEqual(data['level'], 'L3', data)
+        self.assertIn('secret-shaped path: .ENV.EXAMPLE', data['reasons'])
+
+    def test_exact_case_classifications_are_unchanged(self):
+        for name, level in (('README.md', 'L1'), ('docs/guide.md', 'L0'),
+                            ('src/main.py', 'L1')):
+            with self.subTest(name=name):
+                self.setUp()
+                self.branch()
+                self.commit([(name, 'x\n')])
+                data = self.result()
+                self.assertEqual(data['level'], level, data)
+
+    def test_non_secret_uppercase_path_is_not_l3(self):
+        self.branch()
+        self.commit([('UPPER/CASE.TXT', 'x\n')])
+        data = self.result()
+        self.assertEqual(data['level'], 'L2', data)
+        self.assertFalse([reason for reason in data['reasons']
+                          if 'secret-shaped' in reason], data)
+
     def test_ordinary_source_and_config_are_l1(self):
         for name in ('app.py', 'src/main.py', 'package.json', 'Dockerfile'):
             with self.subTest(name=name):

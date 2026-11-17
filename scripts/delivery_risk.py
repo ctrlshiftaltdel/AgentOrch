@@ -36,7 +36,11 @@ STATUS_OK = 0
 STATUS_INVALID = 2
 
 # Credential-shaped paths are L3: a human has to authorize those paths, and no
-# automated runner may treat a secret-bearing diff as ordinary code.
+# automated runner may treat a secret-bearing diff as ordinary code. Matching is
+# case-insensitive because casing is a filesystem detail, not a security
+# boundary: `.ENV` and `.Env` carry the same secret as `.env`. The documented
+# `.env.example` template is the only exemption and is compared exactly, so a
+# look-alike such as `.ENV.EXAMPLE` stays secret-shaped.
 SECRET_PATTERNS = ('.env', '.env.*', '*secret*', '*token*', '*.pem', '*.key',
                    'credentials*')
 SECRET_EXCEPTIONS = ('.env.example',)
@@ -157,10 +161,22 @@ def _safe_name(raw):
 
 
 def _secret(name):
+    """True when ``name`` looks like an environment/credential-bearing path.
+
+    Patterns are matched case-insensitively: ``.ENV``, ``.Env`` and
+    ``Credentials.JSON`` name the same secret as their lowercase spellings, and
+    casing is a platform detail rather than a security boundary. The exact
+    ``.env.example`` template is the single exemption; it is compared against
+    the raw basename so a look-alike such as ``.ENV.EXAMPLE`` stays
+    secret-shaped.
+    """
     basename = name.rsplit('/', 1)[-1]
     if basename in SECRET_EXCEPTIONS:
         return False
-    return any(fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(basename, pattern)
+    folded = name.casefold()
+    folded_basename = basename.casefold()
+    return any(fnmatch.fnmatch(folded, pattern)
+               or fnmatch.fnmatch(folded_basename, pattern)
                for pattern in SECRET_PATTERNS)
 
 
