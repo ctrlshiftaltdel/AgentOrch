@@ -102,6 +102,7 @@
 | [`docs/design/verification-impact-c-contract.md`](../design/verification-impact-c-contract.md) | `authoritative` | `ACTIVE` | AVE C 阶段只读影响面与证据影子的 `FROZEN` 子契约。 |
 | [`docs/design/semver-proactive-release-policy.md`](../design/semver-proactive-release-policy.md) | `reference` | `PROPOSED` | 主动式 SemVer 发行节奏提案；不替代 `release/README.md` 或现行授权规则。 |
 | [`docs/design/task-driven-agent-topology.md`](../design/task-driven-agent-topology.md) | `reference` | `PROPOSED` | 任务驱动 Agent 拓扑提案；不改变现行角色权限、审查门或 C1–C4。 |
+| [`docs/design/batch-tool-stop-and-worktree-contracts.md`](../design/batch-tool-stop-and-worktree-contracts.md) | `authoritative` | `ACTIVE` | 批次工具终止流与工作树边界契约（#263 冻结候选）；只冻结输入判定与边界证明，不表示 #261/#262 findings 已修复或 #250 AC5 已实现。 |
 
 ### 4.4 测试场景
 
