@@ -2375,8 +2375,44 @@ class ExecutorLifecycleTests(BatchCase):
                 'state': 'starting', 'pid': None, 'pgid': None, 'exit': None,
                 'timeout': False, 'stopped': None}])
         problems = self._problems(self._record([started]), {201: 'stopped'})
-        self.assertTrue(any('verifier 1 is unfinished and has no recorded pid'
+        self.assertTrue(any('verifier 1 is starting without a recorded pid'
                             in problem for problem in problems), problems)
+
+    # -- F2: verifier pid evidence is checked for every attempt state ------
+    def test_f2_verifier_without_pid_fails_closed_in_ended_attempts(self):
+        executor = {'state': 'ended', 'pid': 424242, 'pgid': None, 'exit': 0,
+                    'stopped': True, 'session': None}
+        cases = {
+            'starting without pid': ({'state': 'starting', 'pid': None,
+                                      'pgid': None, 'exit': None,
+                                      'timeout': False, 'stopped': None},
+                                     'verifier 1 is starting without a '
+                                     'recorded pid'),
+            'running without pid': ({'state': 'running', 'pid': None,
+                                     'pgid': None, 'exit': None,
+                                     'timeout': False, 'stopped': None},
+                                    'verifier 1 is running without a '
+                                    'recorded pid'),
+            'ended without pid': ({'state': 'ended', 'pid': None,
+                                   'pgid': None, 'exit': 0, 'timeout': False,
+                                   'stopped': True},
+                                  'verifier 1 is ended without a recorded pid'),
+            'unrecorded without pid and unproven': (
+                {'state': 'unrecorded', 'pid': None, 'pgid': None, 'exit': None,
+                 'timeout': False, 'stopped': False},
+                'verifier 1 lost its pid record and was not proven stopped'),
+        }
+        for label, (entry, needle) in cases.items():
+            with self.subTest(label):
+                attempt = self._attempt(executor=dict(executor),
+                                        verifiers=[dict(entry)])
+                problems = self._problems(self._record([attempt]))
+                self.assertTrue(any(needle in problem for problem in problems),
+                                (label, problems))
+        safe = self._attempt(executor=dict(executor), verifiers=[{
+            'state': 'spawn_failed', 'pid': None, 'pgid': None, 'exit': None,
+            'timeout': False, 'stopped': None}])
+        self.assertEqual(self._problems(self._record([safe])), [])
 
     # -- M15: unreadable or inconsistent history ---------------------------
     def test_m15_corrupt_history_fails_closed(self):
@@ -2402,8 +2438,8 @@ class ExecutorLifecycleTests(BatchCase):
                 self.assertTrue(any(needle in problem for problem in problems),
                                 (label, problems))
 
-    # -- M16a / M16b: a reused or still-live pid ---------------------------
-    def test_m16a_reused_pid_outside_the_recorded_group_is_stopped(self):
+    # -- M16a / M16b / F1: dead, reused or still-live pids -----------------
+    def test_m16a_dead_pid_with_no_surviving_descendants_is_stopped(self):
         child = subprocess.Popen([PY, '-c', 'pass'], start_new_session=True)
         child.wait()
         attempt = self._attempt(executor={
@@ -2411,6 +2447,26 @@ class ExecutorLifecycleTests(BatchCase):
             'pgid': child.pid if os.name == 'posix' else None, 'exit': 0,
             'stopped': True, 'session': None})
         self.assertEqual(delivery._attempt_problems(self._record([attempt])), [])
+
+    def test_f1_reused_windows_pid_still_proves_the_descendants(self):
+        with mock.patch.object(delivery, '_windows_creation_time',
+                               return_value=('live', 999)):
+            with mock.patch.object(delivery, '_windows_parent_map',
+                                   return_value={500: 400, 501: 500}):
+                self.assertEqual(
+                    delivery._windows_process_state(500, token=42), 'running')
+            with mock.patch.object(delivery, '_windows_parent_map',
+                                   return_value={500: 400, 502: 401}):
+                self.assertEqual(
+                    delivery._windows_process_state(500, token=42), 'stopped')
+            with mock.patch.object(delivery, '_windows_parent_map',
+                                   return_value=None):
+                self.assertEqual(
+                    delivery._windows_process_state(500, token=42), 'unknown')
+        with mock.patch.object(delivery, '_windows_creation_time',
+                               return_value=('live', 42)):
+            self.assertEqual(
+                delivery._windows_process_state(500, token=42), 'running')
 
     def test_m16b_live_recorded_group_blocks_reuse(self):
         attempt = self._attempt(executor={

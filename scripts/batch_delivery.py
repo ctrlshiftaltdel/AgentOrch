@@ -1084,16 +1084,18 @@ def _windows_process_state(pid, token=None):
     Windows has no queryable process group. The read-only tree snapshot is a
     liveness check only; it is not a termination proof for a timeout kill, so
     ``_prove_stopped`` keeps treating Windows as unproven. A recorded creation
-    time excludes pid reuse: a different creation time means the recorded tree
-    is gone and any live process with that pid is unrelated.
+    time excludes pid reuse for the *root* process only: a different creation
+    time means the recorded root is gone, while its descendants keep that pid
+    as their parent pid, so the sub-tree still has to be proven empty.
     """
     if token is not None:
         kind, value = _windows_creation_time(pid)
         if kind == 'unknown':
             return 'unknown'
-        if kind == 'live':
-            return 'running' if value == token else 'stopped'
-        # The pid is gone, but descendants keep their parent pid on Windows.
+        if kind == 'live' and value == token:
+            return 'running'
+        # The root is gone or reused; a different process may even have reused
+        # the pid. Descendants of the recorded root still name it as parent.
         parents = _windows_parent_map()
         if parents is None:
             return 'unknown'
@@ -1339,9 +1341,24 @@ def _attempt_problems(record, ignore=()):
             if not isinstance(entry, dict):
                 problems.append(f'attempt #{position} verifier {index} is not '
                                 'an object')
-            elif entry.get('state') not in VERIFIER_STATES:
+                continue
+            verifier_state = entry.get('state')
+            if verifier_state not in VERIFIER_STATES:
                 problems.append(f'attempt #{position} verifier {index} state '
-                                f'is {entry.get("state")!r}')
+                                f'is {verifier_state!r}')
+                continue
+            # The pid record is checked independently of the attempt state: a
+            # coordinator that died between spawn and pid persistence leaves a
+            # verifier without a pid that may still be alive.
+            if entry.get('pid') is None:
+                if verifier_state in ('starting', 'running', 'ended'):
+                    problems.append(f'attempt #{position} verifier {index} is '
+                                    f'{verifier_state} without a recorded pid')
+                elif (verifier_state == 'unrecorded'
+                        and entry.get('stopped') is not True):
+                    problems.append(f'attempt #{position} verifier {index} lost '
+                                    'its pid record and was not proven stopped')
+                # spawn_failed without a pid is safe: no process started.
         for role, pid, pgid, token, stopped in _attempt_processes(attempt):
             if pid is not None and (not isinstance(pid, int) or pid <= 0):
                 problems.append(f'attempt #{position} {role} pid is invalid')
@@ -1375,12 +1392,6 @@ def _attempt_problems(record, ignore=()):
                 problems.append(f'attempt #{position} is unfinished and has no '
                                 'executor pid; the previous process cannot be '
                                 'proven stopped')
-            for index, entry in enumerate(verifiers, start=1):
-                if (isinstance(entry, dict)
-                        and entry.get('state') in ('starting', 'running')
-                        and entry.get('pid') is None):
-                    problems.append(f'attempt #{position} verifier {index} is '
-                                    'unfinished and has no recorded pid')
         elif attempt.get('result') in ('timeout', 'unproven_stop'):
             if executor.get('stopped') is not True:
                 problems.append(f'attempt #{position} ended as '
