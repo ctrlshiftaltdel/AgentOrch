@@ -83,6 +83,7 @@ PROCESS_STATES = ('stopped', 'running', 'unknown')
 PROBE_GRACE = 5.0
 CHILD_PROOF_GRACE = 15.0
 PROBE_INTERVAL = 0.05
+_IS_WINDOWS = os.name == 'nt'
 STATUSES = ('PENDING', 'RUNNING', 'VERIFIED', 'INTEGRATED', 'FAILED', 'BLOCKED',
             'SKIPPED')
 PHASES = ('tasks', 'review', 'pr', 'merge', 'post_merge', 'verified', 'blocked')
@@ -1196,15 +1197,52 @@ def _windows_children_before(parents, pid, bound):
     return False
 
 
-def _prove_child_stopped(pid, pgid, token, grace=CHILD_PROOF_GRACE):
+def _windows_exit_time_handle(handle):
+    import ctypes
+    from ctypes import wintypes
+    try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME)]
+        creation = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(
+                wintypes.HANDLE(handle), ctypes.byref(creation),
+                ctypes.byref(exited), ctypes.byref(kernel),
+                ctypes.byref(user)):
+            return None
+        return (exited.dwHighDateTime << 32) | exited.dwLowDateTime
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def _process_exit_ticks(process):
+    """Windows exit time of a reaped child, or None when unavailable."""
+    if not _IS_WINDOWS:
+        return None
+    handle = getattr(process, '_handle', None)
+    if not handle:
+        return None
+    return _windows_exit_time_handle(handle)
+
+
+def _prove_child_stopped(pid, pgid, token, exit_ticks=None,
+                         grace=CHILD_PROOF_GRACE):
     """Prove a direct child that was just reaped left no group/tree behind.
 
     On Windows the recorded pid may already be reused or unreadable, so the
     post-exit proof checks descendants (their parent pid is still the reaped
-    child) and ignores children that belong to a process which reused the pid.
-    On POSIX the group probe is authoritative.
+    child) and ignores children created after the recorded exit time: those
+    belong to a process that reused the pid, not to the recorded tree. On POSIX
+    the group probe is authoritative.
     """
-    if os.name != 'nt':
+    if not _IS_WINDOWS:
         return _proven_process_state(pid, pgid, token, grace)
     deadline = time.monotonic() + max(0.0, grace)
     while True:
@@ -1221,6 +1259,10 @@ def _prove_child_stopped(pid, pgid, token, grace=CHILD_PROOF_GRACE):
                 # The pid was reused after the direct child was reaped. Only
                 # children created before the reused process can be ours.
                 old = _windows_children_before(parents, pid, value)
+                state = ('unknown' if old is None
+                         else 'running' if old else 'stopped')
+            elif exit_ticks is not None:
+                old = _windows_children_before(parents, pid, exit_ticks + 1)
                 state = ('unknown' if old is None
                          else 'running' if old else 'stopped')
             else:
@@ -1671,9 +1713,11 @@ def _run_process(argv, cwd, timeout, *, env=None, input_text=None,
             return {'exit': None, 'tail': detail, 'timeout': True,
                     'stopped': proven, 'pid': process.pid, 'pgid': pgid,
                     'token': token}
-    return {'exit': process.returncode,            'tail': ((stdout or '') + (stderr or ''))[-2000:],
+    return {'exit': process.returncode,
+            'tail': ((stdout or '') + (stderr or ''))[-2000:],
             'timeout': False, 'stopped': None, 'pid': process.pid,
-            'pgid': pgid, 'token': token}
+            'pgid': pgid, 'token': token,
+            'exit_ticks': _process_exit_ticks(process)}
 
 
 def _agent(work, prompt, agent_name, timeout, *, title=None, on_spawn=None):
@@ -1718,7 +1762,8 @@ def _agent(work, prompt, agent_name, timeout, *, title=None, on_spawn=None):
                 'stopped': proven, 'pid': process.pid, 'pgid': pgid,
                 'token': token, 'detail': detail}
     result = _classify_stream(process.returncode, output or '')
-    result.update(pid=process.pid, pgid=pgid, token=token)
+    result.update(pid=process.pid, pgid=pgid, token=token,
+                  exit_ticks=_process_exit_ticks(process))
     return result
 
 
@@ -2377,7 +2422,8 @@ def _verify_task(work, commands, timeout, *, attempt=None, save=None):
                                 error=result['tail'], save=save)
             elif not result['timeout'] and result.get('pid') is not None:
                 liveness = _prove_child_stopped(
-                    result['pid'], result.get('pgid'), result.get('token'))
+                    result['pid'], result.get('pgid'), result.get('token'),
+                    result.get('exit_ticks'))
                 entry['stopped'] = liveness == 'stopped'
                 record['stopped'] = entry['stopped']
                 if liveness != 'stopped':
@@ -2475,7 +2521,8 @@ def _execute_task(plan, spec, record, base, timeout, save, attempt):
             # group proof is independent of the stream verdict.
             liveness = _prove_child_stopped(result['pid'],
                                             result.get('pgid'),
-                                            result.get('token'))
+                                            result.get('token'),
+                                            result.get('exit_ticks'))
             executor.update(state='ended', stopped=liveness == 'stopped')
             if liveness != 'stopped':
                 _finish_attempt(

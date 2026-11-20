@@ -2650,6 +2650,35 @@ class ExecutorLifecycleTests(BatchCase):
             self.assertIsNone(
                 delivery._windows_children_before(parents, 500, 999))
 
+    def test_completion_ignores_children_created_after_the_exit(self):
+        parents = {500: 400, 501: 500}
+
+        def created_after(pid):
+            return ('gone', None) if pid == 500 else ('live', 2000)
+
+        with mock.patch.object(delivery, '_IS_WINDOWS', True), \
+                mock.patch.object(delivery, '_windows_parent_map',
+                                  return_value=parents), \
+                mock.patch.object(delivery, '_windows_creation_time',
+                                  side_effect=created_after):
+            self.assertEqual(
+                delivery._prove_child_stopped(500, None, 42, exit_ticks=1000,
+                                              grace=0.05),
+                'stopped')
+
+        def created_before(pid):
+            return ('gone', None) if pid == 500 else ('live', 500)
+
+        with mock.patch.object(delivery, '_IS_WINDOWS', True), \
+                mock.patch.object(delivery, '_windows_parent_map',
+                                  return_value=parents), \
+                mock.patch.object(delivery, '_windows_creation_time',
+                                  side_effect=created_before):
+            self.assertEqual(
+                delivery._prove_child_stopped(500, None, 42, exit_ticks=1000,
+                                              grace=0.05),
+                'running')
+
     def test_m16b_live_recorded_group_blocks_reuse(self):
         attempt = self._attempt(executor={
             'state': 'ended', 'pid': os.getpid(), 'pgid': None, 'exit': 0,
