@@ -76,7 +76,8 @@ INTEGRATED = ('INTEGRATED', 'VERIFIED')
 ATTEMPT_STATES = ('STARTED', 'ENDED')
 ATTEMPT_RESULTS = ('ok', 'failed', 'timeout', 'unproven_stop', 'spawn_failed',
                    'interrupted', 'error')
-EXECUTOR_STATES = ('pending', 'running', 'ended', 'spawn_failed', 'unrecorded')
+EXECUTOR_STATES = ('pending', 'spawning', 'running', 'ended', 'spawn_failed',
+                   'unrecorded')
 VERIFIER_STATES = ('starting', 'running', 'ended', 'spawn_failed', 'unrecorded')
 PROCESS_STATES = ('stopped', 'running', 'unknown')
 PROBE_GRACE = 5.0
@@ -1084,9 +1085,12 @@ def _windows_process_state(pid, token=None):
     Windows has no queryable process group. The read-only tree snapshot is a
     liveness check only; it is not a termination proof for a timeout kill, so
     ``_prove_stopped`` keeps treating Windows as unproven. A recorded creation
-    time excludes pid reuse for the *root* process only: a different creation
-    time means the recorded root is gone, while its descendants keep that pid
-    as their parent pid, so the sub-tree still has to be proven empty.
+    time excludes pid reuse for the *root* process only. When the root is gone
+    or reused, an empty reachable-descendant set does not prove the tree
+    stopped: an orphan whose intermediate parent already exited keeps that
+    intermediate pid as its parent and cannot be traced back to this root.
+    Without a Job Object (HD-2 B) that case is unprovable and is reported as
+    ``unknown`` (halt), never ``stopped``.
     """
     if token is not None:
         kind, value = _windows_creation_time(pid)
@@ -1094,21 +1098,24 @@ def _windows_process_state(pid, token=None):
             return 'unknown'
         if kind == 'live' and value == token:
             return 'running'
-        # The root is gone or reused; a different process may even have reused
-        # the pid. Descendants of the recorded root still name it as parent.
-        parents = _windows_parent_map()
-        if parents is None:
+        if kind == 'live':
+            # The pid was reused: children that name it as parent now belong to
+            # an unrelated process, and the recorded root's orphans cannot be
+            # attributed. Never infer 'running' or 'stopped' from that map.
             return 'unknown'
-        return 'running' if _windows_children(parents, pid) else 'stopped'
-    kind, _value = _windows_creation_time(pid)
-    if kind == 'unknown':
-        return 'unknown'
-    if kind == 'live':
-        return 'running'
+    else:
+        kind, _value = _windows_creation_time(pid)
+        if kind == 'unknown':
+            return 'unknown'
+        if kind == 'live':
+            return 'running'
+    # The recorded root is gone without a reuse. A reachable live descendant is
+    # definitely running; no reachable descendant is still not a proof of
+    # emptiness (an orphan's middle parent may already be gone).
     parents = _windows_parent_map()
     if parents is None:
         return 'unknown'
-    return 'running' if _windows_children(parents, pid) else 'stopped'
+    return 'running' if _windows_children(parents, pid) else 'unknown'
 
 
 def _posix_process_state(pid, pgid, token=None):
@@ -1171,12 +1178,31 @@ def _proven_process_state(pid, pgid, token=None, grace=PROBE_GRACE):
     return state
 
 
+def _windows_children_before(parents, pid, bound):
+    """Children of ``pid`` created before ``bound`` ticks: True/False/None.
+
+    ``None`` means a child's creation time could not be read, so the set cannot
+    be decided. Children created at or after ``bound`` belong to a process that
+    reused the pid, not to the recorded tree.
+    """
+    for child, parent in parents.items():
+        if parent != pid:
+            continue
+        kind, value = _windows_creation_time(child)
+        if kind == 'unknown':
+            return None
+        if kind == 'live' and value < bound:
+            return True
+    return False
+
+
 def _prove_child_stopped(pid, pgid, token, grace=CHILD_PROOF_GRACE):
     """Prove a direct child that was just reaped left no group/tree behind.
 
     On Windows the recorded pid may already be reused or unreadable, so the
-    post-exit proof looks only for surviving descendants (their parent pid is
-    still the reaped child). On POSIX the group probe is authoritative.
+    post-exit proof checks descendants (their parent pid is still the reaped
+    child) and ignores children that belong to a process which reused the pid.
+    On POSIX the group probe is authoritative.
     """
     if os.name != 'nt':
         return _proven_process_state(pid, pgid, token, grace)
@@ -1185,10 +1211,20 @@ def _prove_child_stopped(pid, pgid, token, grace=CHILD_PROOF_GRACE):
         parents = _windows_parent_map()
         if parents is None:
             state = 'unknown'
-        elif _windows_children(parents, pid):
-            state = 'running'
         else:
-            state = 'stopped'
+            kind, value = _windows_creation_time(pid)
+            if kind == 'unknown':
+                state = 'unknown'
+            elif kind == 'live' and token is not None and value == token:
+                state = 'running'
+            elif kind == 'live':
+                # The pid was reused after the direct child was reaped. Only
+                # children created before the reused process can be ours.
+                old = _windows_children_before(parents, pid, value)
+                state = ('unknown' if old is None
+                         else 'running' if old else 'stopped')
+            else:
+                state = 'running' if _windows_children(parents, pid) else 'stopped'
         if state == 'stopped' or time.monotonic() >= deadline:
             return state
         time.sleep(PROBE_INTERVAL)
@@ -1284,29 +1320,46 @@ def _attempt_problems(record, ignore=()):
     history = record.get('attempt_history')
     attempts = record.get('attempts')
     if history is None:
-        if attempts:
-            problems.append(f'{attempts} recorded attempt(s) have no '
-                            'attempt_history')
-        return problems
-    if not isinstance(history, list):
+        if (not isinstance(attempts, int) or isinstance(attempts, bool)
+                or attempts != 0):
+            problems.append(f'attempt_history is missing and attempts is '
+                            f'{attempts!r}; the attempt count cannot be proven')
+        attempts = 0
+    elif not isinstance(history, list):
         return ['attempt_history is not a list']
-    if not isinstance(attempts, int) or attempts != len(history):
+    elif isinstance(attempts, bool) or not isinstance(attempts, int):
+        problems.append(f'attempts is {attempts!r}; the attempt count cannot '
+                        'be proven')
+    elif attempts != len(history):
         problems.append(f'attempts ({attempts!r}) does not match the '
                         f'attempt_history length ({len(history)})')
+    if not problems and attempts == 0:
+        # A record that claims no attempt may not also carry execution evidence.
+        evidence = [key for key in ('head', 'execution_session',
+                                    'integration_sha') if record.get(key)]
+        if record.get('verify'):
+            evidence.append('verify')
+        if evidence:
+            problems.append('attempts is 0 but the record has '
+                            + ', '.join(evidence))
     seen = set()
-    for position, attempt in enumerate(history, start=1):
+    for position, attempt in enumerate(history or [], start=1):
         if not isinstance(attempt, dict):
             problems.append(f'attempt #{position} is not an object')
             continue
         ident = attempt.get('id')
-        if ident in ignore:
+        if not isinstance(ident, str):
+            problems.append(f'attempt #{position} has no readable id')
+            ident = None
+        elif ident in ignore:
             continue
-        if (not isinstance(ident, str) or not ident.startswith('attempt-')
-                or len(ident) <= len('attempt-')):
+        elif (not ident.startswith('attempt-')
+              or len(ident) <= len('attempt-')):
             problems.append(f'attempt #{position} has no readable id')
         elif ident in seen:
             problems.append(f'attempt id {ident} is used twice')
-        seen.add(ident)
+        if ident is not None:
+            seen.add(ident)
         if attempt.get('index') != position:
             problems.append(f'attempt #{position} has a mismatched index')
         state = attempt.get('state')
@@ -1326,13 +1379,17 @@ def _attempt_problems(record, ignore=()):
         if not isinstance(executor, dict):
             problems.append(f'attempt #{position} has no executor record')
             executor = {}
-        if executor.get('state') not in EXECUTOR_STATES:
+        executor_state = executor.get('state')
+        if executor_state not in EXECUTOR_STATES:
             problems.append(f'attempt #{position} executor state is '
-                            f'{executor.get("state")!r}')
-        if (executor.get('state') in ('running', 'ended')
-                and executor.get('pid') is None):
-            problems.append(f'attempt #{position} executor ran without a '
-                            'recorded pid')
+                            f'{executor_state!r}')
+        if executor.get('pid') is None:
+            if executor_state in ('spawning', 'running', 'ended',
+                                  'unrecorded'):
+                problems.append(f'attempt #{position} executor is '
+                                f'{executor_state} without a recorded pid')
+            # 'pending' means no spawn was attempted; 'spawn_failed' means the
+            # spawn failed, so neither can have started a process.
         verifiers = attempt.get('verifiers')
         if not isinstance(verifiers, list):
             problems.append(f'attempt #{position} has no verifier list')
@@ -1349,16 +1406,12 @@ def _attempt_problems(record, ignore=()):
                 continue
             # The pid record is checked independently of the attempt state: a
             # coordinator that died between spawn and pid persistence leaves a
-            # verifier without a pid that may still be alive.
-            if entry.get('pid') is None:
-                if verifier_state in ('starting', 'running', 'ended'):
-                    problems.append(f'attempt #{position} verifier {index} is '
-                                    f'{verifier_state} without a recorded pid')
-                elif (verifier_state == 'unrecorded'
-                        and entry.get('stopped') is not True):
-                    problems.append(f'attempt #{position} verifier {index} lost '
-                                    'its pid record and was not proven stopped')
-                # spawn_failed without a pid is safe: no process started.
+            # verifier without a pid that may still be alive. Only spawn_failed
+            # may legitimately have no pid.
+            if entry.get('pid') is None and verifier_state in (
+                    'starting', 'running', 'ended', 'unrecorded'):
+                problems.append(f'attempt #{position} verifier {index} is '
+                                f'{verifier_state} without a recorded pid')
         for role, pid, pgid, token, stopped in _attempt_processes(attempt):
             if pid is not None and (not isinstance(pid, int) or pid <= 0):
                 problems.append(f'attempt #{position} {role} pid is invalid')
@@ -1374,6 +1427,16 @@ def _attempt_problems(record, ignore=()):
                 problems.append(f'attempt #{position} {role} stop proof is not '
                                 'a boolean')
                 continue
+            if stopped is True:
+                if pid is None:
+                    problems.append(f'attempt #{position} {role} claims a stop '
+                                    'proof without a pid')
+                    continue
+                if token is None and pgid is None:
+                    problems.append(f'attempt #{position} {role} claims a stop '
+                                    'proof without an identity to check '
+                                    '(token/pgid)')
+                    continue
             if pid is None:
                 continue
             liveness = _proven_process_state(pid, pgid, token)
@@ -1577,7 +1640,13 @@ def _run_process(argv, cwd, timeout, *, env=None, input_text=None,
     # start_new_session makes the child its own group/session leader, so the
     # group id equals its pid. On Windows there is no separate group.
     pgid = process.pid if os.name == 'posix' else None
-    token = _process_token(process, pgid)
+    try:
+        token = _process_token(process, pgid)
+    except Exception as exc:  # the identity could not be read after spawn
+        proven, detail = _stop_timed_out(process)
+        return {'exit': None, 'tail': detail, 'timeout': False,
+                'stopped': proven, 'pid': process.pid, 'pgid': pgid,
+                'token': None, 'record_failed': str(exc)}
     if on_spawn is not None:
         try:
             on_spawn(process.pid, pgid, token)
@@ -1602,8 +1671,7 @@ def _run_process(argv, cwd, timeout, *, env=None, input_text=None,
             return {'exit': None, 'tail': detail, 'timeout': True,
                     'stopped': proven, 'pid': process.pid, 'pgid': pgid,
                     'token': token}
-    return {'exit': process.returncode,
-            'tail': ((stdout or '') + (stderr or ''))[-2000:],
+    return {'exit': process.returncode,            'tail': ((stdout or '') + (stderr or ''))[-2000:],
             'timeout': False, 'stopped': None, 'pid': process.pid,
             'pgid': pgid, 'token': token}
 
@@ -1625,7 +1693,14 @@ def _agent(work, prompt, agent_name, timeout, *, title=None, on_spawn=None):
         return {'exit_code': None, 'session_id': None, 'text': '', 'pid': None,
                 'pgid': None, 'detail': f'spawn failed: {exc}'}
     pgid = process.pid if os.name == 'posix' else None
-    token = _process_token(process, pgid)
+    try:
+        token = _process_token(process, pgid)
+    except Exception as exc:  # the identity could not be read after spawn
+        proven, detail = _stop_timed_out(process)
+        return {'exit_code': None, 'session_id': None, 'text': '',
+                'pid': process.pid, 'pgid': pgid, 'token': None,
+                'stopped': proven, 'record_failed': str(exc),
+                'detail': f'cannot read the executor identity: {exc}; {detail}'}
     if on_spawn is not None:
         try:
             on_spawn(process.pid, pgid, token)
@@ -2362,6 +2437,11 @@ def _execute_task(plan, spec, record, base, timeout, save, attempt):
             executor.update(state='running', pid=pid, pgid=pgid, token=token)
             save()
 
+        # Mark the attempt as about to spawn before Popen: a coordinator that
+        # dies between the spawn and the pid write leaves 'spawning', which the
+        # guard refuses instead of treating as "no process".
+        executor.update(state='spawning')
+        save()
         result = _agent(work, _prompt(spec, plan, base),
                         plan['executor_agent'], timeout, title=title,
                         on_spawn=record_spawn)
@@ -2389,9 +2469,10 @@ def _execute_task(plan, spec, record, base, timeout, save, attempt):
                             save=save)
             raise BatchError(f'execution session failed: {result.get("detail")}',
                              status='FAILED')
-        if result.get('exit_code') is not None:
-            # A direct child exit is not a process group exit: prove the group
-            # stopped before anything may reuse this worktree.
+        if result.get('pid') is not None:
+            # A non-timeout result with a pid means the direct child was reaped.
+            # The stream may still be invalid (exit code 1), but the process
+            # group proof is independent of the stream verdict.
             liveness = _prove_child_stopped(result['pid'],
                                             result.get('pgid'),
                                             result.get('token'))
