@@ -41,6 +41,7 @@ path; ``gh`` and OpenCode are optional executables reached through
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import fnmatch
 import hashlib
 import json
@@ -54,6 +55,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 try:  # run as a script (scripts/ on sys.path) or imported as scripts.batch_delivery
     from delivery_risk import RiskError, classify as classify_risk
@@ -71,6 +73,14 @@ DEFAULT_TIMEOUT = 1800
 DEFAULT_CHECKS_TIMEOUT = 3600
 TERMINAL_BAD = ('FAILED', 'BLOCKED', 'SKIPPED')
 INTEGRATED = ('INTEGRATED', 'VERIFIED')
+ATTEMPT_STATES = ('STARTED', 'ENDED')
+ATTEMPT_RESULTS = ('ok', 'failed', 'timeout', 'unproven_stop', 'spawn_failed',
+                   'interrupted', 'error')
+EXECUTOR_STATES = ('pending', 'running', 'ended', 'spawn_failed', 'unrecorded')
+VERIFIER_STATES = ('starting', 'running', 'ended', 'spawn_failed', 'unrecorded')
+PROCESS_STATES = ('stopped', 'running', 'unknown')
+PROBE_GRACE = 5.0
+PROBE_INTERVAL = 0.05
 STATUSES = ('PENDING', 'RUNNING', 'VERIFIED', 'INTEGRATED', 'FAILED', 'BLOCKED',
             'SKIPPED')
 PHASES = ('tasks', 'review', 'pr', 'merge', 'post_merge', 'verified', 'blocked')
@@ -879,7 +889,514 @@ def _task_record(spec, executor_agent):
             'worktree': spec['worktree'], 'base': None, 'head': None,
             'changed_paths': [], 'verify': [], 'execution_session': None,
             'executor_agent': executor_agent, 'integration_sha': None,
-            'error': None, 'pid': None}
+            'error': None, 'pid': None, 'attempt_history': []}
+
+
+# ------------------------------------------------------ attempt lifecycle proof
+
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def _windows_parent_map():
+    """Return ``{pid: parent pid}`` for every process, or None if unreadable."""
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID_HANDLE = ctypes.c_void_p(-1).value
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ('dwSize', wintypes.DWORD),
+            ('cntUsage', wintypes.DWORD),
+            ('th32ProcessID', wintypes.DWORD),
+            ('th32DefaultHeapID', ctypes.c_size_t),
+            ('th32ModuleID', wintypes.DWORD),
+            ('cntThreads', wintypes.DWORD),
+            ('th32ParentProcessID', wintypes.DWORD),
+            ('pcPriClassBase', ctypes.c_long),
+            ('dwFlags', wintypes.DWORD),
+            ('szExeFile', wintypes.WCHAR * 260),
+        ]
+
+    try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD,
+                                                      wintypes.DWORD]
+        kernel32.Process32FirstW.argtypes = [wintypes.HANDLE,
+                                             ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.Process32NextW.argtypes = [wintypes.HANDLE,
+                                            ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snapshot or snapshot == INVALID_HANDLE:
+            return None
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        parents = {}
+        try:
+            found = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while found:
+                parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+                found = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+    except (OSError, AttributeError, ValueError):
+        return None
+    return parents
+
+
+def _windows_children(parents, pid):
+    children = {}
+    for child, parent in parents.items():
+        children.setdefault(parent, []).append(child)
+    pending = list(children.get(pid, ()))
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        pending.extend(children.get(current, ()))
+    return bool(seen)
+
+
+def _windows_creation_time(pid):
+    """Return ('live', ticks), ('gone', None) or ('unknown', None)."""
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    ERROR_INVALID_PARAMETER = 87
+    STILL_ACTIVE = 259
+    try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                         wintypes.DWORD]
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
+                                                ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME)]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False,
+                                      int(pid))
+        if not handle:
+            if ctypes.get_last_error() == ERROR_INVALID_PARAMETER:
+                return 'gone', None
+            return 'unknown', None
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle,
+                                               ctypes.byref(exit_code)):
+                return 'unknown', None
+            # An exited process keeps its pid while a handle is still open; it
+            # must not be reported as live.
+            if exit_code.value != STILL_ACTIVE:
+                return 'gone', None
+            creation = wintypes.FILETIME()
+            exited = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                    handle, ctypes.byref(creation), ctypes.byref(exited),
+                    ctypes.byref(kernel), ctypes.byref(user)):
+                return 'unknown', None
+            creation_ticks = ((creation.dwHighDateTime << 32)
+                              | creation.dwLowDateTime)
+            return 'live', creation_ticks
+        finally:
+            kernel32.CloseHandle(handle)
+    except (OSError, AttributeError, ValueError):
+        return 'unknown', None
+
+
+def _windows_creation_time_handle(handle):
+    import ctypes
+    from ctypes import wintypes
+    try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME)]
+        creation = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(
+                wintypes.HANDLE(handle), ctypes.byref(creation),
+                ctypes.byref(exited), ctypes.byref(kernel),
+                ctypes.byref(user)):
+            return None
+        return (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def _process_token(process, pgid):
+    """Identity token used to exclude pid reuse, or None when unavailable.
+
+    On Windows the token comes from the live ``Popen`` handle, so it is
+    available even when the child exits immediately.
+    """
+    if os.name == 'nt':
+        handle = getattr(process, '_handle', None)
+        if handle:
+            value = _windows_creation_time_handle(handle)
+            if value is not None:
+                return value
+        kind, value = _windows_creation_time(process.pid)
+        return value if kind == 'live' else None
+    if os.name == 'posix':
+        return _posix_start_token(process.pid)
+    return None
+
+
+def _posix_start_token(pid):
+    """Linux start time of ``pid``; None elsewhere (no /proc)."""
+    try:
+        data = Path(f'/proc/{pid}/stat').read_text(encoding='utf-8',
+                                                   errors='replace')
+        fields = data.rsplit(')', 1)[1].split()
+        return int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _windows_process_state(pid, token=None):
+    """Liveness of the process tree rooted at the recorded ``pid``, on Windows.
+
+    Windows has no queryable process group. The read-only tree snapshot is a
+    liveness check only; it is not a termination proof for a timeout kill, so
+    ``_prove_stopped`` keeps treating Windows as unproven. A recorded creation
+    time excludes pid reuse: a different creation time means the recorded tree
+    is gone and any live process with that pid is unrelated.
+    """
+    if token is not None:
+        kind, value = _windows_creation_time(pid)
+        if kind == 'unknown':
+            return 'unknown'
+        if kind == 'live':
+            return 'running' if value == token else 'stopped'
+        # The pid is gone, but descendants keep their parent pid on Windows.
+        parents = _windows_parent_map()
+        if parents is None:
+            return 'unknown'
+        return 'running' if _windows_children(parents, pid) else 'stopped'
+    kind, _value = _windows_creation_time(pid)
+    if kind == 'unknown':
+        return 'unknown'
+    if kind == 'live':
+        return 'running'
+    parents = _windows_parent_map()
+    if parents is None:
+        return 'unknown'
+    return 'running' if _windows_children(parents, pid) else 'stopped'
+
+
+def _posix_process_state(pid, pgid, token=None):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        alive = False
+    except PermissionError:
+        return 'unknown'
+    except OSError:
+        return 'unknown'
+    else:
+        alive = True
+    if pgid is None:
+        return 'running' if alive else 'unknown'
+    if alive:
+        try:
+            actual = os.getpgid(pid)
+        except ProcessLookupError:
+            alive = False
+        except OSError:
+            return 'unknown'
+        else:
+            if actual != pgid:
+                # The recorded pid now names an unrelated process; it cannot be
+                # the leader we recorded, so decide by the recorded group only.
+                alive = False
+            elif token is not None:
+                current = _posix_start_token(pid)
+                if current is not None and current != token:
+                    alive = False  # pid reuse: not the process we recorded
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return 'stopped'
+    except PermissionError:
+        return 'unknown'
+    except OSError:
+        return 'unknown'
+    return 'running'
+
+
+def _process_state(pid, pgid, token=None):
+    if not isinstance(pid, int) or pid <= 0:
+        return 'unknown'
+    if os.name == 'nt':
+        return _windows_process_state(pid, token)
+    if os.name == 'posix':
+        return _posix_process_state(pid, pgid, token)
+    return 'unknown'
+
+
+def _proven_process_state(pid, pgid, token=None, grace=PROBE_GRACE):
+    """Return the last state after a short grace; only 'stopped' permits reuse."""
+    deadline = time.monotonic() + max(0.0, grace)
+    state = _process_state(pid, pgid, token)
+    while state in ('running', 'unknown') and time.monotonic() < deadline:
+        time.sleep(PROBE_INTERVAL)
+        state = _process_state(pid, pgid, token)
+    return state
+
+
+def _prove_child_stopped(pid, pgid, token, grace=PROBE_GRACE):
+    """Prove a direct child that was just reaped left no group/tree behind.
+
+    On Windows the recorded pid may already be reused or unreadable, so the
+    post-exit proof looks only for surviving descendants (their parent pid is
+    still the reaped child). On POSIX the group probe is authoritative.
+    """
+    if os.name != 'nt':
+        return _proven_process_state(pid, pgid, token, grace)
+    deadline = time.monotonic() + max(0.0, grace)
+    while True:
+        parents = _windows_parent_map()
+        if parents is None:
+            state = 'unknown'
+        elif _windows_children(parents, pid):
+            state = 'running'
+        else:
+            state = 'stopped'
+        if state != 'running' or time.monotonic() >= deadline:
+            return state
+        time.sleep(PROBE_INTERVAL)
+
+
+def _new_attempt(record, spec, trigger):
+    history = record.get('attempt_history')
+    used = {attempt.get('id') for attempt in history if isinstance(attempt, dict)}
+    while True:
+        ident = 'attempt-' + uuid.uuid4().hex
+        if ident not in used:
+            break
+    return {
+        'id': ident, 'index': len(history) + 1, 'task': spec['id'],
+        'trigger': trigger, 'state': 'STARTED', 'started_at': _utc_now(),
+        'ended_at': None, 'result': None, 'error': None,
+        'executor': {'state': 'pending', 'pid': None, 'pgid': None,
+                     'token': None, 'exit': None, 'stopped': None,
+                     'session': None},
+        'verifiers': [],
+    }
+
+
+def _start_attempt(record, spec, trigger, save):
+    """Append and persist a unique attempt before any worktree write or spawn."""
+    history = record.get('attempt_history')
+    attempts = record.get('attempts') or 0
+    if history is None:
+        if attempts:
+            raise BatchError(
+                f'{spec["id"]} has {attempts} recorded attempt(s) but no '
+                'readable attempt_history; the previous process group cannot be '
+                'proven stopped, refusing to start a new attempt',
+                status='BLOCKED', halt=True)
+        history = []
+    if not isinstance(history, list):
+        raise BatchError(
+            f'{spec["id"]} has an unreadable attempt_history; the previous '
+            'process group cannot be proven stopped, refusing to start a new '
+            'attempt', status='BLOCKED', halt=True)
+    record['attempt_history'] = history
+    attempt = _new_attempt(record, spec, trigger)
+    history.append(attempt)
+    record['attempts'] = len(history)
+    save()
+    return attempt
+
+
+def _finish_attempt(attempt, result, *, error=None, save=None):
+    if not isinstance(attempt, dict) or attempt.get('state') != 'STARTED':
+        return
+    attempt['state'] = 'ENDED'
+    attempt['ended_at'] = _utc_now()
+    attempt['result'] = result
+    if error is not None:
+        attempt['error'] = error
+    if save is not None:
+        save()
+
+
+def _settle_interrupted(record, save=None):
+    """Close attempts whose coordinator disappeared, without dropping them."""
+    changed = False
+    for attempt in record.get('attempt_history') or []:
+        if isinstance(attempt, dict) and attempt.get('state') == 'STARTED':
+            attempt['state'] = 'ENDED'
+            attempt['ended_at'] = _utc_now()
+            attempt['result'] = 'interrupted'
+            changed = True
+    if changed and save is not None:
+        save()
+
+
+def _attempt_processes(attempt):
+    rows = []
+    executor = attempt.get('executor')
+    if isinstance(executor, dict):
+        rows.append(('executor', executor.get('pid'), executor.get('pgid'),
+                     executor.get('token'), executor.get('stopped')))
+    verifiers = attempt.get('verifiers')
+    if isinstance(verifiers, list):
+        for index, entry in enumerate(verifiers):
+            if isinstance(entry, dict):
+                rows.append((f'verifier {index + 1}', entry.get('pid'),
+                             entry.get('pgid'), entry.get('token'),
+                             entry.get('stopped')))
+    return rows
+
+
+def _attempt_problems(record, ignore=()):
+    """Return every reason the recorded attempts are not proven stopped."""
+    problems = []
+    history = record.get('attempt_history')
+    attempts = record.get('attempts')
+    if history is None:
+        if attempts:
+            problems.append(f'{attempts} recorded attempt(s) have no '
+                            'attempt_history')
+        return problems
+    if not isinstance(history, list):
+        return ['attempt_history is not a list']
+    if not isinstance(attempts, int) or attempts != len(history):
+        problems.append(f'attempts ({attempts!r}) does not match the '
+                        f'attempt_history length ({len(history)})')
+    seen = set()
+    for position, attempt in enumerate(history, start=1):
+        if not isinstance(attempt, dict):
+            problems.append(f'attempt #{position} is not an object')
+            continue
+        ident = attempt.get('id')
+        if ident in ignore:
+            continue
+        if (not isinstance(ident, str) or not ident.startswith('attempt-')
+                or len(ident) <= len('attempt-')):
+            problems.append(f'attempt #{position} has no readable id')
+        elif ident in seen:
+            problems.append(f'attempt id {ident} is used twice')
+        seen.add(ident)
+        if attempt.get('index') != position:
+            problems.append(f'attempt #{position} has a mismatched index')
+        state = attempt.get('state')
+        if state not in ATTEMPT_STATES:
+            problems.append(f'attempt #{position} has an unknown state '
+                            f'{state!r}')
+            continue
+        if not isinstance(attempt.get('started_at'), str):
+            problems.append(f'attempt #{position} has no start time')
+        if state == 'ENDED':
+            if not isinstance(attempt.get('ended_at'), str):
+                problems.append(f'attempt #{position} has no end time')
+            if attempt.get('result') not in ATTEMPT_RESULTS:
+                problems.append(f'attempt #{position} has an unknown result '
+                                f'{attempt.get("result")!r}')
+        executor = attempt.get('executor')
+        if not isinstance(executor, dict):
+            problems.append(f'attempt #{position} has no executor record')
+            executor = {}
+        if executor.get('state') not in EXECUTOR_STATES:
+            problems.append(f'attempt #{position} executor state is '
+                            f'{executor.get("state")!r}')
+        if (executor.get('state') in ('running', 'ended')
+                and executor.get('pid') is None):
+            problems.append(f'attempt #{position} executor ran without a '
+                            'recorded pid')
+        verifiers = attempt.get('verifiers')
+        if not isinstance(verifiers, list):
+            problems.append(f'attempt #{position} has no verifier list')
+            verifiers = []
+        for index, entry in enumerate(verifiers, start=1):
+            if not isinstance(entry, dict):
+                problems.append(f'attempt #{position} verifier {index} is not '
+                                'an object')
+            elif entry.get('state') not in VERIFIER_STATES:
+                problems.append(f'attempt #{position} verifier {index} state '
+                                f'is {entry.get("state")!r}')
+        for role, pid, pgid, token, stopped in _attempt_processes(attempt):
+            if pid is not None and (not isinstance(pid, int) or pid <= 0):
+                problems.append(f'attempt #{position} {role} pid is invalid')
+                continue
+            if pgid is not None and (not isinstance(pgid, int) or pgid <= 0):
+                problems.append(f'attempt #{position} {role} pgid is invalid')
+                continue
+            if token is not None and not isinstance(token, int):
+                problems.append(f'attempt #{position} {role} identity token is '
+                                'invalid')
+                continue
+            if stopped is not None and not isinstance(stopped, bool):
+                problems.append(f'attempt #{position} {role} stop proof is not '
+                                'a boolean')
+                continue
+            if pid is None:
+                continue
+            liveness = _proven_process_state(pid, pgid, token)
+            if liveness == 'running':
+                problems.append(f'attempt #{position} {role} process group is '
+                                f'still running (pid {pid})')
+            elif liveness == 'unknown' and not (
+                    state == 'ENDED' and stopped is True and token is not None):
+                # A recorded post-exit proof with an identity token stands: the
+                # recorded process already exited, so an unreadable pid now is
+                # a reused or inaccessible process, not evidence of survival.
+                problems.append(f'attempt #{position} {role} liveness cannot be '
+                                f'proven (pid {pid})')
+        if state == 'STARTED':
+            if executor.get('pid') is None:
+                problems.append(f'attempt #{position} is unfinished and has no '
+                                'executor pid; the previous process cannot be '
+                                'proven stopped')
+            for index, entry in enumerate(verifiers, start=1):
+                if (isinstance(entry, dict)
+                        and entry.get('state') in ('starting', 'running')
+                        and entry.get('pid') is None):
+                    problems.append(f'attempt #{position} verifier {index} is '
+                                    'unfinished and has no recorded pid')
+        elif attempt.get('result') in ('timeout', 'unproven_stop'):
+            if executor.get('stopped') is not True:
+                problems.append(f'attempt #{position} ended as '
+                                f'{attempt.get("result")} and its process group '
+                                'was not proven stopped')
+        elif (executor.get('state') == 'unrecorded'
+                and executor.get('stopped') is not True):
+            problems.append(f'attempt #{position} lost its pid record and the '
+                            'process group was not proven stopped')
+    return problems
+
+
+def _reuse_guard(spec, record, *, ignore=()):
+    """Fail closed unless every recorded attempt is proven stopped."""
+    problems = _attempt_problems(record, ignore=ignore)
+    if not problems:
+        return
+    detail = '; '.join(problems[:6])
+    raise BatchError(
+        f'{spec["id"]} cannot reuse its worktree: the previous executor or '
+        f'verifier lifetime is not proven stopped ({detail})',
+        status='BLOCKED', halt=True)
 
 
 # ------------------------------------------------------------------- process I/O
@@ -1026,7 +1543,8 @@ def _stop_timed_out(process):
     return False, 'timed out; could not prove the process group was terminated'
 
 
-def _run_process(argv, cwd, timeout, *, env=None, input_text=None):
+def _run_process(argv, cwd, timeout, *, env=None, input_text=None,
+                 on_spawn=None):
     """Run one argv without a shell; return exit, tail and timeout facts."""
     environment = dict(os.environ, PWD=str(cwd))
     if env:
@@ -1038,25 +1556,42 @@ def _run_process(argv, cwd, timeout, *, env=None, input_text=None):
             text=True, env=environment, start_new_session=(os.name == 'posix'))
     except OSError as exc:
         return {'exit': None, 'tail': f'spawn failed: {exc}', 'timeout': False,
-                'stopped': None}
+                'stopped': None, 'pid': None, 'pgid': None}
+    # start_new_session makes the child its own group/session leader, so the
+    # group id equals its pid. On Windows there is no separate group.
+    pgid = process.pid if os.name == 'posix' else None
+    token = _process_token(process, pgid)
+    if on_spawn is not None:
+        try:
+            on_spawn(process.pid, pgid, token)
+        except Exception as exc:  # the pid could not be persisted
+            proven, detail = _stop_timed_out(process)
+            return {'exit': None, 'tail': detail, 'timeout': False,
+                    'stopped': proven, 'pid': process.pid, 'pgid': pgid,
+                    'token': token, 'record_failed': str(exc)}
     if input_text is not None:
         try:
             stdout, stderr = process.communicate(input_text, timeout=timeout)
         except subprocess.TimeoutExpired:
             proven, detail = _stop_timed_out(process)
-            return {'exit': None, 'tail': detail, 'timeout': True, 'stopped': proven}
+            return {'exit': None, 'tail': detail, 'timeout': True,
+                    'stopped': proven, 'pid': process.pid, 'pgid': pgid,
+                    'token': token}
     else:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             proven, detail = _stop_timed_out(process)
-            return {'exit': None, 'tail': detail, 'timeout': True, 'stopped': proven}
+            return {'exit': None, 'tail': detail, 'timeout': True,
+                    'stopped': proven, 'pid': process.pid, 'pgid': pgid,
+                    'token': token}
     return {'exit': process.returncode,
             'tail': ((stdout or '') + (stderr or ''))[-2000:],
-            'timeout': False, 'stopped': None}
+            'timeout': False, 'stopped': None, 'pid': process.pid,
+            'pgid': pgid, 'token': token}
 
 
-def _agent(work, prompt, agent_name, timeout, *, title=None):
+def _agent(work, prompt, agent_name, timeout, *, title=None, on_spawn=None):
     argv = [*_opencode_binary(), 'run', '--standalone', '--format', 'json']
     if agent_name:
         argv += ['--agent', agent_name]
@@ -1070,15 +1605,29 @@ def _agent(work, prompt, agent_name, timeout, *, title=None):
             stderr=subprocess.DEVNULL, text=True, env=environment,
             start_new_session=(os.name == 'posix'))
     except OSError as exc:
-        return {'exit_code': None, 'session_id': None, 'text': '',
-                'detail': f'spawn failed: {exc}'}
+        return {'exit_code': None, 'session_id': None, 'text': '', 'pid': None,
+                'pgid': None, 'detail': f'spawn failed: {exc}'}
+    pgid = process.pid if os.name == 'posix' else None
+    token = _process_token(process, pgid)
+    if on_spawn is not None:
+        try:
+            on_spawn(process.pid, pgid, token)
+        except Exception as exc:  # the pid could not be persisted
+            proven, detail = _stop_timed_out(process)
+            return {'exit_code': None, 'session_id': None, 'text': '',
+                    'pid': process.pid, 'pgid': pgid, 'token': token,
+                    'stopped': proven, 'record_failed': str(exc),
+                    'detail': f'cannot persist the executor pid: {exc}; {detail}'}
     try:
         output, _ = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         proven, detail = _stop_timed_out(process)
         return {'exit_code': None, 'session_id': None, 'text': '', 'timeout': True,
-                'stopped': proven, 'detail': detail}
-    return _classify_stream(process.returncode, output or '')
+                'stopped': proven, 'pid': process.pid, 'pgid': pgid,
+                'token': token, 'detail': detail}
+    result = _classify_stream(process.returncode, output or '')
+    result.update(pid=process.pid, pgid=pgid, token=token)
+    return result
 
 
 def _session_export(session, work, timeout=120):
@@ -1687,15 +2236,68 @@ def _commit_if_dirty(work, base, spec, plan):
                          f'{(commit.stderr or "").strip()[:400]}', status='FAILED')
 
 
-def _verify_task(work, commands, timeout):
+def _verify_task(work, commands, timeout, *, attempt=None, save=None):
     entries = []
     for command in commands:
-        result = _run_process(command, work, timeout)
+        entry = None
+        if attempt is not None:
+            entry = {'state': 'starting', 'pid': None, 'pgid': None,
+                     'token': None, 'exit': None, 'timeout': False,
+                     'stopped': None}
+            attempt['verifiers'].append(entry)
+            save()
+        on_spawn = None
+        if entry is not None:
+            def on_spawn(pid, pgid, token, entry=entry):
+                entry.update(state='running', pid=pid, pgid=pgid, token=token)
+                save()
+        result = _run_process(command, work, timeout, on_spawn=on_spawn)
         record = {'argv_sha256': hashlib.sha256(
                       json.dumps(command).encode()).hexdigest(),
                   'exit': result['exit'], 'tail': result['tail'],
-                  'timeout': bool(result['timeout'])}
+                  'timeout': bool(result['timeout']), 'pid': result.get('pid'),
+                  'pgid': result.get('pgid'), 'token': result.get('token'),
+                  'stopped': result.get('stopped')}
         entries.append(record)
+        if entry is not None:
+            entry.update(pid=result.get('pid'), pgid=result.get('pgid'),
+                         token=result.get('token'), exit=result['exit'],
+                         timeout=bool(result['timeout']),
+                         stopped=result.get('stopped'))
+            if result.get('pid') is None and not result['timeout']:
+                entry['state'] = 'spawn_failed'
+            elif result.get('record_failed'):
+                entry['state'] = 'unrecorded'
+            else:
+                entry['state'] = 'ended'
+            if result.get('record_failed'):
+                save()
+                _finish_attempt(attempt, 'unproven_stop'
+                                if result.get('stopped') is not True else 'failed',
+                                error=str(result['record_failed']), save=save)
+                raise BatchError(
+                    f'cannot persist the verifier pid: {result["record_failed"]}; '
+                    f'{result["tail"]}', status='FAILED',
+                    halt=result.get('stopped') is not True, verify=entries)
+            if result['timeout']:
+                _finish_attempt(attempt, 'timeout'
+                                if result.get('stopped') else 'unproven_stop',
+                                error=result['tail'], save=save)
+            elif not result['timeout'] and result.get('pid') is not None:
+                liveness = _prove_child_stopped(
+                    result['pid'], result.get('pgid'), result.get('token'))
+                entry['stopped'] = liveness == 'stopped'
+                if liveness != 'stopped':
+                    save()
+                    _finish_attempt(attempt, 'unproven_stop',
+                                    error=f'verification process is {liveness}',
+                                    save=save)
+                    raise BatchError(
+                        f'verification finished but its process group is '
+                        f'{liveness} (pid {result["pid"]}); refusing to reuse '
+                        'the worktree until it is proven stopped',
+                        status='FAILED', halt=True, verify=entries)
+            save()
         if result['timeout']:
             raise BatchError(
                 f'verification timed out: {" ".join(command)}; '
@@ -1728,41 +2330,101 @@ def _integrate(plan, spec):
     return _head(batch)
 
 
-def _execute_task(plan, spec, record, base, timeout, save):
-    work = _prepare_task_worktree(plan, spec, base, record)
-    title = f'batch-{plan["batch"]["id"]}-{spec["id"]}'
-    result = _agent(work, _prompt(spec, plan, base), plan['executor_agent'], timeout,
-                    title=title)
-    if result.get('timeout'):
-        raise BatchError(f'execution timed out; {result["detail"]}', status='FAILED',
-                         halt=not result.get('stopped'))
-    if result.get('exit_code') != 0 or not result.get('session_id'):
-        raise BatchError(f'execution session failed: {result.get("detail")}',
-                         status='FAILED')
-    record['execution_session'] = result['session_id']
-    _commit_if_dirty(work, base, spec, plan)
-    head = _head(work)
-    if head == base:
-        raise BatchError('execution produced no changes', status='FAILED')
-    names = _diff_names(work, base, head)
-    _scope_check(names, spec, plan)
-    record.update(head=head, changed_paths=names)
-    save()
-    record['verify'] = _verify_task(work, spec['verify'], timeout)
-    after = _head(work)
-    if after != head:
-        raise BatchError('a verification command changed the task head',
-                         status='FAILED', verify=record['verify'])
-    if not _clean(work):
-        raise BatchError('a verification command left the worktree dirty',
-                         status='FAILED', verify=record['verify'])
-    record['integration_sha'] = _integrate(plan, spec)
-    record['status'] = 'INTEGRATED'
-    record['error'] = None
-    save()
+def _execute_task(plan, spec, record, base, timeout, save, attempt):
+    try:
+        # The guard also runs before the attempt is appended; this second check
+        # keeps the literal "before _prepare_task_worktree/_agent" ordering and
+        # ignores the just-started attempt, which has no process yet.
+        _reuse_guard(spec, record, ignore={attempt['id']})
+        work = _prepare_task_worktree(plan, spec, base, record)
+        title = f'batch-{plan["batch"]["id"]}-{spec["id"]}'
+        executor = attempt['executor']
+
+        def record_spawn(pid, pgid, token):
+            executor.update(state='running', pid=pid, pgid=pgid, token=token)
+            save()
+
+        result = _agent(work, _prompt(spec, plan, base),
+                        plan['executor_agent'], timeout, title=title,
+                        on_spawn=record_spawn)
+        executor.update(pid=result.get('pid'), pgid=result.get('pgid'),
+                        token=result.get('token'),
+                        exit=result.get('exit_code'))
+        if result.get('record_failed'):
+            stopped = result.get('stopped')
+            executor.update(state='unrecorded', stopped=stopped)
+            _finish_attempt(attempt, 'unproven_stop' if stopped is not True
+                            else 'failed', error=result['detail'], save=save)
+            raise BatchError(result['detail'], status='FAILED',
+                             halt=stopped is not True)
+        if result.get('timeout'):
+            stopped = bool(result.get('stopped'))
+            executor.update(state='ended', stopped=stopped)
+            _finish_attempt(attempt, 'timeout'
+                            if stopped else 'unproven_stop',
+                            error=result['detail'], save=save)
+            raise BatchError(f'execution timed out; {result["detail"]}',
+                             status='FAILED', halt=not stopped)
+        if result.get('pid') is None:
+            executor.update(state='spawn_failed')
+            _finish_attempt(attempt, 'failed', error=result.get('detail'),
+                            save=save)
+            raise BatchError(f'execution session failed: {result.get("detail")}',
+                             status='FAILED')
+        if result.get('exit_code') is not None:
+            # A direct child exit is not a process group exit: prove the group
+            # stopped before anything may reuse this worktree.
+            liveness = _prove_child_stopped(result['pid'],
+                                            result.get('pgid'),
+                                            result.get('token'))
+            executor.update(state='ended', stopped=liveness == 'stopped')
+            if liveness != 'stopped':
+                _finish_attempt(
+                    attempt, 'unproven_stop',
+                    error=f'executor process group is {liveness} after exit',
+                    save=save)
+                raise BatchError(
+                    f'execution finished but its process group is {liveness} '
+                    f'(pid {result["pid"]}); refusing to continue until it is '
+                    'proven stopped', status='FAILED', halt=True)
+        if result.get('exit_code') != 0 or not result.get('session_id'):
+            _finish_attempt(attempt, 'failed', error=result.get('detail'),
+                            save=save)
+            raise BatchError(f'execution session failed: {result.get("detail")}',
+                             status='FAILED')
+        executor['session'] = result['session_id']
+        record['execution_session'] = result['session_id']
+        _commit_if_dirty(work, base, spec, plan)
+        head = _head(work)
+        if head == base:
+            raise BatchError('execution produced no changes', status='FAILED')
+        names = _diff_names(work, base, head)
+        _scope_check(names, spec, plan)
+        record.update(head=head, changed_paths=names)
+        save()
+        record['verify'] = _verify_task(work, spec['verify'], timeout,
+                                        attempt=attempt, save=save)
+        after = _head(work)
+        if after != head:
+            raise BatchError('a verification command changed the task head',
+                             status='FAILED', verify=record['verify'])
+        if not _clean(work):
+            raise BatchError('a verification command left the worktree dirty',
+                             status='FAILED', verify=record['verify'])
+        record['integration_sha'] = _integrate(plan, spec)
+        record['status'] = 'INTEGRATED'
+        record['error'] = None
+        _finish_attempt(attempt, 'ok', save=save)
+        save()
+    except BatchError as exc:
+        _finish_attempt(attempt, 'failed', error=str(exc), save=save)
+        raise
+    except Exception as exc:  # persistence or programming failure: fail closed
+        _finish_attempt(attempt, 'error', error=str(exc), save=save)
+        raise
 
 
-def _apply_retry(state, plan, ids):
+def _apply_retry(state, plan, ids, save=None):
     current_batch = _head(Path(plan['batch']['worktree']))
     for ident in ids:
         spec = next((task for task in plan['tasks'] if task['id'] == ident), None)
@@ -1789,7 +2451,17 @@ def _apply_retry(state, plan, ids):
             if head not in allowed:
                 raise InputError(f'{ident} branch has commits not represented in '
                                  'the journal')
+        try:
+            _reuse_guard(spec, record)
+        except BatchError as exc:
+            record['error'] = str(exc)
+            record['retry_blocked'] = str(exc)
+            if save is not None:
+                save()
+            raise
+        _settle_interrupted(record, save)
         record.update(status='PENDING', error=None)
+        record.pop('retry_blocked', None)
     _reset_dependents(state, plan, ids)
 
 
@@ -1809,7 +2481,8 @@ def _reset_dependents(state, plan, ids):
                 pending.append(spec['id'])
 
 
-def _normalize_interrupted(state, resume):
+def _normalize_interrupted(state, plan, resume, save=None):
+    halt = False
     for ident in sorted(state.get('tasks') or {}):
         record = state['tasks'][ident]
         if record.get('status') != 'RUNNING':
@@ -1819,10 +2492,20 @@ def _normalize_interrupted(state, resume):
                 'an interrupted attempt left a commit; inspect the worktree '
                 'manually and use --retry after reconciling the branch'))
         elif resume:
+            spec = next((task for task in plan['tasks'] if task['id'] == ident),
+                        None) or {'id': ident}
+            try:
+                _reuse_guard(spec, record)
+            except BatchError as exc:
+                record.update(status='BLOCKED', error=str(exc))
+                halt = True
+                continue
+            _settle_interrupted(record, save)
             record.update(status='PENDING', error=None)
         else:
             record.update(status='BLOCKED', error=(
                 'the attempt was interrupted before a commit; rerun with --resume'))
+    return halt
 
 
 def _run_summary(state, plan):
@@ -1901,18 +2584,20 @@ def command_run(args):
             _atomic_json(journal, state)
             print(f'error: {exc}', file=sys.stderr)
             return 1
+        def save():
+            _atomic_json(journal, state)
+
+        retry_ids = []
         if args.retry:
-            _apply_retry(state, plan, [value.strip() for value in args.retry.split(',')
-                                       if value.strip()])
-        _normalize_interrupted(state, args.resume)
+            retry_ids = [value.strip() for value in args.retry.split(',')
+                         if value.strip()]
+            _apply_retry(state, plan, retry_ids, save=save)
+        normalize_halt = _normalize_interrupted(state, plan, args.resume, save=save)
         state['phase'] = 'tasks'
         state['error'] = None
         _atomic_json(journal, state)
 
-        def save():
-            _atomic_json(journal, state)
-
-        halt = False
+        halt = normalize_halt
         for spec in plan['tasks']:
             record = state['tasks'][spec['id']]
             if only is not None and spec['id'] not in only:
@@ -1935,13 +2620,24 @@ def command_run(args):
                               error='the run stopped after an unproven process kill')
                 save()
                 continue
-            base = _head(Path(plan['batch']['worktree']))
-            record.update(status='RUNNING', base=base, error=None,
-                          attempts=int(record.get('attempts') or 0) + 1,
-                          pid=os.getpid())
-            save()
             try:
-                _execute_task(plan, spec, record, base, args.timeout, save)
+                _reuse_guard(spec, record)
+            except BatchError as exc:
+                record.update(status=exc.record_status, error=str(exc))
+                save()
+                if exc.halt:
+                    halt = True
+                continue
+            base = _head(Path(plan['batch']['worktree']))
+            record.update(status='RUNNING', base=base, error=None, pid=os.getpid())
+            trigger = ('retry' if spec['id'] in retry_ids
+                       else 'resume' if args.resume else 'fresh')
+            # The attempt id and start record are on disk before the worktree is
+            # touched or any process starts; a failed save raises here.
+            attempt = _start_attempt(record, spec, trigger, save)
+            try:
+                _execute_task(plan, spec, record, base, args.timeout, save,
+                              attempt)
             except BatchError as exc:
                 record.update(status=exc.record_status, error=str(exc),
                               verify=exc.verify or record.get('verify') or [])
