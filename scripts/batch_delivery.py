@@ -80,6 +80,7 @@ EXECUTOR_STATES = ('pending', 'running', 'ended', 'spawn_failed', 'unrecorded')
 VERIFIER_STATES = ('starting', 'running', 'ended', 'spawn_failed', 'unrecorded')
 PROCESS_STATES = ('stopped', 'running', 'unknown')
 PROBE_GRACE = 5.0
+CHILD_PROOF_GRACE = 15.0
 PROBE_INTERVAL = 0.05
 STATUSES = ('PENDING', 'RUNNING', 'VERIFIED', 'INTEGRATED', 'FAILED', 'BLOCKED',
             'SKIPPED')
@@ -904,6 +905,7 @@ def _windows_parent_map():
     from ctypes import wintypes
 
     TH32CS_SNAPPROCESS = 0x00000002
+    ERROR_NO_MORE_FILES = 18
     INVALID_HANDLE = ctypes.c_void_p(-1).value
 
     class PROCESSENTRY32W(ctypes.Structure):
@@ -941,6 +943,10 @@ def _windows_parent_map():
             while found:
                 parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
                 found = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+            # A partial snapshot would hide a surviving descendant; only treat
+            # ERROR_NO_MORE_FILES as a complete enumeration.
+            if ctypes.get_last_error() not in (0, ERROR_NO_MORE_FILES):
+                return None
         finally:
             kernel32.CloseHandle(snapshot)
     except (OSError, AttributeError, ValueError):
@@ -1163,7 +1169,7 @@ def _proven_process_state(pid, pgid, token=None, grace=PROBE_GRACE):
     return state
 
 
-def _prove_child_stopped(pid, pgid, token, grace=PROBE_GRACE):
+def _prove_child_stopped(pid, pgid, token, grace=CHILD_PROOF_GRACE):
     """Prove a direct child that was just reaped left no group/tree behind.
 
     On Windows the recorded pid may already be reused or unreadable, so the
@@ -1181,7 +1187,7 @@ def _prove_child_stopped(pid, pgid, token, grace=PROBE_GRACE):
             state = 'running'
         else:
             state = 'stopped'
-        if state != 'running' or time.monotonic() >= deadline:
+        if state == 'stopped' or time.monotonic() >= deadline:
             return state
         time.sleep(PROBE_INTERVAL)
 
@@ -2287,6 +2293,7 @@ def _verify_task(work, commands, timeout, *, attempt=None, save=None):
                 liveness = _prove_child_stopped(
                     result['pid'], result.get('pgid'), result.get('token'))
                 entry['stopped'] = liveness == 'stopped'
+                record['stopped'] = entry['stopped']
                 if liveness != 'stopped':
                     save()
                     _finish_attempt(attempt, 'unproven_stop',
