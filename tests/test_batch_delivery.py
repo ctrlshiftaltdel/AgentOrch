@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 try:
     import fcntl
@@ -128,6 +129,14 @@ if args[:1] == ['run']:
         emit(session, text)
         raise SystemExit(0)
     ident = re.search(r'^TASK_ID=(\S+)$', prompt, re.M).group(1)
+    observed = os.environ.get('FAKE_OPENCODE_OBSERVE_JOURNAL')
+    if observed:
+        state = json.loads(Path(observed).read_text())
+        task = state['tasks'][ident]
+        Path(observed + '.attempt').write_text(json.dumps({{
+            'attempts': task.get('attempts'),
+            'history': task.get('attempt_history') or [],
+        }}))
     paths = json.loads(re.search(r'^PATHS_JSON=(.*)$', prompt, re.M).group(1))
     for name in paths:
         path = Path(name)
@@ -1062,8 +1071,16 @@ class GitHubBatchTests(BatchCase):
         self.assertEqual(state['tasks']['T2']['status'], 'SKIPPED')
         second = self.cli('run', '--plan', str(self.write_plan(plan)), '--journal',
                           str(self.journal), '--execute', '--retry', 'T1')
-        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         state = self.journal_data()
+        if os.name == 'nt':
+            # Owner decision A: no Windows reuse before a Job Object (HD-2 B).
+            self.assertEqual(second.returncode, 1, second.stderr)
+            self.assertEqual(state['tasks']['T1']['status'], 'FAILED')
+            self.assertEqual(state['tasks']['T1']['attempts'], 1)
+            self.assertIn('retry_blocked', state['tasks']['T1'])
+            self.assertEqual(state['tasks']['T2']['status'], 'SKIPPED')
+            return
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         self.assertEqual(state['tasks']['T1']['status'], 'INTEGRATED')
         self.assertEqual(state['tasks']['T2']['status'], 'INTEGRATED')
         self.assertEqual(state['tasks']['T2']['base'],
@@ -1997,8 +2014,16 @@ class LocalBatchTests(BatchCase):
             if json.loads(line) == ['task', 'dispatch', 'T1'])
         second = self.cli('run', '--plan', str(self.write_plan(plan)), '--journal',
                           str(self.journal), '--execute', '--retry', 'T1')
-        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         state = self.journal_data()
+        if os.name == 'nt':
+            # Owner decision A: Windows reuse waits for a Job Object (HD-2 B).
+            self.assertEqual(second.returncode, 1, second.stderr)
+            self.assertEqual(state['tasks']['T1']['status'], 'FAILED')
+            self.assertEqual(state['tasks']['T1']['attempts'], 1)
+            self.assertIn('retry_blocked', state['tasks']['T1'])
+            self.assertEqual(state['tasks']['T2']['status'], 'SKIPPED')
+            return
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         self.assertEqual(state['tasks']['T1']['status'], 'INTEGRATED')
         self.assertEqual(state['tasks']['T2']['status'], 'INTEGRATED')
         self.assertEqual(sum(
@@ -2022,8 +2047,15 @@ class LocalBatchTests(BatchCase):
         self.journal.write_text(json.dumps(state))
         second = self.cli('run', '--plan', str(self.write_plan(plan)), '--journal',
                           str(self.journal), '--execute', '--resume')
-        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         state = self.journal_data()
+        if os.name == 'nt':
+            # Owner decision A: an unknown liveness blocks Windows resume.
+            self.assertEqual(second.returncode, 1, second.stderr)
+            self.assertEqual(state['tasks']['T1']['status'], 'BLOCKED')
+            self.assertEqual(state['tasks']['T1']['attempts'], 1)
+            self.assertIn('cannot reuse', state['tasks']['T1']['error'])
+            return
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         self.assertEqual(state['tasks']['T1']['status'], 'INTEGRATED')
         self.assertEqual(sum(
             1 for line in self.orch_log.read_text().splitlines()
@@ -2076,6 +2108,793 @@ class ReviewDiffTests(BatchCase):
         self.assertIn('batch.txt', diff)
         self.assertNotIn('base-only.txt', diff)
         self.assertEqual(digest, hashlib.sha256(diff.encode()).hexdigest())
+
+
+class ExecutorLifecycleTests(BatchCase):
+    """S1 rows of the Issue #265 state matrix: attempt history and stop proof.
+
+    Rows M01-M20 are covered by name; see the matrix comment on Issue #265 for
+    the state x guard x side-effect table these tests execute.
+    """
+
+    def _attempt(self, *, index=1, ident=None, state='ENDED', result='failed',
+                 trigger='fresh', executor=None, verifiers=None):
+        if executor is None:
+            executor = {'state': 'ended', 'pid': 424242, 'pgid': None,
+                        'exit': 0, 'stopped': True, 'session': 'ses_x'}
+        return {
+            'id': ident or 'attempt-' + f'{index:032x}',
+            'index': index, 'task': 'T1', 'trigger': trigger, 'state': state,
+            'started_at': '2026-11-20T00:00:00+00:00',
+            'ended_at': ('2026-11-20T00:00:01+00:00'
+                         if state == 'ENDED' else None),
+            'result': result if state == 'ENDED' else None, 'error': None,
+            'executor': executor,
+            'verifiers': [] if verifiers is None else verifiers,
+        }
+
+    def _record(self, history, attempts=None):
+        return {'status': 'FAILED',
+                'attempts': len(history) if attempts is None else attempts,
+                'attempt_history': history}
+
+    def _problems(self, record, states=None):
+        def probe(pid, pgid, token=None, grace=0.0):
+            return (states or {}).get(pid, 'stopped')
+        with mock.patch.object(delivery, '_proven_process_state', probe):
+            return delivery._attempt_problems(record)
+
+    def _fail_t1(self, plan, extra=None):
+        return self.run_batch(plan, dict({'FAIL_T1': '1'}, **(extra or {})))
+
+    # -- M01 / M02 / AC-1: the attempt exists before the executor starts ----
+    def test_m01_m02_fresh_run_records_the_first_attempt(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        run = self.run_batch(
+            plan, {'FAKE_OPENCODE_OBSERVE_JOURNAL': str(self.journal)})
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['attempts'], 1)
+        attempt = record['attempt_history'][0]
+        self.assertEqual(attempt['state'], 'ENDED')
+        self.assertEqual(attempt['result'], 'ok')
+        self.assertEqual(attempt['trigger'], 'fresh')
+        self.assertTrue(attempt['id'].startswith('attempt-'))
+        self.assertIsInstance(attempt['executor']['pid'], int)
+        if os.name == 'posix':
+            self.assertEqual(attempt['executor']['pgid'],
+                             attempt['executor']['pid'])
+        self.assertIs(attempt['executor']['stopped'], True)
+        # The fake executor read the journal at spawn time: the attempt record
+        # (and its unique id) was already on disk, before the worktree was used.
+        seen = json.loads(
+            Path(str(self.journal) + '.attempt').read_text(encoding='utf-8'))
+        self.assertEqual(seen['attempts'], 1)
+        self.assertEqual(seen['history'][0]['state'], 'STARTED')
+        self.assertTrue(seen['history'][0]['id'].startswith('attempt-'))
+        self.assertEqual(seen['history'][0]['verifiers'], [])
+
+    def test_m02_fresh_run_reuses_a_clean_worktree(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        work = self.root / 'wt-t1'
+        _git(self.repo, 'worktree', 'add', '-q', '-b', 'task/batch-t1',
+             str(work), 'main')
+        run = self.run_batch(plan)
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        self.assertEqual(len(self.opencode_calls()), 1)
+        self.assertEqual(self.journal_data()['tasks']['T1']['attempts'], 1)
+        self.assertEqual(self.journal_data()['tasks']['T1']['status'],
+                         'INTEGRATED')
+
+    # -- M03: missing history with recorded attempts ------------------------
+    def test_m03_missing_history_with_attempts_fails_closed(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        state = self.journal_data()
+        record = state['tasks']['T1']
+        record.update(status='FAILED', integration_sha=None, attempts=1)
+        record.pop('attempt_history')
+        self.journal.write_text(json.dumps(state))
+        before = len(self.opencode_calls())
+        retry = self.cli('run', '--plan', str(self.write_plan(plan)),
+                         '--journal', str(self.journal), '--execute',
+                         '--retry', 'T1')
+        self.assertEqual(retry.returncode, 1, retry.stderr)
+        self.assertIn('attempt_history', retry.stderr)
+        self.assertEqual(len(self.opencode_calls()), before)
+        record = self.journal_data()['tasks']['T1']
+        self.assertNotIn('attempt_history', record)
+        self.assertEqual(record['attempts'], 1)
+        self.assertIn('retry_blocked', record)
+
+    # -- M04 / M19: integrated tasks keep their history --------------------
+    def test_m04_m19_integrated_task_retry_is_refused_without_new_attempt(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        before = len(self.opencode_calls())
+        retry = self.cli('run', '--plan', str(self.write_plan(plan)),
+                         '--journal', str(self.journal), '--execute',
+                         '--retry', 'T1')
+        self.assertEqual(retry.returncode, 2, retry.stderr)
+        self.assertIn('only accepts FAILED', retry.stderr)
+        self.assertEqual(len(self.opencode_calls()), before)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['attempts'], 1)
+        self.assertEqual(len(record['attempt_history']), 1)
+
+    # -- M05: retry appends, never overwrites ------------------------------
+    def test_m05_retry_appends_a_new_attempt_and_keeps_the_old_one(self):
+        script = self.root / 'verify_t1.py'
+        script.write_text(
+            'import os, sys\n'
+            'raise SystemExit(1 if os.environ.get("FAIL_T1") == "1" else 0)\n')
+        plan = self.plan([self.task('T1', 'a.txt', verify=[[PY, str(script)]])])
+        first = self._fail_t1(plan)
+        self.assertEqual(first.returncode, 1)
+        history = self.journal_data()['tasks']['T1']['attempt_history']
+        self.assertEqual(len(history), 1)
+        snapshot = json.dumps(history[0], sort_keys=True)
+        old_id = history[0]['id']
+        second = self.cli('run', '--plan', str(self.write_plan(plan)),
+                          '--journal', str(self.journal), '--execute',
+                          '--retry', 'T1')
+        record = self.journal_data()['tasks']['T1']
+        if os.name == 'nt':
+            # Owner decision A: no Windows retry before a Job Object (HD-2 B).
+            self.assertEqual(second.returncode, 1, second.stderr)
+            self.assertEqual(record['attempts'], 1)
+            self.assertEqual(record['attempt_history'][0]['id'], old_id)
+            self.assertEqual(json.dumps(record['attempt_history'][0],
+                                        sort_keys=True), snapshot)
+            self.assertIn('retry_blocked', record)
+            return
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
+        self.assertEqual(record['attempts'], 2)
+        history = record['attempt_history']
+        self.assertEqual(len(history), 2)
+        self.assertEqual([entry['trigger'] for entry in history],
+                         ['fresh', 'retry'])
+        self.assertNotEqual(history[0]['id'], history[1]['id'])
+        self.assertEqual(history[0]['id'], old_id)
+        self.assertEqual(json.dumps(history[0], sort_keys=True), snapshot)
+
+    def test_attempt_history_append_is_additive(self):
+        record = delivery._task_record(
+            {'id': 'T1', 'branch': 'task/append',
+             'worktree': str(self.root / 'wt-append')}, 'builder')
+        saves = []
+        first = delivery._start_attempt(record, {'id': 'T1'}, 'fresh',
+                                        lambda: saves.append('first'))
+        snapshot = json.dumps(first, sort_keys=True)
+        second = delivery._start_attempt(record, {'id': 'T1'}, 'retry',
+                                         lambda: saves.append('second'))
+        self.assertEqual(record['attempts'], 2)
+        self.assertEqual(len(record['attempt_history']), 2)
+        self.assertNotEqual(first['id'], second['id'])
+        self.assertEqual(json.dumps(record['attempt_history'][0],
+                                    sort_keys=True), snapshot)
+        self.assertEqual(saves, ['first', 'second'])
+
+    # -- M20: every verifier has its own pid/pgid record -------------------
+    def test_m20_each_verifier_is_recorded_with_its_own_pid(self):
+        plan = self.plan([self.task(
+            'T1', 'a.txt', verify=[[PY, '-c', 'pass'], [PY, '-c', 'pass']])])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        verifiers = self.journal_data()['tasks']['T1']['attempt_history'][0][
+            'verifiers']
+        self.assertEqual(len(verifiers), 2)
+        for entry in verifiers:
+            self.assertEqual(entry['state'], 'ended')
+            self.assertIsInstance(entry['pid'], int)
+            self.assertEqual(entry['exit'], 0)
+            self.assertIs(entry['stopped'], True)
+            if os.name == 'posix':
+                self.assertEqual(entry['pgid'], entry['pid'])
+
+    # -- M06: --resume is not a retry --------------------------------------
+    def test_m06_resume_does_not_reopen_a_finished_failure(self):
+        script = self.root / 'verify_t1.py'
+        script.write_text(
+            'import os, sys\n'
+            'raise SystemExit(1 if os.environ.get("FAIL_T1") == "1" else 0)\n')
+        plan = self.plan([self.task('T1', 'a.txt', verify=[[PY, str(script)]])])
+        self.assertEqual(self._fail_t1(plan).returncode, 1)
+        before = len(self.opencode_calls())
+        resumed = self.cli('run', '--plan', str(self.write_plan(plan)),
+                           '--journal', str(self.journal), '--execute',
+                           '--resume')
+        self.assertEqual(resumed.returncode, 1)
+        self.assertEqual(len(self.opencode_calls()), before)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['status'], 'FAILED')
+        self.assertEqual(record['attempts'], 1)
+
+    # -- M07: a dirty worktree is rejected before any new process ----------
+    def test_m07_dirty_worktree_blocks_retry_before_spawn(self):
+        script = self.root / 'verify_t1.py'
+        script.write_text(
+            'import os, sys\n'
+            'raise SystemExit(1 if os.environ.get("FAIL_T1") == "1" else 0)\n')
+        plan = self.plan([self.task('T1', 'a.txt', verify=[[PY, str(script)]])])
+        self.assertEqual(self._fail_t1(plan).returncode, 1)
+        (self.root / 'wt-t1' / 'dirty.txt').write_text('x')
+        before = len(self.opencode_calls())
+        retry = self.cli('run', '--plan', str(self.write_plan(plan)),
+                         '--journal', str(self.journal), '--execute',
+                         '--retry', 'T1')
+        self.assertEqual(retry.returncode, 1, retry.stderr)
+        self.assertEqual(len(self.opencode_calls()), before)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['status'], 'FAILED')
+        if os.name == 'nt':
+            # Owner decision A: the reuse guard blocks before the dirty
+            # worktree is inspected; no new attempt is appended.
+            self.assertEqual(record['attempts'], 1)
+            self.assertIn('retry_blocked', record)
+            return
+        self.assertIn('not clean', record['error'])
+        self.assertEqual(record['attempts'], 2)
+        self.assertEqual(record['attempt_history'][1]['result'], 'failed')
+        self.assertEqual(len(record['attempt_history'][0]['verifiers']), 1)
+
+    # -- M08 / M09: timeout attempts encode the stop proof -----------------
+    def test_m08_m09_timeout_attempts_encode_the_stop_proof(self):
+        proven = self._attempt(result='timeout', executor={
+            'state': 'ended', 'pid': 111, 'pgid': 111, 'exit': None,
+            'stopped': True, 'session': None})
+        self.assertEqual(self._problems(self._record([proven])), [])
+        for result, stopped in (('timeout', False), ('unproven_stop', False),
+                                ('unproven_stop', None)):
+            with self.subTest(result=result, stopped=stopped):
+                unproven = self._attempt(result=result, executor={
+                    'state': 'ended', 'pid': 112, 'pgid': 112, 'exit': None,
+                    'stopped': stopped, 'session': None})
+                problems = self._problems(self._record([unproven]),
+                                          {112: 'stopped'})
+                self.assertTrue(any('not proven stopped' in problem
+                                    for problem in problems), problems)
+
+    def test_m09_unproven_stop_blocks_retry_and_resume_without_spawn(self):
+        script = self.root / 'verify_t1.py'
+        script.write_text(
+            'import os, sys\n'
+            'raise SystemExit(1 if os.environ.get("FAIL_T1") == "1" else 0)\n')
+        plan = self.plan([self.task('T1', 'a.txt', verify=[[PY, str(script)]])])
+        self.assertEqual(self._fail_t1(plan).returncode, 1)
+        state = self.journal_data()
+        attempt = state['tasks']['T1']['attempt_history'][0]
+        attempt['result'] = 'unproven_stop'
+        attempt['executor']['stopped'] = False
+        self.journal.write_text(json.dumps(state))
+        before = len(self.opencode_calls())
+        retry = self.cli('run', '--plan', str(self.write_plan(plan)),
+                         '--journal', str(self.journal), '--execute',
+                         '--retry', 'T1')
+        self.assertEqual(retry.returncode, 1, retry.stderr)
+        self.assertEqual(len(self.opencode_calls()), before)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['status'], 'FAILED')
+        self.assertEqual(record['attempts'], 1)
+        self.assertIn('retry_blocked', record)
+        state = self.journal_data()
+        state['tasks']['T1'].update(status='RUNNING', head=None, error=None)
+        self.journal.write_text(json.dumps(state))
+        resumed = self.cli('run', '--plan', str(self.write_plan(plan)),
+                           '--journal', str(self.journal), '--execute',
+                           '--resume')
+        self.assertEqual(resumed.returncode, 1, resumed.stderr)
+        self.assertEqual(len(self.opencode_calls()), before)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertEqual(record['attempts'], 1)
+
+    # -- M10: a failed stream still records a proven, ended executor ------
+    def test_failed_stream_records_an_ended_executor(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        run = self.run_batch(plan, {'FAKE_OPENCODE_FAIL': '1'})
+        self.assertEqual(run.returncode, 1)
+        attempt = self.journal_data()['tasks']['T1']['attempt_history'][0]
+        self.assertEqual(attempt['result'], 'failed')
+        self.assertEqual(attempt['executor']['state'], 'ended')
+        self.assertIs(attempt['executor']['stopped'], True)
+        if os.name == 'nt':
+            self.assertIsInstance(attempt['executor']['token'], int)
+        else:
+            self.assertEqual(attempt['executor']['pgid'],
+                             attempt['executor']['pid'])
+
+    # -- M10: resume closes the interrupted attempt, then appends ----------
+    def test_m10_resume_closes_the_interrupted_attempt_and_appends_one(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        first = self.run_batch(plan, {'FAKE_OPENCODE_FAIL': '1'})
+        self.assertEqual(first.returncode, 1)
+        state = self.journal_data()
+        record = state['tasks']['T1']
+        self.assertIsNone(record['head'])
+        attempt = record['attempt_history'][0]
+        attempt.update(state='STARTED', ended_at=None, result=None)
+        record['status'] = 'RUNNING'
+        record['error'] = None
+        self.journal.write_text(json.dumps(state))
+        resumed = self.cli('run', '--plan', str(self.write_plan(plan)),
+                           '--journal', str(self.journal), '--execute',
+                           '--resume')
+        record = self.journal_data()['tasks']['T1']
+        if os.name == 'nt':
+            # R-F1: the root is gone and an orphaned intermediate process cannot
+            # be excluded without a Job Object, so Windows refuses to resume.
+            self.assertEqual(resumed.returncode, 1, resumed.stderr)
+            self.assertEqual(record['status'], 'BLOCKED')
+            self.assertEqual(record['attempts'], 1)
+            self.assertIn('cannot reuse', record['error'])
+            return
+        self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
+        self.assertEqual(record['status'], 'INTEGRATED')
+        self.assertEqual(record['attempts'], 2)
+        history = record['attempt_history']
+        self.assertEqual(history[0]['result'], 'interrupted')
+        self.assertEqual(history[1]['result'], 'ok')
+        self.assertNotEqual(history[0]['id'], history[1]['id'])
+
+    # -- M11 / M12 / M13: live or unknown processes fail closed ------------
+    def test_m11_m12_m13_live_or_unknown_process_blocks_reuse(self):
+        stopped = {'state': 'ended', 'pid': 100, 'pgid': 100, 'exit': 0,
+                   'stopped': True, 'session': None}
+        cases = {
+            'M11 executor running': (
+                [self._attempt(executor={
+                    'state': 'ended', 'pid': 101, 'pgid': 101, 'exit': 0,
+                    'stopped': None, 'session': None})],
+                {101: 'running'}, 'still running'),
+            'M11 child exited but group lives': (
+                [self._attempt(executor={
+                    'state': 'ended', 'pid': 104, 'pgid': 104, 'exit': 0,
+                    'stopped': False, 'session': None})],
+                {104: 'running'}, 'still running'),
+            'M12 verifier running': (
+                [self._attempt(executor=dict(stopped), verifiers=[{
+                    'state': 'ended', 'pid': 102, 'pgid': 102, 'exit': 0,
+                    'stopped': None}])],
+                {102: 'running'}, 'still running'),
+            'M13 liveness unknown': (
+                [self._attempt(executor={
+                    'state': 'ended', 'pid': 103, 'pgid': 103, 'exit': 0,
+                    'stopped': None, 'session': None})],
+                {103: 'unknown'}, 'cannot be proven'),
+            'M13 recorded proof with token': (
+                [self._attempt(executor={
+                    'state': 'ended', 'pid': 105, 'pgid': 105, 'token': 42,
+                    'exit': 0, 'stopped': True, 'session': None})],
+                {105: 'unknown'},
+                # Owner decision A: Windows never lets the recorded proof
+                # override an unknown liveness; POSIX keeps the exemption.
+                'cannot be proven' if os.name == 'nt' else None),
+        }
+        for label, (history, states, needle) in cases.items():
+            with self.subTest(label):
+                record = self._record(history)
+                problems = self._problems(record, states)
+                if needle is None:
+                    self.assertEqual(problems, [])
+                    continue
+                self.assertTrue(any(needle in problem for problem in problems),
+                                problems)
+
+                def probe(pid, pgid, token=None, grace=0.0, states=states):
+                    return states.get(pid, 'stopped')
+                with mock.patch.object(delivery, '_proven_process_state',
+                                       probe):
+                    with self.assertRaises(delivery.BatchError) as caught:
+                        delivery._reuse_guard({'id': 'T1'}, record)
+                self.assertEqual(caught.exception.status, 'BLOCKED')
+                self.assertTrue(caught.exception.halt)
+                self.assertIn('not proven stopped', str(caught.exception))
+
+    # -- Owner decision A: Windows never trusts an unknown after a proof ----
+    def test_owner_a_windows_unknown_beats_the_recorded_proof(self):
+        attempt = self._attempt(executor={
+            'state': 'ended', 'pid': 301, 'pgid': 301, 'token': 42,
+            'exit': 0, 'stopped': True, 'session': None})
+
+        def probe(pid, pgid, token=None, grace=0.0):
+            return 'unknown'
+
+        with mock.patch.object(delivery, '_proven_process_state', probe):
+            with mock.patch.object(delivery, '_IS_WINDOWS', True):
+                windows = delivery._attempt_problems(self._record([attempt]))
+            with mock.patch.object(delivery, '_IS_WINDOWS', False):
+                posix = delivery._attempt_problems(self._record([attempt]))
+        self.assertTrue(any('cannot be proven' in problem
+                            for problem in windows), windows)
+        self.assertEqual(posix, [])
+
+    # -- M14: an unfinished attempt without a pid --------------------------
+    def test_m14_unfinished_attempt_without_pid_fails_closed(self):
+        silent = self._attempt(state='STARTED', result=None, executor={
+            'state': 'pending', 'pid': None, 'pgid': None, 'exit': None,
+            'stopped': None, 'session': None})
+        problems = self._problems(self._record([silent]))
+        self.assertTrue(any('no executor pid' in problem
+                            for problem in problems), problems)
+        started = self._attempt(state='STARTED', result=None, executor={
+            'state': 'ended', 'pid': 201, 'pgid': 201, 'exit': 0,
+            'stopped': True, 'session': None}, verifiers=[{
+                'state': 'starting', 'pid': None, 'pgid': None, 'exit': None,
+                'timeout': False, 'stopped': None}])
+        problems = self._problems(self._record([started]), {201: 'stopped'})
+        self.assertTrue(any('verifier 1 is starting without a recorded pid'
+                            in problem for problem in problems), problems)
+
+    # -- F2: verifier pid evidence is checked for every attempt state ------
+    def test_f2_verifier_without_pid_fails_closed_in_ended_attempts(self):
+        executor = {'state': 'ended', 'pid': 424242, 'pgid': 424242, 'exit': 0,
+                    'stopped': True, 'session': None}
+        cases = {
+            'starting without pid': ({'state': 'starting', 'pid': None,
+                                      'pgid': None, 'exit': None,
+                                      'timeout': False, 'stopped': None},
+                                     'verifier 1 is starting without a '
+                                     'recorded pid'),
+            'running without pid': ({'state': 'running', 'pid': None,
+                                     'pgid': None, 'exit': None,
+                                     'timeout': False, 'stopped': None},
+                                    'verifier 1 is running without a '
+                                    'recorded pid'),
+            'ended without pid': ({'state': 'ended', 'pid': None,
+                                   'pgid': None, 'exit': 0, 'timeout': False,
+                                   'stopped': True},
+                                  'verifier 1 is ended without a recorded pid'),
+            'unrecorded without pid and unproven': (
+                {'state': 'unrecorded', 'pid': None, 'pgid': None, 'exit': None,
+                 'timeout': False, 'stopped': False},
+                'verifier 1 is unrecorded without a recorded pid'),
+            'unrecorded without pid but claimed stopped': (
+                {'state': 'unrecorded', 'pid': None, 'pgid': None, 'exit': None,
+                 'timeout': False, 'stopped': True},
+                'verifier 1 is unrecorded without a recorded pid'),
+        }
+        for label, (entry, needle) in cases.items():
+            with self.subTest(label):
+                attempt = self._attempt(executor=dict(executor),
+                                        verifiers=[dict(entry)])
+                problems = self._problems(self._record([attempt]))
+                self.assertTrue(any(needle in problem for problem in problems),
+                                (label, problems))
+        safe = self._attempt(executor=dict(executor), verifiers=[{
+            'state': 'spawn_failed', 'pid': None, 'pgid': None, 'exit': None,
+            'timeout': False, 'stopped': None}])
+        self.assertEqual(self._problems(self._record([safe])), [])
+
+    # -- R-F2 / R-F3: spawn window and stop proofs without identity --------
+    def test_rf2_rf3_spawn_window_and_unidentified_stop_proofs(self):
+        base = {'index': 1, 'task': 'T1', 'trigger': 'fresh',
+                'started_at': '2026-11-20T00:00:00+00:00',
+                'ended_at': '2026-11-20T00:00:01+00:00', 'result': 'failed',
+                'error': None, 'verifiers': []}
+
+        def attempt(state, executor):
+            return dict(base, id='attempt-' + 'a' * 32, state=state,
+                        executor=executor)
+
+        spawning = attempt('STARTED', {
+            'state': 'spawning', 'pid': None, 'pgid': None, 'token': None,
+            'exit': None, 'stopped': None, 'session': None})
+        problems = self._problems(self._record([spawning], attempts=1))
+        self.assertTrue(any('executor is spawning without a recorded pid'
+                            in problem for problem in problems), problems)
+        unrecorded = attempt('ENDED', {
+            'state': 'unrecorded', 'pid': None, 'pgid': None, 'token': None,
+            'exit': None, 'stopped': True, 'session': None})
+        problems = self._problems(self._record([unrecorded]))
+        self.assertTrue(any('executor is unrecorded without a recorded pid'
+                            in problem for problem in problems), problems)
+        no_identity = attempt('ENDED', {
+            'state': 'ended', 'pid': 301, 'pgid': None, 'token': None,
+            'exit': 0, 'stopped': True, 'session': None})
+        problems = self._problems(self._record([no_identity]),
+                                  {301: 'stopped'})
+        self.assertTrue(any('without an identity to check' in problem
+                            for problem in problems), problems)
+        identified = attempt('ENDED', {
+            'state': 'ended', 'pid': 301, 'pgid': 301, 'token': None,
+            'exit': 0, 'stopped': True, 'session': None})
+        self.assertEqual(self._problems(self._record([identified]),
+                                        {301: 'stopped'}), [])
+
+    # -- R-F4: a missing attempt count is not "zero attempts" --------------
+    def test_rf4_missing_attempt_count_is_not_zero(self):
+        cases = {
+            'both fields missing': ({'status': 'FAILED'}, 'cannot be proven'),
+            'attempts is None': ({'status': 'FAILED', 'attempts': None,
+                                  'attempt_history': []}, 'cannot be proven'),
+            'attempts is a bool': ({'status': 'FAILED', 'attempts': True,
+                                    'attempt_history': []}, 'cannot be proven'),
+        }
+        for label, (record, needle) in cases.items():
+            with self.subTest(label):
+                problems = self._problems(record)
+                self.assertTrue(any(needle in problem for problem in problems),
+                                (label, problems))
+        evidence = {'status': 'FAILED', 'attempts': 0, 'attempt_history': [],
+                    'head': 'a' * 40}
+        problems = self._problems(evidence)
+        self.assertTrue(any('attempts is 0 but the record has head' in problem
+                            for problem in problems), problems)
+        clean = {'status': 'PENDING', 'attempts': 0, 'attempt_history': []}
+        self.assertEqual(self._problems(clean), [])
+
+    # -- R-F8: an unhashable id must be reported, not crash ----------------
+    def test_rf8_unhashable_attempt_id_is_reported(self):
+        for ident in ([1, 2], {'x': 1}):
+            with self.subTest(ident=ident):
+                attempt = self._attempt()
+                attempt['id'] = ident
+                problems = self._problems(self._record([attempt]))
+                self.assertTrue(any('no readable id' in problem
+                                    for problem in problems), problems)
+
+    # -- R-F2: an identity failure after spawn terminates the child ---------
+    def test_rf2_identity_failure_kills_the_spawned_executor(self):
+        argv = json.dumps([PY, '-c', 'import time; time.sleep(2)'])
+        work = self.root / 'spawn-work'
+        work.mkdir()
+        with mock.patch.dict(os.environ, {'BATCH_OPENCODE': argv}):
+            with mock.patch.object(delivery, '_process_token',
+                                   side_effect=RuntimeError('token boom')):
+                result = delivery._agent(work, 'prompt', None, 30)
+        self.assertIn('token boom', result.get('record_failed', ''))
+        self.assertIsInstance(result.get('pid'), int)
+        self.assertEqual(
+            delivery._prove_child_stopped(result['pid'], result.get('pgid'),
+                                          None, grace=5.0),
+            'stopped')
+
+    # -- M15: unreadable or inconsistent history ---------------------------
+    def test_m15_corrupt_history_fails_closed(self):
+        good = self._attempt()
+        duplicate = self._attempt(index=2, ident=good['id'])
+        cases = {
+            'not a list': ({'status': 'FAILED', 'attempts': 1,
+                            'attempt_history': 'x'}, 'not a list'),
+            'count mismatch': (self._record([good], attempts=2),
+                               'does not match'),
+            'duplicate id': (self._record([good, duplicate]), 'used twice'),
+            'invalid pid': (self._record([self._attempt(executor={
+                'state': 'ended', 'pid': 'x', 'pgid': None, 'exit': 0,
+                'stopped': True, 'session': None})]), 'pid is invalid'),
+            'unknown state': (self._record([dict(good, state='BOGUS')]),
+                              'unknown state'),
+            'unknown result': (self._record([dict(good, result='BOGUS')]),
+                               'unknown result'),
+        }
+        for label, (record, needle) in cases.items():
+            with self.subTest(label):
+                problems = self._problems(record)
+                self.assertTrue(any(needle in problem for problem in problems),
+                                (label, problems))
+
+    # -- M16a / M16b / F1: dead, reused or still-live pids -----------------
+    def test_m16a_dead_pid_proof_is_platform_specific(self):
+        child = subprocess.Popen([PY, '-c', 'pass'], start_new_session=True)
+        child.wait()
+        attempt = self._attempt(executor={
+            'state': 'ended', 'pid': child.pid,
+            'pgid': child.pid if os.name == 'posix' else None, 'token': 42,
+            'exit': 0, 'stopped': True, 'session': None})
+        problems = delivery._attempt_problems(self._record([attempt]))
+        if os.name == 'nt':
+            # Owner decision A: a gone Windows root is unproven, even with a
+            # recorded proof, until a Job Object (HD-2 B) exists. The exact
+            # message depends on whether the pid was reused, but reuse is
+            # always refused.
+            self.assertTrue(problems)
+        else:
+            self.assertEqual(problems, [])
+
+    def test_f1_reused_windows_pid_still_proves_the_descendants(self):
+        with mock.patch.object(delivery, '_windows_creation_time',
+                               return_value=('live', 999)):
+            for parents in ({500: 400, 501: 500}, {500: 400, 502: 401},
+                            {601: 600}, None):
+                with self.subTest(parents=parents):
+                    with mock.patch.object(delivery, '_windows_parent_map',
+                                           return_value=parents):
+                        # A reused pid's children belong to another process, and
+                        # orphaned grandchildren are not attributable here.
+                        self.assertEqual(
+                            delivery._windows_process_state(500, token=42),
+                            'unknown')
+        with mock.patch.object(delivery, '_windows_creation_time',
+                               return_value=('gone', None)):
+            with mock.patch.object(delivery, '_windows_parent_map',
+                                   return_value={500: 400, 501: 500}):
+                self.assertEqual(
+                    delivery._windows_process_state(500, token=42), 'running')
+            with mock.patch.object(delivery, '_windows_parent_map',
+                                   return_value={601: 600}):
+                self.assertEqual(
+                    delivery._windows_process_state(500, token=42), 'unknown')
+        with mock.patch.object(delivery, '_windows_creation_time',
+                               return_value=('live', 42)):
+            self.assertEqual(
+                delivery._windows_process_state(500, token=42), 'running')
+
+    def test_f1_reused_child_creation_time_is_not_attributed(self):
+        parents = {500: 400, 501: 500}
+        with mock.patch.object(delivery, '_windows_creation_time',
+                               return_value=('live', 1000)):
+            self.assertFalse(
+                delivery._windows_children_before(parents, 500, 999))
+        with mock.patch.object(delivery, '_windows_creation_time',
+                               return_value=('live', 500)):
+            self.assertTrue(
+                delivery._windows_children_before(parents, 500, 999))
+        with mock.patch.object(delivery, '_windows_creation_time',
+                               return_value=('unknown', None)):
+            self.assertIsNone(
+                delivery._windows_children_before(parents, 500, 999))
+
+    def test_completion_ignores_children_created_after_the_exit(self):
+        parents = {500: 400, 501: 500}
+
+        def created_after(pid):
+            return ('gone', None) if pid == 500 else ('live', 2000)
+
+        with mock.patch.object(delivery, '_IS_WINDOWS', True), \
+                mock.patch.object(delivery, '_windows_parent_map',
+                                  return_value=parents), \
+                mock.patch.object(delivery, '_windows_creation_time',
+                                  side_effect=created_after):
+            self.assertEqual(
+                delivery._prove_child_stopped(500, None, 42, exit_ticks=1000,
+                                              grace=0.05),
+                'stopped')
+
+        def created_before(pid):
+            return ('gone', None) if pid == 500 else ('live', 500)
+
+        with mock.patch.object(delivery, '_IS_WINDOWS', True), \
+                mock.patch.object(delivery, '_windows_parent_map',
+                                  return_value=parents), \
+                mock.patch.object(delivery, '_windows_creation_time',
+                                  side_effect=created_before):
+            self.assertEqual(
+                delivery._prove_child_stopped(500, None, 42, exit_ticks=1000,
+                                              grace=0.05),
+                'running')
+
+    def test_m16b_live_recorded_group_blocks_reuse(self):
+        attempt = self._attempt(executor={
+            'state': 'ended', 'pid': os.getpid(), 'pgid': None, 'exit': 0,
+            'stopped': None, 'session': None})
+        problems = delivery._attempt_problems(self._record([attempt]))
+        self.assertTrue(any('still running' in problem for problem in problems),
+                        problems)
+
+    # -- M17: retry recreates a removed worktree ---------------------------
+    def test_m17_retry_recreates_a_missing_worktree(self):
+        script = self.root / 'verify_t1.py'
+        script.write_text(
+            'import os, sys\n'
+            'raise SystemExit(1 if os.environ.get("FAIL_T1") == "1" else 0)\n')
+        plan = self.plan([self.task('T1', 'a.txt', verify=[[PY, str(script)]])])
+        self.assertEqual(self._fail_t1(plan).returncode, 1)
+        _git(self.repo, 'worktree', 'remove', '--force',
+             str(self.root / 'wt-t1'))
+        self.assertFalse((self.root / 'wt-t1').exists())
+        retry = self.cli('run', '--plan', str(self.write_plan(plan)),
+                         '--journal', str(self.journal), '--execute',
+                         '--retry', 'T1')
+        record = self.journal_data()['tasks']['T1']
+        if os.name == 'nt':
+            # Owner decision A: no Windows retry before a Job Object (HD-2 B).
+            self.assertEqual(retry.returncode, 1, retry.stderr)
+            self.assertFalse((self.root / 'wt-t1').exists())
+            self.assertEqual(record['attempts'], 1)
+            self.assertEqual(record['status'], 'FAILED')
+            self.assertIn('retry_blocked', record)
+            return
+        self.assertEqual(retry.returncode, 0, retry.stderr + retry.stdout)
+        self.assertTrue((self.root / 'wt-t1').is_dir())
+        self.assertEqual(record['attempts'], 2)
+        self.assertEqual(record['status'], 'INTEGRATED')
+
+    # -- M18: the attempt must be persisted before the process starts ------
+    def test_m18_persistence_failure_stops_before_spawn(self):
+        journal = self.root / 'persist.json'
+        record = delivery._task_record(
+            {'id': 'T1', 'branch': 'task/persist',
+             'worktree': str(self.root / 'wt-persist')}, 'builder')
+        journal.write_text(json.dumps({'tasks': {'T1': record}}))
+        before = journal.read_bytes()
+
+        def broken_save():
+            delivery._atomic_json(journal, {'tasks': {'T1': record}})
+
+        with mock.patch.object(delivery, '_atomic_json',
+                               side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                delivery._start_attempt(record, {'id': 'T1'}, 'fresh',
+                                        broken_save)
+        # The disk journal is untouched and _start_attempt never returned an
+        # attempt, so the caller cannot reach _prepare_task_worktree/_agent.
+        self.assertEqual(journal.read_bytes(), before)
+        persisted = json.loads(journal.read_text(encoding='utf-8'))['tasks']['T1']
+        self.assertEqual(persisted['attempts'], 0)
+        self.assertEqual(persisted['attempt_history'], [])
+
+    # -- AC-2 end to end: retry and resume check the recorded processes ----
+    def test_retry_refuses_when_the_recorded_executor_is_alive(self):
+        script = self.root / 'verify_t1.py'
+        script.write_text(
+            'import os, sys\n'
+            'raise SystemExit(1 if os.environ.get("FAIL_T1") == "1" else 0)\n')
+        plan = self.plan([self.task('T1', 'a.txt', verify=[[PY, str(script)]])])
+        self.assertEqual(self._fail_t1(plan).returncode, 1)
+        state = self.journal_data()
+        state['tasks']['T1']['attempt_history'][0]['executor'].update(
+            pid=os.getpid(), pgid=None, token=None, stopped=None)
+        self.journal.write_text(json.dumps(state))
+        before = len(self.opencode_calls())
+        retry = self.cli('run', '--plan', str(self.write_plan(plan)),
+                         '--journal', str(self.journal), '--execute',
+                         '--retry', 'T1')
+        self.assertEqual(retry.returncode, 1, retry.stderr)
+        self.assertIn('cannot reuse', retry.stderr)
+        self.assertEqual(len(self.opencode_calls()), before)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['attempts'], 1)
+        self.assertEqual(record['status'], 'FAILED')
+        self.assertIn('retry_blocked', record)
+
+    def test_resume_refuses_when_the_recorded_verifier_is_alive(self):
+        script = self.root / 'verify_t1.py'
+        script.write_text(
+            'import os, sys\n'
+            'raise SystemExit(1 if os.environ.get("FAIL_T1") == "1" else 0)\n')
+        plan = self.plan([self.task('T1', 'a.txt', verify=[[PY, str(script)]])])
+        self.assertEqual(self._fail_t1(plan).returncode, 1)
+        state = self.journal_data()
+        record = state['tasks']['T1']
+        record['attempt_history'][0]['verifiers'] = [{
+            'state': 'ended', 'pid': os.getpid(), 'pgid': None, 'exit': 0,
+            'stopped': None}]
+        record.update(status='RUNNING', head=None, error=None)
+        self.journal.write_text(json.dumps(state))
+        before = len(self.opencode_calls())
+        resumed = self.cli('run', '--plan', str(self.write_plan(plan)),
+                           '--journal', str(self.journal), '--execute',
+                           '--resume')
+        self.assertEqual(resumed.returncode, 1, resumed.stderr)
+        self.assertEqual(len(self.opencode_calls()), before)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIn('cannot reuse', record['error'])
+        self.assertEqual(record['attempts'], 1)
+
+    def test_retry_refuses_when_the_recorded_verifier_is_alive(self):
+        script = self.root / 'verify_t1.py'
+        script.write_text(
+            'import os, sys\n'
+            'raise SystemExit(1 if os.environ.get("FAIL_T1") == "1" else 0)\n')
+        plan = self.plan([self.task('T1', 'a.txt', verify=[[PY, str(script)]])])
+        self.assertEqual(self._fail_t1(plan).returncode, 1)
+        state = self.journal_data()
+        state['tasks']['T1']['attempt_history'][0]['verifiers'] = [{
+            'state': 'ended', 'pid': os.getpid(), 'pgid': None, 'exit': 0,
+            'stopped': None}]
+        self.journal.write_text(json.dumps(state))
+        before = len(self.opencode_calls())
+        retry = self.cli('run', '--plan', str(self.write_plan(plan)),
+                         '--journal', str(self.journal), '--execute',
+                         '--retry', 'T1')
+        self.assertEqual(retry.returncode, 1, retry.stderr)
+        self.assertIn('cannot reuse', retry.stderr)
+        self.assertEqual(len(self.opencode_calls()), before)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['status'], 'FAILED')
+        self.assertEqual(record['attempts'], 1)
+        self.assertIn('retry_blocked', record)
 
 
 if __name__ == '__main__':
