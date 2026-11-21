@@ -1486,7 +1486,13 @@ def _attempt_problems(record, ignore=()):
                 problems.append(f'attempt #{position} {role} process group is '
                                 f'still running (pid {pid})')
             elif liveness == 'unknown' and not (
-                    state == 'ENDED' and stopped is True and token is not None):
+                    # The recorded post-exit proof stands only where the group
+                    # probe is authoritative. On Windows the owner selected
+                    # "no reuse until a Job Object (HD-2 B) proves the tree",
+                    # so an unknown liveness always blocks there.
+                    not _IS_WINDOWS
+                    and state == 'ENDED' and stopped is True
+                    and token is not None):
                 # A recorded post-exit proof with an identity token stands: the
                 # recorded process already exited, so an unreadable pid now is
                 # a reused or inaccessible process, not evidence of survival.

@@ -1071,8 +1071,16 @@ class GitHubBatchTests(BatchCase):
         self.assertEqual(state['tasks']['T2']['status'], 'SKIPPED')
         second = self.cli('run', '--plan', str(self.write_plan(plan)), '--journal',
                           str(self.journal), '--execute', '--retry', 'T1')
-        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         state = self.journal_data()
+        if os.name == 'nt':
+            # Owner decision A: no Windows reuse before a Job Object (HD-2 B).
+            self.assertEqual(second.returncode, 1, second.stderr)
+            self.assertEqual(state['tasks']['T1']['status'], 'FAILED')
+            self.assertEqual(state['tasks']['T1']['attempts'], 1)
+            self.assertIn('retry_blocked', state['tasks']['T1'])
+            self.assertEqual(state['tasks']['T2']['status'], 'SKIPPED')
+            return
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         self.assertEqual(state['tasks']['T1']['status'], 'INTEGRATED')
         self.assertEqual(state['tasks']['T2']['status'], 'INTEGRATED')
         self.assertEqual(state['tasks']['T2']['base'],
@@ -2006,8 +2014,16 @@ class LocalBatchTests(BatchCase):
             if json.loads(line) == ['task', 'dispatch', 'T1'])
         second = self.cli('run', '--plan', str(self.write_plan(plan)), '--journal',
                           str(self.journal), '--execute', '--retry', 'T1')
-        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         state = self.journal_data()
+        if os.name == 'nt':
+            # Owner decision A: Windows reuse waits for a Job Object (HD-2 B).
+            self.assertEqual(second.returncode, 1, second.stderr)
+            self.assertEqual(state['tasks']['T1']['status'], 'FAILED')
+            self.assertEqual(state['tasks']['T1']['attempts'], 1)
+            self.assertIn('retry_blocked', state['tasks']['T1'])
+            self.assertEqual(state['tasks']['T2']['status'], 'SKIPPED')
+            return
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         self.assertEqual(state['tasks']['T1']['status'], 'INTEGRATED')
         self.assertEqual(state['tasks']['T2']['status'], 'INTEGRATED')
         self.assertEqual(sum(
@@ -2031,8 +2047,15 @@ class LocalBatchTests(BatchCase):
         self.journal.write_text(json.dumps(state))
         second = self.cli('run', '--plan', str(self.write_plan(plan)), '--journal',
                           str(self.journal), '--execute', '--resume')
-        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         state = self.journal_data()
+        if os.name == 'nt':
+            # Owner decision A: an unknown liveness blocks Windows resume.
+            self.assertEqual(second.returncode, 1, second.stderr)
+            self.assertEqual(state['tasks']['T1']['status'], 'BLOCKED')
+            self.assertEqual(state['tasks']['T1']['attempts'], 1)
+            self.assertIn('cannot reuse', state['tasks']['T1']['error'])
+            return
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         self.assertEqual(state['tasks']['T1']['status'], 'INTEGRATED')
         self.assertEqual(sum(
             1 for line in self.orch_log.read_text().splitlines()
@@ -2215,8 +2238,17 @@ class ExecutorLifecycleTests(BatchCase):
         second = self.cli('run', '--plan', str(self.write_plan(plan)),
                           '--journal', str(self.journal), '--execute',
                           '--retry', 'T1')
-        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         record = self.journal_data()['tasks']['T1']
+        if os.name == 'nt':
+            # Owner decision A: no Windows retry before a Job Object (HD-2 B).
+            self.assertEqual(second.returncode, 1, second.stderr)
+            self.assertEqual(record['attempts'], 1)
+            self.assertEqual(record['attempt_history'][0]['id'], old_id)
+            self.assertEqual(json.dumps(record['attempt_history'][0],
+                                        sort_keys=True), snapshot)
+            self.assertIn('retry_blocked', record)
+            return
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         self.assertEqual(record['attempts'], 2)
         history = record['attempt_history']
         self.assertEqual(len(history), 2)
@@ -2225,6 +2257,23 @@ class ExecutorLifecycleTests(BatchCase):
         self.assertNotEqual(history[0]['id'], history[1]['id'])
         self.assertEqual(history[0]['id'], old_id)
         self.assertEqual(json.dumps(history[0], sort_keys=True), snapshot)
+
+    def test_attempt_history_append_is_additive(self):
+        record = delivery._task_record(
+            {'id': 'T1', 'branch': 'task/append',
+             'worktree': str(self.root / 'wt-append')}, 'builder')
+        saves = []
+        first = delivery._start_attempt(record, {'id': 'T1'}, 'fresh',
+                                        lambda: saves.append('first'))
+        snapshot = json.dumps(first, sort_keys=True)
+        second = delivery._start_attempt(record, {'id': 'T1'}, 'retry',
+                                         lambda: saves.append('second'))
+        self.assertEqual(record['attempts'], 2)
+        self.assertEqual(len(record['attempt_history']), 2)
+        self.assertNotEqual(first['id'], second['id'])
+        self.assertEqual(json.dumps(record['attempt_history'][0],
+                                    sort_keys=True), snapshot)
+        self.assertEqual(saves, ['first', 'second'])
 
     # -- M20: every verifier has its own pid/pgid record -------------------
     def test_m20_each_verifier_is_recorded_with_its_own_pid(self):
@@ -2277,6 +2326,12 @@ class ExecutorLifecycleTests(BatchCase):
         self.assertEqual(len(self.opencode_calls()), before)
         record = self.journal_data()['tasks']['T1']
         self.assertEqual(record['status'], 'FAILED')
+        if os.name == 'nt':
+            # Owner decision A: the reuse guard blocks before the dirty
+            # worktree is inspected; no new attempt is appended.
+            self.assertEqual(record['attempts'], 1)
+            self.assertIn('retry_blocked', record)
+            return
         self.assertIn('not clean', record['error'])
         self.assertEqual(record['attempts'], 2)
         self.assertEqual(record['attempt_history'][1]['result'], 'failed')
@@ -2410,7 +2465,10 @@ class ExecutorLifecycleTests(BatchCase):
                 [self._attempt(executor={
                     'state': 'ended', 'pid': 105, 'pgid': 105, 'token': 42,
                     'exit': 0, 'stopped': True, 'session': None})],
-                {105: 'unknown'}, None),
+                {105: 'unknown'},
+                # Owner decision A: Windows never lets the recorded proof
+                # override an unknown liveness; POSIX keeps the exemption.
+                'cannot be proven' if os.name == 'nt' else None),
         }
         for label, (history, states, needle) in cases.items():
             with self.subTest(label):
@@ -2431,6 +2489,24 @@ class ExecutorLifecycleTests(BatchCase):
                 self.assertEqual(caught.exception.status, 'BLOCKED')
                 self.assertTrue(caught.exception.halt)
                 self.assertIn('not proven stopped', str(caught.exception))
+
+    # -- Owner decision A: Windows never trusts an unknown after a proof ----
+    def test_owner_a_windows_unknown_beats_the_recorded_proof(self):
+        attempt = self._attempt(executor={
+            'state': 'ended', 'pid': 301, 'pgid': 301, 'token': 42,
+            'exit': 0, 'stopped': True, 'session': None})
+
+        def probe(pid, pgid, token=None, grace=0.0):
+            return 'unknown'
+
+        with mock.patch.object(delivery, '_proven_process_state', probe):
+            with mock.patch.object(delivery, '_IS_WINDOWS', True):
+                windows = delivery._attempt_problems(self._record([attempt]))
+            with mock.patch.object(delivery, '_IS_WINDOWS', False):
+                posix = delivery._attempt_problems(self._record([attempt]))
+        self.assertTrue(any('cannot be proven' in problem
+                            for problem in windows), windows)
+        self.assertEqual(posix, [])
 
     # -- M14: an unfinished attempt without a pid --------------------------
     def test_m14_unfinished_attempt_without_pid_fails_closed(self):
@@ -2598,14 +2674,22 @@ class ExecutorLifecycleTests(BatchCase):
                                 (label, problems))
 
     # -- M16a / M16b / F1: dead, reused or still-live pids -----------------
-    def test_m16a_dead_pid_with_no_surviving_descendants_is_stopped(self):
+    def test_m16a_dead_pid_proof_is_platform_specific(self):
         child = subprocess.Popen([PY, '-c', 'pass'], start_new_session=True)
         child.wait()
         attempt = self._attempt(executor={
             'state': 'ended', 'pid': child.pid,
             'pgid': child.pid if os.name == 'posix' else None, 'token': 42,
             'exit': 0, 'stopped': True, 'session': None})
-        self.assertEqual(delivery._attempt_problems(self._record([attempt])), [])
+        problems = delivery._attempt_problems(self._record([attempt]))
+        if os.name == 'nt':
+            # Owner decision A: a gone Windows root is unproven, even with a
+            # recorded proof, until a Job Object (HD-2 B) exists. The exact
+            # message depends on whether the pid was reused, but reuse is
+            # always refused.
+            self.assertTrue(problems)
+        else:
+            self.assertEqual(problems, [])
 
     def test_f1_reused_windows_pid_still_proves_the_descendants(self):
         with mock.patch.object(delivery, '_windows_creation_time',
@@ -2701,9 +2785,17 @@ class ExecutorLifecycleTests(BatchCase):
         retry = self.cli('run', '--plan', str(self.write_plan(plan)),
                          '--journal', str(self.journal), '--execute',
                          '--retry', 'T1')
+        record = self.journal_data()['tasks']['T1']
+        if os.name == 'nt':
+            # Owner decision A: no Windows retry before a Job Object (HD-2 B).
+            self.assertEqual(retry.returncode, 1, retry.stderr)
+            self.assertFalse((self.root / 'wt-t1').exists())
+            self.assertEqual(record['attempts'], 1)
+            self.assertEqual(record['status'], 'FAILED')
+            self.assertIn('retry_blocked', record)
+            return
         self.assertEqual(retry.returncode, 0, retry.stderr + retry.stdout)
         self.assertTrue((self.root / 'wt-t1').is_dir())
-        record = self.journal_data()['tasks']['T1']
         self.assertEqual(record['attempts'], 2)
         self.assertEqual(record['status'], 'INTEGRATED')
 
