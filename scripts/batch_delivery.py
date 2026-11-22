@@ -75,7 +75,7 @@ TERMINAL_BAD = ('FAILED', 'BLOCKED', 'SKIPPED')
 INTEGRATED = ('INTEGRATED', 'VERIFIED')
 ATTEMPT_STATES = ('STARTED', 'ENDED')
 ATTEMPT_RESULTS = ('ok', 'failed', 'timeout', 'unproven_stop', 'spawn_failed',
-                   'interrupted', 'error')
+                   'interrupted', 'error', 'adapter_rejected')
 EXECUTOR_STATES = ('pending', 'spawning', 'running', 'ended', 'spawn_failed',
                    'unrecorded')
 VERIFIER_STATES = ('starting', 'running', 'ended', 'spawn_failed', 'unrecorded')
@@ -107,6 +107,30 @@ EDITION_RE = re.compile(
     r'(?=[ \t:：]|$)(?P<rest>[^\n]*)$', re.M)
 VERDICT_KEYS = {'verdict', 'base', 'head', 'diff_sha256', 'risk', 'tasks',
                 'findings'}
+# ------------------------------------------------------------------ adapters
+# A plan may select one executor adapter. ``command`` means this tool spawns a
+# child process; ``attached`` means the host (Master) spawns the real agent and
+# hands the result back through the explicit ``attach`` command.
+TRANSPORTS = ('command', 'attached')
+HOST_TERMINALS = ('success', 'failure', 'cancelled', 'unknown')
+ADAPTER_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
+EXECUTION_REQUEST_SCHEMA = 'batch-execution-request/1'
+EXECUTION_RESULT_SCHEMA = 'batch-execution-result/1'
+REVIEW_REQUEST_SCHEMA = 'batch-review-request/1'
+REVIEW_RESULT_SCHEMA = 'batch-review-result/1'
+ATTACHED_EXIT = 3
+LEGACY_ADAPTER = {'transport': 'command', 'name': 'opencode', 'command': None,
+                  'source': 'legacy-default'}
+MAX_RESULT_BYTES = 8 * 1024 * 1024
+EXECUTION_RESULT_KEYS = {
+    'schema', 'kind', 'request_sha256', 'batch_id', 'task_id', 'session_id',
+    'executor_agent', 'workdir', 'terminal', 'exit_code', 'report',
+    'artifacts', 'head', 'diff', 'ended_at'}
+REVIEW_RESULT_KEYS = {
+    'schema', 'kind', 'request_sha256', 'batch_id', 'session_id',
+    'reviewer_agent', 'workdir', 'edit_denied', 'declared_executor_sessions',
+    'base', 'head', 'diff_sha256', 'risk', 'verdict', 'tasks', 'findings',
+    'report', 'ended_at'}
 
 
 class InputError(Exception):
@@ -132,6 +156,15 @@ class BatchError(Exception):
     @property
     def record_status(self):
         return self.status if self.status in STATUSES else 'BLOCKED'
+
+
+class AttachedPending(Exception):
+    """A host request is on disk; the CLI exits 3 and waits for ``attach``."""
+
+    def __init__(self, path, kind):
+        self.path = str(path)
+        self.kind = kind
+        super().__init__(f'{kind} request waiting for the host: {self.path}')
 
 
 # --------------------------------------------------------------------------- git
@@ -439,6 +472,165 @@ def _parse_argv_list(value, what):
     return list(value)
 
 
+def _adapter_capabilities(raw, what):
+    """Consume the existing C1-C4 conclusions; never re-probe them here."""
+    caps = raw.get('capabilities')
+    if not isinstance(caps, dict):
+        raise InputError(f'{what}.capabilities is required for an explicitly '
+                         'selected adapter')
+    for name in ('C1', 'C2', 'C3', 'C4'):
+        if caps.get(name) != 'PASS':
+            raise InputError(f'{what}.capabilities.{name} must be PASS; an '
+                             'adapter is not usable without every C1-C4 result')
+    evidence = raw.get('capability_evidence')
+    if not isinstance(evidence, str) or not evidence.strip():
+        raise InputError(f'{what}.capability_evidence is required: name where '
+                         'the C1-C4 probe result can be located')
+    return {name: 'PASS' for name in ('C1', 'C2', 'C3', 'C4')}
+
+
+def _parse_adapter(raw):
+    """Normalize ``plan.executor_adapter``; absence keeps the old default.
+
+    The legacy default is deliberately *not* a capability claim: it is the
+    pre-existing ``opencode run`` path and is recorded as such in the journal.
+    """
+    if raw is None:
+        return dict(LEGACY_ADAPTER)
+    what = 'executor_adapter'
+    if not isinstance(raw, dict):
+        raise InputError(f'{what} must be an object')
+    unknown = set(raw) - {'transport', 'name', 'command', 'capabilities',
+                          'capability_evidence'}
+    if unknown:
+        raise InputError(f'{what} has unknown field(s): '
+                         f'{", ".join(sorted(unknown))}')
+    transport = raw.get('transport')
+    if transport not in TRANSPORTS:
+        raise InputError(f'{what}.transport must be one of {TRANSPORTS}')
+    name = raw.get('name')
+    if not isinstance(name, str) or not ADAPTER_NAME_RE.match(name):
+        raise InputError(f'{what}.name is not a valid adapter identifier: '
+                         f'{name!r}')
+    command = raw.get('command')
+    if transport == 'command':
+        if name == 'opencode':
+            if command is not None:
+                raise InputError(f'{what}.command is not allowed for the built-in '
+                                 'opencode adapter; BATCH_OPENCODE is its argv '
+                                 'override')
+            argv = None
+        else:
+            argv = _parse_argv_list(command, f'{what}.command')
+    else:
+        if command is not None:
+            raise InputError(f'{what}.command is only meaningful for the command '
+                             'transport')
+        if name == 'opencode':
+            raise InputError('opencode is a command adapter; it cannot be used '
+                             'with the attached transport')
+        argv = None
+    capabilities = _adapter_capabilities(raw, what)
+    evidence = raw['capability_evidence'].strip()
+    return {'transport': transport, 'name': name, 'command': argv,
+            'source': 'plan', 'capabilities': capabilities,
+            'capability_evidence': evidence}
+
+
+def _adapter_identity(adapter):
+    keys = ('transport', 'name', 'command', 'source', 'capabilities',
+            'capability_evidence')
+    return {key: adapter.get(key) for key in keys if adapter.get(key) is not None}
+
+
+def _adapter_transport(plan):
+    return plan['adapter']['transport']
+
+
+def _adapter_is_opencode(adapter):
+    return adapter.get('transport') == 'command' and adapter.get('name') == 'opencode'
+
+
+def _strict_pairs(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f'duplicate key {key!r}')
+        out[key] = value
+    return out
+
+
+def _read_strict_json(path, what, limit=MAX_RESULT_BYTES):
+    path = Path(path)
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise BatchError(f'cannot read the {what} {path}: {exc}',
+                         status='BLOCKED') from None
+    if len(raw) > limit:
+        raise BatchError(f'the {what} is larger than {limit} bytes',
+                         status='BLOCKED')
+    try:
+        data = json.loads(raw.decode('utf-8'), object_pairs_hook=_strict_pairs)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise BatchError(f'the {what} is not readable strict JSON: {exc}',
+                         status='BLOCKED') from None
+    if not isinstance(data, dict):
+        raise BatchError(f'the {what} must be a JSON object', status='BLOCKED')
+    return data, raw
+
+
+def _require_result_keys(data, allowed, what):
+    required = allowed - {'ended_at', 'report'}
+    missing = required - set(data)
+    if missing:
+        raise BatchError(f'the {what} is missing {", ".join(sorted(missing))}',
+                         status='BLOCKED')
+    unknown = set(data) - allowed
+    if unknown:
+        raise BatchError(f'the {what} has unknown field(s): '
+                         f'{", ".join(sorted(unknown))}', status='BLOCKED')
+
+
+def _require_text(data, key, what):
+    value = data.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise BatchError(f'the {what}.{key} must be a nonempty string',
+                         status='BLOCKED')
+    return value
+
+
+def _require_int(data, key, what):
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise BatchError(f'the {what}.{key} must be an integer', status='BLOCKED')
+    return value
+
+
+def _require_sha(data, key, what):
+    value = data.get(key)
+    if not isinstance(value, str) or not SHA_RE.match(value):
+        raise BatchError(f'the {what}.{key} must be a commit SHA', status='BLOCKED')
+    return value
+
+
+def _safe_adapter_file(value, plan, what):
+    """A request/result file must stay outside the repository and worktrees."""
+    if not isinstance(value, str) or not value:
+        raise InputError(f'the {what} path is required')
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise InputError(f'the {what} path must be absolute: {value!r}')
+    path = path.resolve()
+    roots = [plan['batch']['repo'], plan['batch']['worktree']]
+    roots += [task['worktree'] for task in plan['tasks']]
+    for root in roots:
+        if _is_within(path, root):
+            raise InputError(f'the {what} must be outside the repository and '
+                             f'every worktree; {path} is inside {root}')
+    return path
+
+
 def _parse_commands(value, what):
     if not isinstance(value, list) or not value:
         raise InputError(f'{what} must be a nonempty list of argv lists')
@@ -617,6 +809,7 @@ def validate_plan(raw, repo_override=None):
     reviewer = _required_string(raw, 'reviewer_agent', 'plan')
     if executor == reviewer:
         raise InputError('the reviewer agent must differ from the executor agent')
+    adapter = _parse_adapter(raw.get('executor_adapter'))
     config = project_config(repo)
     _require_edition(config)
     tasks_raw = raw.get('tasks')
@@ -701,6 +894,7 @@ def validate_plan(raw, repo_override=None):
                       'worktree': worktree, 'issue': issue,
                       'issue_repo': issue_repo},
             'executor_agent': executor, 'reviewer_agent': reviewer,
+            'adapter': adapter,
             'tasks': tasks, 'config': config,
             'edition': config['edition'],
             'project_paths': 'known' if config['allowed'] is not None else 'unknown',
@@ -867,6 +1061,7 @@ def _new_journal(plan, base_sha):
         'carrier': None, 'error': None, 'decision': None,
         'project_paths': plan['project_paths'],
         'project_verification': plan.get('project_verification'),
+        'adapter': _adapter_identity(plan['adapter']),
     }
 
 
@@ -885,6 +1080,17 @@ def _check_journal_plan(state, plan):
             'docs/PROJECT.md changed after the journal was written; the project '
             'path/edition binding is stale. Reconcile the plan and start a new '
             'batch rather than reusing this journal')
+    wanted = _adapter_identity(plan['adapter'])
+    stored = state.get('adapter')
+    if stored is None:
+        # Journals written before the adapter existed are the legacy opencode
+        # path; record that fact instead of guessing another product.
+        state['adapter'] = wanted
+    elif stored != wanted:
+        raise InputError(
+            'the journal was written for a different executor adapter; an '
+            'adapter cannot change in the middle of a batch. Start a new batch '
+            'or restore the recorded adapter')
 
 
 def _task_record(spec, executor_agent):
@@ -892,7 +1098,8 @@ def _task_record(spec, executor_agent):
             'worktree': spec['worktree'], 'base': None, 'head': None,
             'changed_paths': [], 'verify': [], 'execution_session': None,
             'executor_agent': executor_agent, 'integration_sha': None,
-            'error': None, 'pid': None, 'attempt_history': []}
+            'error': None, 'pid': None, 'attempt_history': [],
+            'adapter_history': [], 'awaiting_host': None}
 
 
 # ------------------------------------------------------ attempt lifecycle proof
@@ -1508,6 +1715,10 @@ def _attempt_problems(record, ignore=()):
                 problems.append(f'attempt #{position} ended as '
                                 f'{attempt.get("result")} and its process group '
                                 'was not proven stopped')
+        elif attempt.get('result') == 'adapter_rejected':
+            problems.append(f'attempt #{position} ended as adapter_rejected; the '
+                            'attached result was not accepted, so the worktree '
+                            'cannot be reused without manual reconciliation')
         elif (executor.get('state') == 'unrecorded'
                 and executor.get('stopped') is not True):
             problems.append(f'attempt #{position} lost its pid record and the '
@@ -1560,14 +1771,54 @@ def _gh_binary():
     return _binary_argv('BATCH_GH', 'gh')
 
 
-def _classify_stream(returncode, output):
-    """Accept only a single-session stream that ends with one terminal stop."""
+def _adapter_command(adapter):
+    if _adapter_is_opencode(adapter):
+        return _opencode_binary()
+    if adapter.get('transport') != 'command':
+        raise BatchError('the attached transport has no command to run',
+                         status='BLOCKED')
+    return list(adapter.get('command') or [])
+
+
+def _require_adapter_ready(plan):
+    """Report an explicitly selected adapter that cannot run, before dispatch.
+
+    The legacy default is not preflighted: it keeps the historical
+    ``opencode`` spawn-failure behaviour. Only an explicit selection is a
+    capability claim that must be checked before any worktree write.
+    """
+    adapter = plan['adapter']
+    if adapter.get('source') != 'plan' or adapter.get('transport') == 'attached':
+        return
+    prefix = _adapter_command(adapter)
+    executable = prefix[0]
+    if Path(executable).is_file() or shutil.which(executable):
+        return
+    raise InputError(
+        f'executor adapter {adapter["name"]!r} is not available: executable '
+        f'{executable!r} was not found; no dispatch or worktree write started')
+
+
+def _pending_host(state):
+    return [(ident, record) for ident, record in (state.get('tasks') or {}).items()
+            if isinstance(record, dict) and record.get('awaiting_host')]
+
+
+def _classify_stream(returncode, output, *, session_prefix='ses_',
+                     label='OpenCode'):
+    """Accept only a single-session stream that ends with one terminal stop.
+
+    ``session_prefix`` is the adapter's session-id rule. The built-in OpenCode
+    adapter keeps ``ses_``; a generic command adapter passes ``None`` and only
+    requires a nonempty string, so no product-specific format leaks into the
+    terminal rules.
+    """
     unknown = {'exit_code': None, 'session_id': None, 'text': '',
                'detail': 'stream is not a completed single-session run'}
     if returncode != 0:
-        return dict(unknown, detail=f'OpenCode exit code {returncode}')
+        return dict(unknown, detail=f'{label} exit code {returncode}')
     if not (output or '').strip():
-        return dict(unknown, detail='OpenCode produced no events')
+        return dict(unknown, detail=f'{label} produced no events')
     session, text = None, []
     started = terminal = in_step = False
     try:
@@ -1578,7 +1829,9 @@ def _classify_stream(returncode, output):
             if not isinstance(event, dict) or terminal:
                 return dict(unknown, detail='event after the terminal stop')
             sid = event.get('sessionID')
-            if not isinstance(sid, str) or not sid.startswith('ses_'):
+            if (not isinstance(sid, str) or not sid
+                    or (session_prefix is not None
+                        and not sid.startswith(session_prefix))):
                 return dict(unknown, detail='event without a usable session id')
             if session is not None and session != sid:
                 return dict(unknown, detail='more than one session in the stream')
@@ -1726,19 +1979,40 @@ def _run_process(argv, cwd, timeout, *, env=None, input_text=None,
             'exit_ticks': _process_exit_ticks(process)}
 
 
-def _agent(work, prompt, agent_name, timeout, *, title=None, on_spawn=None):
-    argv = [*_opencode_binary(), 'run', '--standalone', '--format', 'json']
-    if agent_name:
-        argv += ['--agent', agent_name]
-    if title:
-        argv += ['--title', title]
-    argv.append(prompt)
+def _agent(work, prompt, agent_name, timeout, *, title=None, on_spawn=None,
+           adapter=None, role=None, task_id=None, base_sha=None):
+    adapter = adapter or dict(LEGACY_ADAPTER)
+    if adapter.get('transport') != 'command':
+        raise BatchError('the attached transport does not spawn a process',
+                         status='BLOCKED')
+    input_text = None
     environment = dict(os.environ, PWD=str(work))
+    if _adapter_is_opencode(adapter):
+        argv = [*_opencode_binary(), 'run', '--standalone', '--format', 'json']
+        if agent_name:
+            argv += ['--agent', agent_name]
+        if title:
+            argv += ['--title', title]
+        argv.append(prompt)
+        session_prefix = 'ses_'
+    else:
+        # Generic command contract: the configured argv is started as-is, the
+        # prompt arrives on stdin, and the role facts are passed in the
+        # environment. stdout remains the same JSON event stream.
+        argv = list(adapter['command'])
+        input_text = prompt
+        environment.update({
+            'BATCH_ROLE': role or '', 'BATCH_AGENT': agent_name or '',
+            'BATCH_TASK_ID': task_id or '', 'BATCH_BASE_SHA': base_sha or '',
+            'BATCH_WORKTREE': str(work)})
+        session_prefix = None
     try:
         process = subprocess.Popen(
-            argv, cwd=str(work), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, env=environment,
-            start_new_session=(os.name == 'posix'))
+            argv, cwd=str(work),
+            stdin=subprocess.PIPE if input_text is not None
+            else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            env=environment, start_new_session=(os.name == 'posix'))
     except OSError as exc:
         return {'exit_code': None, 'session_id': None, 'text': '', 'pid': None,
                 'pgid': None, 'detail': f'spawn failed: {exc}'}
@@ -1761,13 +2035,19 @@ def _agent(work, prompt, agent_name, timeout, *, title=None, on_spawn=None):
                     'stopped': proven, 'record_failed': str(exc),
                     'detail': f'cannot persist the executor pid: {exc}; {detail}'}
     try:
-        output, _ = process.communicate(timeout=timeout)
+        if input_text is not None:
+            output, _ = process.communicate(input_text, timeout=timeout)
+        else:
+            output, _ = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         proven, detail = _stop_timed_out(process)
         return {'exit_code': None, 'session_id': None, 'text': '', 'timeout': True,
                 'stopped': proven, 'pid': process.pid, 'pgid': pgid,
                 'token': token, 'detail': detail}
-    result = _classify_stream(process.returncode, output or '')
+    result = _classify_stream(process.returncode, output or '',
+                              session_prefix=session_prefix,
+                              label='OpenCode' if _adapter_is_opencode(adapter)
+                              else 'the command adapter')
     result.update(pid=process.pid, pgid=pgid, token=token,
                   exit_ticks=_process_exit_ticks(process))
     return result
@@ -2475,13 +2755,388 @@ def _integrate(plan, spec):
     return _head(batch)
 
 
-def _execute_task(plan, spec, record, base, timeout, save, attempt):
+def _adapter_dir(journal):
+    journal = Path(journal)
+    return journal.parent / (journal.stem + '.adapter')
+
+
+def _execution_request_path(journal, spec):
+    return _adapter_dir(journal) / f'execution-{spec["id"]}.request.json'
+
+
+def _execution_result_path(journal, spec):
+    return _adapter_dir(journal) / f'execution-{spec["id"]}.result.json'
+
+
+def _review_request_path(journal):
+    return _adapter_dir(journal) / 'review.request.json'
+
+
+def _review_result_path(journal):
+    return _adapter_dir(journal) / 'review.result.json'
+
+
+def _write_bound_json(path, data):
+    """Write one adapter file atomically and return its byte digest."""
+    path = Path(path)
+    _atomic_json(path, data)
+    return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_execution_request(plan, spec, record, base, attempt, save, journal):
+    work = str(Path(spec['worktree']).resolve())
+    path = _execution_request_path(journal, spec)
+    request = {
+        'schema': EXECUTION_REQUEST_SCHEMA, 'kind': 'execution',
+        'batch_id': plan['batch']['id'], 'task_id': spec['id'],
+        'transport': 'attached', 'adapter': plan['adapter']['name'],
+        'executor_agent': plan['executor_agent'],
+        'base_sha': base, 'worktree': work, 'branch': spec['branch'],
+        'paths': list(spec['paths']), 'acceptance': list(spec['acceptance']),
+        'verify': [list(command) for command in spec['verify']],
+        'prompt': _prompt(spec, plan, base),
+        'result_path': str(_execution_result_path(journal, spec)),
+        'diff_contract': {
+            'sha256': 'sha256 of the stdout bytes of: git diff '
+                      '--no-ext-diff --no-color --no-renames <base> <head>',
+            'paths': 'sorted paths of: git diff --no-ext-diff --no-renames '
+                     '--name-status -z <base>..<head>'},
+        'created_at': _utc_now(),
+        'instructions': [
+            'Run one real execution session in the given worktree and branch.',
+            'Stay inside the allowed paths; do not push, merge or rewrite '
+            'history.',
+            'Commit the work and leave the worktree clean at the reported head.',
+            'Write the result file to result_path with schema '
+            f'{EXECUTION_RESULT_SCHEMA} and the terminal, session id, exit '
+            'code, report, artifacts, actual head and recomputed diff summary.',
+            'Submit it with: batch_delivery.py attach --result <path>',
+        ],
+    }
+    path, digest = _write_bound_json(path, request)
+    attempt['adapter'] = {'transport': 'attached', 'kind': 'execution',
+                          'state': 'awaiting_host', 'request_path': str(path),
+                          'request_sha256': digest}
+    record['awaiting_host'] = {'kind': 'execution', 'request_path': str(path),
+                               'request_sha256': digest,
+                               'created_at': _utc_now()}
+    save()
+    return path
+
+
+def _complete_integration(plan, spec, record, base, head, timeout, save,
+                          attempt):
+    """Shared verify + integrate tail for every execution transport."""
+    work = Path(spec['worktree'])
+    if head == base:
+        raise BatchError('execution produced no changes', status='FAILED')
+    names = _diff_names(work, base, head)
+    _scope_check(names, spec, plan)
+    record.update(head=head, changed_paths=names)
+    save()
+    record['verify'] = _verify_task(work, spec['verify'], timeout,
+                                    attempt=attempt, save=save)
+    after = _head(work)
+    if after != head:
+        raise BatchError('a verification command changed the task head',
+                         status='FAILED', verify=record['verify'])
+    if not _clean(work):
+        raise BatchError('a verification command left the worktree dirty',
+                         status='FAILED', verify=record['verify'])
+    record['integration_sha'] = _integrate(plan, spec)
+    record['status'] = 'INTEGRATED'
+    record['error'] = None
+    _finish_attempt(attempt, 'ok', save=save)
+    save()
+
+
+def _adapter_diff_summary(work, base, head):
+    """Recompute the contract's task diff summary from the real worktree."""
+    result = _git(work, 'diff', '--no-ext-diff', '--no-color', '--no-renames',
+                  base, head, binary=True)
+    if result.returncode != 0:
+        raise BatchError(f'cannot compute the task diff {base}..{head}',
+                         status='BLOCKED')
+    raw = result.stdout or b''
+    return {'base': base, 'head': head,
+            'paths': _diff_names(work, base, head),
+            'sha256': hashlib.sha256(raw).hexdigest()}
+
+
+def _adapter_artifacts(artifacts, work, adapter_dir):
+    """Every declared artifact must be readable and match its digest."""
+    if not isinstance(artifacts, list):
+        raise BatchError('the execution result artifacts must be a list',
+                         status='BLOCKED')
+    checked = []
+    for index, item in enumerate(artifacts, start=1):
+        if not isinstance(item, dict) or set(item) != {'path', 'sha256', 'bytes'}:
+            raise BatchError(f'artifact {index} must have exactly path, sha256 '
+                             'and bytes', status='BLOCKED')
+        name = item.get('path')
+        digest = item.get('sha256')
+        size = item.get('bytes')
+        if not isinstance(name, str) or not name:
+            raise BatchError(f'artifact {index}.path must be a nonempty string',
+                             status='BLOCKED')
+        if not isinstance(digest, str) or not DIGEST_RE.match(digest):
+            raise BatchError(f'artifact {index}.sha256 must be a SHA-256 digest',
+                             status='BLOCKED')
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise BatchError(f'artifact {index}.bytes must be a nonnegative '
+                             'integer', status='BLOCKED')
+        candidate = Path(name)
+        if candidate.is_absolute():
+            target = candidate.expanduser().resolve()
+            if not _is_within(target, adapter_dir):
+                raise BatchError(f'artifact {index} is outside the adapter '
+                                 'directory', status='BLOCKED')
+        else:
+            try:
+                relative = _safe_rel(name)
+            except ValueError as exc:
+                raise BatchError(f'artifact {index} path is unsafe: {exc}',
+                                 status='BLOCKED') from None
+            target = (Path(work) / relative).resolve()
+            if not _is_within(target, Path(work)):
+                raise BatchError(f'artifact {index} is outside the task worktree',
+                                 status='BLOCKED')
+        try:
+            data = target.read_bytes()
+        except OSError as exc:
+            raise BatchError(f'artifact {index} is unreadable: {exc}',
+                             status='BLOCKED') from None
+        if len(data) != size:
+            raise BatchError(f'artifact {index} has {len(data)} bytes, not the '
+                             f'reported {size}', status='BLOCKED')
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise BatchError(f'artifact {index} does not match its digest',
+                             status='BLOCKED')
+        checked.append({'path': name, 'sha256': digest, 'bytes': size})
+    return checked
+
+
+def _pending_request_digest(record):
+    pending = record.get('awaiting_host')
+    if not isinstance(pending, dict):
+        raise BatchError('there is no host request for this task', status='BLOCKED')
+    path = Path(pending.get('request_path') or '')
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise BatchError(f'the host request is unreadable: {exc}',
+                         status='BLOCKED') from None
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != pending.get('request_sha256'):
+        raise BatchError('the host request changed after it was written',
+                         status='BLOCKED')
+    return digest
+
+
+def _append_adapter_history(record, entry):
+    history = record.get('adapter_history')
+    if not isinstance(history, list):
+        history = []
+        record['adapter_history'] = history
+    history.append(entry)
+
+
+def _reject_attached(record, attempt, reason, *, terminal, result_sha256,
+                     save, status='BLOCKED'):
+    record.update(status=status, error=reason, awaiting_host=None)
+    if isinstance(attempt.get('adapter'), dict):
+        attempt['adapter'].update({'state': 'rejected', 'terminal': terminal,
+                                   'result_sha256': result_sha256})
+    _append_adapter_history(record, {
+        'kind': 'execution', 'accepted': False, 'terminal': terminal,
+        'result_sha256': result_sha256, 'reason': reason, 'at': _utc_now()})
+    _finish_attempt(attempt, 'adapter_rejected', error=reason, save=save)
+    save()
+
+
+def _attach_execution(plan, state, journal, result_path, timeout):
+    pending = _pending_host(state)
+    if len(pending) != 1:
+        raise InputError('attach needs exactly one pending host request; found '
+                         f'{len(pending)}')
+    ident, record = pending[0]
+    spec = next((task for task in plan['tasks'] if task['id'] == ident), None)
+    if spec is None:
+        raise InputError(f'the pending host request names unknown task {ident!r}')
+    base = record.get('base')
+    if not isinstance(base, str) or not SHA_RE.match(base):
+        raise InputError(f'{ident} has no recorded task base; the result cannot '
+                         'be bound')
+    attempt = next((entry for entry in reversed(record.get('attempt_history') or [])
+                    if isinstance(entry, dict) and entry.get('state') == 'STARTED'),
+                   None)
+    if attempt is None:
+        raise InputError(f'{ident} has no open attempt for an attached result')
+    save = lambda: _atomic_json(journal, state)
+    result_sha256 = None
+    try:
+        request_digest = _pending_request_digest(record)
+    except BatchError as exc:
+        _reject_attached(record, attempt, str(exc), terminal='missing',
+                         result_sha256=None, save=save)
+        return 1
+    try:
+        data, raw = _read_strict_json(result_path, 'execution result')
+        result_sha256 = hashlib.sha256(raw).hexdigest()
+        _require_result_keys(data, EXECUTION_RESULT_KEYS, 'execution result')
+        if data.get('schema') != EXECUTION_RESULT_SCHEMA:
+            raise BatchError(f'the execution result schema must be '
+                             f'{EXECUTION_RESULT_SCHEMA}', status='BLOCKED')
+        if data.get('kind') != 'execution':
+            raise BatchError('the result kind is not execution', status='BLOCKED')
+        if data.get('request_sha256') != request_digest:
+            raise BatchError('the execution result binds a different request',
+                             status='BLOCKED')
+        if data.get('batch_id') != plan['batch']['id']:
+            raise BatchError('the execution result names a different batch',
+                             status='BLOCKED')
+        if data.get('task_id') != ident:
+            raise BatchError('the execution result names a different task',
+                             status='BLOCKED')
+        terminal = _require_text(data, 'terminal', 'execution result')
+        if terminal not in HOST_TERMINALS:
+            raise BatchError(f'the execution result terminal {terminal!r} is not '
+                             f'one of {HOST_TERMINALS}', status='BLOCKED')
+        session = _require_text(data, 'session_id', 'execution result')
+        agent = _require_text(data, 'executor_agent', 'execution result')
+        if agent != plan['executor_agent']:
+            raise BatchError('the execution result names a different executor '
+                             'agent', status='BLOCKED')
+        workdir = Path(_require_text(data, 'workdir', 'execution result')
+                       ).resolve()
+        work = Path(spec['worktree']).resolve()
+        if workdir != work:
+            raise BatchError('the execution result ran in a different worktree',
+                             status='BLOCKED')
+        exit_code = _require_int(data, 'exit_code', 'execution result')
+        report = data.get('report')
+        if not isinstance(report, str):
+            raise BatchError('the execution result report must be a string',
+                             status='BLOCKED')
+        if 'ended_at' in data and not isinstance(data['ended_at'], str):
+            raise BatchError('the execution result ended_at must be a string',
+                             status='BLOCKED')
+        if terminal == 'unknown':
+            raise BatchError('the host reported an unknown terminal; an unknown '
+                             'outcome is never accepted as success',
+                             status='BLOCKED')
+        if terminal in ('failure', 'cancelled'):
+            reason = (f'the host reported {terminal} (exit {exit_code}): '
+                      f'{report.strip()[:500] or "no report"}')
+            record.update(status='FAILED', error=reason, awaiting_host=None)
+            if isinstance(attempt.get('adapter'), dict):
+                attempt['adapter'].update({
+                    'state': 'accepted', 'session': session,
+                    'terminal': terminal, 'result_sha256': result_sha256})
+            _append_adapter_history(record, {
+                'kind': 'execution', 'accepted': True, 'terminal': terminal,
+                'session_id': session, 'exit_code': exit_code,
+                'result_sha256': result_sha256, 'integrated': False,
+                'at': _utc_now()})
+            _finish_attempt(attempt, 'failed', error=reason, save=save)
+            save()
+            return 1
+        # success: every fact is recomputed, never trusted as declared.
+        if exit_code != 0:
+            raise BatchError('a success terminal must report exit code 0',
+                             status='BLOCKED')
+        if not report.strip():
+            raise BatchError('a success terminal needs a nonempty report',
+                             status='BLOCKED')
+        head = _require_sha(data, 'head', 'execution result')
+        resolved = _git(work, 'rev-parse', '--verify', '--quiet',
+                        head + '^{commit}')
+        if (resolved.returncode != 0
+                or (resolved.stdout or '').strip() != head):
+            raise BatchError('the execution result head is not a commit in the '
+                             'task worktree', status='BLOCKED')
+        if not _ancestor(work, base, head):
+            raise BatchError('the reported head is not a descendant of the task '
+                             'base', status='BLOCKED')
+        if _head(work) != head:
+            raise BatchError('the worktree head is not the reported head',
+                             status='BLOCKED')
+        if not _clean(work):
+            raise BatchError('the attached executor left the worktree dirty; '
+                             'commit the work and leave it clean',
+                             status='BLOCKED')
+        diff = data.get('diff')
+        if not isinstance(diff, dict) or set(diff) != {'base', 'head', 'paths',
+                                                       'sha256'}:
+            raise BatchError('the execution result diff must have exactly base, '
+                             'head, paths and sha256', status='BLOCKED')
+        if diff.get('base') != base or diff.get('head') != head:
+            raise BatchError('the execution result diff names a different base '
+                             'or head', status='BLOCKED')
+        if not isinstance(diff.get('paths'), list) or any(
+                not isinstance(item, str) for item in diff['paths']):
+            raise BatchError('the execution result diff paths must be a string '
+                             'list', status='BLOCKED')
+        if not isinstance(diff.get('sha256'), str) or not DIGEST_RE.match(
+                diff['sha256']):
+            raise BatchError('the execution result diff sha256 is invalid',
+                             status='BLOCKED')
+        recomputed = _adapter_diff_summary(work, base, head)
+        if sorted(diff['paths']) != recomputed['paths']:
+            raise BatchError('the execution result diff paths do not match the '
+                             'recomputed diff', status='BLOCKED')
+        if diff['sha256'] != recomputed['sha256']:
+            raise BatchError('the execution result diff digest does not match '
+                             'the recomputed diff', status='BLOCKED')
+        artifacts = _adapter_artifacts(data.get('artifacts'), work,
+                                       _adapter_dir(journal))
+        _scope_check(recomputed['paths'], spec, plan)
+        record['execution_session'] = session
+        record['awaiting_host'] = None
+        if isinstance(attempt.get('adapter'), dict):
+            attempt['adapter'].update({'state': 'accepted', 'session': session,
+                                       'terminal': terminal,
+                                       'result_sha256': result_sha256})
+        _append_adapter_history(record, {
+            'kind': 'execution', 'accepted': True, 'terminal': terminal,
+            'session_id': session, 'exit_code': exit_code,
+            'result_sha256': result_sha256, 'request_sha256': request_digest,
+            'head': head, 'diff_sha256': recomputed['sha256'],
+            'artifacts': artifacts, 'integrated': False, 'at': _utc_now()})
+        save()
+        _commit_if_dirty(work, base, spec, plan)
+        current = _head(work)
+        if current != head:
+            raise BatchError('the worktree head moved after the result was '
+                             'accepted', status='BLOCKED')
+        _complete_integration(plan, spec, record, base, head, timeout, save,
+                              attempt)
+        record['adapter_history'][-1]['integrated'] = True
+        save()
+        return 0
+    except BatchError as exc:
+        _reject_attached(record, attempt, str(exc), terminal='invalid',
+                         result_sha256=result_sha256, save=save,
+                         status=exc.record_status)
+        return 1
+
+
+def _execute_task(plan, spec, record, base, timeout, save, attempt,
+                  journal=None):
     try:
         # The guard also runs before the attempt is appended; this second check
         # keeps the literal "before _prepare_task_worktree/_agent" ordering and
         # ignores the just-started attempt, which has no process yet.
         _reuse_guard(spec, record, ignore={attempt['id']})
         work = _prepare_task_worktree(plan, spec, base, record)
+        if _adapter_transport(plan) == 'attached':
+            if journal is None:
+                raise BatchError('the attached transport needs a journal path',
+                                 status='BLOCKED')
+            _write_execution_request(plan, spec, record, base, attempt, save,
+                                     journal)
+            raise AttachedPending(_execution_request_path(journal, spec),
+                                  'execution')
         title = f'batch-{plan["batch"]["id"]}-{spec["id"]}'
         executor = attempt['executor']
 
@@ -2496,7 +3151,8 @@ def _execute_task(plan, spec, record, base, timeout, save, attempt):
         save()
         result = _agent(work, _prompt(spec, plan, base),
                         plan['executor_agent'], timeout, title=title,
-                        on_spawn=record_spawn)
+                        on_spawn=record_spawn, adapter=plan['adapter'],
+                        role='executor', task_id=spec['id'], base_sha=base)
         executor.update(pid=result.get('pid'), pgid=result.get('pgid'),
                         token=result.get('token'),
                         exit=result.get('exit_code'))
@@ -2548,26 +3204,10 @@ def _execute_task(plan, spec, record, base, timeout, save, attempt):
         record['execution_session'] = result['session_id']
         _commit_if_dirty(work, base, spec, plan)
         head = _head(work)
-        if head == base:
-            raise BatchError('execution produced no changes', status='FAILED')
-        names = _diff_names(work, base, head)
-        _scope_check(names, spec, plan)
-        record.update(head=head, changed_paths=names)
-        save()
-        record['verify'] = _verify_task(work, spec['verify'], timeout,
-                                        attempt=attempt, save=save)
-        after = _head(work)
-        if after != head:
-            raise BatchError('a verification command changed the task head',
-                             status='FAILED', verify=record['verify'])
-        if not _clean(work):
-            raise BatchError('a verification command left the worktree dirty',
-                             status='FAILED', verify=record['verify'])
-        record['integration_sha'] = _integrate(plan, spec)
-        record['status'] = 'INTEGRATED'
-        record['error'] = None
-        _finish_attempt(attempt, 'ok', save=save)
-        save()
+        _complete_integration(plan, spec, record, base, head, timeout, save,
+                              attempt)
+    except AttachedPending:
+        raise
     except BatchError as exc:
         _finish_attempt(attempt, 'failed', error=str(exc), save=save)
         raise
@@ -2639,6 +3279,10 @@ def _normalize_interrupted(state, plan, resume, save=None):
         record = state['tasks'][ident]
         if record.get('status') != 'RUNNING':
             continue
+        if record.get('awaiting_host'):
+            # The host owns this attempt; it is neither interrupted nor
+            # reusable until ``attach`` accepts or rejects the result.
+            continue
         if record.get('head'):
             record.update(status='BLOCKED', error=(
                 'an interrupted attempt left a commit; inspect the worktree '
@@ -2674,15 +3318,19 @@ def _run_summary(state, plan):
 def command_run(args):
     raw = load_plan(args.plan)
     plan = validate_plan(raw, args.repo)
+    adapter = plan['adapter']
     journal = _resolve_journal(args.journal, plan)
     if not args.execute:
         print(f'batch {plan["batch"]["id"]}: {len(plan["tasks"])} task(s), '
-              f'edition {plan["edition"]}, project_paths {plan["project_paths"]}')
+              f'edition {plan["edition"]}, project_paths {plan["project_paths"]}, '
+              f'adapter {adapter["transport"]}/{adapter["name"]} '
+              f'({adapter["source"]})')
         for spec in plan['tasks']:
             deps = ', '.join(spec['depends']) or '-'
             print(f'would run {spec["id"]}: {spec["title"]} (depends: {deps})')
         print('dry run: pass --execute to create worktrees and start agents')
         return 0
+    _require_adapter_ready(plan)
     only = None
     if args.only:
         only = {value.strip() for value in args.only.split(',') if value.strip()}
@@ -2707,6 +3355,13 @@ def command_run(args):
                 print(f'batch {state["batch_id"]}: all tasks are already VERIFIED')
                 return 0
         base_sha = state['base_sha']
+        pending = _pending_host(state)
+        if pending:
+            print('a host request is already waiting; attach its result before '
+                  'starting another task')
+            for ident, record in pending:
+                print(f'{ident}: {record["awaiting_host"].get("request_path")}')
+            return ATTACHED_EXIT
         try:
             if not _clean(plan['batch']['repo']):
                 raise BatchError('the repository worktree is not clean')
@@ -2787,9 +3442,13 @@ def command_run(args):
             # The attempt id and start record are on disk before the worktree is
             # touched or any process starts; a failed save raises here.
             attempt = _start_attempt(record, spec, trigger, save)
+            pending_request = None
             try:
                 _execute_task(plan, spec, record, base, args.timeout, save,
-                              attempt)
+                              attempt, journal)
+            except AttachedPending as exc:
+                record.update(status='RUNNING', error=None)
+                pending_request = exc
             except BatchError as exc:
                 record.update(status=exc.record_status, error=str(exc),
                               verify=exc.verify or record.get('verify') or [])
@@ -2797,6 +3456,15 @@ def command_run(args):
                 if exc.halt:
                     halt = True
             save()
+            if pending_request is not None:
+                state['phase'] = 'tasks'
+                state['error'] = None
+                _atomic_json(journal, state)
+                print(f'awaiting host {pending_request.kind} request: '
+                      f'{pending_request.path}')
+                print('run the real agent, then submit its result with: '
+                      f'{Path(__file__).name} attach --result <path>')
+                return ATTACHED_EXIT
         if halt:
             state['phase'] = 'blocked'
             for spec in plan['tasks']:
@@ -3012,6 +3680,224 @@ def _load_attestation(path, plan, head, digest):
     return decisions, hashlib.sha256(raw).hexdigest()
 
 
+def _write_review_request(plan, state, journal, base, head, digest, risk):
+    """Persist a review request and stop with exit 3 until ``attach`` runs."""
+    existing = state.get('review') or {}
+    if (existing.get('verdict') == 'AWAITING_HOST'
+            and existing.get('head') == head
+            and existing.get('diff_sha256') == digest):
+        path = Path(existing.get('request_path') or '')
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            raw = None
+        if (raw is not None
+                and hashlib.sha256(raw).hexdigest() == existing.get(
+                    'request_sha256')):
+            raise AttachedPending(path, 'review')
+    diff, _ = _diff_for_review(plan['batch']['repo'], base, head)
+    path = _review_request_path(journal)
+    tasks = []
+    for spec in plan['tasks']:
+        tasks.append({
+            'id': spec['id'], 'acceptance': list(spec['acceptance']),
+            'acceptance_checks': spec.get('acceptance_checks'),
+            'verify_commands': [list(command) for command in spec['verify']]})
+    request = {
+        'schema': REVIEW_REQUEST_SCHEMA, 'kind': 'review',
+        'batch_id': plan['batch']['id'],
+        'transport': 'attached', 'adapter': plan['adapter']['name'],
+        'reviewer_agent': plan['reviewer_agent'],
+        'base_sha': base, 'head_sha': head, 'diff_sha256': digest,
+        'risk': risk['level'], 'risk_reasons': list(risk['reasons']),
+        'tasks': tasks, 'diff': diff,
+        'prompt': _review_prompt(plan, state, base, head, digest, risk, diff),
+        'result_path': str(_review_result_path(journal)),
+        'created_at': _utc_now(),
+        'instructions': [
+            'Run one independent reviewer session in the batch worktree; it '
+            'must not be the same session as any executor of this batch.',
+            'Judge every acceptance criterion against the diff and recorded '
+            'evidence; a bare APPROVE without evidence is not acceptable.',
+            'Write the result file to result_path with schema '
+            f'{REVIEW_RESULT_SCHEMA}, the reviewer session id, workdir, '
+            'edit_denied, declared_executor_sessions, base, head, diff_sha256, '
+            'risk, verdict, per-AC conclusions and evidence.',
+            'Submit it with: batch_delivery.py attach --result <path>',
+        ],
+    }
+    path, request_digest = _write_bound_json(path, request)
+    state['review'] = {
+        'head': head, 'diff_sha256': digest, 'risk': risk['level'],
+        'verdict': 'AWAITING_HOST', 'session': None,
+        'reviewer_agent': plan['reviewer_agent'],
+        'request_path': str(path), 'request_sha256': request_digest,
+        'reason': 'an independent review request is waiting for the host',
+        'at': _now()}
+    _atomic_json(journal, state)
+    raise AttachedPending(path, 'review')
+
+
+def _append_review_history(state, entry):
+    history = state.get('review_history')
+    if not isinstance(history, list):
+        history = []
+        state['review_history'] = history
+    history.append(entry)
+
+
+def _attach_review(plan, state, journal, result_path):
+    review = state.get('review') or {}
+    if review.get('verdict') != 'AWAITING_HOST':
+        raise InputError('there is no review request waiting for the host')
+    request_path = Path(review.get('request_path') or '')
+    request_digest = None
+    try:
+        try:
+            request_raw = request_path.read_bytes()
+        except OSError as exc:
+            raise BatchError(f'the review request is unreadable: {exc}',
+                             status='BLOCKED') from None
+        request_digest = hashlib.sha256(request_raw).hexdigest()
+        if request_digest != review.get('request_sha256'):
+            raise BatchError('the review request changed after it was written',
+                             status='BLOCKED')
+    except BatchError as exc:
+        state['review'] = {
+            'head': review.get('head'), 'diff_sha256': review.get('diff_sha256'),
+            'risk': review.get('risk'), 'verdict': 'BLOCKED', 'session': None,
+            'reviewer_agent': plan['reviewer_agent'], 'reason': str(exc),
+            'request_sha256': review.get('request_sha256'),
+            'result_sha256': None, 'at': _now()}
+        _append_review_history(state, {
+            'kind': 'review', 'accepted': False, 'verdict': 'BLOCKED',
+            'reason': str(exc), 'request_sha256': review.get('request_sha256'),
+            'result_sha256': None, 'at': _now()})
+        _atomic_json(journal, state)
+        return 1
+    result_sha256 = None
+    try:
+        data, raw = _read_strict_json(result_path, 'review result')
+        result_sha256 = hashlib.sha256(raw).hexdigest()
+        _require_result_keys(data, REVIEW_RESULT_KEYS, 'review result')
+        if data.get('schema') != REVIEW_RESULT_SCHEMA:
+            raise BatchError(f'the review result schema must be '
+                             f'{REVIEW_RESULT_SCHEMA}', status='BLOCKED')
+        if data.get('kind') != 'review':
+            raise BatchError('the result kind is not review', status='BLOCKED')
+        if data.get('request_sha256') != request_digest:
+            raise BatchError('the review result binds a different request',
+                             status='BLOCKED')
+        if data.get('batch_id') != plan['batch']['id']:
+            raise BatchError('the review result names a different batch',
+                             status='BLOCKED')
+        if 'report' in data and not isinstance(data['report'], str):
+            raise BatchError('the review result report must be a string',
+                             status='BLOCKED')
+        if 'ended_at' in data and not isinstance(data['ended_at'], str):
+            raise BatchError('the review result ended_at must be a string',
+                             status='BLOCKED')
+        session = _require_text(data, 'session_id', 'review result')
+        agent = _require_text(data, 'reviewer_agent', 'review result')
+        if agent != plan['reviewer_agent']:
+            raise BatchError('the review result names a different reviewer agent',
+                             status='BLOCKED')
+        work = Path(plan['batch']['worktree']).resolve()
+        workdir = Path(_require_text(data, 'workdir', 'review result')).resolve()
+        if workdir != work:
+            raise BatchError('the reviewer ran in a different directory',
+                             status='BLOCKED')
+        if data.get('edit_denied') is not True:
+            raise BatchError('the review result must declare that editing was '
+                             'denied', status='BLOCKED')
+        declared = data.get('declared_executor_sessions')
+        if (not isinstance(declared, list)
+                or any(not isinstance(item, str) or not item.strip()
+                       for item in declared)):
+            raise BatchError('declared_executor_sessions must be a string list',
+                             status='BLOCKED')
+        recorded = {record.get('execution_session')
+                    for record in (state.get('tasks') or {}).values()
+                    if record.get('execution_session')}
+        if not recorded.issubset(set(declared)):
+            raise BatchError('the review result does not declare every executor '
+                             'session of this batch', status='BLOCKED')
+        if session in recorded or session in declared:
+            raise BatchError('the reviewer session is an execution session',
+                             status='BLOCKED')
+        base = state.get('base_sha')
+        current_head = _head(work)
+        if data.get('base') != base or data.get('head') != current_head:
+            raise BatchError('the review result binds a different base or head',
+                             status='BLOCKED')
+        if data.get('head') != review.get('head'):
+            raise BatchError('the head changed after the review request was '
+                             'written', status='BLOCKED')
+        _, current_digest = _diff_for_review(plan['batch']['repo'], base,
+                                             current_head)
+        if data.get('diff_sha256') != current_digest:
+            raise BatchError('the review result binds a different diff',
+                             status='BLOCKED')
+        try:
+            current_risk = classify_risk(plan['batch']['repo'], base,
+                                         current_head)
+        except RiskError as exc:
+            raise BatchError(f'cannot reclassify the reviewed diff: {exc}',
+                             status='BLOCKED') from None
+        if data.get('risk') != current_risk['level']:
+            raise BatchError('the review result binds a different risk level',
+                             status='BLOCKED')
+        verdict = data.get('verdict')
+        if not isinstance(verdict, str) or not verdict:
+            raise BatchError('the review result verdict is missing',
+                             status='BLOCKED')
+        findings = data.get('findings')
+        if not isinstance(findings, list):
+            raise BatchError('the review result findings must be a list',
+                             status='BLOCKED')
+        problem = _verdict_problem({
+            'verdict': verdict, 'base': data.get('base'),
+            'head': data.get('head'), 'diff_sha256': data.get('diff_sha256'),
+            'risk': data.get('risk'), 'tasks': data.get('tasks'),
+            'findings': findings}, plan, base, current_head, current_digest,
+            current_risk)
+        if problem:
+            raise BatchError(f'review rejected: {problem}',
+                             status='REVIEW_REJECTED')
+        record = {'head': current_head, 'diff_sha256': current_digest,
+                  'risk': current_risk['level'], 'verdict': 'APPROVE',
+                  'session': session,
+                  'reviewer_agent': plan['reviewer_agent'],
+                  'reason': 'approve (attached host review)',
+                  'adapter': plan['adapter']['name'],
+                  'request_sha256': request_digest,
+                  'result_sha256': result_sha256,
+                  'edit_denied': True, 'at': _now()}
+        _append_review_history(state, {
+            'kind': 'review', 'accepted': True, 'verdict': 'APPROVE',
+            'session_id': session, 'head': current_head,
+            'diff_sha256': current_digest, 'risk': current_risk['level'],
+            'request_sha256': request_digest,
+            'result_sha256': result_sha256, 'at': _now()})
+        state['review'] = record
+        _atomic_json(journal, state)
+        return 0
+    except BatchError as exc:
+        state['review'] = {
+            'head': review.get('head'), 'diff_sha256': review.get('diff_sha256'),
+            'risk': review.get('risk'), 'verdict': 'BLOCKED', 'session': None,
+            'reviewer_agent': plan['reviewer_agent'], 'reason': str(exc),
+            'request_sha256': request_digest,
+            'result_sha256': result_sha256, 'at': _now()}
+        _append_review_history(state, {
+            'kind': 'review', 'accepted': False,
+            'verdict': 'BLOCKED', 'reason': str(exc),
+            'request_sha256': request_digest,
+            'result_sha256': result_sha256, 'at': _now()})
+        _atomic_json(journal, state)
+        return 1
+
+
 def _review(plan, state, journal, args, base, head, digest, risk):
     _prove_task_integration(plan, state, base, head)
     existing = state.get('review') or {}
@@ -3067,6 +3953,16 @@ def _review(plan, state, journal, args, base, head, digest, risk):
     if not args.review:
         raise BatchError('risk L1/L2 requires an independent review; rerun '
                          'finalize with --review', status='BLOCKED')
+    adapter = plan['adapter']
+    if adapter['transport'] == 'attached':
+        return _write_review_request(plan, state, journal, base, head, digest,
+                                     risk)
+    if not _adapter_is_opencode(adapter):
+        raise BatchError(
+            f'the command adapter {adapter["name"]!r} has no independent review '
+            'evidence provider; use the opencode adapter or the attached '
+            'transport. No review, push or merge was attempted',
+            status='BLOCKED')
     diff, _ = _diff_for_review(plan['batch']['repo'], base, head)
     work = Path(plan['batch']['worktree'])
     before_head, before_clean = _head(work), _clean(work)
@@ -4109,6 +5005,14 @@ def command_finalize(args):
                 _resume_after_merge(plan, state, journal, args)
             else:
                 _finalize_body(plan, state, journal, args)
+        except AttachedPending as exc:
+            state['phase'] = 'review'
+            state['error'] = None
+            _atomic_json(journal, state)
+            print(f'awaiting host {exc.kind} request: {exc.path}')
+            print('run the real reviewer, then submit its result with: '
+                  f'{Path(__file__).name} attach --result <path>')
+            return ATTACHED_EXIT
         except BatchError as exc:
             if state.get('phase') != 'verified':
                 state['phase'] = 'blocked'
@@ -4133,11 +5037,53 @@ def command_finalize(args):
     return 0
 
 
+def command_attach(args):
+    raw = load_plan(args.plan)
+    plan = validate_plan(raw, args.repo)
+    if plan['adapter']['transport'] != 'attached':
+        raise InputError('attach is only available for the attached transport')
+    journal = _resolve_journal(args.journal, plan, new=False)
+    if not journal.exists():
+        raise InputError(f'no batch journal at {journal}; run the batch first')
+    result_path = _safe_adapter_file(args.result, plan, 'result')
+    with _Lock(journal):
+        state = _load_journal(journal)
+        _check_journal_plan(state, plan)
+        if state.get('edition') != plan['edition']:
+            raise InputError('the journal edition does not match the project')
+        if _pending_host(state):
+            code = _attach_execution(plan, state, journal, result_path,
+                                     args.timeout)
+        elif (state.get('review') or {}).get('verdict') == 'AWAITING_HOST':
+            code = _attach_review(plan, state, journal, result_path)
+        else:
+            raise InputError('there is no host request waiting for a result')
+        _atomic_json(journal, state)
+    if code == 0:
+        print('host result accepted; the journal records the session and result '
+              'digest')
+    else:
+        reasons = []
+        for ident in sorted(state.get('tasks') or {}):
+            record = state['tasks'][ident]
+            if record.get('error'):
+                reasons.append(f'{ident}: {record["error"]}')
+        review = state.get('review') or {}
+        if review.get('verdict') == 'BLOCKED' and review.get('reason'):
+            reasons.append(str(review['reason']))
+        detail = '; '.join(reasons) or 'see the journal for the rejected fields'
+        print(f'host result rejected: {detail}', file=sys.stderr)
+        print(f'the journal is at {journal}', file=sys.stderr)
+    return code
+
+
 def command_check(args):
     raw = load_plan(args.plan)
     plan = validate_plan(raw, args.repo)
     print(f'batch {plan["batch"]["id"]}: {plan["batch"]["title"]}')
     print(f'edition: {plan["edition"]}; project_paths: {plan["project_paths"]}')
+    print(f'adapter: {plan["adapter"]["transport"]}/{plan["adapter"]["name"]} '
+          f'({plan["adapter"]["source"]})')
     print(f'base: {plan["batch"]["base"]}; branch: {plan["batch"]["branch"]}')
     print('order: ' + ' -> '.join(spec['id'] for spec in plan['tasks']))
     for spec in plan['tasks']:
@@ -4156,13 +5102,19 @@ def command_status(args):
         print(json.dumps(state, ensure_ascii=False, sort_keys=True))
         return 0
     print(f'batch {state.get("batch_id")} phase {state.get("phase")}')
+    adapter = state.get('adapter') or {}
+    if adapter:
+        print(f'adapter: {adapter.get("transport")}/{adapter.get("name")} '
+              f'({adapter.get("source") or "-"})')
     for ident in sorted(state.get('tasks') or {}):
         record = state['tasks'][ident]
         merge = state.get('merge') or {}
+        waiting = record.get('awaiting_host') or {}
         print(f'{ident}: {record.get("status")} head={record.get("head") or "-"} '
               f'integration={record.get("integration_sha") or "-"} '
               f'pr={(state.get("pr") or {}).get("number") or "-"} '
-              f'merge={merge.get("state") or "-"}')
+              f'merge={merge.get("state") or "-"}'
+              + (f' awaiting={waiting.get("request_path")}' if waiting else ''))
     return 0
 
 
@@ -4204,6 +5156,14 @@ def _parser():
     status.add_argument('--journal', required=True)
     status.add_argument('--json', action='store_true')
     status.set_defaults(func=command_status)
+    attach = sub.add_parser('attach', help='submit a host result for a pending '
+                                           'attached request')
+    attach.add_argument('--plan', required=True)
+    attach.add_argument('--journal', required=True)
+    attach.add_argument('--repo')
+    attach.add_argument('--result', required=True)
+    attach.add_argument('--timeout', type=int, default=DEFAULT_TIMEOUT)
+    attach.set_defaults(func=command_attach)
     return parser
 
 
@@ -4211,6 +5171,11 @@ def main(argv=None):
     args = _parser().parse_args(argv)
     try:
         return args.func(args)
+    except AttachedPending as exc:
+        print(f'awaiting host {exc.kind} request: {exc.path}')
+        print('run the real agent, then submit its result with: '
+              f'{Path(__file__).name} attach --result <path>')
+        return ATTACHED_EXIT
     except InputError as exc:
         print(f'error: {exc}', file=sys.stderr)
         return 2

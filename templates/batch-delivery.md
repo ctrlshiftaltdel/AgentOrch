@@ -28,6 +28,7 @@
 python scripts/batch_delivery.py check    --plan PLAN [--repo PATH]
 python scripts/batch_delivery.py run      --plan PLAN --journal JOURNAL [--repo PATH] --execute [--only T1,T2] [--retry T1] [--resume] [--timeout SECONDS]
 python scripts/batch_delivery.py finalize --plan PLAN --journal JOURNAL [--repo PATH] [--review] [--push] [--merge --authorization TEXT] [--resume] [--checks-timeout SECONDS] [--next-plan PLAN2]
+python scripts/batch_delivery.py attach   --plan PLAN --journal JOURNAL --result PATH [--repo PATH] [--timeout SECONDS]
 python scripts/batch_delivery.py status   --journal JOURNAL [--json]
 ```
 
@@ -94,6 +95,33 @@ python scripts/batch_delivery.py status   --journal JOURNAL [--json]
 - 项目允许/禁止路径从 `docs/PROJECT.md` 的「允许改动路径」「永远禁止改动路径」读取。缺失该节时不会声称检查过；journal 记录 `project_paths: unknown`，只做计划级路径检查。journal 同时绑定 `docs/PROJECT.md` 的 SHA-256；run / finalize 之间该文件变化即拒绝继续，必须重新对齐计划。
 - `github` 的必需检查来自 `gh api repos/{owner}/{repo}/rules/branches/{base}` 的有效规则，而不是检查运行结果：计划里的 context 必须全部出现在有效规则中。每个 context 还必须在该 head 上有同名 check run，`app.id` 与规则中的 `integration_id` 一致、`status == completed`、`conclusion == success`；检查运行失败、缺失、app 不符或列表被截断（`total_count > len(check_runs)`）都阻塞。推送和合并使用审查过的确切 SHA，并在合并前重新核对 PR base、head、`mergeable == MERGEABLE` 以及 `origin/<base>` 是否仍为已审查 head 的祖先。
 
+## 2.1 执行体适配器（executor adapter）
+
+批次通过计划里的可选字段 `executor_adapter` 选择运行方式；**不写该字段就是旧计划默认**：`{"transport":"command","name":"opencode","source":"legacy-default"}`，行为与既有 `opencode run --standalone --format json` 完全一致，`BATCH_OPENCODE` 仍是它的 argv 覆盖。`journal` 会记录实际使用的传输、适配器名和来源（`adapter` 字段），恢复时据此拒绝中途更换适配器。
+
+```json
+"executor_adapter": {
+  "transport": "command",
+  "name": "generic-command",
+  "command": ["/absolute/path/to/executor", "--flag"],
+  "capabilities": {"C1": "PASS", "C2": "PASS", "C3": "PASS", "C4": "PASS"},
+  "capability_evidence": "https://.../the C1-C4 probe record"
+}
+```
+
+两种传输：
+
+- **`command`**：工具自己 spawn 子进程。`name` 为 `opencode` 时使用内置 argv（唯一允许 `BATCH_OPENCODE` 覆盖的适配器）；其他名字必须给 `command`，工具按原样启动该 argv，prompt 走 stdin，并把 `BATCH_ROLE`、`BATCH_AGENT`、`BATCH_TASK_ID`、`BATCH_BASE_SHA`、`BATCH_WORKTREE` 放进环境。stdout 必须是同一套 JSON 事件流（`step_start` / `text` / `tool_use` / `step_finish`）；通用命令的会话标识只需是非空字符串，不要求 `ses_`。通用命令适配器**不提供** `session export` / 审查 profile 查询，因此 `L1` / `L2` 独立审查必须改用 `opencode` 或 `attached`，否则阻塞。
+- **`attached`**：本机没有可被 `subprocess` 调用的 agent CLI，宿主（Master）才是 spawn 者。`run --execute` 在完成权威派发与 worktree 准备后写出 `execution-<task>.request.json`（prompt、任务 ID、基线 head、允许路径、worktree、branch、AC、verify、建议的 `result_path`），任务保持 `RUNNING` 且带 `awaiting_host`，命令以退出码 **3** 结束。宿主运行真实执行体后写结果文件，再用显式 `attach --result PATH` 提交。`finalize --review` 同样写 `review.request.json` 并以 **3** 结束，宿主返回 verdict 后再 `attach`。
+
+显式选择（计划里写了 `executor_adapter`）必须带 C1–C4 全 `PASS` 的 `capabilities` 与可定位的 `capability_evidence`；缺项在派发和 worktree 写入前以退出码 2 报错。`command` 适配器的可执行文件不存在也会在派发前报错。`check`、dry run、`status` 仍是只读操作，不需要安装任何运行时。
+
+`attach` 对结果做失败关闭校验：schema/字段、request 摘要、任务 ID、终端（`success` / `failure` / `cancelled` / `unknown`）、worktree、head 是基线的后代且等于当前 HEAD、worktree 干净、重新计算的 diff 路径与摘要、artifact 字节与 SHA-256。缺失、损坏、`unknown`、head/diff 不符、越界、worktree 不干净、产物不可读时任务 `FAILED` / `BLOCKED`，**零集成**，attempt 记 `adapter_rejected`（复用门禁会继续阻断该 worktree）。`failure` / `cancelled` 是宿主声明的有效终局，任务记 `FAILED`，但不会集成。
+
+审查结果必须绑定**被审 head、diff 摘要、风险等级**，逐条 AC 为 `PASS` 且有可定位证据，并声明 `reviewer_agent`、`workdir`、`edit_denied`、`declared_executor_sessions`；审查会话等于任一执行会话、缺 AC、无证据、只有 `APPROVE` 没有证据、head/diff/风险不符，一律 `BLOCKED`，不得合并。有效结果写入 `review_history`（append-only）后才成为当前 review。合并仍需原有授权文本与必需检查。
+
+适配器自报不能替代真实终局、权限或审查证据；`UNKNOWN` 永不等于成功。当前实现的接口、失败关闭规则、请求/结果 schema 与限制见 `docs/design/executor-adapter-contract.md`。
+
 ## 3. 风险分级
 
 `scripts/delivery_risk.py` 是只读分类器。它只看 NUL 分隔的 `git diff --name-status -z --no-renames`，因此带空格、制表符或非 ASCII 的路径不会被 Git 的引号格式降级；不接受调用方指定的等级。
@@ -115,7 +143,7 @@ python scripts/batch_delivery.py status   --journal JOURNAL [--json]
 
 - `run --execute` 先完成权威派发：`github` 写 Issue 的 `ORCH-TASK-REGISTRY`（保留首次 `dispatched_at`），`local` 走 `task ready` / `task dispatch`；随后才创建/校验任务 Worktree。派发失败时任何 Agent 都不会启动，已取得的锁仍按契约保留并需人工核对。
 - `github` 派发前完整枚举开放 PR 与开放 Issue 的登记块（各以 1000 为上限）；任一枚举达到上限即视为不可证明并整体阻塞。每个开放 Issue 必须最多一个可读登记块；活动状态（`DISPATCHED`/`IN_PROGRESS`/`REVIEW_READY`/`MASTER_REVIEW`/`APPROVED`/`BLOCKED`/`NEEDS_HUMAN_DECISION`/`FAILED`）的 `locked_paths` 与本批次并集重叠、或多个/不可读登记块，都整体阻塞；当前批次 Issue 自身除外。恢复时重新执行同一枚举。
-- `run --execute` 按稳定依赖顺序：创建/校验任务 Worktree → 启动一个 `opencode run --standalone --format json --agent ...` 会话 → 检查实际改动是否都在声明路径内 → 用任务命令验证 → 在集成分支上 `git merge --no-ff`。
+- `run --execute` 按稳定依赖顺序：创建/校验任务 Worktree → 按选定适配器启动执行会话（默认是 `opencode run --standalone --format json --agent ...`；`attached` 则写请求并以退出码 3 等待宿主）→ 检查实际改动是否都在声明路径内 → 用任务命令验证 → 在集成分支上 `git merge --no-ff`。
 - 合并成功只把任务标为 `INTEGRATED`。这是**内部里程碑**：它只说明改动已进入集成分支，不说明外部交付完成。
 - `finalize` 做批次验证、风险分类、审查、推送、PR、必需检查、合并、合并后验证和载体更新。
 - 只有合并成功、合并后验证通过、载体（Issue 登记块或本地任务库）更新完成之后，任务才标 `VERIFIED`。`VERIFIED` 才是外部交付完成。
@@ -130,9 +158,9 @@ python scripts/batch_delivery.py status   --journal JOURNAL [--json]
 - `L0`：不启动第二模型；每个任务必须有覆盖全部 AC 的 `acceptance_checks`，在已审查的 head 上逐条执行并记录 PASS/FAIL。缺 `acceptance_checks` 时必须有独立审查，二者都缺则阻塞；journal 记录 `NOT_REQUIRED_L0`、diff 哈希和逐 AC 证据。
 - `L1`：一次独立批次审查。
 - `L2` / `L3`：独立审查；`L3` 在审查前就要求人工授权。
-- 审查会话必须使用与执行不同的 Agent，且该 Agent 的有效 `edit` 规则为 `deny`；查询失败或规则不是 deny 一律阻塞。
+- 审查会话必须使用与执行不同的 Agent；`opencode` 适配器还要求该 Agent 的有效 `edit` 规则为 `deny`（查询失败或规则不是 deny 一律阻塞）。`attached` 传输由宿主在结果里声明 `edit_denied` 与 `declared_executor_sessions`，工具拒绝同一会话自审。
 - 审查必须返回唯一的 fenced JSON 裁决，绑定确切的 base、head、diff 哈希和风险等级，逐条验收标准为 `PASS` 且有证据，`findings` 为空。
-- 流式输出和 `opencode session export` 必须包含同一份裁决；不一致即拒绝。
+- `opencode` 适配器的流式输出和 `opencode session export` 必须包含同一份裁决；不一致即拒绝。`attached` 传输以宿主结果文件为裁决来源，工具重新计算 head/diff/风险并与结果比对。
 - 审查绑定的 head / diff 一旦变化，批准立即失效；推送或合并前会重新计算并拒绝。
 
 ## 7. 恢复

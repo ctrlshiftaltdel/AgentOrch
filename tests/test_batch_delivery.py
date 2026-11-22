@@ -2897,5 +2897,472 @@ class ExecutorLifecycleTests(BatchCase):
         self.assertIn('retry_blocked', record)
 
 
+class AdapterTransportTests(BatchCase):
+    """Execution/review adapters: legacy default, generic command, attached."""
+
+    CAPS = {'C1': 'PASS', 'C2': 'PASS', 'C3': 'PASS', 'C4': 'PASS'}
+
+    def host_plan(self, tasks):
+        plan = self.plan(tasks)
+        plan['executor_adapter'] = {
+            'transport': 'attached', 'name': 'zcode-host',
+            'capabilities': dict(self.CAPS),
+            'capability_evidence': 'https://example.invalid/probe/230'}
+        return plan
+
+    def _pending(self, ident='T1'):
+        state = self.journal_data()
+        pending = state['tasks'][ident].get('awaiting_host')
+        self.assertIsInstance(pending, dict, state['tasks'][ident])
+        path = Path(pending['request_path'])
+        self.assertTrue(path.is_file(), path)
+        return path, json.loads(path.read_text(encoding='utf-8'))
+
+    def _execution_result(self, request_path, *, terminal='success',
+                          exit_code=0, report='host report', session='host-exec-1',
+                          head_override=None, write=True, commit=True,
+                          extra=None, agent=None, workdir=None):
+        request_path = Path(request_path)
+        request = json.loads(request_path.read_text(encoding='utf-8'))
+        work = Path(request['worktree'])
+        base = request['base_sha']
+        if write:
+            for name in request['paths']:
+                target = work / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text('host execution\n', encoding='utf-8')
+        if extra:
+            target = work / extra
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('out of scope\n', encoding='utf-8')
+        if commit:
+            _git(work, 'add', '-A')
+            _git(work, 'commit', '-q', '-m', f'host {request["task_id"]}')
+        head = head_override or self.head(work)
+        if head_override:
+            paths, raw = [], b''
+        else:
+            paths = (delivery._diff_names(work, base, head)
+                     if write or extra else [])
+            raw = delivery._git(work, 'diff', '--no-ext-diff', '--no-color',
+                                '--no-renames', base, head,
+                                binary=True).stdout or b''
+        adapter_dir = request_path.parent
+        artifact = adapter_dir / 'execution-report.txt'
+        artifact.write_text('artifact\n', encoding='utf-8')
+        data = artifact.read_bytes()
+        result = {
+            'schema': delivery.EXECUTION_RESULT_SCHEMA, 'kind': 'execution',
+            'request_sha256': hashlib.sha256(request_path.read_bytes()).hexdigest(),
+            'batch_id': request['batch_id'], 'task_id': request['task_id'],
+            'session_id': session,
+            'executor_agent': agent or request['executor_agent'],
+            'workdir': workdir or request['worktree'],
+            'terminal': terminal, 'exit_code': exit_code, 'report': report,
+            'artifacts': [{'path': str(artifact),
+                           'sha256': hashlib.sha256(data).hexdigest(),
+                           'bytes': len(data)}],
+            'head': head,
+            'diff': {'base': base, 'head': head, 'paths': paths,
+                     'sha256': hashlib.sha256(raw).hexdigest()},
+            'ended_at': '2026-11-22T00:00:00+00:00',
+        }
+        path = Path(request['result_path'])
+        path.write_text(json.dumps(result), encoding='utf-8')
+        return path
+
+    def _review_result(self, request_path, *, verdict='APPROVE', session='host-rev-1',
+                       head=None, diff_sha256=None, risk=None, tasks=None,
+                       edit_denied=True, declared=None, reviewer_agent=None,
+                       workdir=None):
+        request_path = Path(request_path)
+        request = json.loads(request_path.read_text(encoding='utf-8'))
+        state = self.journal_data()
+        head = head or self.head(self.root / 'wt-batch')
+        digest = diff_sha256 or delivery._diff_for_review(
+            self.repo, state['base_sha'], head)[1]
+        risk = risk or request['risk']
+        if tasks is None:
+            tasks = []
+            for task in request['tasks']:
+                tasks.append({'id': task['id'], 'acceptance': [
+                    {'id': f'AC-{index}', 'criterion': criterion,
+                     'status': 'PASS', 'evidence': f'checked {task["id"]} '
+                                                   f'AC-{index}'}
+                    for index, criterion in enumerate(task['acceptance'],
+                                                      start=1)]})
+        if declared is None:
+            declared = [record['execution_session']
+                        for record in state['tasks'].values()
+                        if record.get('execution_session')]
+        result = {
+            'schema': delivery.REVIEW_RESULT_SCHEMA, 'kind': 'review',
+            'request_sha256': hashlib.sha256(request_path.read_bytes()).hexdigest(),
+            'batch_id': request['batch_id'], 'session_id': session,
+            'reviewer_agent': reviewer_agent or request['reviewer_agent'],
+            'workdir': workdir or str(self.root / 'wt-batch'),
+            'edit_denied': edit_denied, 'declared_executor_sessions': declared,
+            'base': state['base_sha'], 'head': head, 'diff_sha256': digest,
+            'risk': risk, 'verdict': verdict, 'tasks': tasks,
+            'findings': [] if verdict == 'APPROVE' else [
+                {'severity': 'high', 'note': 'host reviewer rejection'}],
+            'report': 'host review report',
+            'ended_at': '2026-11-22T00:00:00+00:00',
+        }
+        path = Path(request['result_path'])
+        path.write_text(json.dumps(result), encoding='utf-8')
+        return path
+
+    def _integrate_one(self, plan, path):
+        self.assertEqual(self.run_batch(plan).returncode, 3)
+        request_path, _ = self._pending()
+        result = self._execution_result(request_path)
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 0, attach.stderr)
+        self.assertEqual(self.journal_data()['tasks']['T1']['status'],
+                         'INTEGRATED')
+        return request_path
+
+    # -- legacy default -------------------------------------------------
+    def test_default_plan_records_the_legacy_opencode_adapter(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        run = self.run_batch(plan)
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        adapter = self.journal_data()['adapter']
+        self.assertEqual(adapter['transport'], 'command')
+        self.assertEqual(adapter['name'], 'opencode')
+        self.assertEqual(adapter['source'], 'legacy-default')
+
+    def test_read_only_entries_work_without_a_runtime(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path = self.write_plan(plan)
+        check = self.cli('check', '--plan', str(path))
+        self.assertEqual(check.returncode, 0, check.stderr)
+        self.assertIn('attached/zcode-host', check.stdout)
+        dry = self.cli('run', '--plan', str(path), '--journal', str(self.journal))
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn('attached/zcode-host', dry.stdout)
+        self.assertFalse((self.root / 'wt-t1').exists())
+
+    # -- attached execution --------------------------------------------
+    def test_attached_request_then_attach_integrates_and_records_evidence(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path = self.write_plan(plan)
+        run = self.run_batch(plan)
+        self.assertEqual(run.returncode, 3, run.stderr + run.stdout)
+        self.assertIn('awaiting host execution request', run.stdout)
+        self.assertEqual(self.opencode_calls(), [])
+        state = self.journal_data()
+        record = state['tasks']['T1']
+        self.assertEqual(record['status'], 'RUNNING')
+        self.assertEqual(record['attempts'], 1)
+        request_path, request = self._pending()
+        self.assertEqual(request['task_id'], 'T1')
+        self.assertEqual(request['worktree'], str(self.root / 'wt-t1'))
+        self.assertEqual(request['branch'], 'task/batch-t1')
+        self.assertEqual(request['paths'], ['a.txt'])
+        self.assertIn('TASK_ID=T1', request['prompt'])
+        self.assertIn('PATHS_JSON=["a.txt"]', request['prompt'])
+        self.assertRegex(request['base_sha'], r'^[0-9a-f]{40}$')
+        result = self._execution_result(request_path)
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 0, attach.stderr)
+        state = self.journal_data()
+        record = state['tasks']['T1']
+        self.assertEqual(record['status'], 'INTEGRATED')
+        self.assertIsNone(record['awaiting_host'])
+        self.assertEqual(record['execution_session'], 'host-exec-1')
+        self.assertEqual(len(record['adapter_history']), 1)
+        entry = record['adapter_history'][0]
+        self.assertTrue(entry['accepted'])
+        self.assertTrue(entry['integrated'])
+        self.assertEqual(entry['terminal'], 'success')
+        attempt = record['attempt_history'][0]
+        self.assertEqual(attempt['state'], 'ENDED')
+        self.assertEqual(attempt['result'], 'ok')
+        self.assertEqual(attempt['adapter']['state'], 'accepted')
+        self.assertEqual(attempt['adapter']['session'], 'host-exec-1')
+        replay = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(replay.returncode, 2, replay.stderr)
+        self.assertIn('no host request waiting', replay.stderr)
+
+    def test_second_run_while_attached_is_idempotent(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        first = self.run_batch(plan)
+        self.assertEqual(first.returncode, 3, first.stderr)
+        first_request, _ = self._pending()
+        second = self.cli('run', '--plan', str(self.write_plan(plan)), '--journal',
+                          str(self.journal), '--execute')
+        self.assertEqual(second.returncode, 3, second.stderr)
+        self.assertIn(str(first_request), second.stdout)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['attempts'], 1)
+        self.assertEqual(len(list(self.journal.parent.glob(
+            f'{self.journal.stem}.adapter/execution-*.request.json'))), 1)
+
+    def test_missing_result_is_rejected_without_integration(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path = self.write_plan(plan)
+        self.assertEqual(self.run_batch(plan).returncode, 3)
+        missing = self.root / 'no-such-result.json'
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(missing))
+        self.assertEqual(attach.returncode, 1, attach.stderr)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIsNone(record['integration_sha'])
+        self.assertEqual(record['attempt_history'][0]['result'],
+                         'adapter_rejected')
+        self.assertFalse(record.get('head'))
+
+    def test_unknown_terminal_is_rejected(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path = self.write_plan(plan)
+        self.assertEqual(self.run_batch(plan).returncode, 3)
+        request_path, _ = self._pending()
+        result = self._execution_result(request_path, terminal='unknown', write=False,
+                                        commit=False)
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 1, attach.stderr)
+        self.assertIn('unknown terminal', attach.stderr)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIsNone(record['integration_sha'])
+
+    def test_head_mismatch_is_rejected(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path = self.write_plan(plan)
+        self.assertEqual(self.run_batch(plan).returncode, 3)
+        request_path, _ = self._pending()
+        result = self._execution_result(request_path, head_override='0' * 40)
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 1, attach.stderr)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertEqual(record['attempt_history'][0]['result'],
+                         'adapter_rejected')
+        self.assertIsNone(record['integration_sha'])
+
+    def test_out_of_scope_result_is_failed_without_integration(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path = self.write_plan(plan)
+        self.assertEqual(self.run_batch(plan).returncode, 3)
+        request_path, _ = self._pending()
+        result = self._execution_result(request_path, extra='extra.txt')
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 1, attach.stderr)
+        self.assertIn('scope violation', attach.stderr)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['status'], 'FAILED')
+        self.assertIsNone(record['integration_sha'])
+
+    def test_dirty_attached_worktree_is_rejected(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path = self.write_plan(plan)
+        self.assertEqual(self.run_batch(plan).returncode, 3)
+        request_path, _ = self._pending()
+        request = json.loads(request_path.read_text())
+        (Path(request['worktree']) / 'a.txt').write_text('dirty\n')
+        result = self._execution_result(request_path, write=False, commit=False)
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 1, attach.stderr)
+        self.assertIn('dirty', attach.stderr)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIsNone(record['integration_sha'])
+
+    def test_host_failure_terminal_marks_task_failed(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path = self.write_plan(plan)
+        self.assertEqual(self.run_batch(plan).returncode, 3)
+        request_path, _ = self._pending()
+        result = self._execution_result(request_path, terminal='failure',
+                                        exit_code=1, report='host failed',
+                                        write=False, commit=False)
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 1, attach.stderr)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['status'], 'FAILED')
+        self.assertIsNone(record['integration_sha'])
+        self.assertEqual(record['adapter_history'][0]['terminal'], 'failure')
+        self.assertEqual(record['attempt_history'][0]['result'], 'failed')
+        self.assertEqual(record['attempt_history'][0]['adapter']['state'],
+                         'accepted')
+        self.assertEqual(record['attempt_history'][0]['adapter']['terminal'],
+                         'failure')
+
+    # -- attached review ------------------------------------------------
+    def test_attached_review_binds_head_diff_and_per_ac_evidence(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path = self.write_plan(plan)
+        self._integrate_one(plan, path)
+        done = self.finalize(plan, None, '--review')
+        self.assertEqual(done.returncode, 3, done.stderr + done.stdout)
+        self.assertIn('awaiting host review request', done.stdout)
+        state = self.journal_data()
+        self.assertEqual(state['review']['verdict'], 'AWAITING_HOST')
+        request_path = Path(state['review']['request_path'])
+        request = json.loads(request_path.read_text(encoding='utf-8'))
+        head = self.head(self.root / 'wt-batch')
+        self.assertEqual(request['head_sha'], head)
+        self.assertEqual(request['diff_sha256'],
+                         delivery._diff_for_review(self.repo, state['base_sha'],
+                                                   head)[1])
+        self.assertEqual(request['tasks'][0]['acceptance'],
+                         plan['tasks'][0]['acceptance'])
+        self.assertIn('DIFF_BEGIN', request['prompt'])
+        self.assertIn('a.txt', request['diff'])
+        before = request_path.read_bytes()
+        again = self.finalize(plan, None, '--review')
+        self.assertEqual(again.returncode, 3, again.stderr + again.stdout)
+        self.assertEqual(request_path.read_bytes(), before)
+        result = self._review_result(request_path)
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 0, attach.stderr)
+        state = self.journal_data()
+        self.assertEqual(state['review']['verdict'], 'APPROVE')
+        self.assertEqual(state['review']['session'], 'host-rev-1')
+        self.assertEqual(len(state['review_history']), 1)
+        self.assertTrue(state['review_history'][0]['accepted'])
+        self.assertFalse(any('pr merge' in call for call in self.gh_calls()))
+
+    def _pending_review(self, plan):
+        path = self.write_plan(plan)
+        self._integrate_one(plan, path)
+        done = self.finalize(plan, None, '--review')
+        self.assertEqual(done.returncode, 3, done.stderr + done.stdout)
+        review = self.journal_data()['review']
+        return path, Path(review['request_path'])
+
+    def test_attached_review_rejects_the_executor_session(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path, request_path = self._pending_review(plan)
+        result = self._review_result(request_path, session='host-exec-1')
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 1, attach.stderr)
+        self.assertIn('reviewer session is an execution session', attach.stderr)
+        self.assertEqual(self.journal_data()['review']['verdict'], 'BLOCKED')
+
+    def test_attached_review_rejects_missing_acceptance_evidence(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path, request_path = self._pending_review(plan)
+        tasks = [{'id': 'T1', 'acceptance': [
+            {'id': 'AC-1', 'criterion': plan['tasks'][0]['acceptance'][0],
+             'status': 'PASS', 'evidence': ''}]}]
+        result = self._review_result(request_path, tasks=tasks)
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 1, attach.stderr)
+        self.assertIn('has no evidence', attach.stderr)
+        state = self.journal_data()
+        self.assertEqual(state['review']['verdict'], 'BLOCKED')
+        self.assertFalse(any('pr merge' in call for call in self.gh_calls()))
+
+    def test_attached_review_rejects_a_different_diff(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path, request_path = self._pending_review(plan)
+        result = self._review_result(request_path, diff_sha256='0' * 64)
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 1, attach.stderr)
+        self.assertIn('different diff', attach.stderr)
+        self.assertEqual(self.journal_data()['review']['verdict'], 'BLOCKED')
+
+    # -- generic command transport -------------------------------------
+    def _generic_plan(self):
+        script = self.bin / 'generic.py'
+        script.write_text(
+            'import json, os, re, sys\n'
+            'from pathlib import Path\n'
+            'prompt = sys.stdin.read()\n'
+            'Path(os.environ["GENERIC_MARKER"]).write_text(prompt)\n'
+            'paths = json.loads(re.search(r"^PATHS_JSON=(.*)$", prompt, re.M).group(1))\n'
+            'for name in paths:\n'
+            '    path = Path(name); path.parent.mkdir(parents=True, exist_ok=True)\n'
+            '    path.write_text("generic\\n")\n'
+            'session = "generic-session-1"\n'
+            'print(json.dumps({"type": "step_start", "sessionID": session}))\n'
+            'print(json.dumps({"type": "text", "sessionID": session, '
+            '"part": {"text": "done"}}))\n'
+            'print(json.dumps({"type": "step_finish", "sessionID": session, '
+            '"part": {"reason": "stop"}}))\n')
+        plan = self.plan([self.task('T1', 'a.txt')])
+        plan['executor_adapter'] = {
+            'transport': 'command', 'name': 'generic-command',
+            'command': [PY, '-S', str(script)],
+            'capabilities': dict(self.CAPS),
+            'capability_evidence': 'https://example.invalid/probe/230'}
+        return plan
+
+    def test_generic_command_adapter_runs_a_contracted_stream(self):
+        plan = self._generic_plan()
+        marker = self.root / 'generic-prompt.txt'
+        run = self.run_batch(plan, {'GENERIC_MARKER': str(marker)})
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        self.assertIn('TASK_ID=T1', marker.read_text(encoding='utf-8'))
+        state = self.journal_data()
+        self.assertEqual(state['adapter']['name'], 'generic-command')
+        record = state['tasks']['T1']
+        self.assertEqual(record['status'], 'INTEGRATED')
+        self.assertEqual(record['execution_session'], 'generic-session-1')
+        self.assertIsInstance(
+            record['attempt_history'][0]['executor']['pid'], int)
+
+    def test_generic_command_adapter_blocks_independent_review(self):
+        plan = self._generic_plan()
+        marker = self.root / 'generic-prompt.txt'
+        run = self.run_batch(plan, {'GENERIC_MARKER': str(marker)})
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        done = self.finalize(plan, {'GENERIC_MARKER': str(marker)}, '--review')
+        self.assertEqual(done.returncode, 1, done.stderr + done.stdout)
+        self.assertIn('no independent review evidence provider', done.stderr)
+        self.assertFalse(any('pr merge' in call for call in self.gh_calls()))
+
+    # -- selection and preflight ---------------------------------------
+    def test_explicit_adapter_requires_capabilities(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        plan['executor_adapter'] = {'transport': 'attached', 'name': 'host'}
+        run = self.run_batch(plan)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertIn('capabilities', run.stderr)
+        self.assertFalse((self.root / 'wt-t1').exists())
+        self.assertFalse(self.journal.exists())
+
+    def test_missing_explicit_command_is_reported_before_worktrees(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        plan['executor_adapter'] = {
+            'transport': 'command', 'name': 'generic-command',
+            'command': [str(self.root / 'no-such-executable')],
+            'capabilities': dict(self.CAPS),
+            'capability_evidence': 'https://example.invalid/probe/230'}
+        run = self.run_batch(plan)
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertIn('not available', run.stderr)
+        self.assertFalse((self.root / 'wt-t1').exists())
+        self.assertFalse(self.journal.exists())
+
+    def test_journal_refuses_a_mid_batch_adapter_switch(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        state = self.journal_data()
+        state['adapter'] = {'transport': 'attached', 'name': 'other',
+                            'source': 'plan'}
+        self.journal.write_text(json.dumps(state))
+        again = self.cli('run', '--plan', str(self.write_plan(plan)),
+                         '--journal', str(self.journal), '--execute')
+        self.assertEqual(again.returncode, 2, again.stderr)
+        self.assertIn('different executor adapter', again.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()
