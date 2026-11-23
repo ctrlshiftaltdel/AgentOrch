@@ -83,7 +83,17 @@ PROCESS_STATES = ('stopped', 'running', 'unknown')
 PROBE_GRACE = 5.0
 CHILD_PROOF_GRACE = 15.0
 PROBE_INTERVAL = 0.05
+KILL_GRACE = 15
 _IS_WINDOWS = os.name == 'nt'
+# A Windows process tree is proven stopped through a kill-on-close Job Object
+# (owner decision HD-2 B, Issue #267). ``state`` is the recorded lifetime of
+# that Job; the kernel object name is the only durable identifier because a
+# handle cannot be persisted.
+JOB_STATES = ('created', 'assigned', 'ended')
+JOB_NAME_PREFIX = 'Local\\AgentOrch-batch-'
+# ``subprocess`` does not export CREATE_SUSPENDED; the child must not run a
+# single instruction before it is bound to its Job Object.
+CREATE_SUSPENDED = 0x00000004
 STATUSES = ('PENDING', 'RUNNING', 'VERIFIED', 'INTEGRATED', 'FAILED', 'BLOCKED',
             'SKIPPED')
 PHASES = ('tasks', 'review', 'pr', 'merge', 'post_merge', 'verified', 'blocked')
@@ -1116,6 +1126,401 @@ def _utc_now():
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
 
 
+# ------------------------------------------------- Windows Job Object proof
+#
+# The owner selected HD-2 B (Issue #267): a Windows process tree is proven
+# stopped through a kill-on-close Job Object. The Job query is authoritative;
+# ``_windows_process_state`` stays as a secondary liveness check because its
+# parent map cannot attribute an orphan whose intermediate parent exited.
+
+class _JobError(RuntimeError):
+    """A Job Object operation failed; the tree cannot be proven stopped."""
+
+
+_JOB_API = None
+
+
+def _job_api():
+    """Return the kernel32 Job Object bindings, created once per process."""
+    global _JOB_API
+    if _JOB_API is not None:
+        return _JOB_API
+    import ctypes
+    from ctypes import wintypes
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [('ReadOperationCount', ctypes.c_ulonglong),
+                    ('WriteOperationCount', ctypes.c_ulonglong),
+                    ('OtherOperationCount', ctypes.c_ulonglong),
+                    ('ReadTransferCount', ctypes.c_ulonglong),
+                    ('WriteTransferCount', ctypes.c_ulonglong),
+                    ('OtherTransferCount', ctypes.c_ulonglong)]
+
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [('PerProcessUserTimeLimit', ctypes.c_int64),
+                    ('PerJobUserTimeLimit', ctypes.c_int64),
+                    ('LimitFlags', wintypes.DWORD),
+                    ('MinimumWorkingSetSize', ctypes.c_size_t),
+                    ('MaximumWorkingSetSize', ctypes.c_size_t),
+                    ('ActiveProcessLimit', wintypes.DWORD),
+                    ('Affinity', ctypes.c_size_t),
+                    ('PriorityClass', wintypes.DWORD),
+                    ('SchedulingClass', wintypes.DWORD)]
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [('BasicLimitInformation', JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                    ('IoInfo', IO_COUNTERS),
+                    ('ProcessMemoryLimit', ctypes.c_size_t),
+                    ('JobMemoryLimit', ctypes.c_size_t),
+                    ('PeakProcessMemoryUsed', ctypes.c_size_t),
+                    ('PeakJobMemoryUsed', ctypes.c_size_t)]
+
+    class JOBOBJECT_BASIC_ACCOUNTING_INFORMATION(ctypes.Structure):
+        _fields_ = [('TotalUserTime', ctypes.c_int64),
+                    ('TotalKernelTime', ctypes.c_int64),
+                    ('ThisPeriodTotalUserTime', ctypes.c_int64),
+                    ('ThisPeriodTotalKernelTime', ctypes.c_int64),
+                    ('TotalPageFaultCount', wintypes.DWORD),
+                    ('TotalProcesses', wintypes.DWORD),
+                    ('ActiveProcesses', wintypes.DWORD),
+                    ('TotalTerminatedProcesses', wintypes.DWORD)]
+
+    class THREADENTRY32(ctypes.Structure):
+        _fields_ = [('dwSize', wintypes.DWORD),
+                    ('cntUsage', wintypes.DWORD),
+                    ('th32ThreadID', wintypes.DWORD),
+                    ('th32OwnerProcessID', wintypes.DWORD),
+                    ('tpBasePri', ctypes.c_long),
+                    ('tpDeltaPri', ctypes.c_long),
+                    ('dwFlags', wintypes.DWORD)]
+
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE,
+                                                  wintypes.HANDLE]
+    kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+    kernel32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD)]
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.OpenJobObjectW.restype = wintypes.HANDLE
+    kernel32.OpenJobObjectW.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                        wintypes.LPCWSTR]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD,
+                                                  wintypes.DWORD]
+    kernel32.Thread32First.argtypes = [wintypes.HANDLE,
+                                       ctypes.POINTER(THREADENTRY32)]
+    kernel32.Thread32Next.argtypes = [wintypes.HANDLE,
+                                      ctypes.POINTER(THREADENTRY32)]
+    kernel32.OpenThread.restype = wintypes.HANDLE
+    kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                    wintypes.DWORD]
+    kernel32.ResumeThread.restype = wintypes.DWORD
+    kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+    _JOB_API = {
+        'ctypes': ctypes, 'wintypes': wintypes, 'kernel32': kernel32,
+        'extended': JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        'accounting': JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        'thread': THREADENTRY32,
+        'kill_on_close': 0x00002000,      # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        'extended_class': 9,              # JobObjectExtendedLimitInformation
+        'accounting_class': 1,            # JobObjectBasicAccountingInformation
+        'query_access': 0x0004,           # JOB_OBJECT_QUERY
+        'thread_suspend_resume': 0x0002,  # THREAD_SUSPEND_RESUME
+        'snap_thread': 0x00000004,        # TH32CS_SNAPTHREAD
+        'error_file_not_found': 2,
+    }
+    return _JOB_API
+
+
+def _new_job_name():
+    return JOB_NAME_PREFIX + uuid.uuid4().hex
+
+
+def _create_job_handle(name):
+    api = _job_api()
+    handle = api['kernel32'].CreateJobObjectW(None, name)
+    if not handle:
+        raise _JobError('CreateJobObjectW failed '
+                        f'({api["ctypes"].get_last_error()})')
+    info = api['extended']()
+    info.BasicLimitInformation.LimitFlags = api['kill_on_close']
+    if not api['kernel32'].SetInformationJobObject(
+            handle, api['extended_class'], api['ctypes'].byref(info),
+            api['ctypes'].sizeof(info)):
+        error = api['ctypes'].get_last_error()
+        api['kernel32'].CloseHandle(handle)
+        raise _JobError(f'SetInformationJobObject failed ({error})')
+    return handle
+
+
+def _assign_job_handle(handle, process):
+    api = _job_api()
+    raw = getattr(process, '_handle', None)
+    if not raw:
+        raise _JobError('the child process handle is unavailable')
+    if not api['kernel32'].AssignProcessToJobObject(
+            handle, api['wintypes'].HANDLE(int(raw))):
+        raise _JobError('AssignProcessToJobObject failed '
+                        f'({api["ctypes"].get_last_error()})')
+
+
+def _resume_job_child(pid):
+    """Resume every (initially one) thread of a suspended Job-bound child."""
+    api = _job_api()
+    kernel32 = api['kernel32']
+    ctypes = api['ctypes']
+    snapshot = kernel32.CreateToolhelp32Snapshot(api['snap_thread'], 0)
+    if not snapshot or snapshot == ctypes.c_void_p(-1).value:
+        raise _JobError('CreateToolhelp32Snapshot failed '
+                        f'({ctypes.get_last_error()})')
+    entry = api['thread']()
+    entry.dwSize = ctypes.sizeof(entry)
+    resumed = 0
+    failure = None
+    try:
+        found = kernel32.Thread32First(snapshot, ctypes.byref(entry))
+        while found:
+            if entry.th32OwnerProcessID == int(pid):
+                thread = kernel32.OpenThread(api['thread_suspend_resume'],
+                                             False, entry.th32ThreadID)
+                if not thread:
+                    failure = ('OpenThread failed '
+                               f'({ctypes.get_last_error()})')
+                    break
+                try:
+                    if kernel32.ResumeThread(thread) == 0xFFFFFFFF:
+                        failure = ('ResumeThread failed '
+                                   f'({ctypes.get_last_error()})')
+                        break
+                finally:
+                    kernel32.CloseHandle(thread)
+                resumed += 1
+            found = kernel32.Thread32Next(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    if failure is not None:
+        raise _JobError(failure)
+    if not resumed:
+        raise _JobError('no thread could be resumed')
+
+
+def _job_active(handle):
+    api = _job_api()
+    info = api['accounting']()
+    written = api['wintypes'].DWORD()
+    if not api['kernel32'].QueryInformationJobObject(
+            handle, api['accounting_class'], api['ctypes'].byref(info),
+            api['ctypes'].sizeof(info), api['ctypes'].byref(written)):
+        raise _JobError('QueryInformationJobObject failed '
+                        f'({api["ctypes"].get_last_error()})')
+    return int(info.ActiveProcesses)
+
+
+def _job_active_by_name(name):
+    """Query a persisted Job by name: ('present', count) / ('absent'|'unknown')."""
+    if not _IS_WINDOWS:
+        return 'unknown', None
+    try:
+        api = _job_api()
+    except _JobError:
+        return 'unknown', None
+    handle = api['kernel32'].OpenJobObjectW(api['query_access'], False, name)
+    if not handle:
+        # ERROR_FILE_NOT_FOUND means no handle can be open, so the
+        # kill-on-close limit already terminated every member.
+        if api['ctypes'].get_last_error() == api['error_file_not_found']:
+            return 'absent', None
+        return 'unknown', None
+    try:
+        return 'present', _job_active(handle)
+    except _JobError:
+        return 'unknown', None
+    finally:
+        api['kernel32'].CloseHandle(handle)
+
+
+class _WindowsJob:
+    """One kill-on-close Job Object bound to one spawned child.
+
+    ``record`` is the JSON-serialisable proof stored in the attempt history.
+    It is the same dict the caller persists, so later proofs are visible
+    without rewriting history.
+    """
+
+    def __init__(self, name):
+        self.name = name
+        self.handle = None
+        self.record = {'kind': 'windows-job-object', 'id': name,
+                       'state': 'created', 'active': None, 'stopped': None,
+                       'created_at': _utc_now(), 'proven_at': None,
+                       'closed_at': None, 'detail': None}
+
+    def create(self):
+        self.handle = _create_job_handle(self.name)
+        return self
+
+    def bind(self, process):
+        """Assign the still-suspended child; it may not run before this."""
+        _assign_job_handle(self.handle, process)
+        self.record['state'] = 'assigned'
+
+    def resume(self, pid):
+        _resume_job_child(pid)
+
+    def active(self):
+        if self.handle is None:
+            raise _JobError('the Job Object handle is closed')
+        return _job_active(self.handle)
+
+    def terminate(self):
+        if self.handle is None:
+            return False
+        return bool(_job_api()['kernel32'].TerminateJobObject(self.handle, 1))
+
+    def prove_empty(self, grace=CHILD_PROOF_GRACE):
+        """Return 'stopped', 'running' or 'unknown'; updates ``record``."""
+        deadline = time.monotonic() + max(0.0, grace)
+        while True:
+            try:
+                count = self.active()
+            except _JobError as exc:
+                self.record.update(state='ended', stopped=None, detail=str(exc))
+                return 'unknown'
+            self.record['active'] = count
+            if count == 0:
+                self.record.update(state='ended', stopped=True,
+                                   proven_at=_utc_now(), detail=None)
+                return 'stopped'
+            if time.monotonic() >= deadline:
+                self.record.update(
+                    state='ended', stopped=False,
+                    detail=f'{count} process(es) still active in the Job')
+                return 'running'
+            time.sleep(PROBE_INTERVAL)
+
+    def stop_and_prove(self, grace=KILL_GRACE):
+        """Terminate the whole tree, then prove it empty; never assume success."""
+        if self.handle is None:
+            return False
+        if not self.terminate():
+            self.record['detail'] = 'TerminateJobObject was refused'
+        return self.prove_empty(grace) == 'stopped'
+
+    def close(self):
+        if self.handle is None:
+            return
+        _job_api()['kernel32'].CloseHandle(self.handle)
+        self.handle = None
+        self.record['closed_at'] = _utc_now()
+
+
+def _discard_child(process, job):
+    """Terminate a child that must not run, then prove its Job empty."""
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.communicate(timeout=KILL_GRACE)
+    except (subprocess.TimeoutExpired, OSError, ValueError, UnicodeError):
+        pass
+    if job is None:
+        return None
+    try:
+        return job.stop_and_prove()
+    finally:
+        job.close()
+
+
+def _settle_job(job, grace=CHILD_PROOF_GRACE):
+    """Prove a Job empty after its direct child ended, then close the handle."""
+    if job is None:
+        return None
+    try:
+        return job.prove_empty(grace)
+    finally:
+        job.close()
+
+
+def _spawn_bound(argv, popen_kwargs, *, on_bound=None):
+    """Spawn ``argv``; on Windows bind it to a Job before it may run.
+
+    Returns a dict with ``process``, ``job``, ``token``, ``job_record`` and the
+    mutually exclusive failure keys ``error`` (no process exists),
+    ``job_failed`` (the Job could not be created/bound/resumed; the child was
+    terminated and the tree proven empty) and ``record_failed`` (the proof
+    could not be persisted; the child was terminated). ``on_bound(pid, pgid,
+    token, record)`` runs while the child is still suspended, so the caller
+    can persist pid, token and the Job id before it is allowed to run.
+    """
+    result = {'process': None, 'job': None, 'token': None,
+              'job_record': None, 'error': None, 'job_failed': None,
+              'record_failed': None, 'stopped': None}
+    job = None
+    flags = 0
+    if _IS_WINDOWS:
+        job = _WindowsJob(_new_job_name())
+        try:
+            job.create()
+        except _JobError as exc:
+            job.close()
+            result.update(job_record=job.record,
+                          job_failed=f'cannot create a Job Object: {exc}')
+            return result
+        result.update(job=job, job_record=job.record)
+        flags = CREATE_SUSPENDED
+    try:
+        process = subprocess.Popen(argv, creationflags=flags, **popen_kwargs)
+    except (OSError, ValueError) as exc:
+        if job is not None:
+            job.close()
+        result['error'] = f'spawn failed: {exc}'
+        return result
+    result['process'] = process
+    if job is None:
+        return result
+    try:
+        job.bind(process)
+    except Exception as exc:
+        proven = _discard_child(process, job)
+        result.update(process=None, stopped=proven,
+                      job_failed=f'cannot bind the child to its Job Object: '
+                                 f'{exc}')
+        return result
+    try:
+        token = _process_token(process, None)
+    except Exception as exc:
+        proven = _discard_child(process, job)
+        result.update(stopped=proven,
+                      record_failed=f'cannot read the child identity: {exc}')
+        return result
+    result['token'] = token
+    if on_bound is not None:
+        try:
+            on_bound(process.pid, None, token, job.record)
+        except Exception as exc:
+            proven = _discard_child(process, job)
+            result.update(stopped=proven, record_failed=str(exc))
+            return result
+    try:
+        job.resume(process.pid)
+    except _JobError as exc:
+        proven = _discard_child(process, job)
+        result.update(process=None, stopped=proven,
+                      job_failed=f'cannot resume the Job-bound child: {exc}')
+        return result
+    return result
+
+
 def _windows_parent_map():
     """Return ``{pid: parent pid}`` for every process, or None if unreadable."""
     import ctypes
@@ -1298,15 +1703,15 @@ def _posix_start_token(pid):
 def _windows_process_state(pid, token=None):
     """Liveness of the process tree rooted at the recorded ``pid``, on Windows.
 
-    Windows has no queryable process group. The read-only tree snapshot is a
-    liveness check only; it is not a termination proof for a timeout kill, so
-    ``_prove_stopped`` keeps treating Windows as unproven. A recorded creation
-    time excludes pid reuse for the *root* process only. When the root is gone
-    or reused, an empty reachable-descendant set does not prove the tree
-    stopped: an orphan whose intermediate parent already exited keeps that
-    intermediate pid as its parent and cannot be traced back to this root.
-    Without a Job Object (HD-2 B) that case is unprovable and is reported as
-    ``unknown`` (halt), never ``stopped``.
+    Windows has no queryable process group, so this read-only tree snapshot is
+    a secondary liveness check only; the recorded Job Object query
+    (:func:`_job_proof_status`) is the authoritative termination proof (HD-2 B,
+    Issue #267). A recorded creation time excludes pid reuse for the *root*
+    process only. When the root is gone or reused, an empty
+    reachable-descendant set does not prove the tree stopped: an orphan whose
+    intermediate parent already exited keeps that intermediate pid as its
+    parent and cannot be traced back to this root. That case is reported as
+    ``unknown`` here and is decided by the Job query, never by this probe.
     """
     if token is not None:
         kind, value = _windows_creation_time(pid)
@@ -1500,7 +1905,7 @@ def _new_attempt(record, spec, trigger):
         'ended_at': None, 'result': None, 'error': None,
         'executor': {'state': 'pending', 'pid': None, 'pgid': None,
                      'token': None, 'exit': None, 'stopped': None,
-                     'session': None},
+                     'session': None, 'job': None},
         'verifiers': [],
     }
 
@@ -1560,15 +1965,69 @@ def _attempt_processes(attempt):
     executor = attempt.get('executor')
     if isinstance(executor, dict):
         rows.append(('executor', executor.get('pid'), executor.get('pgid'),
-                     executor.get('token'), executor.get('stopped')))
+                     executor.get('token'), executor.get('stopped'),
+                     executor.get('job')))
     verifiers = attempt.get('verifiers')
     if isinstance(verifiers, list):
         for index, entry in enumerate(verifiers):
             if isinstance(entry, dict):
                 rows.append((f'verifier {index + 1}', entry.get('pid'),
                              entry.get('pgid'), entry.get('token'),
-                             entry.get('stopped')))
+                             entry.get('stopped'), entry.get('job')))
     return rows
+
+
+def _job_proof_status(job):
+    """Classify a recorded Job proof as ``(verdict, detail)``.
+
+    ``verdict`` is one of ``missing`` (no Job record at all), ``invalid`` (a
+    corrupt record), ``unknown`` (the named Job cannot be queried), ``running``
+    (the Job still has live members) and ``empty``/``absent`` (proven stopped).
+    """
+    if job is None:
+        return 'missing', 'no Job Object was recorded'
+    if not isinstance(job, dict):
+        return 'invalid', 'the Job Object record is not an object'
+    if job.get('kind') != 'windows-job-object':
+        return 'invalid', f'the Job Object kind is {job.get("kind")!r}'
+    ident = job.get('id')
+    if not isinstance(ident, str) or not ident:
+        return 'invalid', 'the Job Object id is unreadable'
+    state = job.get('state')
+    if state not in JOB_STATES:
+        return 'invalid', f'the Job Object state is {state!r}'
+    active = job.get('active')
+    if active is not None and (isinstance(active, bool)
+                               or not isinstance(active, int) or active < 0):
+        return 'invalid', 'the recorded Job Object active count is invalid'
+    stopped = job.get('stopped')
+    if stopped is not None and not isinstance(stopped, bool):
+        return 'invalid', 'the recorded Job Object stop proof is not a boolean'
+    if state == 'created':
+        # The child was suspended but never bound, so it may have outlived the
+        # Job; nothing proves it stopped.
+        return 'unknown', 'the Job Object was never bound to the child'
+    query, count = _job_active_by_name(ident)
+    if query == 'present':
+        if count == 0:
+            return 'empty', 'the Job Object is empty'
+        return 'running', f'{count} active process(es) in the Job Object'
+    if query == 'absent':
+        # No handle can be open, so JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE has
+        # already terminated every member. An unproven recorded result is still
+        # never upgraded to "stopped".
+        if stopped is True:
+            return 'absent', 'the Job Object no longer exists'
+        if state == 'assigned' and stopped is None:
+            # The coordinator died mid-attempt before any proof was attempted;
+            # closing the last handle made the kernel terminate every member.
+            return 'absent', ('the Job Object was destroyed with the '
+                              'coordinator and its members were terminated')
+        if stopped is False:
+            return 'running', 'the recorded proof saw live processes'
+        return 'unknown', ('the Job Object vanished after an unproven query; '
+                           'the process tree cannot be proven stopped')
+    return 'unknown', 'the Job Object could not be opened or queried'
 
 
 def _attempt_problems(record, ignore=()):
@@ -1669,7 +2128,7 @@ def _attempt_problems(record, ignore=()):
                     'starting', 'running', 'ended', 'unrecorded'):
                 problems.append(f'attempt #{position} verifier {index} is '
                                 f'{verifier_state} without a recorded pid')
-        for role, pid, pgid, token, stopped in _attempt_processes(attempt):
+        for role, pid, pgid, token, stopped, job in _attempt_processes(attempt):
             if pid is not None and (not isinstance(pid, int) or pid <= 0):
                 problems.append(f'attempt #{position} {role} pid is invalid')
                 continue
@@ -1700,14 +2159,26 @@ def _attempt_problems(record, ignore=()):
             if liveness == 'running':
                 problems.append(f'attempt #{position} {role} process group is '
                                 f'still running (pid {pid})')
-            elif liveness == 'unknown' and not (
-                    # The recorded post-exit proof stands only where the group
-                    # probe is authoritative. On Windows the owner selected
-                    # "no reuse until a Job Object (HD-2 B) proves the tree",
-                    # so an unknown liveness always blocks there.
-                    not _IS_WINDOWS
-                    and state == 'ENDED' and stopped is True
-                    and token is not None):
+                continue
+            if _IS_WINDOWS:
+                # HD-2 B: the Job Object query is the termination proof. A
+                # missing, corrupt or unqueryable Job never authorises reuse,
+                # and a recorded proof may not stand in for a live query.
+                verdict, detail = _job_proof_status(job)
+                if verdict == 'running':
+                    problems.append(f'attempt #{position} {role} Job Object is '
+                                    f'still running ({detail})')
+                elif verdict in ('invalid', 'unknown'):
+                    problems.append(f'attempt #{position} {role} Job Object '
+                                    f'proof {detail}; the process tree cannot '
+                                    'be proven stopped')
+                elif verdict == 'missing' and liveness != 'stopped':
+                    problems.append(f'attempt #{position} {role} has no Job '
+                                    'Object record; on Windows the process tree '
+                                    'cannot be proven stopped (pid {pid})')
+                continue
+            if liveness == 'unknown' and not (
+                    state == 'ENDED' and stopped is True and token is not None):
                 # A recorded post-exit proof with an identity token stands: the
                 # recorded process already exited, so an unreadable pid now is
                 # a reused or inaccessible process, not evidence of survival.
@@ -1911,11 +2382,13 @@ def _classify_stream(returncode, output, *, session_prefix='ses_',
             'detail': 'ok'}
 
 
-KILL_GRACE = 15
-
-
-def _kill_group(process):
-    if os.name == 'nt':  # pragma: no cover - POSIX CI path
+def _kill_group(process, job=None):
+    if os.name == 'nt':
+        if job is not None:
+            # The Job covers the whole tree, including orphans that PID
+            # enumeration cannot attribute; taskkill stays as the fallback for
+            # processes that were never bound.
+            return job.terminate(), None
         issued = False
         try:
             issued = subprocess.run(
@@ -1937,7 +2410,7 @@ def _kill_group(process):
     return True, pgid
 
 
-def _prove_stopped(process, issued, pgid):
+def _prove_stopped(process, issued, pgid, job=None):
     try:
         process.communicate(timeout=KILL_GRACE)
     except subprocess.TimeoutExpired:
@@ -1945,6 +2418,10 @@ def _prove_stopped(process, issued, pgid):
     except (OSError, ValueError, UnicodeError):
         # A decode/pipe failure while reaping is not proof of termination.
         return False
+    if _IS_WINDOWS and job is not None:
+        # TerminateJobObject is idempotent: this both stops anything the
+        # direct kill missed and proves the Job is empty.
+        return job.stop_and_prove(KILL_GRACE)
     if not issued or os.name == 'nt' or pgid is None:
         return False
     try:
@@ -1956,70 +2433,99 @@ def _prove_stopped(process, issued, pgid):
     return False
 
 
-def _stop_timed_out(process):
-    issued, pgid = _kill_group(process)
-    if _prove_stopped(process, issued, pgid):
-        return True, 'timed out; process group killed'
-    return False, 'timed out; could not prove the process group was terminated'
+def _stop_timed_out(process, job=None):
+    try:
+        issued, pgid = _kill_group(process, job)
+        if _prove_stopped(process, issued, pgid, job):
+            return True, 'timed out; process group killed'
+        return False, 'timed out; could not prove the process group was terminated'
+    finally:
+        if job is not None:
+            job.close()
 
 
 def _run_process(argv, cwd, timeout, *, env=None, input_text=None,
-                 on_spawn=None):
-    """Run one argv without a shell; return exit, tail and timeout facts."""
+                 on_spawn=None, on_bound=None):
+    """Run one argv without a shell; return exit, tail and timeout facts.
+
+    On Windows the child is created suspended, bound to a kill-on-close Job
+    Object and only then resumed. ``on_bound(pid, pgid, token, job)`` runs
+    while the child is still suspended so the caller can persist the Job id
+    before any instruction executes.
+    """
     environment = dict(os.environ, PWD=str(cwd))
     if env:
         environment.update(env)
-    try:
-        process = subprocess.Popen(
-            argv, cwd=str(cwd), stdin=subprocess.DEVNULL if input_text is None
-            else subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, env=environment, start_new_session=(os.name == 'posix'))
-    except OSError as exc:
-        return {'exit': None, 'tail': f'spawn failed: {exc}', 'timeout': False,
-                'stopped': None, 'pid': None, 'pgid': None}
-    # start_new_session makes the child its own group/session leader, so the
-    # group id equals its pid. On Windows there is no separate group.
+    spawn = _spawn_bound(
+        argv,
+        dict(cwd=str(cwd),
+             stdin=(subprocess.DEVNULL if input_text is None
+                    else subprocess.PIPE),
+             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+             env=environment, start_new_session=(os.name == 'posix')),
+        on_bound=on_bound)
+    job = spawn.get('job')
+    if spawn['error'] is not None:
+        return {'exit': None, 'tail': spawn['error'], 'timeout': False,
+                'stopped': None, 'pid': None, 'pgid': None,
+                'job': spawn.get('job_record')}
+    if spawn['job_failed'] is not None:
+        return {'exit': None, 'tail': spawn['job_failed'], 'timeout': False,
+                'stopped': spawn.get('stopped'), 'pid': None, 'pgid': None,
+                'job': spawn.get('job_record'),
+                'job_failed': spawn['job_failed']}
+    process = spawn['process']
+    # start_new_session makes the POSIX child its own group/session leader, so
+    # the group id equals its pid. On Windows the Job replaces the group.
     pgid = process.pid if os.name == 'posix' else None
-    try:
-        token = _process_token(process, pgid)
-    except Exception as exc:  # the identity could not be read after spawn
-        proven, detail = _stop_timed_out(process)
+    if spawn['record_failed'] is not None:
+        proven, detail = _stop_timed_out(process, job)
         return {'exit': None, 'tail': detail, 'timeout': False,
                 'stopped': proven, 'pid': process.pid, 'pgid': pgid,
-                'token': None, 'record_failed': str(exc)}
+                'token': spawn.get('token'), 'job': spawn.get('job_record'),
+                'record_failed': spawn['record_failed']}
+    token = spawn.get('token')
+    if token is None and job is None:
+        try:
+            token = _process_token(process, pgid)
+        except Exception as exc:  # the identity could not be read after spawn
+            proven, detail = _stop_timed_out(process, job)
+            return {'exit': None, 'tail': detail, 'timeout': False,
+                    'stopped': proven, 'pid': process.pid, 'pgid': pgid,
+                    'token': None, 'job': spawn.get('job_record'),
+                    'record_failed': str(exc)}
     if on_spawn is not None:
         try:
             on_spawn(process.pid, pgid, token)
         except Exception as exc:  # the pid could not be persisted
-            proven, detail = _stop_timed_out(process)
+            proven, detail = _stop_timed_out(process, job)
             return {'exit': None, 'tail': detail, 'timeout': False,
                     'stopped': proven, 'pid': process.pid, 'pgid': pgid,
-                    'token': token, 'record_failed': str(exc)}
-    if input_text is not None:
-        try:
+                    'token': token, 'job': spawn.get('job_record'),
+                    'record_failed': str(exc)}
+    try:
+        if input_text is not None:
             stdout, stderr = process.communicate(input_text, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proven, detail = _stop_timed_out(process)
-            return {'exit': None, 'tail': detail, 'timeout': True,
-                    'stopped': proven, 'pid': process.pid, 'pgid': pgid,
-                    'token': token}
-    else:
-        try:
+        else:
             stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proven, detail = _stop_timed_out(process)
-            return {'exit': None, 'tail': detail, 'timeout': True,
-                    'stopped': proven, 'pid': process.pid, 'pgid': pgid,
-                    'token': token}
+    except subprocess.TimeoutExpired:
+        proven, detail = _stop_timed_out(process, job)
+        return {'exit': None, 'tail': detail, 'timeout': True,
+                'stopped': proven, 'pid': process.pid, 'pgid': pgid,
+                'token': token, 'job': spawn.get('job_record')}
+    settled = _settle_job(job)
     return {'exit': process.returncode,
             'tail': ((stdout or '') + (stderr or ''))[-2000:],
-            'timeout': False, 'stopped': None, 'pid': process.pid,
-            'pgid': pgid, 'token': token,
-            'exit_ticks': _process_exit_ticks(process)}
+            'timeout': False,
+            'stopped': None if settled is None else settled == 'stopped',
+            'job_state': settled, 'job_proven': settled is not None,
+            'pid': process.pid, 'pgid': pgid, 'token': token,
+            'exit_ticks': _process_exit_ticks(process),
+            'job': spawn.get('job_record')}
 
 
 def _agent(work, prompt, agent_name, timeout, *, title=None, on_spawn=None,
-           adapter=None, role=None, task_id=None, base_sha=None):
+           adapter=None, role=None, task_id=None, base_sha=None, on_bound=None):
     adapter = adapter or dict(LEGACY_ADAPTER)
     if adapter.get('transport') != 'command':
         raise BatchError('the attached transport does not spawn a process',
@@ -2045,62 +2551,85 @@ def _agent(work, prompt, agent_name, timeout, *, title=None, on_spawn=None,
             'BATCH_TASK_ID': task_id or '', 'BATCH_BASE_SHA': base_sha or '',
             'BATCH_WORKTREE': str(work)})
         session_prefix = None
-    try:
-        process = subprocess.Popen(
-            argv, cwd=str(work),
-            stdin=subprocess.PIPE if input_text is not None
-            else subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-            encoding='utf-8', errors='strict',
-            env=environment, start_new_session=(os.name == 'posix'))
-    except (OSError, ValueError) as exc:
+    spawn = _spawn_bound(
+        argv,
+        dict(cwd=str(work),
+             stdin=(subprocess.PIPE if input_text is not None
+                    else subprocess.DEVNULL),
+             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+             encoding='utf-8', errors='strict', env=environment,
+             start_new_session=(os.name == 'posix')),
+        on_bound=on_bound)
+    job = spawn.get('job')
+    idle = {'exit_code': None, 'session_id': None, 'text': '', 'pid': None,
+            'pgid': None}
+    if spawn['error'] is not None:
         # No process was spawned, so there is nothing to stop.
-        return {'exit_code': None, 'session_id': None, 'text': '', 'pid': None,
-                'pgid': None, 'detail': f'spawn failed: {exc}'}
+        return dict(idle, detail=spawn['error'], job=spawn.get('job_record'))
+    if spawn['job_failed'] is not None:
+        return dict(idle, stopped=spawn.get('stopped'),
+                    job=spawn.get('job_record'),
+                    job_failed=spawn['job_failed'],
+                    detail=spawn['job_failed'])
+    process = spawn['process']
     pgid = process.pid if os.name == 'posix' else None
-    try:
-        token = _process_token(process, pgid)
-    except Exception as exc:  # the identity could not be read after spawn
-        proven, detail = _stop_timed_out(process)
-        return {'exit_code': None, 'session_id': None, 'text': '',
-                'pid': process.pid, 'pgid': pgid, 'token': None,
-                'stopped': proven, 'record_failed': str(exc),
-                'detail': f'cannot read the executor identity: {exc}; {detail}'}
+    if spawn['record_failed'] is not None:
+        proven, detail = _stop_timed_out(process, job)
+        return dict(idle, pid=process.pid, pgid=pgid, token=spawn.get('token'),
+                    stopped=proven, job=spawn.get('job_record'),
+                    record_failed=spawn['record_failed'],
+                    detail=f'{spawn["record_failed"]}; {detail}')
+    token = spawn.get('token')
+    if token is None and job is None:
+        try:
+            token = _process_token(process, pgid)
+        except Exception as exc:  # the identity could not be read after spawn
+            proven, detail = _stop_timed_out(process, job)
+            return dict(idle, pid=process.pid, pgid=pgid, token=None,
+                        stopped=proven, job=spawn.get('job_record'),
+                        record_failed=str(exc),
+                        detail=f'cannot read the executor identity: {exc}; '
+                               f'{detail}')
     if on_spawn is not None:
         try:
             on_spawn(process.pid, pgid, token)
         except Exception as exc:  # the pid could not be persisted
-            proven, detail = _stop_timed_out(process)
-            return {'exit_code': None, 'session_id': None, 'text': '',
-                    'pid': process.pid, 'pgid': pgid, 'token': token,
-                    'stopped': proven, 'record_failed': str(exc),
-                    'detail': f'cannot persist the executor pid: {exc}; {detail}'}
+            proven, detail = _stop_timed_out(process, job)
+            return dict(idle, pid=process.pid, pgid=pgid, token=token,
+                        stopped=proven, job=spawn.get('job_record'),
+                        record_failed=str(exc),
+                        detail=f'cannot persist the executor pid: {exc}; '
+                               f'{detail}')
     try:
         if input_text is not None:
             output, _ = process.communicate(input_text, timeout=timeout)
         else:
             output, _ = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proven, detail = _stop_timed_out(process)
-        return {'exit_code': None, 'session_id': None, 'text': '', 'timeout': True,
-                'stopped': proven, 'pid': process.pid, 'pgid': pgid,
-                'token': token, 'detail': detail}
+        proven, detail = _stop_timed_out(process, job)
+        return dict(idle, timeout=True, stopped=proven, pid=process.pid,
+                    pgid=pgid, token=token, job=spawn.get('job_record'),
+                    detail=detail)
     except (OSError, ValueError, UnicodeError) as exc:
         # Writing the prompt or reading stdout failed after the spawn. The
         # child may still be alive, so kill it and record whether termination
         # could actually be proven; never leave a 'spawning'/'running' record.
-        proven, detail = _stop_timed_out(process)
-        return {'exit_code': None, 'session_id': None, 'text': '',
-                'pid': process.pid, 'pgid': pgid, 'token': token,
-                'stopped': proven, 'timeout': False,
-                'io_error': f'{type(exc).__name__}: {exc}',
-                'detail': f'{type(exc).__name__}: {exc}; {detail}'}
+        proven, detail = _stop_timed_out(process, job)
+        return dict(idle, pid=process.pid, pgid=pgid, token=token,
+                    stopped=proven, timeout=False,
+                    job=spawn.get('job_record'),
+                    io_error=f'{type(exc).__name__}: {exc}',
+                    detail=f'{type(exc).__name__}: {exc}; {detail}')
+    settled = _settle_job(job)
     result = _classify_stream(process.returncode, output or '',
                               session_prefix=session_prefix,
                               label='OpenCode' if _adapter_is_opencode(adapter)
                               else 'the command adapter')
     result.update(pid=process.pid, pgid=pgid, token=token,
-                  exit_ticks=_process_exit_ticks(process))
+                  exit_ticks=_process_exit_ticks(process),
+                  job=spawn.get('job_record'), job_state=settled,
+                  job_proven=settled is not None,
+                  stopped=None if settled is None else settled == 'stopped')
     return result
 
 
@@ -2727,27 +3256,49 @@ def _verify_task(work, commands, timeout, *, attempt=None, save=None):
         if attempt is not None:
             entry = {'state': 'starting', 'pid': None, 'pgid': None,
                      'token': None, 'exit': None, 'timeout': False,
-                     'stopped': None}
+                     'stopped': None, 'job': None}
             attempt['verifiers'].append(entry)
             save()
         on_spawn = None
+        on_bound = None
         if entry is not None:
+            def on_bound(pid, pgid, token, job, entry=entry):
+                # Runs while the Windows child is still suspended: the Job id,
+                # pid and token are on disk before any instruction executes.
+                entry.update(state='running', pid=pid, pgid=pgid, token=token,
+                             job=job)
+                save()
+
             def on_spawn(pid, pgid, token, entry=entry):
                 entry.update(state='running', pid=pid, pgid=pgid, token=token)
                 save()
-        result = _run_process(command, work, timeout, on_spawn=on_spawn)
+        result = _run_process(command, work, timeout, on_spawn=on_spawn,
+                              on_bound=on_bound)
         record = {'argv_sha256': hashlib.sha256(
                       json.dumps(command).encode()).hexdigest(),
                   'exit': result['exit'], 'tail': result['tail'],
                   'timeout': bool(result['timeout']), 'pid': result.get('pid'),
                   'pgid': result.get('pgid'), 'token': result.get('token'),
-                  'stopped': result.get('stopped')}
+                  'stopped': result.get('stopped'),
+                  'job': result.get('job')}
         entries.append(record)
         if entry is not None:
             entry.update(pid=result.get('pid'), pgid=result.get('pgid'),
                          token=result.get('token'), exit=result['exit'],
                          timeout=bool(result['timeout']),
                          stopped=result.get('stopped'))
+            if result.get('job_failed'):
+                entry.update(state='spawn_failed', job=result.get('job'))
+                save()
+                _finish_attempt(attempt,
+                                'failed' if result.get('stopped') is True
+                                else 'unproven_stop',
+                                error=str(result['job_failed']), save=save)
+                raise BatchError(
+                    f'verification could not be bound to a Job Object: '
+                    f'{result["job_failed"]}; {result["tail"]}',
+                    status='FAILED',
+                    halt=result.get('stopped') is not True, verify=entries)
             if result.get('pid') is None and not result['timeout']:
                 entry['state'] = 'spawn_failed'
             elif result.get('record_failed'):
@@ -2768,9 +3319,10 @@ def _verify_task(work, commands, timeout, *, attempt=None, save=None):
                                 if result.get('stopped') else 'unproven_stop',
                                 error=result['tail'], save=save)
             elif not result['timeout'] and result.get('pid') is not None:
-                liveness = _prove_child_stopped(
-                    result['pid'], result.get('pgid'), result.get('token'),
-                    result.get('exit_ticks'))
+                liveness = (result['job_state'] if result.get('job_proven')
+                            else _prove_child_stopped(
+                                result['pid'], result.get('pgid'),
+                                result.get('token'), result.get('exit_ticks')))
                 entry['stopped'] = liveness == 'stopped'
                 record['stopped'] = entry['stopped']
                 if liveness != 'stopped':
@@ -3205,6 +3757,13 @@ def _execute_task(plan, spec, record, base, timeout, save, attempt,
         title = f'batch-{plan["batch"]["id"]}-{spec["id"]}'
         executor = attempt['executor']
 
+        def record_bound(pid, pgid, token, job):
+            # Runs while the Windows child is still suspended: the Job id,
+            # pid and token are persisted before it may execute anything.
+            executor.update(state='running', pid=pid, pgid=pgid, token=token,
+                            job=job)
+            save()
+
         def record_spawn(pid, pgid, token):
             executor.update(state='running', pid=pid, pgid=pgid, token=token)
             save()
@@ -3216,11 +3775,22 @@ def _execute_task(plan, spec, record, base, timeout, save, attempt,
         save()
         result = _agent(work, _prompt(spec, plan, base),
                         plan['executor_agent'], timeout, title=title,
-                        on_spawn=record_spawn, adapter=plan['adapter'],
-                        role='executor', task_id=spec['id'], base_sha=base)
+                        on_spawn=record_spawn, on_bound=record_bound,
+                        adapter=plan['adapter'], role='executor',
+                        task_id=spec['id'], base_sha=base)
         executor.update(pid=result.get('pid'), pgid=result.get('pgid'),
                         token=result.get('token'),
-                        exit=result.get('exit_code'))
+                        exit=result.get('exit_code'),
+                        job=result.get('job') or executor.get('job'))
+        if result.get('job_failed'):
+            stopped = result.get('stopped')
+            executor.update(state='spawn_failed', stopped=stopped)
+            _finish_attempt(attempt,
+                            'failed' if stopped is True else 'unproven_stop',
+                            error=result['detail'], save=save)
+            raise BatchError(
+                f'execution could not be bound to a Job Object: '
+                f'{result["detail"]}', status='FAILED', halt=stopped is not True)
         if result.get('record_failed'):
             stopped = result.get('stopped')
             executor.update(state='unrecorded', stopped=stopped)
@@ -3255,11 +3825,12 @@ def _execute_task(plan, spec, record, base, timeout, save, attempt,
         if result.get('pid') is not None:
             # A non-timeout result with a pid means the direct child was reaped.
             # The stream may still be invalid (exit code 1), but the process
-            # group proof is independent of the stream verdict.
-            liveness = _prove_child_stopped(result['pid'],
-                                            result.get('pgid'),
-                                            result.get('token'),
-                                            result.get('exit_ticks'))
+            # tree proof is independent of the stream verdict. On Windows the
+            # Job Object query is that proof.
+            liveness = (result['job_state'] if result.get('job_proven')
+                        else _prove_child_stopped(
+                            result['pid'], result.get('pgid'),
+                            result.get('token'), result.get('exit_ticks')))
             executor.update(state='ended', stopped=liveness == 'stopped')
             if liveness != 'stopped':
                 _finish_attempt(

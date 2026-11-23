@@ -1072,14 +1072,8 @@ class GitHubBatchTests(BatchCase):
         second = self.cli('run', '--plan', str(self.write_plan(plan)), '--journal',
                           str(self.journal), '--execute', '--retry', 'T1')
         state = self.journal_data()
-        if os.name == 'nt':
-            # Owner decision A: no Windows reuse before a Job Object (HD-2 B).
-            self.assertEqual(second.returncode, 1, second.stderr)
-            self.assertEqual(state['tasks']['T1']['status'], 'FAILED')
-            self.assertEqual(state['tasks']['T1']['attempts'], 1)
-            self.assertIn('retry_blocked', state['tasks']['T1'])
-            self.assertEqual(state['tasks']['T2']['status'], 'SKIPPED')
-            return
+        # HD-2 B (Issue #267): the Windows Job Object proof makes the retry
+        # path identical to POSIX instead of blocking on an unknown liveness.
         self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         self.assertEqual(state['tasks']['T1']['status'], 'INTEGRATED')
         self.assertEqual(state['tasks']['T2']['status'], 'INTEGRATED')
@@ -2016,14 +2010,8 @@ class LocalBatchTests(BatchCase):
         second = self.cli('run', '--plan', str(self.write_plan(plan)), '--journal',
                           str(self.journal), '--execute', '--retry', 'T1')
         state = self.journal_data()
-        if os.name == 'nt':
-            # Owner decision A: Windows reuse waits for a Job Object (HD-2 B).
-            self.assertEqual(second.returncode, 1, second.stderr)
-            self.assertEqual(state['tasks']['T1']['status'], 'FAILED')
-            self.assertEqual(state['tasks']['T1']['attempts'], 1)
-            self.assertIn('retry_blocked', state['tasks']['T1'])
-            self.assertEqual(state['tasks']['T2']['status'], 'SKIPPED')
-            return
+        # HD-2 B (Issue #267): Windows reuses the worktree exactly like POSIX
+        # once the Job Object proof is recorded.
         self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         self.assertEqual(state['tasks']['T1']['status'], 'INTEGRATED')
         self.assertEqual(state['tasks']['T2']['status'], 'INTEGRATED')
@@ -2049,13 +2037,8 @@ class LocalBatchTests(BatchCase):
         second = self.cli('run', '--plan', str(self.write_plan(plan)), '--journal',
                           str(self.journal), '--execute', '--resume')
         state = self.journal_data()
-        if os.name == 'nt':
-            # Owner decision A: an unknown liveness blocks Windows resume.
-            self.assertEqual(second.returncode, 1, second.stderr)
-            self.assertEqual(state['tasks']['T1']['status'], 'BLOCKED')
-            self.assertEqual(state['tasks']['T1']['attempts'], 1)
-            self.assertIn('cannot reuse', state['tasks']['T1']['error'])
-            return
+        # HD-2 B (Issue #267): the recorded Job Object is gone after the
+        # coordinator died, so kill-on-close already stopped the whole tree.
         self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         self.assertEqual(state['tasks']['T1']['status'], 'INTEGRATED')
         self.assertEqual(sum(
@@ -2166,6 +2149,16 @@ class ExecutorLifecycleTests(BatchCase):
             self.assertEqual(attempt['executor']['pgid'],
                              attempt['executor']['pid'])
         self.assertIs(attempt['executor']['stopped'], True)
+        if os.name == 'nt':
+            # AC-1: the Job id sits in the attempt record with the pid/token
+            # and the recorded proof is a real Job query result.
+            job = attempt['executor']['job']
+            self.assertEqual(job['kind'], 'windows-job-object')
+            self.assertTrue(job['id'].startswith('Local\\'))
+            self.assertEqual(job['state'], 'ended')
+            self.assertIs(job['stopped'], True)
+            self.assertEqual(job['active'], 0)
+            self.assertIsInstance(job['closed_at'], str)
         # The fake executor read the journal at spawn time: the attempt record
         # (and its unique id) was already on disk, before the worktree was used.
         seen = json.loads(
@@ -2174,6 +2167,15 @@ class ExecutorLifecycleTests(BatchCase):
         self.assertEqual(seen['history'][0]['state'], 'STARTED')
         self.assertTrue(seen['history'][0]['id'].startswith('attempt-'))
         self.assertEqual(seen['history'][0]['verifiers'], [])
+        if os.name == 'nt':
+            # AC-1: at spawn time the journal already binds the attempt to a
+            # live Job Object id, pid and token (state 'assigned').
+            observed = seen['history'][0]['executor']
+            self.assertEqual(observed['job']['kind'], 'windows-job-object')
+            self.assertEqual(observed['job']['state'], 'assigned')
+            self.assertTrue(observed['job']['id'].startswith('Local\\'))
+            self.assertIsInstance(observed['pid'], int)
+            self.assertIsInstance(observed['token'], int)
 
     def test_m02_fresh_run_reuses_a_clean_worktree(self):
         plan = self.plan([self.task('T1', 'a.txt')])
@@ -2240,15 +2242,8 @@ class ExecutorLifecycleTests(BatchCase):
                           '--journal', str(self.journal), '--execute',
                           '--retry', 'T1')
         record = self.journal_data()['tasks']['T1']
-        if os.name == 'nt':
-            # Owner decision A: no Windows retry before a Job Object (HD-2 B).
-            self.assertEqual(second.returncode, 1, second.stderr)
-            self.assertEqual(record['attempts'], 1)
-            self.assertEqual(record['attempt_history'][0]['id'], old_id)
-            self.assertEqual(json.dumps(record['attempt_history'][0],
-                                        sort_keys=True), snapshot)
-            self.assertIn('retry_blocked', record)
-            return
+        # HD-2 B (Issue #267): a recorded Job Object makes Windows retry
+        # behave exactly like POSIX instead of blocking on a decision-A halt.
         self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         self.assertEqual(record['attempts'], 2)
         history = record['attempt_history']
@@ -2291,6 +2286,13 @@ class ExecutorLifecycleTests(BatchCase):
             self.assertIs(entry['stopped'], True)
             if os.name == 'posix':
                 self.assertEqual(entry['pgid'], entry['pid'])
+        if os.name == 'nt':
+            # Every verifier is bound to its own Job Object (AC-1).
+            for entry in verifiers:
+                self.assertEqual(entry['job']['kind'], 'windows-job-object')
+                self.assertIs(entry['job']['stopped'], True)
+            self.assertNotEqual(verifiers[0]['job']['id'],
+                                verifiers[1]['job']['id'])
 
     # -- M06: --resume is not a retry --------------------------------------
     def test_m06_resume_does_not_reopen_a_finished_failure(self):
@@ -2327,12 +2329,8 @@ class ExecutorLifecycleTests(BatchCase):
         self.assertEqual(len(self.opencode_calls()), before)
         record = self.journal_data()['tasks']['T1']
         self.assertEqual(record['status'], 'FAILED')
-        if os.name == 'nt':
-            # Owner decision A: the reuse guard blocks before the dirty
-            # worktree is inspected; no new attempt is appended.
-            self.assertEqual(record['attempts'], 1)
-            self.assertIn('retry_blocked', record)
-            return
+        # HD-2 B (Issue #267): the Job proof lets the guard pass, so the dirty
+        # worktree is the failure on every platform; no new process spawned.
         self.assertIn('not clean', record['error'])
         self.assertEqual(record['attempts'], 2)
         self.assertEqual(record['attempt_history'][1]['result'], 'failed')
@@ -2421,14 +2419,8 @@ class ExecutorLifecycleTests(BatchCase):
                            '--journal', str(self.journal), '--execute',
                            '--resume')
         record = self.journal_data()['tasks']['T1']
-        if os.name == 'nt':
-            # R-F1: the root is gone and an orphaned intermediate process cannot
-            # be excluded without a Job Object, so Windows refuses to resume.
-            self.assertEqual(resumed.returncode, 1, resumed.stderr)
-            self.assertEqual(record['status'], 'BLOCKED')
-            self.assertEqual(record['attempts'], 1)
-            self.assertIn('cannot reuse', record['error'])
-            return
+        # HD-2 B (Issue #267): the interrupted attempt was bound to a
+        # kill-on-close Job, so the vanished name proves the tree stopped.
         self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
         self.assertEqual(record['status'], 'INTEGRATED')
         self.assertEqual(record['attempts'], 2)
@@ -2787,14 +2779,7 @@ class ExecutorLifecycleTests(BatchCase):
                          '--journal', str(self.journal), '--execute',
                          '--retry', 'T1')
         record = self.journal_data()['tasks']['T1']
-        if os.name == 'nt':
-            # Owner decision A: no Windows retry before a Job Object (HD-2 B).
-            self.assertEqual(retry.returncode, 1, retry.stderr)
-            self.assertFalse((self.root / 'wt-t1').exists())
-            self.assertEqual(record['attempts'], 1)
-            self.assertEqual(record['status'], 'FAILED')
-            self.assertIn('retry_blocked', record)
-            return
+        # HD-2 B (Issue #267): Windows retry recreates the worktree like POSIX.
         self.assertEqual(retry.returncode, 0, retry.stderr + retry.stdout)
         self.assertTrue((self.root / 'wt-t1').is_dir())
         self.assertEqual(record['attempts'], 2)
@@ -2896,6 +2881,416 @@ class ExecutorLifecycleTests(BatchCase):
         self.assertEqual(record['status'], 'FAILED')
         self.assertEqual(record['attempts'], 1)
         self.assertIn('retry_blocked', record)
+
+
+    # -- #267 AC-4: a journal without Job records is never upgraded ----------
+    def test_attempt_without_a_job_record_blocks_windows_retry(self):
+        script = self.root / 'verify_t1.py'
+        script.write_text(
+            'import os, sys\n'
+            'raise SystemExit(1 if os.environ.get("FAIL_T1") == "1" else 0)\n')
+        plan = self.plan([self.task('T1', 'a.txt', verify=[[PY, str(script)]])])
+        self.assertEqual(self._fail_t1(plan).returncode, 1)
+        state = self.journal_data()
+        for attempt in state['tasks']['T1']['attempt_history']:
+            attempt['executor'].pop('job', None)
+            for entry in attempt['verifiers']:
+                entry.pop('job', None)
+        self.journal.write_text(json.dumps(state))
+        before = len(self.opencode_calls())
+        retry = self.cli('run', '--plan', str(self.write_plan(plan)),
+                         '--journal', str(self.journal), '--execute',
+                         '--retry', 'T1')
+        record = self.journal_data()['tasks']['T1']
+        if os.name == 'nt':
+            # A pre-#267 journal has no Job proof and is not silently upgraded.
+            self.assertEqual(retry.returncode, 1, retry.stderr)
+            self.assertEqual(len(self.opencode_calls()), before)
+            self.assertEqual(record['attempts'], 1)
+            self.assertIn('retry_blocked', record)
+            self.assertIn('Job Object', record['retry_blocked'])
+        else:
+            self.assertEqual(retry.returncode, 0,
+                             retry.stderr + retry.stdout)
+            self.assertEqual(record['attempts'], 2)
+
+    # -- #267: attempt state x Job state x operation matrix (mocked rows) ---
+    def _job_problems(self, job, verdict, liveness='unknown'):
+        executor = {'state': 'ended', 'pid': 500, 'pgid': None, 'token': 42,
+                    'exit': 0, 'stopped': True, 'session': None, 'job': job}
+        record = self._record([self._attempt(executor=executor)])
+        with mock.patch.object(delivery, '_IS_WINDOWS', True), \
+                mock.patch.object(delivery, '_proven_process_state',
+                                  lambda *args, **kwargs: liveness), \
+                mock.patch.object(delivery, '_job_active_by_name',
+                                  return_value=verdict):
+            return delivery._attempt_problems(record)
+
+    def test_windows_job_query_rows(self):
+        empty = {'kind': 'windows-job-object', 'id': 'Local\\AgentOrch-x',
+                 'state': 'ended', 'active': 0, 'stopped': True,
+                 'created_at': 'x', 'proven_at': 'y', 'closed_at': 'z',
+                 'detail': None}
+        cases = {
+            'row 7 absent after close': ('absent', None),
+            'row 8 present and empty': ('present', 0),
+        }
+        for label, verdict in cases.items():
+            with self.subTest(label):
+                self.assertEqual(
+                    self._job_problems(dict(empty), verdict), [], label)
+        blocked = {
+            'row 5 present with a live member': ('present', 1),
+            'row 11 query failure': ('unknown', None),
+        }
+        for label, verdict in blocked.items():
+            with self.subTest(label):
+                problems = self._job_problems(dict(empty), verdict)
+                self.assertTrue(problems, label)
+        self.assertTrue(any('still running' in problem for problem in
+                            self._job_problems(dict(empty), ('present', 1))))
+        self.assertTrue(any('cannot be proven' in problem for problem in
+                            self._job_problems(dict(empty), ('unknown', None))))
+
+    def test_windows_job_record_rows_fail_closed(self):
+        good = {'kind': 'windows-job-object', 'id': 'Local\\AgentOrch-x',
+                'state': 'ended', 'active': 0, 'stopped': True,
+                'created_at': 'x', 'proven_at': 'y', 'closed_at': 'z',
+                'detail': None}
+        corrupt = {
+            'row 2 no Job record': None,
+            'row 2 not an object': ['x'],
+            'row 2 wrong kind': dict(good, kind='other-job'),
+            'row 2 no id': dict(good, id=None),
+            'row 2 bad state': dict(good, state='BOGUS'),
+            'row 2 bad active': dict(good, active=True),
+            'row 2 bad stopped': dict(good, stopped='yes'),
+            'row 6 created but never bound': dict(good, state='created'),
+        }
+        for label, job in corrupt.items():
+            with self.subTest(label):
+                problems = self._job_problems(job, ('present', 0))
+                self.assertTrue(problems, label)
+                self.assertTrue(any('cannot be proven' in problem
+                                    for problem in problems), (label, problems))
+
+    def test_windows_live_job_proof_is_not_upgraded_by_a_vanished_name(self):
+        job = {'kind': 'windows-job-object', 'id': 'Local\\AgentOrch-x',
+               'state': 'ended', 'active': 3, 'stopped': False,
+               'created_at': 'x', 'proven_at': None, 'closed_at': 'z',
+               'detail': '3 process(es) still active in the Job'}
+        problems = self._job_problems(job, ('absent', None))
+        self.assertTrue(any('still running' in problem for problem in problems),
+                        problems)
+
+    def test_windows_unproven_job_is_not_upgraded_by_a_vanished_name(self):
+        # Row 11: an explicit proof failed, so the vanished name may not turn
+        # the recorded "unknown" into a reusable proof.
+        job = {'kind': 'windows-job-object', 'id': 'Local\\AgentOrch-x',
+               'state': 'ended', 'active': None, 'stopped': None,
+               'created_at': 'x', 'proven_at': None, 'closed_at': 'z',
+               'detail': 'QueryInformationJobObject failed (5)'}
+        problems = self._job_problems(job, ('absent', None))
+        self.assertTrue(any('cannot be proven' in problem
+                            for problem in problems), problems)
+
+    def test_windows_interrupted_job_is_proven_by_kill_on_close(self):
+        # Row 3: the coordinator died mid-attempt. Its last handle closing made
+        # the kernel terminate every member, which the absent name proves.
+        job = {'kind': 'windows-job-object', 'id': 'Local\\AgentOrch-x',
+               'state': 'assigned', 'active': 1, 'stopped': None,
+               'created_at': 'x', 'proven_at': None, 'closed_at': None,
+               'detail': None}
+        self.assertEqual(self._job_problems(job, ('absent', None)), [])
+
+    def test_posix_reuse_keeps_its_recorded_proof_and_ignores_job_rows(self):
+        job = {'kind': 'windows-job-object', 'id': 'Local\\AgentOrch-x',
+               'state': 'ended', 'active': 1, 'stopped': False,
+               'created_at': 'x', 'proven_at': None, 'closed_at': None,
+               'detail': None}
+        executor = {'state': 'ended', 'pid': 500, 'pgid': None, 'token': 42,
+                    'exit': 0, 'stopped': True, 'session': None, 'job': job}
+        record = self._record([self._attempt(executor=executor)])
+        with mock.patch.object(delivery, '_IS_WINDOWS', False), \
+                mock.patch.object(delivery, '_proven_process_state',
+                                  lambda *args, **kwargs: 'unknown'):
+            self.assertEqual(delivery._attempt_problems(record), [])
+
+
+class WindowsJobObjectTests(unittest.TestCase):
+    """#267 AC-1/AC-3/AC-5: the real Job Object proof and its failure branches."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    # -- real Windows coverage ---------------------------------------------
+    @unittest.skipUnless(os.name == 'nt', 'real Windows Job Object test')
+    def test_real_job_binds_a_suspended_child_before_it_runs(self):
+        marker = self.root / 'child-started.txt'
+        seen = {}
+        script = ('import pathlib, sys\n'
+                  f'pathlib.Path({str(marker)!r}).write_text("ran")\n'
+                  'print("child-ok")\n')
+
+        def on_bound(pid, pgid, token, record):
+            seen.update(pid=pid, token=token, record=dict(record),
+                        premature=marker.exists(),
+                        query=delivery._job_active_by_name(record['id']))
+
+        spawn = delivery._spawn_bound(
+            [PY, '-c', script],
+            dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                 stderr=subprocess.PIPE, text=True, env=dict(os.environ)),
+            on_bound=on_bound)
+        job = spawn['job']
+        try:
+            self.assertIsNone(spawn['error'], spawn['error'])
+            self.assertIsNone(spawn['job_failed'], spawn['job_failed'])
+            self.assertIsInstance(seen['pid'], int)
+            self.assertIsInstance(seen['token'], int)
+            self.assertEqual(seen['record']['kind'], 'windows-job-object')
+            self.assertTrue(seen['record']['id'].startswith('Local\\'))
+            self.assertEqual(seen['record']['state'], 'assigned')
+            # Bound and persisted before the child may run: the Job already
+            # counts it, but the child has not written its marker yet.
+            self.assertEqual(seen['query'], ('present', 1))
+            self.assertFalse(seen['premature'])
+            out, err = spawn['process'].communicate(timeout=60)
+            self.assertEqual(spawn['process'].returncode, 0, err)
+            self.assertEqual(out.strip(), 'child-ok')
+            self.assertTrue(marker.exists())
+            self.assertEqual(delivery._job_active_by_name(job.name),
+                             ('present', 0))
+            self.assertEqual(delivery._settle_job(job, grace=5.0), 'stopped')
+            self.assertIs(job.record['stopped'], True)
+            self.assertEqual(job.record['active'], 0)
+            self.assertEqual(job.record['state'], 'ended')
+            self.assertIsInstance(job.record['closed_at'], str)
+            self.assertEqual(delivery._job_active_by_name(job.name),
+                             ('absent', None))
+        finally:
+            job.close()
+
+    @unittest.skipUnless(os.name == 'nt', 'real Windows Job Object test')
+    def test_real_job_tracks_and_terminates_an_orphan_grandchild(self):
+        script = (
+            'import subprocess, sys\n'
+            'child = subprocess.Popen([sys.executable, "-c", '
+            '"import time; time.sleep(120)"],\n'
+            '    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n'
+            '    stderr=subprocess.DEVNULL)\n'
+            'print(child.pid, flush=True)\n')
+        spawn = delivery._spawn_bound(
+            [PY, '-c', script],
+            dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                 stderr=subprocess.PIPE, text=True, env=dict(os.environ)))
+        job = spawn['job']
+        try:
+            self.assertIsNone(spawn['job_failed'], spawn['job_failed'])
+            out, err = spawn['process'].communicate(timeout=60)
+            self.assertEqual(spawn['process'].returncode, 0, err)
+            grandchild = int(out.strip())
+            # The direct child is gone; the Job still tracks its descendant,
+            # which the Windows parent map could not attribute.
+            self.assertEqual(delivery._job_active_by_name(job.name),
+                             ('present', 1))
+            self.assertEqual(job.prove_empty(grace=0.2), 'running')
+            self.assertIs(job.record['stopped'], False)
+            self.assertTrue(job.stop_and_prove(grace=10.0))
+            self.assertEqual(job.active(), 0)
+            self.assertIs(job.record['stopped'], True)
+            self.assertEqual(delivery._windows_creation_time(grandchild)[0],
+                             'gone')
+        finally:
+            job.close()
+
+    @unittest.skipUnless(os.name == 'nt', 'real Windows Job Object test')
+    def test_real_job_name_is_queryable_and_disappears_on_close(self):
+        job = delivery._WindowsJob(delivery._new_job_name()).create()
+        try:
+            self.assertEqual(delivery._job_active_by_name(job.name),
+                             ('present', 0))
+        finally:
+            job.close()
+        self.assertIsInstance(job.record['closed_at'], str)
+        self.assertEqual(delivery._job_active_by_name(job.name),
+                         ('absent', None))
+        self.assertEqual(delivery._job_active_by_name('Local\\no-such-job'),
+                         ('absent', None))
+
+    @unittest.skipUnless(os.name == 'nt', 'real Windows Job Object test')
+    def test_real_timeout_terminates_the_job_tree_and_proves_it_empty(self):
+        result = delivery._run_process(
+            [PY, '-c', 'import time; time.sleep(120)'], self.root, 1)
+        self.assertTrue(result['timeout'])
+        self.assertIs(result['stopped'], True)
+        self.assertEqual(result['job']['state'], 'ended')
+        self.assertIs(result['job']['stopped'], True)
+        self.assertEqual(result['job']['active'], 0)
+        self.assertIsInstance(result['job']['closed_at'], str)
+        self.assertEqual(delivery._job_active_by_name(result['job']['id']),
+                         ('absent', None))
+
+    @unittest.skipUnless(os.name == 'nt', 'real Windows Job Object test')
+    def test_real_timeout_is_unproven_when_the_job_query_fails(self):
+        with mock.patch.object(delivery, '_job_active',
+                               side_effect=delivery._JobError('query boom')):
+            result = delivery._run_process(
+                [PY, '-c', 'import time; time.sleep(120)'], self.root, 1)
+        self.assertTrue(result['timeout'])
+        self.assertIs(result['stopped'], False)
+        self.assertIs(result['job']['stopped'], None)
+        self.assertIn('query boom', result['job']['detail'])
+
+    # -- mocked failure and non-Windows branches (AC-5) --------------------
+    def test_job_creation_failure_spawns_nothing(self):
+        popen = mock.Mock()
+        with mock.patch.object(delivery, '_IS_WINDOWS', True), \
+                mock.patch.object(delivery, '_create_job_handle',
+                                  side_effect=delivery._JobError('job boom')), \
+                mock.patch.object(delivery.subprocess, 'Popen', popen):
+            spawn = delivery._spawn_bound(
+                [PY, '-c', 'pass'],
+                dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                     stderr=subprocess.PIPE, text=True))
+        self.assertIsNone(spawn['process'])
+        self.assertIn('job boom', spawn['job_failed'])
+        self.assertEqual(spawn['job_record']['state'], 'created')
+        self.assertIsNone(spawn['job_record']['stopped'])
+        popen.assert_not_called()
+
+    def test_bind_failure_terminates_the_suspended_child(self):
+        killed = []
+
+        class FakeProcess:
+            pid = 4321
+            _handle = 1
+
+            def kill(self):
+                killed.append(True)
+
+            def communicate(self, timeout=None):
+                return '', ''
+
+        def create(job):
+            job.handle = 1
+            return job
+
+        with mock.patch.object(delivery, '_IS_WINDOWS', True), \
+                mock.patch.object(delivery._WindowsJob, 'create', create), \
+                mock.patch.object(delivery, '_assign_job_handle',
+                                  side_effect=delivery._JobError('assign boom')), \
+                mock.patch.object(delivery._WindowsJob, 'stop_and_prove',
+                                  return_value=True), \
+                mock.patch.object(delivery._WindowsJob, 'close',
+                                  lambda job: job.record.update(closed_at='x')), \
+                mock.patch.object(delivery.subprocess, 'Popen',
+                                  return_value=FakeProcess()):
+            spawn = delivery._spawn_bound(
+                [PY, '-c', 'pass'],
+                dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                     stderr=subprocess.PIPE, text=True))
+        self.assertIsNone(spawn['process'])
+        self.assertIn('assign boom', spawn['job_failed'])
+        self.assertIs(spawn['stopped'], True)
+        self.assertEqual(killed, [True])
+
+    def test_resume_failure_terminates_the_bound_child(self):
+        killed = []
+        bound = []
+
+        class FakeProcess:
+            pid = 4321
+            _handle = 1
+
+            def kill(self):
+                killed.append(True)
+
+            def communicate(self, timeout=None):
+                return '', ''
+
+        def create(job):
+            job.handle = 1
+            return job
+
+        with mock.patch.object(delivery, '_IS_WINDOWS', True), \
+                mock.patch.object(delivery._WindowsJob, 'create', create), \
+                mock.patch.object(delivery, '_assign_job_handle',
+                                  side_effect=lambda handle, process: None), \
+                mock.patch.object(delivery, '_process_token', return_value=9), \
+                mock.patch.object(delivery, '_resume_job_child',
+                                  side_effect=delivery._JobError('resume boom')), \
+                mock.patch.object(delivery._WindowsJob, 'stop_and_prove',
+                                  return_value=True), \
+                mock.patch.object(delivery._WindowsJob, 'close',
+                                  lambda job: job.record.update(closed_at='x')), \
+                mock.patch.object(delivery.subprocess, 'Popen',
+                                  return_value=FakeProcess()):
+            spawn = delivery._spawn_bound(
+                [PY, '-c', 'pass'],
+                dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                     stderr=subprocess.PIPE, text=True),
+                on_bound=lambda pid, pgid, token, record: bound.append(
+                    (pid, token, record['state'])))
+        self.assertIsNone(spawn['process'])
+        self.assertIn('resume boom', spawn['job_failed'])
+        self.assertIs(spawn['stopped'], True)
+        self.assertEqual(bound, [(4321, 9, 'assigned')])
+        self.assertEqual(killed, [True])
+
+    def test_unpersisted_job_proof_stops_the_child(self):
+        class FakeProcess:
+            pid = 4321
+            _handle = 1
+
+            def kill(self):
+                pass
+
+            def communicate(self, timeout=None):
+                return '', ''
+
+        def create(job):
+            job.handle = 1
+            return job
+
+        def broken(pid, pgid, token, record):
+            raise OSError('disk full')
+
+        with mock.patch.object(delivery, '_IS_WINDOWS', True), \
+                mock.patch.object(delivery._WindowsJob, 'create', create), \
+                mock.patch.object(delivery, '_assign_job_handle',
+                                  side_effect=lambda handle, process: None), \
+                mock.patch.object(delivery, '_process_token', return_value=9), \
+                mock.patch.object(delivery._WindowsJob, 'stop_and_prove',
+                                  return_value=True), \
+                mock.patch.object(delivery._WindowsJob, 'close',
+                                  lambda job: job.record.update(closed_at='x')), \
+                mock.patch.object(delivery.subprocess, 'Popen',
+                                  return_value=FakeProcess()):
+            spawn = delivery._spawn_bound(
+                [PY, '-c', 'pass'],
+                dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                     stderr=subprocess.PIPE, text=True),
+                on_bound=broken)
+        self.assertIn('disk full', spawn['record_failed'])
+        self.assertIs(spawn['stopped'], True)
+        self.assertEqual(spawn['process'].pid, 4321)
+
+    def test_non_windows_spawn_creates_no_job(self):
+        # Mocks the POSIX branch so the shared guard logic is exercised on
+        # every platform as well.
+        with mock.patch.object(delivery, '_IS_WINDOWS', False):
+            spawn = delivery._spawn_bound(
+                [PY, '-c', 'print("plain")'],
+                dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                     stderr=subprocess.PIPE, text=True))
+        self.assertIsNone(spawn['job'])
+        self.assertIsNone(spawn['job_record'])
+        self.assertIsNone(spawn['token'])
+        out, _err = spawn['process'].communicate(timeout=60)
+        self.assertEqual(out.strip(), 'plain')
 
 
 class AdapterTransportTests(BatchCase):
@@ -3298,9 +3693,12 @@ class AdapterTransportTests(BatchCase):
 
         adapter = {'transport': 'command', 'name': 'generic-command',
                    'command': [PY, '-S', 'x'], 'source': 'plan'}
-        with mock.patch.object(delivery.subprocess, 'Popen',
-                               return_value=BrokenProcess()), \
-                mock.patch.object(delivery, '_process_token', return_value=7), \
+        # The spawn itself (including the Windows Job binding) is covered by
+        # its own tests; this unit isolates the post-spawn I/O failure.
+        spawn = {'process': BrokenProcess(), 'job': None, 'token': 7,
+                 'job_record': None, 'error': None, 'job_failed': None,
+                 'record_failed': None, 'stopped': None}
+        with mock.patch.object(delivery, '_spawn_bound', return_value=spawn), \
                 mock.patch.object(delivery, '_stop_timed_out',
                                   return_value=(True, 'timed out; process group '
                                                        'killed')):
