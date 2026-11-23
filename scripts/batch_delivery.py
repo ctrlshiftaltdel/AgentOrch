@@ -1415,6 +1415,14 @@ class _WindowsJob:
             self.record['detail'] = 'TerminateJobObject was refused'
         return self.prove_empty(grace) == 'stopped'
 
+    def mark_unproven(self, detail):
+        """Record an unproven outcome without overwriting a real proof."""
+        if self.record.get('stopped') is not None:
+            return
+        if not self.record.get('detail'):
+            self.record['detail'] = detail
+        self.record.update(state='ended', stopped=None)
+
     def close(self):
         if self.handle is None:
             return
@@ -1424,7 +1432,7 @@ class _WindowsJob:
 
 
 def _discard_child(process, job):
-    """Terminate a child that must not run, then prove its Job empty."""
+    """Terminate a Job-bound child that must not run and prove the Job empty."""
     try:
         process.kill()
     except OSError:
@@ -1438,7 +1446,39 @@ def _discard_child(process, job):
     try:
         return job.stop_and_prove()
     finally:
+        job.mark_unproven('the Job Object could not prove the tree stopped')
         job.close()
+
+
+def _discard_unbound_child(process, job):
+    """Terminate a child that never entered ``job`` and prove it is gone.
+
+    An empty Job is no evidence for a child that was never a member, so only
+    the direct child's own reaping counts here: a successful ``communicate``
+    after ``kill`` means the operating system reaped it. A failed kill, a
+    timeout or any unreadable state stays unproven. The record keeps
+    ``state='created'`` (never assigned) and stores this direct proof with an
+    explicit detail, so it is never mistaken for a Job empty-set proof.
+    """
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.communicate(timeout=KILL_GRACE)
+    except (subprocess.TimeoutExpired, OSError, ValueError, UnicodeError):
+        proven = False
+    else:
+        proven = process.poll() is not None
+    if job is not None:
+        job.record.update(
+            stopped=proven,
+            proven_at=_utc_now() if proven else None,
+            detail=('the child was never bound to the Job; the direct child '
+                    'was ' + ('terminated and reaped' if proven
+                              else 'not proven stopped')))
+        job.close()
+    return proven
 
 
 def _settle_job(job, grace=CHILD_PROOF_GRACE):
@@ -1491,8 +1531,15 @@ def _spawn_bound(argv, popen_kwargs, *, on_bound=None):
     try:
         job.bind(process)
     except Exception as exc:
-        proven = _discard_child(process, job)
-        result.update(process=None, stopped=proven,
+        # The child never entered the Job, so an empty Job proves nothing; the
+        # direct child's own reap is the only evidence that may be recorded.
+        try:
+            token = _process_token(process, None)
+        except Exception:
+            token = None
+        proven = _discard_unbound_child(process, job)
+        result.update(process=process if proven else None, token=token,
+                      stopped=proven,
                       job_failed=f'cannot bind the child to its Job Object: '
                                  f'{exc}')
         return result
@@ -2003,7 +2050,19 @@ def _job_proof_status(job):
     stopped = job.get('stopped')
     if stopped is not None and not isinstance(stopped, bool):
         return 'invalid', 'the recorded Job Object stop proof is not a boolean'
+    if stopped is True and active not in (None, 0):
+        return 'invalid', (f'the record claims the Job stopped while {active} '
+                           'process(es) were active')
+    if stopped is False and active == 0:
+        return 'invalid', ('the record claims live processes while the active '
+                           'count was 0')
     if state == 'created':
+        if stopped is True:
+            # The child was never a member; this record holds the direct-reap
+            # proof taken at spawn time (kill plus a successful wait), not a
+            # Job empty-set claim.
+            return 'empty', ('the child was never bound to the Job; the direct '
+                             'child was terminated and reaped')
         # The child was suspended but never bound, so it may have outlived the
         # Job; nothing proves it stopped.
         return 'unknown', 'the Job Object was never bound to the child'
@@ -2128,6 +2187,13 @@ def _attempt_problems(record, ignore=()):
                     'starting', 'running', 'ended', 'unrecorded'):
                 problems.append(f'attempt #{position} verifier {index} is '
                                 f'{verifier_state} without a recorded pid')
+            # The executor rule is symmetric: a verifier that finished (or lost
+            # its record) without a proven stop blocks reuse just as an
+            # unfinished executor would.
+            if (verifier_state in ('ended', 'unrecorded')
+                    and entry.get('stopped') is not True):
+                problems.append(f'attempt #{position} verifier {index} is '
+                                f'{verifier_state} without a stop proof')
         for role, pid, pgid, token, stopped, job in _attempt_processes(attempt):
             if pid is not None and (not isinstance(pid, int) or pid <= 0):
                 problems.append(f'attempt #{position} {role} pid is invalid')
@@ -2441,6 +2507,9 @@ def _stop_timed_out(process, job=None):
         return False, 'timed out; could not prove the process group was terminated'
     finally:
         if job is not None:
+            # Never let an unproven record stay 'assigned'/None: that shape is
+            # the interrupted-attempt proof and must not be borrowed here.
+            job.mark_unproven('termination could not be proven')
             job.close()
 
 
@@ -2470,8 +2539,11 @@ def _run_process(argv, cwd, timeout, *, env=None, input_text=None,
                 'stopped': None, 'pid': None, 'pgid': None,
                 'job': spawn.get('job_record')}
     if spawn['job_failed'] is not None:
+        proven_process = spawn.get('process')
         return {'exit': None, 'tail': spawn['job_failed'], 'timeout': False,
-                'stopped': spawn.get('stopped'), 'pid': None, 'pgid': None,
+                'stopped': spawn.get('stopped'),
+                'pid': proven_process.pid if proven_process else None,
+                'pgid': None, 'token': spawn.get('token'),
                 'job': spawn.get('job_record'),
                 'job_failed': spawn['job_failed']}
     process = spawn['process']
@@ -2567,7 +2639,11 @@ def _agent(work, prompt, agent_name, timeout, *, title=None, on_spawn=None,
         # No process was spawned, so there is nothing to stop.
         return dict(idle, detail=spawn['error'], job=spawn.get('job_record'))
     if spawn['job_failed'] is not None:
-        return dict(idle, stopped=spawn.get('stopped'),
+        proven_process = spawn.get('process')
+        return dict(idle,
+                    pid=proven_process.pid if proven_process else None,
+                    token=spawn.get('token'),
+                    stopped=spawn.get('stopped'),
                     job=spawn.get('job_record'),
                     job_failed=spawn['job_failed'],
                     detail=spawn['job_failed'])

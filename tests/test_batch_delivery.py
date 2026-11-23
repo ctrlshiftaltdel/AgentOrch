@@ -2676,10 +2676,10 @@ class ExecutorLifecycleTests(BatchCase):
             'exit': 0, 'stopped': True, 'session': None})
         problems = delivery._attempt_problems(self._record([attempt]))
         if os.name == 'nt':
-            # Owner decision A: a gone Windows root is unproven, even with a
-            # recorded proof, until a Job Object (HD-2 B) exists. The exact
-            # message depends on whether the pid was reused, but reuse is
-            # always refused.
+            # A pre-#267 record has no Job Object proof, so a gone Windows root
+            # stays unproven and reuse is refused (HD-2 B replaced decision A
+            # for new records; old records are never silently upgraded). The
+            # message depends on whether the pid was reused.
             self.assertTrue(problems)
         else:
             self.assertEqual(problems, [])
@@ -2965,7 +2965,12 @@ class ExecutorLifecycleTests(BatchCase):
             'row 2 bad state': dict(good, state='BOGUS'),
             'row 2 bad active': dict(good, active=True),
             'row 2 bad stopped': dict(good, stopped='yes'),
-            'row 6 created but never bound': dict(good, state='created'),
+            'row 2 stopped while processes were active': dict(
+                good, active=5, stopped=True),
+            'row 2 live while the active count was 0': dict(
+                good, active=0, stopped=False),
+            'row 6 created but never bound': dict(
+                good, state='created', stopped=None, proven_at=None),
         }
         for label, job in corrupt.items():
             with self.subTest(label):
@@ -3015,6 +3020,22 @@ class ExecutorLifecycleTests(BatchCase):
                 mock.patch.object(delivery, '_proven_process_state',
                                   lambda *args, **kwargs: 'unknown'):
             self.assertEqual(delivery._attempt_problems(record), [])
+
+    def test_unproven_verifier_blocks_reuse_like_the_executor(self):
+        # Medium 1: a verifier that ended without a stop proof is checked with
+        # the same rule as the executor instead of being skipped.
+        executor = {'state': 'ended', 'pid': 100, 'pgid': None, 'token': 42,
+                    'exit': 0, 'stopped': True, 'session': None, 'job': None}
+        verifier = {'state': 'ended', 'pid': 101, 'pgid': None, 'token': 43,
+                    'exit': None, 'timeout': True, 'stopped': False,
+                    'job': None}
+        record = self._record([self._attempt(executor=executor,
+                                             verifiers=[verifier])])
+        problems = self._problems(record)
+        self.assertTrue(any('verifier 1 is ended without a stop proof' in
+                            problem for problem in problems), problems)
+        with self.assertRaises(delivery.BatchError):
+            delivery._reuse_guard({'id': 'T1'}, record)
 
 
 class WindowsJobObjectTests(unittest.TestCase):
@@ -3161,7 +3182,7 @@ class WindowsJobObjectTests(unittest.TestCase):
         self.assertIsNone(spawn['job_record']['stopped'])
         popen.assert_not_called()
 
-    def test_bind_failure_terminates_the_suspended_child(self):
+    def test_bind_failure_proves_only_the_reaped_child(self):
         killed = []
 
         class FakeProcess:
@@ -3174,6 +3195,55 @@ class WindowsJobObjectTests(unittest.TestCase):
             def communicate(self, timeout=None):
                 return '', ''
 
+            def poll(self):
+                return -9
+
+        def create(job):
+            job.handle = 1
+            return job
+
+        with mock.patch.object(delivery, '_IS_WINDOWS', True), \
+                mock.patch.object(delivery._WindowsJob, 'create', create), \
+                mock.patch.object(delivery, '_assign_job_handle',
+                                  side_effect=delivery._JobError('assign boom')), \
+                mock.patch.object(delivery, '_process_token', return_value=9), \
+                mock.patch.object(delivery._WindowsJob, 'stop_and_prove',
+                                  side_effect=AssertionError(
+                                      'an empty Job is not a proof for an '
+                                      'unbound child')), \
+                mock.patch.object(delivery._WindowsJob, 'close',
+                                  lambda job: job.record.update(closed_at='x')), \
+                mock.patch.object(delivery.subprocess, 'Popen',
+                                  return_value=FakeProcess()):
+            spawn = delivery._spawn_bound(
+                [PY, '-c', 'pass'],
+                dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                     stderr=subprocess.PIPE, text=True))
+        self.assertEqual(spawn['process'].pid, 4321)
+        self.assertEqual(spawn['token'], 9)
+        self.assertIn('assign boom', spawn['job_failed'])
+        self.assertIs(spawn['stopped'], True)
+        self.assertEqual(killed, [True])
+        # The record never claims the child was bound to the Job: the proof is
+        # the direct child's reap, recorded with an explicit detail.
+        self.assertEqual(spawn['job_record']['state'], 'created')
+        self.assertIs(spawn['job_record']['stopped'], True)
+        self.assertIn('never bound', spawn['job_record']['detail'])
+
+    def test_bind_failure_without_a_reap_proof_stays_unproven(self):
+        class StuckProcess:
+            pid = 4321
+            _handle = 1
+
+            def kill(self):
+                raise OSError('kill refused')
+
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired('cmd', timeout)
+
+            def poll(self):
+                return None
+
         def create(job):
             job.handle = 1
             return job
@@ -3183,19 +3253,20 @@ class WindowsJobObjectTests(unittest.TestCase):
                 mock.patch.object(delivery, '_assign_job_handle',
                                   side_effect=delivery._JobError('assign boom')), \
                 mock.patch.object(delivery._WindowsJob, 'stop_and_prove',
-                                  return_value=True), \
+                                  side_effect=AssertionError(
+                                      'an empty Job is not a proof')), \
                 mock.patch.object(delivery._WindowsJob, 'close',
                                   lambda job: job.record.update(closed_at='x')), \
                 mock.patch.object(delivery.subprocess, 'Popen',
-                                  return_value=FakeProcess()):
+                                  return_value=StuckProcess()):
             spawn = delivery._spawn_bound(
                 [PY, '-c', 'pass'],
                 dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                      stderr=subprocess.PIPE, text=True))
         self.assertIsNone(spawn['process'])
         self.assertIn('assign boom', spawn['job_failed'])
-        self.assertIs(spawn['stopped'], True)
-        self.assertEqual(killed, [True])
+        self.assertIs(spawn['stopped'], False)
+        self.assertIs(spawn['job_record']['stopped'], False)
 
     def test_resume_failure_terminates_the_bound_child(self):
         killed = []
@@ -3291,6 +3362,44 @@ class WindowsJobObjectTests(unittest.TestCase):
         self.assertIsNone(spawn['token'])
         out, _err = spawn['process'].communicate(timeout=60)
         self.assertEqual(out.strip(), 'plain')
+
+    def test_unproven_termination_marks_the_job_record_unproven(self):
+        # Medium 1: a timeout whose stop cannot be proven must not leave an
+        # 'assigned'/None record, which is the interrupted-attempt proof.
+        class SlowProcess:
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired('cmd', timeout)
+
+        job = delivery._WindowsJob('Local\\AgentOrch-x')
+        job.handle = 1
+        with mock.patch.object(delivery, '_kill_group',
+                               return_value=(True, None)), \
+                mock.patch.object(delivery._WindowsJob, 'close',
+                                  lambda worker: worker.record.update(
+                                      closed_at='x')):
+            proven, _detail = delivery._stop_timed_out(SlowProcess(), job)
+        self.assertFalse(proven)
+        self.assertEqual(job.record['state'], 'ended')
+        self.assertIsNone(job.record['stopped'])
+        with mock.patch.object(delivery, '_job_active_by_name',
+                               return_value=('absent', None)):
+            verdict, detail = delivery._job_proof_status(job.record)
+        self.assertEqual(verdict, 'unknown', detail)
+
+    def test_inconsistent_job_record_is_never_treated_as_proven(self):
+        # Low: stopped=True with a recorded active>0 is contradictory.
+        record = {'kind': 'windows-job-object', 'id': 'Local\\AgentOrch-x',
+                  'state': 'ended', 'active': 5, 'stopped': True,
+                  'created_at': 'x', 'proven_at': 'y', 'closed_at': 'z',
+                  'detail': None}
+        with mock.patch.object(delivery, '_job_active_by_name',
+                               return_value=('absent', None)):
+            verdict, detail = delivery._job_proof_status(record)
+        self.assertEqual(verdict, 'invalid', detail)
+        live = dict(record, active=0, stopped=False)
+        with mock.patch.object(delivery, '_job_active_by_name',
+                               return_value=('absent', None)):
+            self.assertEqual(delivery._job_proof_status(live)[0], 'invalid')
 
 
 class AdapterTransportTests(BatchCase):
@@ -3744,6 +3853,93 @@ class AdapterTransportTests(BatchCase):
                                  'failed' if stopped else 'unproven_stop')
                 self.assertEqual(attempt['executor']['state'], 'ended')
                 self.assertIs(attempt['executor']['stopped'], stopped)
+
+    def test_execute_task_job_failure_rows_halt_only_when_unproven(self):
+        raw = self.plan([self.task('T1', 'a.txt')])
+        plan = delivery.validate_plan(raw, str(self.repo))
+        spec = plan['tasks'][0]
+        base = self.head(self.repo)
+        cases = {
+            # Matrix rows 13-16: halt only when the stop is not proven.
+            'row 13 job creation failed': (
+                'cannot create a Job Object: job boom', None, True),
+            'row 14 bind failed after the child was reaped': (
+                'cannot bind the child to its Job Object: assign boom',
+                True, False),
+            'row 14 bind failed without a proof': (
+                'cannot bind the child to its Job Object: assign boom',
+                False, True),
+            'row 16 resume failed after the tree was proven empty': (
+                'cannot resume the Job-bound child: resume boom', True, False),
+            'row 16 resume failed without a proof': (
+                'cannot resume the Job-bound child: resume boom', False, True),
+        }
+        for label, (detail, stopped, halt) in cases.items():
+            with self.subTest(label):
+                record = delivery._task_record(spec, plan['executor_agent'])
+                saves = []
+                attempt = delivery._start_attempt(
+                    record, spec, 'fresh', lambda: saves.append('start'))
+                result = {'exit_code': None, 'session_id': None, 'text': '',
+                          'pid': 424242 if stopped is True else None,
+                          'pgid': None, 'token': 7 if stopped is True else None,
+                          'stopped': stopped, 'timeout': False,
+                          'job_failed': detail, 'detail': detail,
+                          'job': {'kind': 'windows-job-object',
+                                  'id': 'Local\\AgentOrch-x',
+                                  'state': 'created',
+                                  'active': None,
+                                  'stopped': stopped,
+                                  'created_at': 'x',
+                                  'proven_at': 'x' if stopped is True else None,
+                                  'closed_at': 'x',
+                                  'detail': detail}}
+                with mock.patch.object(delivery, '_agent', return_value=result):
+                    with self.assertRaises(delivery.BatchError) as caught:
+                        delivery._execute_task(
+                            plan, spec, record, base, 5,
+                            lambda: saves.append('save'), attempt, self.journal)
+                self.assertIs(caught.exception.halt, halt, label)
+                self.assertEqual(
+                    attempt['result'],
+                    'failed' if stopped is True else 'unproven_stop')
+                self.assertEqual(attempt['executor']['state'], 'spawn_failed')
+                self.assertIs(attempt['executor']['stopped'], stopped)
+                problems = delivery._attempt_problems(record)
+                if stopped is True:
+                    # Proven: the recorded direct reap is the evidence, so a
+                    # retry is permitted instead of trading on the empty Job.
+                    self.assertEqual(problems, [], label)
+                else:
+                    self.assertTrue(any('not proven stopped' in problem
+                                        for problem in problems),
+                                    (label, problems))
+
+    def test_verify_task_job_failure_rows_halt_only_when_unproven(self):
+        cases = {
+            'row 13 job creation failed': (None, True),
+            'row 14 bind failed after the verifier was reaped': (True, False),
+            'row 14 bind failed without a proof': (False, True),
+        }
+        for label, (stopped, halt) in cases.items():
+            with self.subTest(label):
+                attempt = {'state': 'STARTED', 'verifiers': []}
+                result = {'exit': None, 'tail': 'job boom', 'timeout': False,
+                          'pid': None, 'pgid': None, 'token': None,
+                          'stopped': stopped, 'job': None,
+                          'job_failed': 'cannot bind the child'}
+                with mock.patch.object(delivery, '_run_process',
+                                       return_value=result):
+                    with self.assertRaises(delivery.BatchError) as caught:
+                        delivery._verify_task(
+                            self.repo, [[PY, '-c', 'pass']], 5,
+                            attempt=attempt, save=lambda: None)
+                self.assertIs(caught.exception.halt, halt, label)
+                self.assertEqual(attempt['verifiers'][0]['state'],
+                                 'spawn_failed')
+                self.assertEqual(
+                    attempt.get('result'),
+                    'failed' if stopped is True else 'unproven_stop')
 
     def test_attached_success_rejects_a_detached_worktree(self):
         plan = self.host_plan([self.task('T1', 'a.txt')])
