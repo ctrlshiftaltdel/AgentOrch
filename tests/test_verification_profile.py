@@ -1,8 +1,10 @@
 """Tests for the post-merge verification profile (Issue #188).
 
-The default fixpoint is the full post-merge set: quick test, full regression,
-backup and static check. Only the exact ``verification_profile: risk_pilot``
-value plus caller-supplied L0 proof may drop the full regression. Every test
+The default fixpoint is the full post-merge set: quick test, full regression
+and static check. The archive backup is conditional (required only while the
+task database exists), so it is not part of either automatic set. Only the
+exact ``verification_profile: risk_pilot`` value plus caller-supplied L0 proof
+may drop the full regression. Every test
 below either proves that reduction or proves that a missing / non-L0 / risky
 input keeps the full set. No test executes the listed commands; the module is a
 read-only decision helper.
@@ -81,16 +83,17 @@ class RepositoryConfigTests(unittest.TestCase):
 class ProvenL0Tests(ProjectFixture):
     """Positive coverage: only a proven L0 change may drop the full regression."""
 
-    def test_proven_l0_keeps_validate_kit_backup_and_static(self):
+    def test_proven_l0_keeps_validate_kit_and_static(self):
         self.write_profile('risk_pilot')
         document = profile.resolve(self.root, make_evidence())
 
         self.assertEqual(document['decision'], 'reduced')
         self.assertEqual(document['reasons'], ['risk_pilot_l0_proven'])
-        self.assertEqual(self.command_ids(document), ['quick', 'backup', 'static'])
+        self.assertEqual(self.command_ids(document), ['quick', 'static'])
         self.assertEqual(
-            set(self.command_strings(document)), {VALIDATE_KIT, BACKUP, STATIC})
+            set(self.command_strings(document)), {VALIDATE_KIT, STATIC})
         self.assertNotIn(UNITTEST, self.command_strings(document))
+        self.assertNotIn(BACKUP, self.command_strings(document))
 
 
 class ProfileFallbackTests(ProjectFixture):
@@ -100,8 +103,9 @@ class ProfileFallbackTests(ProjectFixture):
         self.assertEqual(document['decision'], 'full')
         self.assertEqual(
             self.command_ids(document),
-            ['quick', 'full_regression', 'backup', 'static'])
+            ['quick', 'full_regression', 'static'])
         self.assertIn(UNITTEST, self.command_strings(document))
+        self.assertNotIn(BACKUP, self.command_strings(document))
         if reason is not None:
             self.assertIn(reason, document['reasons'])
 
@@ -143,8 +147,10 @@ class EvidenceFallbackTests(ProjectFixture):
         self.assertEqual(document['decision'], 'full')
         self.assertEqual(
             [item['id'] for item in document['commands']],
-            ['quick', 'full_regression', 'backup', 'static'])
+            ['quick', 'full_regression', 'static'])
         self.assertIn(UNITTEST, [item['command'] for item in document['commands']])
+        self.assertNotIn(BACKUP,
+                         [item['command'] for item in document['commands']])
         if reason is not None:
             self.assertIn(reason, document['reasons'])
 
@@ -238,21 +244,22 @@ class CommandLineTests(ProjectFixture):
         document = json.loads(proc.stdout)
         self.assertEqual(document['decision'], 'reduced')
         self.assertEqual([item['id'] for item in document['commands']],
-                         ['quick', 'backup', 'static'])
+                         ['quick', 'static'])
+        self.assertNotIn(BACKUP, self.command_strings(document))
 
     def test_plain_output_lists_commands_without_the_full_regression(self):
         self.evidence_path.write_text(json.dumps(make_evidence()), encoding='utf-8')
         proc = self.run_cli('--evidence', str(self.evidence_path))
 
         self.assertEqual(proc.returncode, profile.EXIT_OK, proc.stderr)
-        self.assertEqual(proc.stdout.splitlines(), [VALIDATE_KIT, BACKUP, STATIC])
+        self.assertEqual(proc.stdout.splitlines(), [VALIDATE_KIT, STATIC])
 
     def test_without_evidence_the_cli_prints_the_full_set(self):
         proc = self.run_cli()
 
         self.assertEqual(proc.returncode, profile.EXIT_OK, proc.stderr)
         self.assertEqual(
-            proc.stdout.splitlines(), [VALIDATE_KIT, UNITTEST, BACKUP, STATIC])
+            proc.stdout.splitlines(), [VALIDATE_KIT, UNITTEST, STATIC])
 
     def test_broken_evidence_fails_closed(self):
         self.evidence_path.write_text('{not json', encoding='utf-8')

@@ -9,8 +9,14 @@ The default post-merge set is the full one::
 
     python scripts/validate_kit.py                          # quick
     python -m unittest discover -s tests                    # full regression
-    python scripts/orchestrator.py backup                   # backup
     python -m py_compile scripts/orchestrator.py scripts/validate_kit.py  # static
+
+``python scripts/orchestrator.py backup`` is a conditional archive-maintenance
+step, not part of either automatic set. It is required when
+``.orchestration/state.sqlite3`` exists; when the archive is absent the command
+must refuse (no ``init``, no pseudo-success file) and post-merge verification
+records ``NOT_APPLICABLE: archive absent`` instead of a failure. ``COMMANDS``
+keeps the ``backup`` entry only as a reference for that call site.
 
 This module answers one question, read-only: which post-merge commands apply to
 this checkout? Only the exact ``verification_profile: risk_pilot`` value in
@@ -70,8 +76,8 @@ PROFILE_LINE = re.compile(
 # empty declaration) is not the exact opt-in and therefore keeps the full set.
 VALUE_TOKEN = re.compile(r'^`?([A-Za-z0-9_-]+)`?$')
 
-FULL_COMMAND_IDS = ('quick', 'full_regression', 'backup', 'static')
-RISK_PILOT_COMMAND_IDS = ('quick', 'backup', 'static')
+FULL_COMMAND_IDS = ('quick', 'full_regression', 'static')
+RISK_PILOT_COMMAND_IDS = ('quick', 'static')
 
 COMMANDS = {
     'quick': 'python scripts/validate_kit.py',
