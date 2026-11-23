@@ -2971,6 +2971,13 @@ class ExecutorLifecycleTests(BatchCase):
                 good, active=0, stopped=False),
             'row 6 created but never bound': dict(
                 good, state='created', stopped=None, proven_at=None),
+            'row 14 created+stopped without a proof timestamp': dict(
+                good, state='created', stopped=True, proven_at=None,
+                detail='the child was never bound to the Job; the direct child '
+                       'was terminated and reaped'),
+            'row 14 created+stopped without detail markers': dict(
+                good, state='created', stopped=True, proven_at='x',
+                detail='terminated'),
         }
         for label, job in corrupt.items():
             with self.subTest(label):
@@ -3022,20 +3029,46 @@ class ExecutorLifecycleTests(BatchCase):
             self.assertEqual(delivery._attempt_problems(record), [])
 
     def test_unproven_verifier_blocks_reuse_like_the_executor(self):
-        # Medium 1: a verifier that ended without a stop proof is checked with
-        # the same rule as the executor instead of being skipped.
+        # Round-2 High: an explicit negative verifier stop proof is never
+        # reusable on any platform, including a spawn_failed row without a pid.
         executor = {'state': 'ended', 'pid': 100, 'pgid': None, 'token': 42,
                     'exit': 0, 'stopped': True, 'session': None, 'job': None}
-        verifier = {'state': 'ended', 'pid': 101, 'pgid': None, 'token': 43,
-                    'exit': None, 'timeout': True, 'stopped': False,
-                    'job': None}
-        record = self._record([self._attempt(executor=executor,
+        for state in ('ended', 'spawn_failed'):
+            with self.subTest(state=state):
+                verifier = {'state': state, 'pid': None, 'pgid': None,
+                            'token': None, 'exit': None, 'timeout': True,
+                            'stopped': False,
+                            'job': {'kind': 'windows-job-object',
+                                    'id': 'Local\\AgentOrch-x',
+                                    'state': 'created', 'active': None,
+                                    'stopped': False, 'created_at': 'x',
+                                    'proven_at': None, 'closed_at': 'x',
+                                    'detail': 'never bound; not proven stopped'}}
+                record = self._record([self._attempt(
+                    executor=dict(executor), verifiers=[verifier])])
+                problems = self._problems(record)
+                self.assertTrue(any('verifier 1' in problem
+                                    for problem in problems), problems)
+                with self.assertRaises(delivery.BatchError):
+                    delivery._reuse_guard({'id': 'T1'}, record)
+
+    def test_posix_verifier_without_a_stop_proof_keeps_the_old_verdict(self):
+        # Low: the Windows-only "no stop proof" verifier rule must not change
+        # the historical POSIX verdict for an ended verifier with no proof.
+        executor = {'state': 'ended', 'pid': 100, 'pgid': None, 'token': 42,
+                    'exit': 0, 'stopped': True, 'session': None, 'job': None}
+        verifier = {'state': 'ended', 'pid': 101, 'pgid': 101, 'token': None,
+                    'exit': 0, 'timeout': False, 'stopped': None, 'job': None}
+        record = self._record([self._attempt(executor=dict(executor),
                                              verifiers=[verifier])])
-        problems = self._problems(record)
+        with mock.patch.object(delivery, '_proven_process_state',
+                               lambda *args, **kwargs: 'stopped'):
+            with mock.patch.object(delivery, '_IS_WINDOWS', False):
+                self.assertEqual(delivery._attempt_problems(record), [])
+            with mock.patch.object(delivery, '_IS_WINDOWS', True):
+                windows = delivery._attempt_problems(record)
         self.assertTrue(any('verifier 1 is ended without a stop proof' in
-                            problem for problem in problems), problems)
-        with self.assertRaises(delivery.BatchError):
-            delivery._reuse_guard({'id': 'T1'}, record)
+                            problem for problem in windows), windows)
 
 
 class WindowsJobObjectTests(unittest.TestCase):
@@ -3229,6 +3262,10 @@ class WindowsJobObjectTests(unittest.TestCase):
         self.assertEqual(spawn['job_record']['state'], 'created')
         self.assertIs(spawn['job_record']['stopped'], True)
         self.assertIn('never bound', spawn['job_record']['detail'])
+        with mock.patch.object(delivery, '_job_active_by_name',
+                               return_value=('absent', None)):
+            self.assertEqual(
+                delivery._job_proof_status(spawn['job_record'])[0], 'empty')
 
     def test_bind_failure_without_a_reap_proof_stays_unproven(self):
         class StuckProcess:
@@ -3859,87 +3896,159 @@ class AdapterTransportTests(BatchCase):
         plan = delivery.validate_plan(raw, str(self.repo))
         spec = plan['tasks'][0]
         base = self.head(self.repo)
+        reap_detail = ('the child was never bound to the Job; the direct child '
+                       'was terminated and reaped')
+        lost_detail = ('the child was never bound to the Job; the direct child '
+                       'was not proven stopped')
         cases = {
-            # Matrix rows 13-16: halt only when the stop is not proven.
-            'row 13 job creation failed': (
-                'cannot create a Job Object: job boom', None, True),
-            'row 14 bind failed after the child was reaped': (
-                'cannot bind the child to its Job Object: assign boom',
-                True, False),
-            'row 14 bind failed without a proof': (
-                'cannot bind the child to its Job Object: assign boom',
-                False, True),
-            'row 16 resume failed after the tree was proven empty': (
-                'cannot resume the Job-bound child: resume boom', True, False),
-            'row 16 resume failed without a proof': (
-                'cannot resume the Job-bound child: resume boom', False, True),
+            # Matrix rows 13-16 with the exact production shapes. A resume
+            # failure terminates the Job but has no direct-child pid, so the
+            # guard over-blocks it (documented, fail closed).
+            'row 13 job creation failed': {
+                'detail': 'cannot create a Job Object: job boom',
+                'pid': None, 'token': None, 'stopped': None,
+                'job': {'state': 'created', 'stopped': None, 'proven_at': None,
+                        'detail': 'cannot create a Job Object'},
+                'halt': True, 'expect': 'not proven stopped'},
+            'row 14a bind failed after the child was reaped': {
+                'detail': 'cannot bind the child to its Job Object: assign boom',
+                'pid': 424242, 'token': 7, 'stopped': True,
+                'job': {'state': 'created', 'stopped': True,
+                        'proven_at': 'x', 'detail': reap_detail},
+                'halt': False, 'expect': None},
+            'row 14b bind failed without a proof': {
+                'detail': 'cannot bind the child to its Job Object: assign boom',
+                'pid': None, 'token': None, 'stopped': False,
+                'job': {'state': 'created', 'stopped': False,
+                        'proven_at': None, 'detail': lost_detail},
+                'halt': True, 'expect': 'not proven stopped'},
+            'row 16a resume failed after the tree was proven empty': {
+                'detail': 'cannot resume the Job-bound child: resume boom',
+                'pid': None, 'token': None, 'stopped': True,
+                'job': {'state': 'ended', 'stopped': True, 'proven_at': 'x',
+                        'detail': None},
+                'halt': False, 'expect': 'claims a stop proof without a pid'},
+            'row 16b resume failed without a proof': {
+                'detail': 'cannot resume the Job-bound child: resume boom',
+                'pid': None, 'token': None, 'stopped': False,
+                'job': {'state': 'ended', 'stopped': False, 'proven_at': None,
+                        'detail': 'not proven'},
+                'halt': True, 'expect': 'not proven stopped'},
         }
-        for label, (detail, stopped, halt) in cases.items():
+        for label, row in cases.items():
             with self.subTest(label):
                 record = delivery._task_record(spec, plan['executor_agent'])
                 saves = []
                 attempt = delivery._start_attempt(
                     record, spec, 'fresh', lambda: saves.append('start'))
                 result = {'exit_code': None, 'session_id': None, 'text': '',
-                          'pid': 424242 if stopped is True else None,
-                          'pgid': None, 'token': 7 if stopped is True else None,
-                          'stopped': stopped, 'timeout': False,
-                          'job_failed': detail, 'detail': detail,
-                          'job': {'kind': 'windows-job-object',
-                                  'id': 'Local\\AgentOrch-x',
-                                  'state': 'created',
-                                  'active': None,
-                                  'stopped': stopped,
-                                  'created_at': 'x',
-                                  'proven_at': 'x' if stopped is True else None,
-                                  'closed_at': 'x',
-                                  'detail': detail}}
+                          'pid': row['pid'], 'pgid': None,
+                          'token': row['token'], 'stopped': row['stopped'],
+                          'timeout': False,
+                          'job_failed': row['detail'], 'detail': row['detail'],
+                          'job': dict(row['job'],
+                                      kind='windows-job-object',
+                                      id='Local\\AgentOrch-x', active=None,
+                                      created_at='x', closed_at='x')}
                 with mock.patch.object(delivery, '_agent', return_value=result):
                     with self.assertRaises(delivery.BatchError) as caught:
                         delivery._execute_task(
                             plan, spec, record, base, 5,
                             lambda: saves.append('save'), attempt, self.journal)
-                self.assertIs(caught.exception.halt, halt, label)
+                self.assertIs(caught.exception.halt, row['halt'], label)
                 self.assertEqual(
                     attempt['result'],
-                    'failed' if stopped is True else 'unproven_stop')
+                    'failed' if row['stopped'] is True else 'unproven_stop')
                 self.assertEqual(attempt['executor']['state'], 'spawn_failed')
-                self.assertIs(attempt['executor']['stopped'], stopped)
-                problems = delivery._attempt_problems(record)
-                if stopped is True:
-                    # Proven: the recorded direct reap is the evidence, so a
-                    # retry is permitted instead of trading on the empty Job.
+                self.assertIs(attempt['executor']['stopped'], row['stopped'])
+                with mock.patch.object(delivery, '_proven_process_state',
+                                       lambda *args, **kwargs: 'stopped'):
+                    problems = delivery._attempt_problems(record)
+                if row['expect'] is None:
                     self.assertEqual(problems, [], label)
                 else:
-                    self.assertTrue(any('not proven stopped' in problem
+                    self.assertTrue(any(row['expect'] in problem
                                         for problem in problems),
                                     (label, problems))
 
-    def test_verify_task_job_failure_rows_halt_only_when_unproven(self):
-        cases = {
-            'row 13 job creation failed': (None, True),
-            'row 14 bind failed after the verifier was reaped': (True, False),
-            'row 14 bind failed without a proof': (False, True),
-        }
-        for label, (stopped, halt) in cases.items():
-            with self.subTest(label):
-                attempt = {'state': 'STARTED', 'verifiers': []}
-                result = {'exit': None, 'tail': 'job boom', 'timeout': False,
-                          'pid': None, 'pgid': None, 'token': None,
-                          'stopped': stopped, 'job': None,
-                          'job_failed': 'cannot bind the child'}
-                with mock.patch.object(delivery, '_run_process',
-                                       return_value=result):
-                    with self.assertRaises(delivery.BatchError) as caught:
-                        delivery._verify_task(
-                            self.repo, [[PY, '-c', 'pass']], 5,
-                            attempt=attempt, save=lambda: None)
-                self.assertIs(caught.exception.halt, halt, label)
-                self.assertEqual(attempt['verifiers'][0]['state'],
-                                 'spawn_failed')
-                self.assertEqual(
-                    attempt.get('result'),
-                    'failed' if stopped is True else 'unproven_stop')
+    def _job_bound_attempt(self):
+        return {
+            'id': 'attempt-' + 'a' * 32, 'index': 1, 'task': 'T1',
+            'trigger': 'fresh', 'state': 'STARTED',
+            'started_at': '2026-11-20T00:00:00+00:00', 'ended_at': None,
+            'result': None, 'error': None,
+            'executor': {'state': 'ended', 'pid': 424242, 'pgid': None,
+                         'token': 7, 'exit': 0, 'stopped': True,
+                         'session': 'ses_x', 'job': None},
+            'verifiers': []}
+
+    def test_verify_task_unproven_job_failure_blocks_retry(self):
+        # Round-2 High/Medium: reproduce the exact production shape of an
+        # unproven verifier bind failure and prove the reuse guard refuses it.
+        attempt = self._job_bound_attempt()
+        detail = ('the child was never bound to the Job; the direct child was '
+                  'not proven stopped')
+        result = {'exit': None, 'tail': 'job boom', 'timeout': False,
+                  'pid': None, 'pgid': None, 'token': None, 'stopped': False,
+                  'job': {'kind': 'windows-job-object',
+                          'id': 'Local\\AgentOrch-x', 'state': 'created',
+                          'active': None, 'stopped': False,
+                          'created_at': 'x', 'proven_at': None,
+                          'closed_at': 'x', 'detail': detail},
+                  'job_failed': 'cannot bind the child to its Job Object'}
+        with mock.patch.object(delivery, '_run_process', return_value=result):
+            with self.assertRaises(delivery.BatchError) as caught:
+                delivery._verify_task(
+                    self.repo, [[PY, '-c', 'pass']], 5,
+                    attempt=attempt, save=lambda: None)
+        self.assertIs(caught.exception.halt, True)
+        entry = attempt['verifiers'][0]
+        self.assertEqual(entry['state'], 'spawn_failed')
+        self.assertIsNone(entry['pid'])
+        self.assertIs(entry['stopped'], False)
+        self.assertEqual(entry['job']['state'], 'created')
+        self.assertIs(entry['job']['stopped'], False)
+        self.assertEqual(attempt['result'], 'unproven_stop')
+        record = {'status': 'FAILED', 'attempts': 1,
+                  'attempt_history': [attempt]}
+        with mock.patch.object(delivery, '_proven_process_state',
+                               lambda *args, **kwargs: 'stopped'):
+            problems = delivery._attempt_problems(record)
+        self.assertTrue(any('verifier 1' in problem
+                            and 'not proven stopped' in problem
+                            for problem in problems), problems)
+        with mock.patch.object(delivery, '_proven_process_state',
+                               lambda *args, **kwargs: 'stopped'):
+            with self.assertRaises(delivery.BatchError) as guarded:
+                delivery._reuse_guard({'id': 'T1'}, record)
+        self.assertEqual(guarded.exception.status, 'BLOCKED')
+        self.assertTrue(guarded.exception.halt)
+
+    def test_verify_task_proven_job_failure_stays_reusable(self):
+        attempt = self._job_bound_attempt()
+        detail = ('the child was never bound to the Job; the direct child was '
+                  'terminated and reaped')
+        result = {'exit': None, 'tail': '', 'timeout': False,
+                  'pid': 424242, 'pgid': None, 'token': 7, 'stopped': True,
+                  'job': {'kind': 'windows-job-object',
+                          'id': 'Local\\AgentOrch-x', 'state': 'created',
+                          'active': None, 'stopped': True,
+                          'created_at': 'x', 'proven_at': 'x',
+                          'closed_at': 'x', 'detail': detail},
+                  'job_failed': 'cannot bind the child to its Job Object'}
+        with mock.patch.object(delivery, '_run_process', return_value=result):
+            with self.assertRaises(delivery.BatchError) as caught:
+                delivery._verify_task(
+                    self.repo, [[PY, '-c', 'pass']], 5,
+                    attempt=attempt, save=lambda: None)
+        self.assertIs(caught.exception.halt, False)
+        self.assertEqual(attempt['verifiers'][0]['state'], 'spawn_failed')
+        self.assertIs(attempt['verifiers'][0]['stopped'], True)
+        record = {'status': 'FAILED', 'attempts': 1,
+                  'attempt_history': [attempt]}
+        with mock.patch.object(delivery, '_proven_process_state',
+                               lambda *args, **kwargs: 'stopped'):
+            self.assertEqual(delivery._attempt_problems(record), [])
 
     def test_attached_success_rejects_a_detached_worktree(self):
         plan = self.host_plan([self.task('T1', 'a.txt')])

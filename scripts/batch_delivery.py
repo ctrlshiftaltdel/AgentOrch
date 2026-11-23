@@ -2024,6 +2024,20 @@ def _attempt_processes(attempt):
     return rows
 
 
+def _direct_reap_proof(job):
+    """True when a never-bound record carries the direct-reap proof markers.
+
+    The markers are written only by :func:`_discard_unbound_child` after a
+    successful kill and reap, so a bare ``stopped=true`` on a 'created' record
+    is treated as an unproven claim.
+    """
+    proven_at = job.get('proven_at')
+    detail = job.get('detail')
+    return (isinstance(proven_at, str) and bool(proven_at)
+            and isinstance(detail, str)
+            and 'never bound' in detail and 'reaped' in detail)
+
+
 def _job_proof_status(job):
     """Classify a recorded Job proof as ``(verdict, detail)``.
 
@@ -2057,10 +2071,11 @@ def _job_proof_status(job):
         return 'invalid', ('the record claims live processes while the active '
                            'count was 0')
     if state == 'created':
-        if stopped is True:
+        if stopped is True and _direct_reap_proof(job):
             # The child was never a member; this record holds the direct-reap
             # proof taken at spawn time (kill plus a successful wait), not a
-            # Job empty-set claim.
+            # Job empty-set claim. The proof must carry its own timestamp and
+            # detail markers, otherwise it is just a corrupted claim.
             return 'empty', ('the child was never bound to the Job; the direct '
                              'child was terminated and reaped')
         # The child was suspended but never bound, so it may have outlived the
@@ -2187,13 +2202,33 @@ def _attempt_problems(record, ignore=()):
                     'starting', 'running', 'ended', 'unrecorded'):
                 problems.append(f'attempt #{position} verifier {index} is '
                                 f'{verifier_state} without a recorded pid')
-            # The executor rule is symmetric: a verifier that finished (or lost
-            # its record) without a proven stop blocks reuse just as an
-            # unfinished executor would.
-            if (verifier_state in ('ended', 'unrecorded')
-                    and entry.get('stopped') is not True):
+            # An explicit negative stop proof is never reusable, whatever the
+            # state: a spawn_failed verifier whose child could not be proven
+            # gone may still exist, and it was never bound to a Job.
+            if entry.get('stopped') is False:
+                problems.append(f'attempt #{position} verifier {index} is '
+                                f'{verifier_state} and its process was not '
+                                'proven stopped')
+            elif entry.get('stopped') is True and entry.get('pid') is None:
+                problems.append(f'attempt #{position} verifier {index} claims a '
+                                'stop proof without a pid')
+            elif (_IS_WINDOWS and verifier_state in ('ended', 'unrecorded')
+                  and entry.get('stopped') is not True):
+                # Windows-only: the Job proof is mandatory there, while the
+                # historical POSIX verdict for these rows is left unchanged.
                 problems.append(f'attempt #{position} verifier {index} is '
                                 f'{verifier_state} without a stop proof')
+            if _IS_WINDOWS and entry.get('pid') is None:
+                # A pid-less row is skipped by the process loop, so its Job
+                # record is validated here instead of being ignored.
+                verifier_job = entry.get('job')
+                if verifier_job is not None:
+                    verdict, detail = _job_proof_status(verifier_job)
+                    if verdict not in ('empty', 'absent'):
+                        problems.append(
+                            f'attempt #{position} verifier {index} Job Object '
+                            f'proof {detail}; the process tree cannot be proven '
+                            'stopped')
         for role, pid, pgid, token, stopped, job in _attempt_processes(attempt):
             if pid is not None and (not isinstance(pid, int) or pid <= 0):
                 problems.append(f'attempt #{position} {role} pid is invalid')
