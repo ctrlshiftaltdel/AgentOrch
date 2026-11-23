@@ -2959,7 +2959,7 @@ class AdapterTransportTests(BatchCase):
             'executor_agent': agent or request['executor_agent'],
             'workdir': workdir or request['worktree'],
             'terminal': terminal, 'exit_code': exit_code, 'report': report,
-            'artifacts': [{'path': str(artifact),
+            'artifacts': [{'path': str(artifact.resolve()),
                            'sha256': hashlib.sha256(data).hexdigest(),
                            'bytes': len(data)}],
             'head': head,
@@ -3000,7 +3000,7 @@ class AdapterTransportTests(BatchCase):
             'request_sha256': hashlib.sha256(request_path.read_bytes()).hexdigest(),
             'batch_id': request['batch_id'], 'session_id': session,
             'reviewer_agent': reviewer_agent or request['reviewer_agent'],
-            'workdir': workdir or str(self.root / 'wt-batch'),
+            'workdir': workdir or str((self.root / 'wt-batch').resolve()),
             'edit_denied': edit_denied, 'declared_executor_sessions': declared,
             'base': state['base_sha'], 'head': head, 'diff_sha256': digest,
             'risk': risk, 'verdict': verdict, 'tasks': tasks,
@@ -3059,7 +3059,8 @@ class AdapterTransportTests(BatchCase):
         self.assertEqual(record['attempts'], 1)
         request_path, request = self._pending()
         self.assertEqual(request['task_id'], 'T1')
-        self.assertEqual(request['worktree'], str(self.root / 'wt-t1'))
+        self.assertEqual(Path(request['worktree']).resolve(),
+                         (self.root / 'wt-t1').resolve())
         self.assertEqual(request['branch'], 'task/batch-t1')
         self.assertEqual(request['paths'], ['a.txt'])
         self.assertIn('TASK_ID=T1', request['prompt'])
