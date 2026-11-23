@@ -278,7 +278,7 @@ PLANNED → READY → DISPATCHED/IN_PROGRESS → TASK_VERIFIED → INTEGRATED �
 - 批次交付允许一个批次只开一个最终 PR / 做一次合并；合并前必须在该批次最终 head 上通过必需检查与批次审查（2.2、4.2 节），一个批次 PR 可以包含多个任务 ID。不得用逐任务 PR 的旧规则否定批次交付，也不得用批次合并跳过单任务验收。
 - 只有 Master 执行合并（`local` 例如 `git merge --no-ff <branch>`，`github` 例如平台合并按钮 / `gh pr merge`；具体策略由项目配置决定）。执行者不能自批自合。
 - 合并前备份或确认可恢复；遇到冲突不自动覆盖他人 / 主分支内容。
-- 合并后运行 `docs/PROJECT.md` 指定的验证命令，保存日志与退出码；全部通过后转 `VERIFIED`。默认集合是快速测试 + 完整回归 + `backup` + 静态检查；只有 `verification_profile` 精确为 `risk_pilot` 且调用者显式证明变更为 L0 时，才可以省略完整回归，`validate_kit`、`py_compile` 与 `backup` 仍必须执行。证明缺失、语义标记为真或路径命中编排器 / `kit/orchestration.md` / CI / `PROJECT.md` / `PLAN.md` / `AGENTS.md` / `editions/` / `scripts/` / `release/` / `templates/` 时不得省略。
+- 合并后运行 `docs/PROJECT.md` 指定的验证命令，保存日志与退出码；全部通过后转 `VERIFIED`。无条件集合是快速测试 + 完整回归 + 静态检查；`backup` 不是无条件项，按 `docs/PROJECT.md` 的「归档备份（条件项）」执行：`.orchestration/state.sqlite3` 存在时必须运行 `python scripts/orchestrator.py backup`，缺库时按维护写入边界拒绝、不得 `init`，合并后验证记 `NOT_APPLICABLE: archive absent`，不计为失败。只有 `verification_profile` 精确为 `risk_pilot` 且调用者显式证明变更为 L0 时，才可以省略完整回归，`validate_kit` 与 `py_compile` 仍必须执行。证明缺失、语义标记为真或路径命中编排器 / `kit/orchestration.md` / CI / `PROJECT.md` / `PLAN.md` / `AGENTS.md` / `editions/` / `scripts/` / `release/` / `templates/` 时不得省略。
 - 批次交付同样要求合并后验证：只有验证通过后才把批次内任务逐个标记 `VERIFIED`；不得把 `INTEGRATED` / `PREPARED` 写成 `VERIFIED`。批次 PR 的描述与证据见 `editions/github/pr-template.md`。
 - 合并成功与分支清理分开记账。清理失败不能触发重复合并。
 - 默认最多 3 轮审查—修复往返；达到上限仍未通过 → `BLOCKED`，由项目所有者决定拆分、扩大范围或取消。

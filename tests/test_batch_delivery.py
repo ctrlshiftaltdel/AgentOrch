@@ -1750,8 +1750,9 @@ class InputErrorTests(BatchCase):
         self.assertIn(('post', ('<python>', '-m', 'py_compile',
                                 'scripts/orchestrator.py',
                                 'scripts/validate_kit.py')), commands)
-        self.assertIn(('post', ('<python>', 'scripts/orchestrator.py', 'backup')),
-                      commands)
+        self.assertNotIn(
+            ('post', ('<python>', 'scripts/orchestrator.py', 'backup')),
+            commands)
         self.assertTrue(all(stage == 'post' for stage, _ in commands))
 
     def test_all_four_default_commands_in_post_merge_passes(self):

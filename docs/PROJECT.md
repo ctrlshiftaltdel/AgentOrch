@@ -31,8 +31,9 @@
 - 静态检查 / 类型检查：`python -m py_compile scripts/orchestrator.py scripts/validate_kit.py`（零依赖语法检查；不引入第三方依赖）
 - 构建 / 打包：不适用（无构建产物）
 - 手工 / UI 冒烟检查：按新提示词走一遍空目录启动冒烟
-- 合并后必须执行：快速测试 + 完整回归 + `python scripts/orchestrator.py backup` + 静态检查。`backup` 只按「维护写入边界」执行；该边界未出现在合并目标 `main` 上时，不得用待合并文本给当次合并授权。
-- 合并后验证 profile（2026-10-31 项目所有者授权，Issue #188）：每个 HEAD 的必需检查仍必须真实通过；`L2` / `L3` 与合并后验证保留完整回归，`L0` / `L1` 的 pull request 运行按 CI 风险分层只跑增量检查（见 `docs/README.md` 7.1 与 `kit/orchestration.md` 4.2），不得被描述成“全套通过”。默认集合仍是快速测试 + 完整回归 + `backup` + 静态检查。唯一授权减项仅当 `verification_profile` 精确等于 `risk_pilot` 且调用者用 `python scripts/verification_profile.py --evidence <json>` 显式证明变更为 L0 时生效：此时合并后集合可以不含 `python -m unittest discover -s tests`，但仍必须含 `python scripts/validate_kit.py`、`python -m py_compile scripts/orchestrator.py scripts/validate_kit.py` 与 `python scripts/orchestrator.py backup`。
+- 合并后必做：快速测试 + 完整回归 + 静态检查（命令见上），这三项是无条件项。归档备份不在无条件集合内，按「归档备份（条件项）」执行。
+- 归档备份（条件项）：`.orchestration/state.sqlite3` 存在时必须运行 `python scripts/orchestrator.py backup`；缺库时该命令必须拒绝执行，不得 `init`，不得留下伪成功文件，合并后验证中记为 `NOT_APPLICABLE: archive absent`，不计为失败。`backup` 只按「维护写入边界」执行；该边界未出现在合并目标 `main` 上时，不得用待合并文本给当次合并授权。该条由 Master 在合并后手动执行；批次工具的自动 post-merge 集合只覆盖快速测试、完整回归与静态检查，不代跑 `backup`。
+- 合并后验证 profile（2026-10-31 项目所有者授权，Issue #188）：每个 HEAD 的必需检查仍必须真实通过；`L2` / `L3` 与合并后验证保留完整回归，`L0` / `L1` 的 pull request 运行按 CI 风险分层只跑增量检查（见 `docs/README.md` 7.1 与 `kit/orchestration.md` 4.2），不得被描述成“全套通过”。默认集合仍是快速测试 + 完整回归 + 静态检查；`backup` 不是无条件必含项，按「归档备份（条件项）」判定。唯一授权减项仅当 `verification_profile` 精确等于 `risk_pilot` 且调用者用 `python scripts/verification_profile.py --evidence <json>` 显式证明变更为 L0 时生效：此时合并后集合可以不含 `python -m unittest discover -s tests`，但仍必须含 `python scripts/validate_kit.py` 与 `python -m py_compile scripts/orchestrator.py scripts/validate_kit.py`；`python scripts/orchestrator.py backup` 是否执行同样按「归档备份（条件项）」判定。
 - 上述减项的关闭条件：证明缺失或不可判定、`executable_doc` / `policy` / `contract` / `uncertainty_l3` 任一为真，或任一路径命中 `scripts/orchestrator.py`、`docs/orchestration.md`、`kit/`、`.github/workflows/`、`docs/PROJECT.md`、`docs/PLAN.md`、`AGENTS.md`、`editions/`、`scripts/`、`release/`、`templates/`、`VERSION.md` 时，仍执行完整回归。L1 / L2 / L3、发布、安全、权限、身份、迁移、锁与状态机相关检查一律不减。
 - 回退：把 `verification_profile` 改回 `strict`（或删除该键）即恢复唯一的默认完整集合，不需要改代码。
 
