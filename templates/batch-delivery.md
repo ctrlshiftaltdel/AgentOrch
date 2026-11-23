@@ -112,7 +112,7 @@ python scripts/batch_delivery.py status   --journal JOURNAL [--json]
 两种传输：
 
 - **`command`**：工具自己 spawn 子进程。`name` 为 `opencode` 时使用内置 argv（唯一允许 `BATCH_OPENCODE` 覆盖的适配器）；其他名字必须给 `command`，工具按原样启动该 argv，prompt 走 stdin，并把 `BATCH_ROLE`、`BATCH_AGENT`、`BATCH_TASK_ID`、`BATCH_BASE_SHA`、`BATCH_WORKTREE` 放进环境。stdout 必须是同一套 JSON 事件流（`step_start` / `text` / `tool_use` / `step_finish`）；通用命令的会话标识只需是非空字符串，不要求 `ses_`。通用命令适配器**不提供** `session export` / 审查 profile 查询，因此 `L1` / `L2` 独立审查必须改用 `opencode` 或 `attached`，否则阻塞。
-- **`attached`**：本机没有可被 `subprocess` 调用的 agent CLI，宿主（Master）才是 spawn 者。`run --execute` 在完成权威派发与 worktree 准备后写出 `execution-<task>.request.json`（prompt、任务 ID、基线 head、允许路径、worktree、branch、AC、verify、建议的 `result_path`），任务保持 `RUNNING` 且带 `awaiting_host`，命令以退出码 **3** 结束。宿主运行真实执行体后写结果文件，再用显式 `attach --result PATH` 提交。`finalize --review` 同样写 `review.request.json` 并以 **3** 结束，宿主返回 verdict 后再 `attach`。
+- **`attached`**：本机没有可被 `subprocess` 调用的 agent CLI，宿主（Master）才是 spawn 者。`run --execute` 在完成权威派发与 worktree 准备后写出 `execution-<task>.request.json`（prompt、任务 ID、基线 head、允许路径、worktree、branch、AC、verify、建议的 `result_path`），任务保持 `RUNNING` 且带 `awaiting_host`，命令以退出码 **3** 结束。宿主运行真实执行体后写结果文件，再用显式 `attach --result PATH` 提交。`finalize --review` 同样写 `review.request.json` 并以 **3** 结束，宿主返回 verdict 后再 `attach`。该传输**没有工具侧执行超时**：宿主负责给真实执行体设上限；`--timeout` 只约束 `attach` 之后的验证命令。有 pending 请求时，`run` / `--resume` 只重新打印同一请求，不启动第二个执行体。
 
 显式选择（计划里写了 `executor_adapter`）必须带 C1–C4 全 `PASS` 的 `capabilities` 与可定位的 `capability_evidence`；缺项在派发和 worktree 写入前以退出码 2 报错。`command` 适配器的可执行文件不存在也会在派发前报错。`check`、dry run、`status` 仍是只读操作，不需要安装任何运行时。
 

@@ -1083,6 +1083,14 @@ def _check_journal_plan(state, plan):
     wanted = _adapter_identity(plan['adapter'])
     stored = state.get('adapter')
     if stored is None:
+        # Only a plan that itself omits ``executor_adapter`` may be backfilled
+        # as the legacy opencode default. A journal written before adapters
+        # existed cannot prove which runtime an explicit selection used.
+        if plan['adapter'].get('source') == 'plan':
+            raise InputError(
+                'the journal predates executor adapters but the plan explicitly '
+                'selects one; the recorded runtime cannot be proven. Start a new '
+                'batch instead of backfilling the adapter mid-batch')
         # Journals written before the adapter existed are the legacy opencode
         # path; record that fact instead of guessing another product.
         state['adapter'] = wanted
@@ -1804,6 +1812,34 @@ def _pending_host(state):
             if isinstance(record, dict) and record.get('awaiting_host')]
 
 
+def _recorded_execution_sessions(state):
+    """Every execution session this batch has recorded, including failures.
+
+    ``execution_session`` only holds the last successful session; the
+    adapter/attempt histories also carry failed, cancelled and retried
+    sessions. A reviewer must not be any of them.
+    """
+    sessions = set()
+    for record in (state.get('tasks') or {}).values():
+        if not isinstance(record, dict):
+            continue
+        if record.get('execution_session'):
+            sessions.add(record['execution_session'])
+        for entry in record.get('adapter_history') or []:
+            if isinstance(entry, dict) and entry.get('session_id'):
+                sessions.add(entry['session_id'])
+        for attempt in record.get('attempt_history') or []:
+            if not isinstance(attempt, dict):
+                continue
+            executor = attempt.get('executor')
+            if isinstance(executor, dict) and executor.get('session'):
+                sessions.add(executor['session'])
+            adapter = attempt.get('adapter')
+            if isinstance(adapter, dict) and adapter.get('session'):
+                sessions.add(adapter['session'])
+    return sessions
+
+
 def _classify_stream(returncode, output, *, session_prefix='ses_',
                      label='OpenCode'):
     """Accept only a single-session stream that ends with one terminal stop.
@@ -1905,6 +1941,9 @@ def _prove_stopped(process, issued, pgid):
     try:
         process.communicate(timeout=KILL_GRACE)
     except subprocess.TimeoutExpired:
+        return False
+    except (OSError, ValueError, UnicodeError):
+        # A decode/pipe failure while reaping is not proof of termination.
         return False
     if not issued or os.name == 'nt' or pgid is None:
         return False
@@ -2012,8 +2051,10 @@ def _agent(work, prompt, agent_name, timeout, *, title=None, on_spawn=None,
             stdin=subprocess.PIPE if input_text is not None
             else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            encoding='utf-8', errors='strict',
             env=environment, start_new_session=(os.name == 'posix'))
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # No process was spawned, so there is nothing to stop.
         return {'exit_code': None, 'session_id': None, 'text': '', 'pid': None,
                 'pgid': None, 'detail': f'spawn failed: {exc}'}
     pgid = process.pid if os.name == 'posix' else None
@@ -2044,6 +2085,16 @@ def _agent(work, prompt, agent_name, timeout, *, title=None, on_spawn=None,
         return {'exit_code': None, 'session_id': None, 'text': '', 'timeout': True,
                 'stopped': proven, 'pid': process.pid, 'pgid': pgid,
                 'token': token, 'detail': detail}
+    except (OSError, ValueError, UnicodeError) as exc:
+        # Writing the prompt or reading stdout failed after the spawn. The
+        # child may still be alive, so kill it and record whether termination
+        # could actually be proven; never leave a 'spawning'/'running' record.
+        proven, detail = _stop_timed_out(process)
+        return {'exit_code': None, 'session_id': None, 'text': '',
+                'pid': process.pid, 'pgid': pgid, 'token': token,
+                'stopped': proven, 'timeout': False,
+                'io_error': f'{type(exc).__name__}: {exc}',
+                'detail': f'{type(exc).__name__}: {exc}; {detail}'}
     result = _classify_stream(process.returncode, output or '',
                               session_prefix=session_prefix,
                               label='OpenCode' if _adapter_is_opencode(adapter)
@@ -2556,7 +2607,7 @@ def _dispatch_batch(plan, state, journal):
 
 # ------------------------------------------------------------- execution stage
 
-def _prompt(spec, plan, base):
+def _prompt(spec, plan, base, *, attached=False):
     lines = [
         f'TASK_ID={spec["id"]}',
         'ROLE=executor',
@@ -2576,12 +2627,22 @@ def _prompt(spec, plan, base):
               for index, text in enumerate(spec['acceptance'], start=1)]
     lines += ['Verification commands:']
     lines += ['- ' + ' '.join(command) for command in spec['verify']]
-    lines += [
-        '',
-        'Rules: do not touch paths outside the allowed list, do not push, do not '
-        'merge, do not rewrite history, and leave the worktree clean. Commit your '
-        'own work if you prefer, but uncommitted changes are also acceptable.',
-    ]
+    if attached:
+        lines += [
+            '',
+            'Rules: do not touch paths outside the allowed list, do not push, do '
+            'not merge, and do not rewrite history. Commit your changes and leave '
+            'the worktree clean at the reported head: uncommitted or untracked '
+            'changes are rejected by attach, so do not rely on the coordinator '
+            'committing them for you.',
+        ]
+    else:
+        lines += [
+            '',
+            'Rules: do not touch paths outside the allowed list, do not push, do not '
+            'merge, do not rewrite history, and leave the worktree clean. Commit your '
+            'own work if you prefer, but uncommitted changes are also acceptable.',
+        ]
     return '\n'.join(lines)
 
 
@@ -2794,7 +2855,7 @@ def _write_execution_request(plan, spec, record, base, attempt, save, journal):
         'base_sha': base, 'worktree': work, 'branch': spec['branch'],
         'paths': list(spec['paths']), 'acceptance': list(spec['acceptance']),
         'verify': [list(command) for command in spec['verify']],
-        'prompt': _prompt(spec, plan, base),
+        'prompt': _prompt(spec, plan, base, attached=True),
         'result_path': str(_execution_result_path(journal, spec)),
         'diff_contract': {
             'sha256': 'sha256 of the stdout bytes of: git diff '
@@ -3061,6 +3122,10 @@ def _attach_execution(plan, state, journal, result_path, timeout):
         if _head(work) != head:
             raise BatchError('the worktree head is not the reported head',
                              status='BLOCKED')
+        if _branch(work) != spec['branch']:
+            raise BatchError('the attached worktree is not on the task branch '
+                             f'{spec["branch"]!r} (detached or wrong branch)',
+                             status='BLOCKED')
         if not _clean(work):
             raise BatchError('the attached executor left the worktree dirty; '
                              'commit the work and leave it clean',
@@ -3163,6 +3228,16 @@ def _execute_task(plan, spec, record, base, timeout, save, attempt,
                             else 'failed', error=result['detail'], save=save)
             raise BatchError(result['detail'], status='FAILED',
                              halt=stopped is not True)
+        if result.get('io_error'):
+            stopped = result.get('stopped')
+            executor.update(state='ended', stopped=stopped)
+            _finish_attempt(attempt, 'failed' if stopped is True
+                            else 'unproven_stop',
+                            error=result['detail'], save=save)
+            raise BatchError(
+                f'execution I/O failed: {result["io_error"]}; '
+                f'{result.get("detail") or ""}',
+                status='FAILED', halt=stopped is not True)
         if result.get('timeout'):
             stopped = bool(result.get('stopped'))
             executor.update(state='ended', stopped=stopped)
@@ -3500,7 +3575,8 @@ def _diff_for_review(work, base, head):
     return raw.decode('utf-8', 'replace'), hashlib.sha256(raw).hexdigest()
 
 
-def _review_prompt(plan, state, base, head, digest, risk, diff):
+def _review_prompt(plan, state, base, head, digest, risk, diff, *,
+                   attached=False, result_path=None):
     tasks = []
     for spec in plan['tasks']:
         record = state['tasks'].get(spec['id'], {})
@@ -3524,14 +3600,36 @@ def _review_prompt(plan, state, base, head, digest, risk, diff):
         '(the exact argv that was executed) and the already-recorded verify argv '
         'hashes, exits and tails. Judge whether the diff and evidence actually '
         'satisfy every criterion; do not infer a PASS from a command name alone.',
-        'Review the complete diff below. Answer with exactly one fenced ```json '
-        'block using this shape:',
-        '{"verdict":"APPROVE|REJECT","base":"<sha>","head":"<sha>",'
-        '"diff_sha256":"<sha>","risk":"L0|L1|L2|L3","tasks":[{"id":"T1",'
-        '"acceptance":[{"id":"AC-1","criterion":"<exact>",'
-        '"status":"PASS|FAIL|NOT_RUN","evidence":"..."}]}],"findings":[]}',
-        'Every acceptance criterion must be PASS with evidence, or the verdict '
-        'must be REJECT with findings. Do not edit files.',
+    ]
+    if attached:
+        lines += [
+            'Review the complete diff below. Do not only print a fenced JSON '
+            'verdict: write the review result file expected by the attached '
+            'transport.',
+            f'Write {result_path or "result_path"} with schema '
+            f'{REVIEW_RESULT_SCHEMA}. Required top-level fields: schema, kind, '
+            'request_sha256, batch_id, session_id, reviewer_agent, workdir, '
+            'edit_denied, declared_executor_sessions, base, head, diff_sha256, '
+            'risk, verdict, tasks, findings, report, ended_at.',
+            'request_sha256 must be the SHA-256 of the review request file that '
+            'carried this prompt. tasks must cover every task and every AC with '
+            '{"id","criterion","status","evidence"}; every AC must be PASS with '
+            'locatable evidence, or the verdict must be REJECT with findings.',
+            'Do not edit files; the session must be independent from every '
+            'executor session in declared_executor_sessions.',
+        ]
+    else:
+        lines += [
+            'Review the complete diff below. Answer with exactly one fenced '
+            '```json block using this shape:',
+            '{"verdict":"APPROVE|REJECT","base":"<sha>","head":"<sha>",'
+            '"diff_sha256":"<sha>","risk":"L0|L1|L2|L3","tasks":[{"id":"T1",'
+            '"acceptance":[{"id":"AC-1","criterion":"<exact>",'
+            '"status":"PASS|FAIL|NOT_RUN","evidence":"..."}]}],"findings":[]}',
+            'Every acceptance criterion must be PASS with evidence, or the verdict '
+            'must be REJECT with findings. Do not edit files.',
+        ]
+    lines += [
         'DIFF_BEGIN',
         diff,
         'DIFF_END',
@@ -3697,6 +3795,7 @@ def _write_review_request(plan, state, journal, base, head, digest, risk):
             raise AttachedPending(path, 'review')
     diff, _ = _diff_for_review(plan['batch']['repo'], base, head)
     path = _review_request_path(journal)
+    result_path = _review_result_path(journal)
     tasks = []
     for spec in plan['tasks']:
         tasks.append({
@@ -3711,8 +3810,9 @@ def _write_review_request(plan, state, journal, base, head, digest, risk):
         'base_sha': base, 'head_sha': head, 'diff_sha256': digest,
         'risk': risk['level'], 'risk_reasons': list(risk['reasons']),
         'tasks': tasks, 'diff': diff,
-        'prompt': _review_prompt(plan, state, base, head, digest, risk, diff),
-        'result_path': str(_review_result_path(journal)),
+        'prompt': _review_prompt(plan, state, base, head, digest, risk, diff,
+                                 attached=True, result_path=str(result_path)),
+        'result_path': str(result_path),
         'created_at': _utc_now(),
         'instructions': [
             'Run one independent reviewer session in the batch worktree; it '
@@ -3816,9 +3916,7 @@ def _attach_review(plan, state, journal, result_path):
                        for item in declared)):
             raise BatchError('declared_executor_sessions must be a string list',
                              status='BLOCKED')
-        recorded = {record.get('execution_session')
-                    for record in (state.get('tasks') or {}).values()
-                    if record.get('execution_session')}
+        recorded = _recorded_execution_sessions(state)
         if not recorded.issubset(set(declared)):
             raise BatchError('the review result does not declare every executor '
                              'session of this batch', status='BLOCKED')

@@ -3064,6 +3064,10 @@ class AdapterTransportTests(BatchCase):
         self.assertEqual(request['paths'], ['a.txt'])
         self.assertIn('TASK_ID=T1', request['prompt'])
         self.assertIn('PATHS_JSON=["a.txt"]', request['prompt'])
+        self.assertIn('Commit your changes and leave the worktree clean',
+                      request['prompt'])
+        self.assertNotIn('uncommitted changes are also acceptable',
+                         request['prompt'])
         self.assertRegex(request['base_sha'], r'^[0-9a-f]{40}$')
         result = self._execution_result(request_path)
         attach = self.cli('attach', '--plan', str(path), '--journal',
@@ -3220,6 +3224,9 @@ class AdapterTransportTests(BatchCase):
                          plan['tasks'][0]['acceptance'])
         self.assertIn('DIFF_BEGIN', request['prompt'])
         self.assertIn('a.txt', request['diff'])
+        self.assertIn(delivery.REVIEW_RESULT_SCHEMA, request['prompt'])
+        self.assertIn('Do not only print a fenced JSON verdict', request['prompt'])
+        self.assertNotIn('Answer with exactly one fenced', request['prompt'])
         before = request_path.read_bytes()
         again = self.finalize(plan, None, '--review')
         self.assertEqual(again.returncode, 3, again.stderr + again.stdout)
@@ -3277,6 +3284,201 @@ class AdapterTransportTests(BatchCase):
         self.assertEqual(attach.returncode, 1, attach.stderr)
         self.assertIn('different diff', attach.stderr)
         self.assertEqual(self.journal_data()['review']['verdict'], 'BLOCKED')
+
+    # -- I/O failure and attached invariants ---------------------------
+    def test_agent_io_error_kills_and_reports_the_stop_proof(self):
+        class BrokenProcess:
+            pid = 4242
+            returncode = None
+
+            def communicate(self, input=None, timeout=None):
+                raise UnicodeEncodeError('utf-8', '中', 0, 1, 'cannot encode')
+
+        adapter = {'transport': 'command', 'name': 'generic-command',
+                   'command': [PY, '-S', 'x'], 'source': 'plan'}
+        with mock.patch.object(delivery.subprocess, 'Popen',
+                               return_value=BrokenProcess()), \
+                mock.patch.object(delivery, '_process_token', return_value=7), \
+                mock.patch.object(delivery, '_stop_timed_out',
+                                  return_value=(True, 'timed out; process group '
+                                                       'killed')):
+            result = delivery._agent(self.root, '中文 prompt', 'builder', 5,
+                                     adapter=adapter, role='executor')
+        self.assertIn('UnicodeEncodeError', result['io_error'])
+        self.assertIs(result['stopped'], True)
+        self.assertIsNone(result['session_id'])
+        self.assertIsNone(result['exit_code'])
+
+    def test_prove_stopped_treats_a_decode_failure_as_unproven(self):
+        class BrokenProcess:
+            def communicate(self, timeout=None):
+                raise UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'bad byte')
+
+        self.assertFalse(delivery._prove_stopped(BrokenProcess(), True, 1234))
+
+    def test_execute_task_io_error_ends_the_attempt_without_orphans(self):
+        raw = self.plan([self.task('T1', 'a.txt')])
+        plan = delivery.validate_plan(raw, str(self.repo))
+        spec = plan['tasks'][0]
+        base = self.head(self.repo)
+        for stopped in (True, False):
+            with self.subTest(stopped=stopped):
+                record = delivery._task_record(spec, plan['executor_agent'])
+                saves = []
+                attempt = delivery._start_attempt(
+                    record, spec, 'fresh', lambda: saves.append('start'))
+                result = {'exit_code': None, 'session_id': None, 'text': '',
+                          'pid': 4242, 'pgid': None, 'token': None,
+                          'stopped': stopped, 'timeout': False,
+                          'io_error': 'UnicodeEncodeError: cannot encode',
+                          'detail': 'UnicodeEncodeError: cannot encode; killed'}
+                with mock.patch.object(delivery, '_agent', return_value=result):
+                    with self.assertRaises(delivery.BatchError) as caught:
+                        delivery._execute_task(
+                            plan, spec, record, base, 5,
+                            lambda: saves.append('save'), attempt, self.journal)
+                self.assertEqual(caught.exception.status, 'FAILED')
+                self.assertIs(caught.exception.halt, stopped is not True)
+                self.assertEqual(attempt['state'], 'ENDED')
+                self.assertEqual(attempt['result'],
+                                 'failed' if stopped else 'unproven_stop')
+                self.assertEqual(attempt['executor']['state'], 'ended')
+                self.assertIs(attempt['executor']['stopped'], stopped)
+
+    def test_attached_success_rejects_a_detached_worktree(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path = self.write_plan(plan)
+        self.assertEqual(self.run_batch(plan).returncode, 3)
+        request_path, request = self._pending()
+        result = self._execution_result(request_path)
+        _git(Path(request['worktree']), 'checkout', '--detach')
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 1, attach.stderr)
+        self.assertIn('not on the task branch', attach.stderr)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertIsNone(record['integration_sha'])
+
+    def test_attached_result_rejects_duplicate_keys(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path = self.write_plan(plan)
+        self.assertEqual(self.run_batch(plan).returncode, 3)
+        request_path, _ = self._pending()
+        result = self._execution_result(request_path)
+        text = result.read_text(encoding='utf-8')
+        needle = '"task_id": "T1"'
+        self.assertIn(needle, text)
+        result.write_text(text.replace(
+            needle, '"task_id": "T1", "task_id": "T1"', 1), encoding='utf-8')
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 1, attach.stderr)
+        self.assertIn('duplicate key', attach.stderr)
+        self.assertEqual(self.journal_data()['tasks']['T1']['status'],
+                         'BLOCKED')
+
+    def test_attached_result_rejects_unknown_fields(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path = self.write_plan(plan)
+        self.assertEqual(self.run_batch(plan).returncode, 3)
+        request_path, _ = self._pending()
+        result = self._execution_result(request_path)
+        data = json.loads(result.read_text(encoding='utf-8'))
+        data['unexpected'] = 1
+        result.write_text(json.dumps(data), encoding='utf-8')
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 1, attach.stderr)
+        self.assertIn('unknown field', attach.stderr)
+        self.assertEqual(self.journal_data()['tasks']['T1']['status'],
+                         'BLOCKED')
+
+    def test_attached_result_rejects_artifact_mismatch(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path = self.write_plan(plan)
+        self.assertEqual(self.run_batch(plan).returncode, 3)
+        request_path, _ = self._pending()
+        result = self._execution_result(request_path)
+        data = json.loads(result.read_text(encoding='utf-8'))
+        data['artifacts'][0]['sha256'] = '0' * 64
+        result.write_text(json.dumps(data), encoding='utf-8')
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 1, attach.stderr)
+        self.assertIn('does not match its digest', attach.stderr)
+        self.assertIsNone(self.journal_data()['tasks']['T1']['integration_sha'])
+
+    def test_attached_result_rejects_a_rewritten_request(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path = self.write_plan(plan)
+        self.assertEqual(self.run_batch(plan).returncode, 3)
+        request_path, _ = self._pending()
+        request_path.write_bytes(request_path.read_bytes() + b' ')
+        result = self._execution_result(request_path)
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 1, attach.stderr)
+        self.assertIn('request changed', attach.stderr)
+        self.assertEqual(self.journal_data()['tasks']['T1']['status'],
+                         'BLOCKED')
+
+    def test_review_rejects_a_session_from_an_earlier_failed_attempt(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path = self.write_plan(plan)
+        self._integrate_one(plan, path)
+        state = self.journal_data()
+        record = state['tasks']['T1']
+        record['adapter_history'].append({
+            'kind': 'execution', 'accepted': True, 'terminal': 'failure',
+            'session_id': 'old-failed-session', 'exit_code': 1,
+            'result_sha256': '0' * 64, 'integrated': False,
+            'at': '2026-11-22T00:00:00+00:00'})
+        self.journal.write_text(json.dumps(state))
+        done = self.finalize(plan, None, '--review')
+        self.assertEqual(done.returncode, 3, done.stderr + done.stdout)
+        review = self.journal_data()['review']
+        request_path = Path(review['request_path'])
+        declared = [record['execution_session'], 'old-failed-session']
+        result = self._review_result(request_path,
+                                     session='old-failed-session',
+                                     declared=declared)
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 1, attach.stderr)
+        self.assertIn('reviewer session is an execution session', attach.stderr)
+        self.assertEqual(self.journal_data()['review']['verdict'], 'BLOCKED')
+
+    def test_recorded_execution_sessions_cover_all_histories(self):
+        state = {'tasks': {'T1': {
+            'execution_session': 's1',
+            'adapter_history': [{'session_id': 's2'}],
+            'attempt_history': [
+                {'executor': {'session': 's3'}, 'adapter': {'session': 's4'}},
+                {'executor': {'session': None}, 'adapter': None}]}}}
+        self.assertEqual(delivery._recorded_execution_sessions(state),
+                         {'s1', 's2', 's3', 's4'})
+
+    def test_old_journal_refuses_a_backfilled_explicit_adapter(self):
+        explicit_raw = self.host_plan([self.task('T1', 'a.txt')])
+        explicit = delivery.validate_plan(explicit_raw, str(self.repo))
+        state = {'batch_id': explicit['batch']['id'],
+                 'plan_sha256': delivery.plan_hash(explicit_raw),
+                 'repo': explicit['batch']['repo'],
+                 'project_config_sha256':
+                     delivery._project_config_digest(self.repo)}
+        with self.assertRaises(delivery.InputError) as caught:
+            delivery._check_journal_plan(state, explicit)
+        self.assertIn('predates executor adapters', str(caught.exception))
+        legacy_raw = self.plan([self.task('T1', 'a.txt')])
+        legacy = delivery.validate_plan(legacy_raw, str(self.repo))
+        legacy_state = {'batch_id': legacy['batch']['id'],
+                        'plan_sha256': delivery.plan_hash(legacy_raw),
+                        'repo': legacy['batch']['repo'],
+                        'project_config_sha256':
+                            delivery._project_config_digest(self.repo)}
+        delivery._check_journal_plan(legacy_state, legacy)
+        self.assertEqual(legacy_state['adapter']['source'], 'legacy-default')
 
     # -- generic command transport -------------------------------------
     def _generic_plan(self):

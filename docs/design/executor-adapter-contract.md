@@ -78,6 +78,8 @@
 
 因此通用命令适配器可以执行任务，但 `L1` / `L2` 的独立审查必须使用 `opencode` 或 `attached`。通用命令 + `--review` 在 L1/L2 会以 `BLOCKED` 结束，不会降级成自审或跳过审查。
 
+命令传输的 stdin 与 stdout 固定为 UTF-8 严格解码/编码。prompt 写入或 stdout 读取失败（`UnicodeEncodeError` / `UnicodeDecodeError` / 管道 `OSError`）不是“空结果”，工具会先终止子进程并尝试证明停止，再记 `FAILED`；未能证明停止时同既有 timeout 语义一样 halt，绝不留下 `spawning` / `running` 的孤儿记录。
+
 ## 3. `attached` 执行
 
 ### 3.1 请求
@@ -138,7 +140,7 @@
 | `terminal` 属于四个允许值 | `BLOCKED` |
 | `session_id` 非空；`executor_agent` 与计划一致；`workdir` 等于任务 worktree | `BLOCKED` |
 | `exit_code` 为整数；`report` 为字符串；成功时 exit 0 且 report 非空 | `BLOCKED` |
-| 成功结果的 `head` 是 worktree 中真实 commit、是 base 的后代、等于当前 `HEAD` | `BLOCKED` |
+| 成功结果的 `head` 是 worktree 中真实 commit、是 base 的后代、等于当前 `HEAD`，且 worktree 仍在任务分支上（detached / 错分支拒绝） | `BLOCKED` |
 | 成功结果时 worktree 干净（无未提交/未跟踪改动） | `BLOCKED` |
 | 重新计算的 diff 路径与摘要与结果完全一致 | `BLOCKED` |
 | artifact 存在、在允许位置、字节数与 SHA-256 匹配 | `BLOCKED` |
@@ -170,7 +172,7 @@
 
 - 路径：`<journal>.adapter/review.request.json`。
 - schema：`batch-review-request/1`。
-- 内容：`base_sha`、`head_sha`、`diff_sha256`、`risk`、`risk_reasons`、每个任务的 `acceptance` / `acceptance_checks` / `verify_commands`、完整 `diff`、`prompt`、`result_path`。
+- 内容：`base_sha`、`head_sha`、`diff_sha256`、`risk`、`risk_reasons`、每个任务的 `acceptance` / `acceptance_checks` / `verify_commands`、完整 `diff`、`prompt`、`result_path`。`prompt` 明确要求把 `batch-review-result/1` 写到 `result_path`，并列出必需字段；它不再只要求输出 fenced JSON。
 - 状态：`state.review = {head, diff_sha256, risk, verdict: "AWAITING_HOST", reviewer_agent, request_path, request_sha256}`。
 - 退出：**3**。
 
@@ -209,7 +211,7 @@
 |---|---|
 | schema/kind/字段集合、request 摘要、batch | `BLOCKED` |
 | `reviewer_agent` 与计划一致；`workdir` 等于 batch worktree；`edit_denied` 为 `true` | `BLOCKED` |
-| `declared_executor_sessions` 覆盖本批所有已记录执行会话 | `BLOCKED` |
+| `declared_executor_sessions` 覆盖本批所有已记录执行会话（`execution_session`、`adapter_history.session_id`、attempt 的 executor/adapter 会话） | `BLOCKED` |
 | 审查会话不等于任何执行会话，也不出现在声明列表 | `BLOCKED` |
 | 结果 `base` / `head` 等于当前 base / head；`head` 仍等于请求时的 head | `BLOCKED` |
 | `diff_sha256` 等于重新计算的 reviewed diff | `BLOCKED` |
@@ -221,10 +223,12 @@
 ## 5. journal、恢复与适配器切换
 
 - 新 journal 记录 `adapter`（规范化后的 transport/name/command/source/capabilities/evidence）。
-- 旧 journal 没有 `adapter` 时，按当前计划的规范化结果补写；这保证历史 `opencode` journal 仍可恢复。
+- 旧 journal 没有 `adapter` 时，只有**当前计划也未声明** `executor_adapter` 才按 legacy 默认补写；计划显式选择适配器时拒绝回填（旧 journal 无法证明当时的运行时），必须开新批次。
 - journal 已有 `adapter` 且与当前计划不同：`InputError`，拒绝继续；不允许中途换适配器。
 - `awaiting_host` 的记录在 `_normalize_interrupted` 中被跳过：它是等待宿主，不是中断，`--resume` 不会把它改回 `PENDING`。
 - 有 pending 请求时，`run --execute` 直接返回 3 并打印请求路径，不追加 attempt。
+- `attached` 传输**没有工具侧执行超时**：宿主负责给真实执行体/审查体设上限。`--timeout` / `attach --timeout` 只约束 attach 之后的验证命令，不约束宿主的会话；宿主长时间不返回时，工具既不会杀死宿主进程，也不会把等待当成成功。
+- `run --execute`、`run --resume` 在有 pending 请求时只重新打印同一请求路径并退出 3；`--resume` 不会把 `awaiting_host` 改回 `PENDING`，也不会启动第二个执行体。
 - `attach` 必须找到唯一 pending 请求；没有 pending 请求时退出 2，防止结果重放。
 - 适配器拒绝结果会使 attempt 结果为 `adapter_rejected`，复用门禁继续阻断该 worktree，直到人工核对。
 

@@ -103,6 +103,7 @@
 | [`docs/design/semver-proactive-release-policy.md`](../design/semver-proactive-release-policy.md) | `reference` | `PROPOSED` | 主动式 SemVer 发行节奏提案；不替代 `release/README.md` 或现行授权规则。 |
 | [`docs/design/task-driven-agent-topology.md`](../design/task-driven-agent-topology.md) | `reference` | `PROPOSED` | 任务驱动 Agent 拓扑提案；不改变现行角色权限、审查门或 C1–C4。 |
 | [`docs/design/batch-tool-stop-and-worktree-contracts.md`](../design/batch-tool-stop-and-worktree-contracts.md) | `authoritative` | `ACTIVE` | 批次工具终止流与工作树边界契约（#263 冻结候选）；只冻结输入判定与边界证明，不表示 #261/#262 findings 已修复或 #250 AC5 已实现。 |
+| [`docs/design/executor-adapter-contract.md`](../design/executor-adapter-contract.md) | `authoritative` | `ACTIVE` | 批次执行与独立审查的执行体适配契约（#274 实现并随代码交付）：`command` / `attached` 传输、请求与结果 schema、失败关闭、C1–C4 消费与兼容默认；不改变状态机、锁、G1–G6 或证据矩阵。 |
 
 ### 4.4 测试场景
 
