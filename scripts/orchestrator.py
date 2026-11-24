@@ -6,7 +6,7 @@
 # (v1). That file is the only authority for their semantics; this module must not
 # restate or extend it. Path-lock behaviour is unchanged.
 from __future__ import annotations
-import argparse, hashlib, json, os, re, socket, sqlite3, stat, sys, unicodedata
+import argparse, hashlib, json, os, re, socket, sqlite3, stat, sys, tempfile, unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
@@ -318,7 +318,45 @@ def record_path_conflict(con, task_id, phase, status, conflicts):
           f'{phase} refused: path conflict; no lock row was inserted',
           {'kind':'path','phase':phase,'status':status,'conflicts':detail})
 
-def init_plan(root):
+def _plan_file_exists(root, relative):
+    """Check a plan path without accepting a directory or a redirected path."""
+    path=root/relative
+    if path.resolve()!=root.resolve()/relative:
+        raise LayoutError(f'{relative} must not use a linked path')
+    try:
+        entry=path.lstat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(entry.st_mode):
+        raise LayoutError(f'{relative} is not a regular file')
+    return True
+
+def _publish_new_plan(target, data):
+    """Stage the entire file and publish it without replacing an existing plan."""
+    staged=tempfile.NamedTemporaryFile(dir=target.parent, prefix='.PLAN.', suffix='.tmp', delete=False)
+    try:
+        with staged:
+            staged.write(data)
+        try:
+            if os.name=='nt':
+                # On Windows rename raises FileExistsError for an occupied destination.
+                os.rename(staged.name, target)
+            else:
+                os.link(staged.name, target)
+        except FileExistsError:
+            raise
+        except OSError as exc:
+            method='a same-directory rename' if os.name=='nt' else 'a hard link'
+            raise RuntimeError(f'Could not publish {PLAN_DOC} using {method}: {exc}') from exc
+    finally:
+        Path(staged.name).unlink(missing_ok=True)
+
+def _show_kept_plan(path):
+    print(f'PLAN.md already present, kept unchanged: {path}')
+    print('Next: judge task direction from the design goals in docs/PLAN.md; templates/plan.md is only the initial copy.')
+    return 'kept'
+
+def init_plan(root, *, plan_only=False):
     """Seed <root>/docs/PLAN.md from templates/plan.md exactly once.
 
     docs/PLAN.md is the plan of record, so an existing file is never
@@ -329,25 +367,40 @@ def init_plan(root):
     template is reported and skipped: `init` must still finish its task-store
     work and exit 0. A write failure is raised instead of being reported as
     success. Returns 'created', 'kept', 'legacy-present' or 'template-missing'.
+    The plan-only entry requires ordinary in-tree plan paths and publishes
+    the complete file exclusively.
     """
     target=root/PLAN_DOC
     legacy=root/LEGACY_PLAN_DOC
-    if target.exists():
-        print(f'PLAN.md already present, kept unchanged: {target}')
-        print('Next: judge task direction from the design goals in docs/PLAN.md; templates/plan.md is only the initial copy.')
-        return 'kept'
-    if legacy.exists():
-        print(f'Legacy root PLAN.md found; docs/PLAN.md not created: {legacy}')
-        print('Next: keep a single design-goal authority — run `git mv PLAN.md docs/PLAN.md` (create docs/ first if needed), then rerun init; see README section 10.')
+    command='init-plan' if plan_only else 'init'
+    target_exists=_plan_file_exists(root, PLAN_DOC) if plan_only else target.exists()
+    if target_exists:
+        return _show_kept_plan(PLAN_DOC if plan_only else target)
+    if legacy.exists() or (plan_only and legacy.is_symlink()):
+        print(f'Legacy root PLAN.md found; docs/PLAN.md not created: {LEGACY_PLAN_DOC if plan_only else legacy}')
+        print(f'Next: keep a single design-goal authority — run `git mv PLAN.md docs/PLAN.md` (create docs/ first if needed), then rerun {command}; see README section 10.')
         return 'legacy-present'
     template=root/PLAN_TEMPLATE
-    if not template.is_file():
-        print(f'PLAN.md not created: template missing at {template}')
-        print('Next: copy templates/plan.md into docs/PLAN.md (kit installed there), then rerun init.')
+    template_exists=_plan_file_exists(root, PLAN_TEMPLATE) if plan_only else template.is_file()
+    if not template_exists:
+        print(f'PLAN.md not created: template missing at {PLAN_TEMPLATE if plan_only else template}')
+        if plan_only:
+            print('Next: restore templates/plan.md from the installed kit, then rerun init-plan.')
+        else:
+            print('Next: copy templates/plan.md into docs/PLAN.md (kit installed there), then rerun init.')
         return 'template-missing'
     (root/'docs').mkdir(parents=True,exist_ok=True)
-    target.write_bytes(template.read_bytes())
-    print(f'Created docs/PLAN.md from {template}')
+    data=template.read_bytes()
+    if plan_only:
+        try:
+            _publish_new_plan(target, data)
+        except FileExistsError:
+            if not _plan_file_exists(root, PLAN_DOC):
+                raise
+            return _show_kept_plan(PLAN_DOC)
+    else:
+        target.write_bytes(data)
+    print(f'Created docs/PLAN.md from {PLAN_TEMPLATE if plan_only else template}')
     print('下一步：填写 docs/PLAN.md 的设计目标（为什么做、做到什么程度、原则与边界）；配图放 docs/images/，在正文中用相对路径引用，Agent 只按文中指引查看图片')
     return 'created'
 
@@ -1798,6 +1851,7 @@ def main(argv=None):
                         help='project root (default: current directory)')
     sub=parser.add_subparsers(dest='cmd',required=True)
     sub.add_parser('init',help='initialize the local task database and .orchestration/config.json (retry_cap, local_dir); seed docs/PLAN.md from templates/plan.md when absent')
+    sub.add_parser('init-plan',help='seed docs/PLAN.md for an explicit github project without initializing a task database')
     sub.add_parser('backup',help='create a consistent SQLite backup')
     cf=sub.add_parser('config',help='inspect runtime configuration'); cs=cf.add_subparsers(dest='configcmd',required=True)
     cs.add_parser('show',help='print effective config values and their source')
@@ -1855,6 +1909,12 @@ def main(argv=None):
         raise
     try:
         if args.cmd=='init': init(root,state_root=state)
+        elif args.cmd=='init-plan':
+            edition=read_project_edition(root, isolated=state is not None)
+            if edition!='github':
+                raise EditionError(f'{PROJECT_CONFIG}: `edition` is {edition!r}; '
+                                   '`init-plan` requires github. Use `init` to initialize a local project.')
+            return 0 if init_plan(root, plan_only=True) in ('created', 'kept') else 1
         elif args.cmd=='backup': backup(root,state_root=state)
         elif args.cmd=='config': return config_show(root,state_root=state)
         elif args.taskcmd=='add': task_add(root,args,state_root=state)
