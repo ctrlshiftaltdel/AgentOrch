@@ -3984,16 +3984,21 @@ def _attach_execution(plan, state, journal, result_path, timeout):
             'artifacts': artifacts, 'integrated': False, 'at': _utc_now()}
         _append_adapter_history(record, accepted)
         save()
-        _complete_integration(plan, spec, record, head, batch_head, timeout,
-                              save, attempt, attached_result=accepted)
-        return 0
     except BatchError as exc:
-        if exc.verify:
-            record['verify'] = exc.verify
         _reject_attached(record, attempt, str(exc), terminal='invalid',
                          result_sha256=result_sha256, save=save,
                          status=exc.record_status)
         return 1
+    try:
+        _complete_integration(plan, spec, record, head, batch_head, timeout,
+                              save, attempt, attached_result=accepted)
+    except BatchError as exc:
+        record.update(status=exc.record_status, error=str(exc),
+                      verify=exc.verify or record.get('verify') or [])
+        _finish_attempt(attempt, 'failed', error=str(exc), save=save)
+        save()
+        return 1
+    return 0
 
 
 def _execute_task(plan, spec, record, base, timeout, save, attempt,
@@ -4146,6 +4151,8 @@ def _apply_retry(state, plan, ids, batch_head, save=None):
                 save()
             raise
         records.append(record)
+    _prove_task_integration(plan, state, state['base_sha'], batch_head,
+                            require_all=False)
     for record in records:
         _settle_interrupted(record, save)
         record.update(status='PENDING', error=None)
@@ -4302,20 +4309,22 @@ def command_run(args):
         def save():
             _atomic_json(journal, state)
 
-        normalize_halt = _normalize_interrupted(state, plan, batch_head,
-                                                args.resume, save=save)
-        try:
-            _prove_task_integration(plan, state, base_sha, batch_head,
-                                    require_all=False)
-        except BatchError as exc:
-            state.update(phase='blocked', error=str(exc))
-            save()
-            raise
         retry_ids = []
         if args.retry:
             retry_ids = [value.strip() for value in args.retry.split(',')
                          if value.strip()]
-            _apply_retry(state, plan, retry_ids, batch_head, save=save)
+        try:
+            if retry_ids:
+                _apply_retry(state, plan, retry_ids, batch_head, save=save)
+            normalize_halt = _normalize_interrupted(state, plan, batch_head,
+                                                    args.resume, save=save)
+            if not retry_ids:
+                _prove_task_integration(plan, state, base_sha, batch_head,
+                                        require_all=False)
+        except BatchError as exc:
+            state.update(phase='blocked', error=str(exc))
+            save()
+            raise
         state['phase'] = 'tasks'
         state['error'] = None
         _atomic_json(journal, state)

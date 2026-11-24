@@ -4032,6 +4032,9 @@ class AdapterTransportTests(BatchCase):
         self.assertEqual(record['observed_paths'], ['a.txt'])
         self.assertEqual(candidate, self.head(Path(first_request['worktree'])))
         self.assertEqual(record['verify'][0]['exit'], 17)
+        self.assertEqual(record['attempt_history'][0]['result'], 'failed')
+        self.assertTrue(record['adapter_history'][-1]['accepted'])
+        self.assertFalse(record['adapter_history'][-1]['integrated'])
         self.assertIsNone(record['integration_sha'])
 
         retried = self.run_batch(plan, None, '--retry', 'T1')
