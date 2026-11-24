@@ -73,6 +73,8 @@ DEFAULT_TIMEOUT = 1800
 DEFAULT_CHECKS_TIMEOUT = 3600
 TERMINAL_BAD = ('FAILED', 'BLOCKED', 'SKIPPED')
 INTEGRATED = ('INTEGRATED', 'VERIFIED')
+PROCESS_HALT_REASON = 'the run stopped after an unproven process kill'
+GIT_HALT_REASON = 'the run stopped because batch merge reconciliation is unproven'
 ATTEMPT_STATES = ('STARTED', 'ENDED')
 ATTEMPT_RESULTS = ('ok', 'failed', 'timeout', 'unproven_stop', 'spawn_failed',
                    'interrupted', 'error', 'adapter_rejected')
@@ -150,16 +152,17 @@ class InputError(Exception):
 class BatchError(Exception):
     """A task or batch gate failed; the CLI exits 1.
 
-    ``status`` is the task status to record, ``halt`` stops all later tasks
-    (used when a timed-out process tree could not be proved stopped), and
-    ``conflicts`` carries merge-conflict paths for the summary.
+    ``status`` is the task status to record. ``halt`` stops all later tasks
+    after an unproven process stop. ``halt_reason`` stops them for a different
+    reason. ``conflicts`` carries merge-conflict paths for the summary.
     """
 
     def __init__(self, message, status='BLOCKED', *, halt=False, conflicts=None,
-                 verify=None):
+                 verify=None, halt_reason=None):
         super().__init__(message)
         self.status = status
-        self.halt = halt
+        self.halt = halt or halt_reason is not None
+        self.halt_reason = halt_reason
         self.conflicts = list(conflicts or [])
         self.verify = list(verify or [])
 
@@ -216,6 +219,16 @@ def _branch(where):
 def _clean(where):
     result = _git(where, 'status', '--porcelain')
     return result.returncode == 0 and not (result.stdout or '').strip()
+
+
+def _merge_in_progress(where):
+    marker = Path(where) / _git_text(where, 'rev-parse', '--git-path',
+                                     'MERGE_HEAD')
+    try:
+        marker.lstat()
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def _ancestor(where, ancestor, descendant):
@@ -2891,6 +2904,9 @@ def _prepare_batch_worktree(plan, base_sha, execute):
             raise BatchError(f'batch worktree is not a Git worktree root: {path}')
         if _branch(path) != branch:
             raise BatchError(f'batch worktree is on {_branch(path)!r}, not {branch!r}')
+        if _merge_in_progress(path):
+            raise BatchError('the batch worktree has an unfinished Git merge '
+                             '(MERGE_HEAD). Reconcile it before resuming')
         if not _clean(path):
             raise BatchError('the batch worktree is not clean')
         head = _head(path)
@@ -3582,16 +3598,69 @@ def _commit_parents(work, commit):
     return _git_text(work, 'rev-list', '--parents', '-n', '1', commit).split()[1:]
 
 
+def _merge_failure(batch, branch, before, ident, merge):
+    """Describe the merge failure and stop the batch if cleanup is unproven."""
+    conflicts = []
+    problems = []
+    cleanup = []
+    active = None
+    try:
+        conflicts = _nul_names(batch, 'diff', '--name-only', '-z', '--diff-filter=U')
+        active = _merge_in_progress(batch)
+        if active:
+            try:
+                abort = _git(batch, 'merge', '--abort')
+            except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+                problems.append(f'git merge --abort could not be verified ({exc})')
+            else:
+                cleanup.append(f'git merge --abort exited {abort.returncode}')
+                if abort.returncode != 0:
+                    diagnostic = (abort.stderr or abort.stdout or '').strip()[:400]
+                    problems.append(diagnostic or 'Git could not abort the merge')
+        if _merge_in_progress(batch):
+            problems.append('MERGE_HEAD remains present')
+        remaining = _nul_names(batch, 'diff', '--name-only', '-z',
+                               '--diff-filter=U')
+        if remaining:
+            problems.append('unmerged paths remain (' + ', '.join(remaining) + ')')
+        if not _clean(batch):
+            problems.append('the batch worktree could not be proved clean')
+        if _head(batch) != before:
+            problems.append('the batch HEAD differs from its pre-merge value')
+        if _branch(batch) != branch:
+            problems.append('the batch branch differs from its pre-merge branch')
+    except (BatchError, OSError, subprocess.SubprocessError, UnicodeError) as exc:
+        problems.append(f'could not inspect the batch Git state ({exc})')
+    if conflicts:
+        detail = f'integration conflict for {ident}: ' + ', '.join(conflicts)
+    else:
+        detail = (f'Git could not integrate {ident}: '
+                  f'{(merge.stderr or "").strip()[:400]}')
+    if problems:
+        if active is False:
+            cleanup.append('MERGE_HEAD was absent before cleanup')
+        cleanup.append('Batch merge reconciliation is unproven')
+        cleanup.extend(problems)
+    return BatchError('. '.join([detail, *cleanup]), conflicts=conflicts,
+                      halt_reason=GIT_HALT_REASON if problems else None)
+
+
 def _integrate(plan, spec, head, expected_batch_head):
     batch = Path(plan['batch']['worktree'])
+    branch = plan['batch']['branch']
+    if _merge_in_progress(batch):
+        raise BatchError('the batch worktree has an unfinished Git merge '
+                         '(MERGE_HEAD)', halt_reason=GIT_HALT_REASON)
     if not _clean(batch):
-        raise BatchError('the batch worktree is not clean before integration')
-    if _branch(batch) != plan['batch']['branch']:
-        raise BatchError('the batch worktree is not on the batch branch')
+        raise BatchError('the batch worktree is not clean before integration',
+                         halt_reason=GIT_HALT_REASON)
+    if _branch(batch) != branch:
+        raise BatchError('the batch worktree is not on the batch branch',
+                         halt_reason=GIT_HALT_REASON)
     before = _head(batch)
     if before != expected_batch_head:
         raise BatchError('the batch head moved before task integration',
-                         status='BLOCKED')
+                         halt_reason=GIT_HALT_REASON)
     if _git_text(batch, 'rev-parse', f'refs/heads/{spec["branch"]}') != head:
         raise BatchError('the task branch head moved before integration',
                          status='BLOCKED')
@@ -3602,21 +3671,13 @@ def _integrate(plan, spec, head, expected_batch_head):
     message = f'batch {plan["batch"]["id"]}: integrate {spec["id"]}'
     result = _git(batch, 'merge', '--no-ff', head, '-m', message)
     if result.returncode != 0:
-        unmerged = _nul_names(batch, 'diff', '--name-only', '-z',
-                              '--diff-filter=U')
-        conflicts = sorted(unmerged)
-        _git(batch, 'merge', '--abort')
-        if conflicts:
-            detail = f'integration conflict for {spec["id"]}: ' + ', '.join(conflicts)
-        else:
-            detail = (f'Git could not integrate {spec["id"]}: '
-                      f'{(result.stderr or "").strip()[:400]}')
-        raise BatchError(detail, status='BLOCKED', conflicts=conflicts)
+        raise _merge_failure(batch, branch, before, spec['id'], result)
     integration = _head(batch)
     if (integration == before or _commit_parents(batch, integration) != [before, head]
-            or not _clean(batch) or _branch(batch) != plan['batch']['branch']):
+            or _merge_in_progress(batch) or not _clean(batch)
+            or _branch(batch) != branch):
         raise BatchError('Git did not leave a clean integration of the verified '
-                         'task head on the batch branch', status='BLOCKED')
+                         'task head on the batch branch', halt_reason=GIT_HALT_REASON)
     return integration
 
 
@@ -3717,6 +3778,7 @@ def _complete_integration(plan, spec, record, head, batch_head, timeout,
                                     attempt=attempt, save=save,
                                     expected_head=head,
                                     expected_branch=spec['branch'])
+    save()
     record['integration_sha'] = _integrate(plan, spec, head, batch_head)
     record['status'] = 'INTEGRATED'
     record['error'] = None
@@ -3995,6 +4057,8 @@ def _attach_execution(plan, state, journal, result_path, timeout):
     except BatchError as exc:
         record.update(status=exc.record_status, error=str(exc),
                       verify=exc.verify or record.get('verify') or [])
+        if exc.halt_reason:
+            state.update(phase='blocked', error=str(exc))
         _finish_attempt(attempt, 'failed', error=str(exc), save=save)
         save()
         return 1
@@ -4329,7 +4393,7 @@ def command_run(args):
         state['error'] = None
         _atomic_json(journal, state)
 
-        halt = normalize_halt
+        halt_reason = PROCESS_HALT_REASON if normalize_halt else None
         for spec in plan['tasks']:
             record = state['tasks'][spec['id']]
             if only is not None and spec['id'] not in only:
@@ -4347,9 +4411,8 @@ def command_run(args):
                 record.update(status='BLOCKED', error=conflicts[spec['id']])
                 save()
                 continue
-            if halt:
-                record.update(status='BLOCKED',
-                              error='the run stopped after an unproven process kill')
+            if halt_reason:
+                record.update(status='BLOCKED', error=halt_reason)
                 save()
                 continue
             if _head(Path(plan['batch']['worktree'])) != batch_head:
@@ -4369,7 +4432,7 @@ def command_run(args):
                 record.update(status=exc.record_status, error=str(exc))
                 save()
                 if exc.halt:
-                    halt = True
+                    halt_reason = exc.halt_reason or PROCESS_HALT_REASON
                 continue
             if not record.get('attempts'):
                 record.setdefault('observed_head', None)
@@ -4391,9 +4454,11 @@ def command_run(args):
             except BatchError as exc:
                 record.update(status=exc.record_status, error=str(exc),
                               verify=exc.verify or record.get('verify') or [])
-                save()
                 if exc.halt:
-                    halt = True
+                    halt_reason = exc.halt_reason or PROCESS_HALT_REASON
+                    if exc.halt_reason:
+                        state['error'] = str(exc)
+                save()
             if record['status'] == 'INTEGRATED':
                 batch_head = record['integration_sha']
             save()
@@ -4406,16 +4471,15 @@ def command_run(args):
                 print('run the real agent, then submit its result with: '
                       f'{Path(__file__).name} attach --result <path>')
                 return ATTACHED_EXIT
-        if halt:
+        if halt_reason:
             state['phase'] = 'blocked'
             for spec in plan['tasks']:
                 record = state['tasks'][spec['id']]
                 if record.get('status') == 'PENDING':
-                    record.update(status='BLOCKED',
-                                  error='the run stopped after an unproven process kill')
+                    record.update(status='BLOCKED', error=halt_reason)
         else:
             state['phase'] = 'tasks'
-        state['error'] = None if not halt else state.get('error')
+        state['error'] = None if not halt_reason else state.get('error')
         _atomic_json(journal, state)
         _run_summary(state, plan)
         pending = [record for record in state['tasks'].values()

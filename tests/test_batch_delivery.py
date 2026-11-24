@@ -7,6 +7,8 @@ local Git merges into the bare origin, and the coordinator itself performs the
 real worktree creation, commits, merges and verification. No network, no model
 call, no third-party import.
 """
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -2214,11 +2216,96 @@ class ObservedIntegratedHeadTests(BatchCase):
         self.assertEqual(record['observed_paths'], ['a.txt'])
         self.assertIsNone(record['integration_sha'])
         self.assertEqual(self.head(batch), self.head(self.repo))
+        self.assertEqual(self.journal_data()['phase'], 'tasks')
+        self.assertNotIn('git merge --abort', record['error'])
         resumed = self.run_batch(plan, None, '--resume')
         self.assertEqual(resumed.returncode, 1, resumed.stderr)
         self.assertEqual(self.task_record(), record)
         self.assertEqual(self.count_merges(batch, 'HEAD'), 0)
         self.assertEqual(len(self.opencode_calls()), 1)
+
+    def test_conflicting_merge_with_failed_abort_blocks_next_task_and_resume(self):
+        verify = self.verification(
+            'import os, sys; sys.exit(17 if os.getenv("FAIL_T1") else 0)')
+        plan = self.plan([self.task('T1', 'a.txt', verify=verify),
+                          self.task('T2', 'b.txt')])
+        first = self.run_batch(plan, {'FAIL_T1': '1'}, '--only', 'T1')
+        self.assertEqual(first.returncode, 1, first.stderr + first.stdout)
+        before = self.task_record()
+        self.assertEqual(before['status'], 'FAILED')
+        candidate = before['observed_head']
+        batch = self.root / 'wt-batch'
+        # Seed a known, divergent batch base. The retry still uses the
+        # earlier task base and reaches Git's real add/add conflict.
+        (batch / 'a.txt').write_text('batch change\n')
+        _git(batch, 'add', 'a.txt')
+        _git(batch, 'commit', '-q', '-m', 'conflicting batch base')
+        batch_head = self.head(batch)
+        state = self.journal_data()
+        state['base_sha'] = batch_head
+        self.journal.write_text(json.dumps(state))
+        lock = Path(_git(batch, 'rev-parse', '--path-format=absolute',
+                         '--git-path', 'index.lock').stdout.decode().strip())
+        git = delivery._git
+        aborts = []
+
+        def hold_index_for_abort(where, *args, **kwargs):
+            if Path(where) == batch and args == ('merge', '--abort'):
+                lock.write_text('held fixture index')
+                result = git(where, *args, **kwargs)
+                aborts.append(result)
+                return result
+            return git(where, *args, **kwargs)
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {**self.env, **self._task_env()}, clear=True), \
+                mock.patch.object(delivery, '_git', side_effect=hold_index_for_abort), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = delivery.main(['run', '--plan', str(self.write_plan(plan)),
+                                  '--journal', str(self.journal), '--execute',
+                                  '--retry', 'T1'])
+        self.assertEqual(code, 1, err.getvalue() + out.getvalue())
+        self.assertEqual(len(aborts), 1)
+        self.assertNotEqual(aborts[0].returncode, 0)
+        self.assertIn('index.lock', aborts[0].stderr)
+        record = self.task_record()
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertEqual(record['verify'][0]['exit'], 0)
+        self.assertEqual(record['observed_head'], candidate)
+        self.assertEqual(record['observed_paths'], ['a.txt'])
+        self.assertIsNone(record['integration_sha'])
+        self.assertIn('integration conflict for T1: a.txt', record['error'])
+        self.assertIn(f'git merge --abort exited {aborts[0].returncode}',
+                      record['error'])
+        self.assertIn('index.lock', record['error'])
+        self.assertIn('MERGE_HEAD remains present', record['error'])
+        self.assertIn('unmerged paths remain (a.txt)', record['error'])
+        self.assertEqual(self.head(batch), batch_head)
+        self.assertEqual(self.head(batch, 'MERGE_HEAD'), candidate)
+        self.assertEqual(_git(batch, 'diff', '--name-only', '--diff-filter=U')
+                         .stdout.decode().splitlines(), ['a.txt'])
+
+        state = self.journal_data()
+        self.assertEqual(state['phase'], 'blocked')
+        self.assertEqual(state['error'], record['error'])
+        next_task = state['tasks']['T2']
+        self.assertEqual(next_task['status'], 'BLOCKED')
+        self.assertEqual(next_task['attempts'], 0)
+        self.assertIn('batch merge reconciliation', next_task['error'])
+        self.assertEqual(len(self.opencode_calls()), 2)
+        self.assertFalse((self.root / 'wt-t2').exists())
+
+        lock.unlink()
+        _git(batch, 'checkout', '--ours', '--', 'a.txt')
+        _git(batch, 'add', 'a.txt')
+        self.assertEqual(_git(batch, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.head(batch, 'MERGE_HEAD'), candidate)
+        resumed = self.run_batch(plan, None, '--resume')
+        self.assertEqual(resumed.returncode, 1, resumed.stderr)
+        self.assertIn('unfinished Git merge (MERGE_HEAD)', resumed.stderr)
+        self.assertEqual(self.task_record(), record)
+        self.assertEqual(self.journal_data()['tasks']['T2'], next_task)
+        self.assertEqual(len(self.opencode_calls()), 2)
 
     def test_git_merge_without_its_journal_save_blocks_repeated_recovery(self):
         batch = self.root / 'wt-batch'
