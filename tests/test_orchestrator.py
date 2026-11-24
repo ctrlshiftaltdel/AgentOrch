@@ -1126,17 +1126,63 @@ class PlanDocumentInitTests(unittest.TestCase):
         self.declare_github()
         self.write_template(b'# template\n')
         before = self.snapshot()
-        open_path = Path.open
-        def refuse_plan(path, mode='r', *args, **kwargs):
-            if path == self.root/'docs/PLAN.md' and mode == 'xb':
-                raise PermissionError('read-only file system')
-            return open_path(path, mode, *args, **kwargs)
 
-        with mock.patch.object(Path, 'open', refuse_plan):
+        with mock.patch.object(tempfile, 'NamedTemporaryFile',
+                               side_effect=PermissionError('read-only file system')):
             rc, out, err = self.run_init('init-plan')
         self.assertEqual(rc, 1, out + err)
         self.assertIn('ERROR: read-only file system', err)
         self.assertEqual(self.snapshot(), before)
+
+    def test_github_init_plan_cleans_an_interrupted_stage_before_retry(self):
+        self.declare_github()
+        data = b'# template bytes\n'
+        self.write_template(data)
+        before = self.snapshot()
+        target = self.root/'docs/PLAN.md'
+        create_stage = tempfile.NamedTemporaryFile
+
+        def interrupt_stage(*args, **kwargs):
+            stage = create_stage(*args, **kwargs)
+            write = stage.write
+            def incomplete(contents):
+                write(contents[:5])
+                self.assertFalse(target.exists())
+                raise InterruptedError('copy interrupted')
+            stage.write = incomplete
+            return stage
+
+        with mock.patch.object(tempfile, 'NamedTemporaryFile', interrupt_stage):
+            rc, out, err = self.run_init('init-plan')
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn('copy interrupted', err)
+        self.assertEqual(self.snapshot(), before)
+
+        rc, out, err = self.run_init('init-plan')
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.snapshot(), {**before, 'docs/PLAN.md': data})
+
+    def test_github_init_plan_publishes_full_bytes_and_keeps_a_concurrent_plan(self):
+        self.declare_github()
+        data = b'# template bytes\n'
+        owner = b'# concurrent owner plan\n'
+        self.write_template(data)
+        before = self.snapshot()
+        operation = 'rename' if os.name == 'nt' else 'link'
+        publish = getattr(os, operation)
+
+        def owner_publishes_first(stage, target):
+            self.assertEqual(Path(stage).parent, target.parent)
+            self.assertEqual(Path(stage).read_bytes(), data)
+            self.assertFalse(target.exists())
+            target.write_bytes(owner)
+            return publish(stage, target)
+
+        with mock.patch.object(os, operation, owner_publishes_first):
+            rc, out, err = self.run_init('init-plan')
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn('kept unchanged: docs/PLAN.md', out)
+        self.assertEqual(self.snapshot(), {**before, 'docs/PLAN.md': owner})
 
     def test_github_init_plan_leaves_an_existing_archive_and_backup_intact(self):
         rc, out, err = self.run_init()

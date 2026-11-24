@@ -6,7 +6,7 @@
 # (v1). That file is the only authority for their semantics; this module must not
 # restate or extend it. Path-lock behaviour is unchanged.
 from __future__ import annotations
-import argparse, hashlib, json, os, re, socket, sqlite3, stat, sys, unicodedata
+import argparse, hashlib, json, os, re, socket, sqlite3, stat, sys, tempfile, unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
@@ -331,6 +331,31 @@ def _plan_file_exists(root, relative):
         raise LayoutError(f'{relative} is not a regular file')
     return True
 
+def _publish_new_plan(target, data):
+    """Stage the entire file and publish it without replacing an existing plan."""
+    staged=tempfile.NamedTemporaryFile(dir=target.parent, prefix='.PLAN.', suffix='.tmp', delete=False)
+    try:
+        with staged:
+            staged.write(data)
+        try:
+            if os.name=='nt':
+                # On Windows rename raises FileExistsError for an occupied destination.
+                os.rename(staged.name, target)
+            else:
+                os.link(staged.name, target)
+        except FileExistsError:
+            raise
+        except OSError as exc:
+            method='a same-directory rename' if os.name=='nt' else 'a hard link'
+            raise RuntimeError(f'Could not publish {PLAN_DOC} using {method}: {exc}') from exc
+    finally:
+        Path(staged.name).unlink(missing_ok=True)
+
+def _show_kept_plan(path):
+    print(f'PLAN.md already present, kept unchanged: {path}')
+    print('Next: judge task direction from the design goals in docs/PLAN.md; templates/plan.md is only the initial copy.')
+    return 'kept'
+
 def init_plan(root, *, plan_only=False):
     """Seed <root>/docs/PLAN.md from templates/plan.md exactly once.
 
@@ -342,17 +367,15 @@ def init_plan(root, *, plan_only=False):
     template is reported and skipped: `init` must still finish its task-store
     work and exit 0. A write failure is raised instead of being reported as
     success. Returns 'created', 'kept', 'legacy-present' or 'template-missing'.
-    The plan-only entry requires ordinary in-tree plan paths and creates the
-    destination exclusively so it cannot overwrite a file added meanwhile.
+    The plan-only entry requires ordinary in-tree plan paths and publishes
+    the complete file exclusively.
     """
     target=root/PLAN_DOC
     legacy=root/LEGACY_PLAN_DOC
     command='init-plan' if plan_only else 'init'
     target_exists=_plan_file_exists(root, PLAN_DOC) if plan_only else target.exists()
     if target_exists:
-        print(f'PLAN.md already present, kept unchanged: {PLAN_DOC if plan_only else target}')
-        print('Next: judge task direction from the design goals in docs/PLAN.md; templates/plan.md is only the initial copy.')
-        return 'kept'
+        return _show_kept_plan(PLAN_DOC if plan_only else target)
     if legacy.exists() or (plan_only and legacy.is_symlink()):
         print(f'Legacy root PLAN.md found; docs/PLAN.md not created: {LEGACY_PLAN_DOC if plan_only else legacy}')
         print(f'Next: keep a single design-goal authority — run `git mv PLAN.md docs/PLAN.md` (create docs/ first if needed), then rerun {command}; see README section 10.')
@@ -369,13 +392,12 @@ def init_plan(root, *, plan_only=False):
     (root/'docs').mkdir(parents=True,exist_ok=True)
     data=template.read_bytes()
     if plan_only:
-        plan=target.open('xb')
         try:
-            with plan:
-                plan.write(data)
-        except OSError:
-            target.unlink()
-            raise
+            _publish_new_plan(target, data)
+        except FileExistsError:
+            if not _plan_file_exists(root, PLAN_DOC):
+                raise
+            return _show_kept_plan(PLAN_DOC)
     else:
         target.write_bytes(data)
     print(f'Created docs/PLAN.md from {PLAN_TEMPLATE if plan_only else template}')

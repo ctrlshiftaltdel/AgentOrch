@@ -238,7 +238,7 @@ python scripts/orchestrator.py init-plan
 python agentorch/scripts/orchestrator.py --layout isolated init-plan
 ```
 
-命令的写入范围仅限套件所在目录下的 `docs/PLAN.md`。首次生成逐字节复制 `templates/plan.md`，输出 `Created docs/PLAN.md from templates/plan.md`。计划已存在时输出 `kept unchanged`。这两种结果的退出码均为 0。
+首次生成会在 `docs/` 中暂存 `templates/plan.md` 的完整字节，成功后仅新增 `docs/PLAN.md`，并输出 `Created docs/PLAN.md from templates/plan.md`。计划已存在时输出 `kept unchanged`。这两种结果的退出码均为 0。任务记录使用 GitHub Issue 和 PR。
 
 缺少有效的 GitHub 底座声明、模板缺失或路径不可写时，命令打印诊断并以退出码 1 结束。生成前发现历史根 `PLAN.md` 时，按第 10.6 节的提示迁移，退出码也是 1。
 
