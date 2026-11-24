@@ -2256,7 +2256,7 @@ class ObservedIntegratedHeadTests(BatchCase):
         aborts = []
 
         def hold_index_for_abort(where, *args, **kwargs):
-            if Path(where) == batch and args == ('merge', '--abort'):
+            if args == ('merge', '--abort') and Path(where).resolve() == batch.resolve():
                 lock.write_text('held fixture index')
                 result = git(where, *args, **kwargs)
                 aborts.append(result)
