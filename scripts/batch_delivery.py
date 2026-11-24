@@ -1111,9 +1111,24 @@ def _check_journal_plan(state, plan):
             'or restore the recorded adapter')
 
 
+def _check_task_records(state, plan):
+    base = state.get('base_sha')
+    if not isinstance(base, str) or not SHA_RE.fullmatch(base):
+        raise InputError('the journal has no valid recorded batch base')
+    tasks = state.get('tasks')
+    if (not isinstance(tasks, dict)
+            or set(tasks) != {spec['id'] for spec in plan['tasks']}
+            or any(not isinstance(record, dict)
+                   or record.get('status') not in STATUSES
+                   for record in tasks.values())):
+        raise InputError('the journal has missing or invalid task records; '
+                         'reconcile the batch before continuing')
+
+
 def _task_record(spec, executor_agent):
     return {'status': 'PENDING', 'attempts': 0, 'branch': spec['branch'],
             'worktree': spec['worktree'], 'base': None, 'head': None,
+            'observed_head': None, 'observed_paths': [],
             'changed_paths': [], 'verify': [], 'execution_session': None,
             'executor_agent': executor_agent, 'integration_sha': None,
             'error': None, 'pid': None, 'attempt_history': [],
@@ -1948,6 +1963,7 @@ def _new_attempt(record, spec, trigger):
             break
     return {
         'id': ident, 'index': len(history) + 1, 'task': spec['id'],
+        'base': record.get('base'),
         'trigger': trigger, 'state': 'STARTED', 'started_at': _utc_now(),
         'ended_at': None, 'result': None, 'error': None,
         'executor': {'state': 'pending', 'pid': None, 'pgid': None,
@@ -2125,7 +2141,8 @@ def _attempt_problems(record, ignore=()):
                         f'attempt_history length ({len(history)})')
     if not problems and attempts == 0:
         # A record that claims no attempt may not also carry execution evidence.
-        evidence = [key for key in ('head', 'execution_session',
+        evidence = [key for key in ('head', 'changed_paths', 'observed_head',
+                                    'observed_paths', 'execution_session',
                                     'integration_sha') if record.get(key)]
         if record.get('verify'):
             evidence.append('verify')
@@ -3308,10 +3325,86 @@ def _scope_check(names, spec, plan, *, where='changed'):
                              'by docs/PROJECT.md', status='FAILED')
 
 
+def _observed_head(record):
+    return record.get('observed_head', record.get('head'))
+
+
+def _task_evidence(plan, spec, record, batch_head):
+    """Read a task's original base and check its observation against Git."""
+    ident = spec['id']
+    repo = plan['batch']['repo']
+    base = record.get('base')
+    if (not isinstance(base, str) or not SHA_RE.fullmatch(base)
+            or not _ancestor(repo, base, batch_head)):
+        raise BatchError(f'{ident} has no valid recorded task base on the batch '
+                         'branch', status='BLOCKED')
+    history = record.get('attempt_history')
+    if (not isinstance(history, list) or not history
+            or type(record.get('attempts')) is not int
+            or record.get('attempts') != len(history)
+            or any(not isinstance(attempt, dict) for attempt in history)):
+        raise BatchError(f'{ident} has no readable attempt history for its '
+                         'recorded base', status='BLOCKED')
+    # A single pre-S2 attempt can use the task-level base. More than one
+    # unbound attempt cannot prove which base the former writer overwrote.
+    legacy_first = 'base' not in history[0]
+    bound_attempts = history[1:] if legacy_first else history
+    if ('observation' in history[0] and legacy_first
+            or legacy_first and not bound_attempts and 'observed_head' in record
+            or any(attempt.get('base') != base for attempt in bound_attempts)):
+        raise BatchError(f'{ident} has an unknown or inconsistent attempt '
+                         'base', status='BLOCKED')
+
+    head = _observed_head(record)
+    paths = record.get('observed_paths', record.get('changed_paths'))
+    if (('observed_head' in record) != ('observed_paths' in record)
+            or head != record.get('head') or paths != record.get('changed_paths')
+            or not legacy_first and 'observed_head' not in record
+            or not isinstance(paths, list)):
+        raise BatchError(f'{ident} has inconsistent observed head or paths in '
+                         'the journal', status='BLOCKED')
+    observed_attempt = next((attempt for attempt in reversed(history)
+                             if 'observation' in attempt), None)
+    if observed_attempt is not None:
+        valid = observed_attempt['observation'] == {'head': head, 'paths': paths}
+    else:
+        valid = head is None or legacy_first
+    if not valid or (head is None and paths):
+        raise BatchError(f'{ident} has incomplete attempt evidence for its '
+                         'observation', status='BLOCKED')
+    if head is not None:
+        if (not isinstance(head, str) or not SHA_RE.fullmatch(head)
+                or head == base or not _ancestor(repo, base, head)
+                or paths != _diff_names(repo, base, head)):
+            raise BatchError(f'{ident} recorded observation does not match the '
+                             'task diff in Git', status='BLOCKED')
+        _scope_check(paths, spec, plan, where='observed')
+    return base, head, paths
+
+
+def _check_recovery_branch(plan, spec, base, observed, batch_head):
+    repo = plan['batch']['repo']
+    branch = spec['branch']
+    if _branch_exists(repo, branch):
+        actual = _git_text(repo, 'rev-parse', f'refs/heads/{branch}')
+        if actual != (observed or base):
+            raise BatchError(f'{spec["id"]} branch head does not match the '
+                             'recorded observation or original base',
+                             status='BLOCKED')
+    elif observed is not None:
+        raise BatchError(f'{spec["id"]} branch is missing for the recorded '
+                         'observation', status='BLOCKED')
+    if observed is not None and _ancestor(repo, observed, batch_head):
+        raise BatchError(f'{spec["id"]} observed head is already in the batch '
+                         'without a recorded successful integration',
+                         status='BLOCKED')
+
+
 def _prepare_task_worktree(plan, spec, base, record):
     repo = plan['batch']['repo']
     path = Path(spec['worktree'])
-    allow = record.get('head') if record.get('head') else None
+    observed = _observed_head(record)
+    expected = observed or base
     if path.exists():
         if _repo_root(path) != path.resolve():
             raise BatchError(f'task worktree is not a Git worktree root: {path}',
@@ -3322,21 +3415,31 @@ def _prepare_task_worktree(plan, spec, base, record):
         if not _clean(path):
             raise BatchError('the task worktree is not clean', status='FAILED')
         head = _head(path)
-        if head != base and head != allow:
-            raise BatchError('the task worktree is not at the expected base',
+        if head != expected:
+            raise BatchError('the task worktree is not at the recorded '
+                             'observation or original base',
                              status='BLOCKED')
         return path
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
     if _branch_exists(repo, spec['branch']):
-        result = _git(repo, 'worktree', 'add', str(path), spec['branch'])
+        branch_head = _git_text(repo, 'rev-parse', f'refs/heads/{spec["branch"]}')
+        if branch_head != expected:
+            raise BatchError('the task branch is not at the recorded '
+                             'observation or original base', status='BLOCKED')
+        arguments = [str(path), spec['branch']]
     else:
-        result = _git(repo, 'worktree', 'add', '-b', spec['branch'], str(path), base)
+        if observed is not None:
+            raise BatchError('the task branch is missing for the recorded '
+                             'observation', status='BLOCKED')
+        arguments = ['-b', spec['branch'], str(path), base]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    result = _git(repo, 'worktree', 'add', *arguments)
     if result.returncode != 0:
         raise BatchError('cannot create the task worktree: '
                          f'{(result.stderr or "").strip()[:400]}', status='FAILED')
     head = _head(path)
-    if head != base and head != allow:
-        raise BatchError('the task worktree is not at the expected base',
+    if head != expected:
+        raise BatchError('the task worktree is not at the recorded '
+                         'observation or original base',
                          status='BLOCKED')
     return path
 
@@ -3360,7 +3463,8 @@ def _commit_if_dirty(work, base, spec, plan):
                          f'{(commit.stderr or "").strip()[:400]}', status='FAILED')
 
 
-def _verify_task(work, commands, timeout, *, attempt=None, save=None):
+def _verify_task(work, commands, timeout, *, attempt=None, save=None,
+                 expected_head=None, expected_branch=None):
     entries = []
     for command in commands:
         entry = None
@@ -3457,26 +3561,63 @@ def _verify_task(work, commands, timeout, *, attempt=None, save=None):
                 f'verification failed with exit {result["exit"]}: '
                 f'{" ".join(command)}\n{result["tail"]}', status='FAILED',
                 verify=entries)
+        if expected_head is not None:
+            _check_verified_tree(work, expected_head, expected_branch, entries)
     return entries
 
 
-def _integrate(plan, spec):
+def _check_verified_tree(work, head, branch, verify):
+    if _head(work) != head:
+        raise BatchError('a verification command changed the task head',
+                         status='FAILED', verify=verify)
+    if _branch(work) != branch:
+        raise BatchError('a verification command changed the task branch',
+                         status='FAILED', verify=verify)
+    if not _clean(work):
+        raise BatchError('a verification command left the worktree dirty',
+                         status='FAILED', verify=verify)
+
+
+def _commit_parents(work, commit):
+    return _git_text(work, 'rev-list', '--parents', '-n', '1', commit).split()[1:]
+
+
+def _integrate(plan, spec, head, expected_batch_head):
     batch = Path(plan['batch']['worktree'])
     if not _clean(batch):
         raise BatchError('the batch worktree is not clean before integration')
     if _branch(batch) != plan['batch']['branch']:
         raise BatchError('the batch worktree is not on the batch branch')
+    before = _head(batch)
+    if before != expected_batch_head:
+        raise BatchError('the batch head moved before task integration',
+                         status='BLOCKED')
+    if _git_text(batch, 'rev-parse', f'refs/heads/{spec["branch"]}') != head:
+        raise BatchError('the task branch head moved before integration',
+                         status='BLOCKED')
+    if _ancestor(batch, head, before):
+        raise BatchError('the observed task head is already in the batch '
+                         'without a recorded successful integration',
+                         status='BLOCKED')
     message = f'batch {plan["batch"]["id"]}: integrate {spec["id"]}'
-    result = _git(batch, 'merge', '--no-ff', spec['branch'], '-m', message)
+    result = _git(batch, 'merge', '--no-ff', head, '-m', message)
     if result.returncode != 0:
         unmerged = _nul_names(batch, 'diff', '--name-only', '-z',
                               '--diff-filter=U')
         conflicts = sorted(unmerged)
         _git(batch, 'merge', '--abort')
-        raise BatchError('integration conflict for ' + spec['id'] + ': '
-                         + ', '.join(conflicts), status='BLOCKED',
-                         conflicts=conflicts)
-    return _head(batch)
+        if conflicts:
+            detail = f'integration conflict for {spec["id"]}: ' + ', '.join(conflicts)
+        else:
+            detail = (f'Git could not integrate {spec["id"]}: '
+                      f'{(result.stderr or "").strip()[:400]}')
+        raise BatchError(detail, status='BLOCKED', conflicts=conflicts)
+    integration = _head(batch)
+    if (integration == before or _commit_parents(batch, integration) != [before, head]
+            or not _clean(batch) or _branch(batch) != plan['batch']['branch']):
+        raise BatchError('Git did not leave a clean integration of the verified '
+                         'task head on the batch branch', status='BLOCKED')
+    return integration
 
 
 def _adapter_dir(journal):
@@ -3548,30 +3689,40 @@ def _write_execution_request(plan, spec, record, base, attempt, save, journal):
     return path
 
 
-def _complete_integration(plan, spec, record, base, head, timeout, save,
-                          attempt):
-    """Shared verify + integrate tail for every execution transport."""
+def _record_candidate(plan, spec, record, base, head, save, attempt):
+    """Persist the candidate before any verifier can affect the worktree."""
     work = Path(spec['worktree'])
     if head == base:
         raise BatchError('execution produced no changes', status='FAILED')
+    previous = _observed_head(record) or base
+    if not _ancestor(work, previous, head):
+        raise BatchError('the task head does not descend from the recorded '
+                         'observation or original base', status='BLOCKED')
     names = _diff_names(work, base, head)
-    _scope_check(names, spec, plan)
-    record.update(head=head, changed_paths=names)
+    record.update(head=head, changed_paths=names, observed_head=head,
+                  observed_paths=names)
+    attempt['observation'] = {'head': head, 'paths': names}
     save()
+    _scope_check(names, spec, plan)
+    if not names:
+        raise BatchError('execution produced no changes', status='FAILED')
+
+
+def _complete_integration(plan, spec, record, head, batch_head, timeout,
+                          save, attempt, *, attached_result=None):
+    """Shared verify + integrate tail for every execution transport."""
+    work = Path(spec['worktree'])
+    _check_verified_tree(work, head, spec['branch'], [])
     record['verify'] = _verify_task(work, spec['verify'], timeout,
-                                    attempt=attempt, save=save)
-    after = _head(work)
-    if after != head:
-        raise BatchError('a verification command changed the task head',
-                         status='FAILED', verify=record['verify'])
-    if not _clean(work):
-        raise BatchError('a verification command left the worktree dirty',
-                         status='FAILED', verify=record['verify'])
-    record['integration_sha'] = _integrate(plan, spec)
+                                    attempt=attempt, save=save,
+                                    expected_head=head,
+                                    expected_branch=spec['branch'])
+    record['integration_sha'] = _integrate(plan, spec, head, batch_head)
     record['status'] = 'INTEGRATED'
     record['error'] = None
+    if attached_result is not None:
+        attached_result['integrated'] = True
     _finish_attempt(attempt, 'ok', save=save)
-    save()
 
 
 def _adapter_diff_summary(work, base, head):
@@ -3687,10 +3838,10 @@ def _attach_execution(plan, state, journal, result_path, timeout):
     spec = next((task for task in plan['tasks'] if task['id'] == ident), None)
     if spec is None:
         raise InputError(f'the pending host request names unknown task {ident!r}')
-    base = record.get('base')
-    if not isinstance(base, str) or not SHA_RE.match(base):
-        raise InputError(f'{ident} has no recorded task base; the result cannot '
-                         'be bound')
+    batch_head = _prepare_batch_worktree(plan, state['base_sha'], execute=False)
+    _prove_task_integration(plan, state, state['base_sha'], batch_head,
+                            require_all=False)
+    base, _, _ = _task_evidence(plan, spec, record, batch_head)
     attempt = next((entry for entry in reversed(record.get('attempt_history') or [])
                     if isinstance(entry, dict) and entry.get('state') == 'STARTED'),
                    None)
@@ -3818,31 +3969,27 @@ def _attach_execution(plan, state, journal, result_path, timeout):
                              'the recomputed diff', status='BLOCKED')
         artifacts = _adapter_artifacts(data.get('artifacts'), work,
                                        _adapter_dir(journal))
-        _scope_check(recomputed['paths'], spec, plan)
+        _record_candidate(plan, spec, record, base, head, save, attempt)
         record['execution_session'] = session
         record['awaiting_host'] = None
         if isinstance(attempt.get('adapter'), dict):
             attempt['adapter'].update({'state': 'accepted', 'session': session,
                                        'terminal': terminal,
                                        'result_sha256': result_sha256})
-        _append_adapter_history(record, {
+        accepted = {
             'kind': 'execution', 'accepted': True, 'terminal': terminal,
             'session_id': session, 'exit_code': exit_code,
             'result_sha256': result_sha256, 'request_sha256': request_digest,
             'head': head, 'diff_sha256': recomputed['sha256'],
-            'artifacts': artifacts, 'integrated': False, 'at': _utc_now()})
+            'artifacts': artifacts, 'integrated': False, 'at': _utc_now()}
+        _append_adapter_history(record, accepted)
         save()
-        _commit_if_dirty(work, base, spec, plan)
-        current = _head(work)
-        if current != head:
-            raise BatchError('the worktree head moved after the result was '
-                             'accepted', status='BLOCKED')
-        _complete_integration(plan, spec, record, base, head, timeout, save,
-                              attempt)
-        record['adapter_history'][-1]['integrated'] = True
-        save()
+        _complete_integration(plan, spec, record, head, batch_head, timeout,
+                              save, attempt, attached_result=accepted)
         return 0
     except BatchError as exc:
+        if exc.verify:
+            record['verify'] = exc.verify
         _reject_attached(record, attempt, str(exc), terminal='invalid',
                          result_sha256=result_sha256, save=save,
                          status=exc.record_status)
@@ -3850,7 +3997,7 @@ def _attach_execution(plan, state, journal, result_path, timeout):
 
 
 def _execute_task(plan, spec, record, base, timeout, save, attempt,
-                  journal=None):
+                  journal=None, *, batch_head=None):
     try:
         # The guard also runs before the attempt is appended; this second check
         # keeps the literal "before _prepare_task_worktree/_agent" ordering and
@@ -3961,8 +4108,9 @@ def _execute_task(plan, spec, record, base, timeout, save, attempt,
         record['execution_session'] = result['session_id']
         _commit_if_dirty(work, base, spec, plan)
         head = _head(work)
-        _complete_integration(plan, spec, record, base, head, timeout, save,
-                              attempt)
+        _record_candidate(plan, spec, record, base, head, save, attempt)
+        _complete_integration(plan, spec, record, head, batch_head, timeout,
+                              save, attempt)
     except AttachedPending:
         raise
     except BatchError as exc:
@@ -3973,8 +4121,8 @@ def _execute_task(plan, spec, record, base, timeout, save, attempt,
         raise
 
 
-def _apply_retry(state, plan, ids, save=None):
-    current_batch = _head(Path(plan['batch']['worktree']))
+def _apply_retry(state, plan, ids, batch_head, save=None):
+    records = []
     for ident in ids:
         spec = next((task for task in plan['tasks'] if task['id'] == ident), None)
         if spec is None:
@@ -3987,27 +4135,18 @@ def _apply_retry(state, plan, ids, save=None):
                              f'{record.get("status")}')
         if record.get('integration_sha'):
             raise InputError(f'{ident} is already integrated and cannot be retried')
-        branch = spec['branch']
-        if _branch_exists(plan['batch']['repo'], branch):
-            head = _git_text(plan['batch']['repo'], 'rev-parse',
-                             f'refs/heads/{branch}')
-            if record.get('head'):
-                allowed = {record['head']}
-            else:
-                # A failure before any commit is retryable when the branch is
-                # still exactly at the attempt base or the current batch head.
-                allowed = {record.get('base'), current_batch} - {None}
-            if head not in allowed:
-                raise InputError(f'{ident} branch has commits not represented in '
-                                 'the journal')
         try:
             _reuse_guard(spec, record)
+            base, head, _ = _task_evidence(plan, spec, record, batch_head)
+            _check_recovery_branch(plan, spec, base, head, batch_head)
         except BatchError as exc:
             record['error'] = str(exc)
             record['retry_blocked'] = str(exc)
             if save is not None:
                 save()
             raise
+        records.append(record)
+    for record in records:
         _settle_interrupted(record, save)
         record.update(status='PENDING', error=None)
         record.pop('retry_blocked', None)
@@ -4030,7 +4169,7 @@ def _reset_dependents(state, plan, ids):
                 pending.append(spec['id'])
 
 
-def _normalize_interrupted(state, plan, resume, save=None):
+def _normalize_interrupted(state, plan, batch_head, resume, save=None):
     halt = False
     for ident in sorted(state.get('tasks') or {}):
         record = state['tasks'][ident]
@@ -4040,24 +4179,29 @@ def _normalize_interrupted(state, plan, resume, save=None):
             # The host owns this attempt; it is neither interrupted nor
             # reusable until ``attach`` accepts or rejects the result.
             continue
-        if record.get('head'):
-            record.update(status='BLOCKED', error=(
-                'an interrupted attempt left a commit; inspect the worktree '
-                'manually and use --retry after reconciling the branch'))
-        elif resume:
-            spec = next((task for task in plan['tasks'] if task['id'] == ident),
-                        None) or {'id': ident}
+        if resume:
+            spec = next(task for task in plan['tasks'] if task['id'] == ident)
             try:
                 _reuse_guard(spec, record)
+                base, head, _ = _task_evidence(plan, spec, record, batch_head)
+                executor = record['attempt_history'][-1]['executor']
+                if (head is not None or record.get('integration_sha') is not None
+                        or executor.get('session')):
+                    raise BatchError(
+                        'an interrupted attempt has recorded execution or commit evidence; '
+                        'reconcile the batch and task branches before reuse',
+                        status='BLOCKED')
+                _check_recovery_branch(plan, spec, base, head, batch_head)
             except BatchError as exc:
                 record.update(status='BLOCKED', error=str(exc))
-                halt = True
+                halt = halt or exc.halt
                 continue
             _settle_interrupted(record, save)
             record.update(status='PENDING', error=None)
         else:
             record.update(status='BLOCKED', error=(
-                'the attempt was interrupted before a commit; rerun with --resume'))
+                'the attempt was interrupted; reconcile its recorded evidence '
+                'before starting another attempt'))
     return halt
 
 
@@ -4067,8 +4211,8 @@ def _run_summary(state, plan):
     for spec in plan['tasks']:
         record = state['tasks'].get(spec['id'], {})
         print(f'{spec["id"]:6} {record.get("status", "-"):11} '
-              f'{(record.get("head") or "-")[:12]:12} '
-              f'{(record.get("integration_sha") or "-")[:12]:12} '
+              f'{str(_observed_head(record) or "-")[:12]:12} '
+              f'{str(record.get("integration_sha") or "-")[:12]:12} '
               f'{record.get("error") or ""}')
 
 
@@ -4104,13 +4248,14 @@ def command_run(args):
             _atomic_json(journal, state)
         else:
             _check_journal_plan(state, plan)
+            _check_task_records(state, plan)
             if state.get('edition') != plan['edition']:
                 raise InputError('the journal edition does not match the project')
-            if (state.get('tasks')
-                    and all(record.get('status') == 'VERIFIED'
-                            for record in state['tasks'].values())):
-                print(f'batch {state["batch_id"]}: all tasks are already VERIFIED')
-                return 0
+        if (state.get('phase') == 'verified'
+                and all(record.get('status') == 'VERIFIED'
+                        for record in state['tasks'].values())):
+            print(f'batch {state["batch_id"]}: all tasks are already VERIFIED')
+            return 0
         base_sha = state['base_sha']
         pending = _pending_host(state)
         if pending:
@@ -4129,19 +4274,25 @@ def command_run(args):
             try:
                 conflicts = _open_pr_conflicts(plan, plan['batch']['branch'])
             except BatchError as exc:
-                for spec in plan['tasks']:
-                    state['tasks'][spec['id']].update(status='BLOCKED',
-                                                      error=str(exc))
+                for record in state['tasks'].values():
+                    if record['status'] not in INTEGRATED:
+                        record.update(status='BLOCKED', error=str(exc))
                 raise
             if conflicts:
                 detail = ('active lock conflict blocks the whole batch: '
                           + '; '.join(f'{ident}: {reason}'
                                       for ident, reason in sorted(conflicts.items())))
-                for spec in plan['tasks']:
-                    state['tasks'][spec['id']].update(status='BLOCKED', error=detail)
+                for record in state['tasks'].values():
+                    if record['status'] not in INTEGRATED:
+                        record.update(status='BLOCKED', error=detail)
                 raise BatchError(detail)
             _dispatch_batch(plan, state, journal)
-            _prepare_batch_worktree(plan, base_sha, args.execute)
+            batch_head = _prepare_batch_worktree(plan, base_sha, args.execute)
+            review = state.get('review') or {}
+            if review.get('verdict') in ('APPROVE', 'NOT_REQUIRED_L0'):
+                _, digest = _diff_for_review(plan['batch']['repo'], base_sha,
+                                             batch_head)
+                _prove_review_current(state, plan, batch_head, digest)
         except BatchError as exc:
             state['phase'] = 'blocked'
             state['error'] = str(exc)
@@ -4151,12 +4302,20 @@ def command_run(args):
         def save():
             _atomic_json(journal, state)
 
+        normalize_halt = _normalize_interrupted(state, plan, batch_head,
+                                                args.resume, save=save)
+        try:
+            _prove_task_integration(plan, state, base_sha, batch_head,
+                                    require_all=False)
+        except BatchError as exc:
+            state.update(phase='blocked', error=str(exc))
+            save()
+            raise
         retry_ids = []
         if args.retry:
             retry_ids = [value.strip() for value in args.retry.split(',')
                          if value.strip()]
-            _apply_retry(state, plan, retry_ids, save=save)
-        normalize_halt = _normalize_interrupted(state, plan, args.resume, save=save)
+            _apply_retry(state, plan, retry_ids, batch_head, save=save)
         state['phase'] = 'tasks'
         state['error'] = None
         _atomic_json(journal, state)
@@ -4184,16 +4343,30 @@ def command_run(args):
                               error='the run stopped after an unproven process kill')
                 save()
                 continue
+            if _head(Path(plan['batch']['worktree'])) != batch_head:
+                detail = 'the batch head moved before starting the next task'
+                state.update(phase='blocked', error=detail)
+                save()
+                raise BatchError(detail, status='BLOCKED')
             try:
                 _reuse_guard(spec, record)
+                if record.get('base') is not None or record.get('attempts'):
+                    base, observed, _ = _task_evidence(plan, spec, record,
+                                                        batch_head)
+                    _check_recovery_branch(plan, spec, base, observed, batch_head)
+                else:
+                    base = batch_head
             except BatchError as exc:
                 record.update(status=exc.record_status, error=str(exc))
                 save()
                 if exc.halt:
                     halt = True
                 continue
-            base = _head(Path(plan['batch']['worktree']))
-            record.update(status='RUNNING', base=base, error=None, pid=os.getpid())
+            if not record.get('attempts'):
+                record.setdefault('observed_head', None)
+                record.setdefault('observed_paths', [])
+                record['base'] = base
+            record.update(status='RUNNING', error=None, pid=os.getpid())
             trigger = ('retry' if spec['id'] in retry_ids
                        else 'resume' if args.resume else 'fresh')
             # The attempt id and start record are on disk before the worktree is
@@ -4202,7 +4375,7 @@ def command_run(args):
             pending_request = None
             try:
                 _execute_task(plan, spec, record, base, args.timeout, save,
-                              attempt, journal)
+                              attempt, journal, batch_head=batch_head)
             except AttachedPending as exc:
                 record.update(status='RUNNING', error=None)
                 pending_request = exc
@@ -4212,6 +4385,8 @@ def command_run(args):
                 save()
                 if exc.halt:
                     halt = True
+            if record['status'] == 'INTEGRATED':
+                batch_head = record['integration_sha']
             save()
             if pending_request is not None:
                 state['phase'] = 'tasks'
@@ -4644,6 +4819,7 @@ def _attach_review(plan, state, journal, result_path):
         if problem:
             raise BatchError(f'review rejected: {problem}',
                              status='REVIEW_REJECTED')
+        _prove_task_integration(plan, state, base, current_head)
         record = {'head': current_head, 'diff_sha256': current_digest,
                   'risk': current_risk['level'], 'verdict': 'APPROVE',
                   'session': session,
@@ -4817,29 +4993,86 @@ def _review(plan, state, journal, args, base, head, digest, risk):
     return record
 
 
-def _prove_task_integration(plan, state, base, head):
-    """Every INTEGRATED task must still be present in the reviewed head."""
+def _proved_verification(spec, record, candidate, paths):
+    attempt = record['attempt_history'][-1]
+    if attempt.get('state') != 'ENDED' or attempt.get('result') != 'ok':
+        return False
+    if ('base' in attempt
+            and attempt.get('observation') != {'head': candidate, 'paths': paths}):
+        return False
+    verify, verifiers = record.get('verify'), attempt.get('verifiers')
+    commands = spec['verify']
+    if (not isinstance(verify, list) or len(verify) != len(commands)
+            or not isinstance(verifiers, list) or len(verifiers) != len(commands)):
+        return False
+    for command, result, process in zip(commands, verify, verifiers):
+        if not isinstance(result, dict) or not isinstance(process, dict):
+            return False
+        digest = hashlib.sha256(json.dumps(command).encode()).hexdigest()
+        if (result.get('argv_sha256') != digest or process.get('state') != 'ended'
+                or any(type(entry.get('exit')) is not int or entry['exit'] != 0
+                       or entry.get('timeout') is not False
+                       or entry.get('stopped') is not True
+                       for entry in (result, process))):
+            return False
+    return True
+
+
+def _prove_task_integration(plan, state, base, head, *, require_all=True):
+    """Reconcile the entire first-parent integration chain with the journal."""
     repo = plan['batch']['repo']
-    batch_paths = set(_changed_paths_range(repo, base, head))
+    batch_paths = None
+    integrations = {}
     for spec in plan['tasks']:
-        record = state['tasks'].get(spec['id'], {})
-        if record.get('status') not in INTEGRATED:
-            raise BatchError(f'{spec["id"]} is not integrated before review',
-                             status='BLOCKED')
+        ident = spec['id']
+        record = state['tasks'][ident]
         integration = record.get('integration_sha')
-        if not integration or not _ancestor(repo, integration, head):
-            raise BatchError(f'{spec["id"]} integration commit is not an ancestor '
+        if record.get('status') not in INTEGRATED:
+            if integration is not None:
+                raise BatchError(f'{ident} has a recorded integration without a '
+                                 'successful task status', status='BLOCKED')
+            if require_all:
+                raise BatchError(f'{ident} is not integrated before review',
+                                 status='BLOCKED')
+            continue
+        if (not isinstance(integration, str) or not SHA_RE.fullmatch(integration)
+                or not _ancestor(repo, integration, head)):
+            raise BatchError(f'{ident} integration commit is not an ancestor '
                              'of the reviewed head; the batch branch was rewritten',
                              status='REVIEW_REJECTED')
-        changed = set(record.get('changed_paths') or [])
-        if not changed:
-            raise BatchError(f'{spec["id"]} has no recorded changed paths',
+        task_base, candidate, paths = _task_evidence(plan, spec, record, head)
+        parents = _commit_parents(repo, integration)
+        if (integration in integrations or len(parents) != 2
+                or parents[1] != candidate
+                or not _ancestor(repo, task_base, parents[0])):
+            raise BatchError(f'{ident} integration commit does not bind its '
+                             'recorded observation to the batch history',
                              status='REVIEW_REJECTED')
+        if not _proved_verification(spec, record, candidate, paths):
+            raise BatchError(f'{ident} has no successful verification for the '
+                             'recorded integration', status='REVIEW_REJECTED')
+        if not paths:
+            raise BatchError(f'{ident} has no recorded changed paths',
+                             status='REVIEW_REJECTED')
+        if batch_paths is None:
+            batch_paths = set(_changed_paths_range(repo, base, head))
+        changed = set(paths)
         if not changed.issubset(batch_paths):
             missing = sorted(changed - batch_paths)
-            raise BatchError(f'{spec["id"]} is marked INTEGRATED but is missing from '
+            raise BatchError(f'{ident} is marked INTEGRATED but is missing from '
                              f'the batch diff: {", ".join(missing)}',
                              status='REVIEW_REJECTED')
+        integrations[integration] = parents[0]
+    cursor = head
+    while cursor != base:
+        cursor = integrations.pop(cursor, None)
+        if cursor is None:
+            raise BatchError('the batch head does not match the recorded '
+                             'successful integrations; reconcile Git and the '
+                             'journal before continuing', status='BLOCKED')
+    if integrations:
+        raise BatchError('a recorded integration is outside the batch '
+                         'first-parent history', status='BLOCKED')
 
 
 # --------------------------------------------------------------------- carriers
@@ -5774,6 +6007,7 @@ def command_finalize(args):
     with _Lock(journal):
         state = _load_journal(journal)
         _check_journal_plan(state, plan)
+        _check_task_records(state, plan)
         if state.get('edition') != plan['edition']:
             raise InputError('the journal edition does not match the project')
         if state.get('phase') == 'verified':
@@ -5829,6 +6063,7 @@ def command_attach(args):
     with _Lock(journal):
         state = _load_journal(journal)
         _check_journal_plan(state, plan)
+        _check_task_records(state, plan)
         if state.get('edition') != plan['edition']:
             raise InputError('the journal edition does not match the project')
         if _pending_host(state):

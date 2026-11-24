@@ -141,7 +141,7 @@ if args[:1] == ['run']:
     for name in paths:
         path = Path(name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f'{{ident}}\n')
+        path.write_text(os.environ.get('FAKE_EXECUTOR_CONTENT', ident) + '\n')
     extra = os.environ.get('FAKE_EXTRA_PATH')
     if extra:
         Path(extra).write_text('out of scope\n')
@@ -2094,6 +2094,311 @@ class ReviewDiffTests(BatchCase):
         self.assertEqual(digest, hashlib.sha256(diff.encode()).hexdigest())
 
 
+class ObservedIntegratedHeadTests(BatchCase):
+    def verification(self, body, *args):
+        return [[PY, '-c', body, *map(str, args)]]
+
+    def task_record(self):
+        return self.journal_data()['tasks']['T1']
+
+    def test_observation_is_durable_before_verification_and_after_resumes(self):
+        batch, work = self.root / 'wt-batch', self.root / 'wt-t1'
+        verify = self.verification(
+            'import json, pathlib, subprocess, sys\n'
+            'row = json.loads(pathlib.Path(sys.argv[1]).read_text())["tasks"]["T1"]\n'
+            'head = subprocess.check_output(["git", "rev-parse", "HEAD"], '
+            'text=True).strip()\n'
+            'assert row["observed_head"] == head\n'
+            'assert row["observed_paths"] == ["a.txt"]\n'
+            'assert row["integration_sha"] is None\n'
+            'raise SystemExit(17)', self.journal)
+        plan = self.plan([self.task('T1', 'a.txt', verify=verify)])
+        first = self.run_batch(plan)
+        self.assertEqual(first.returncode, 1, first.stderr + first.stdout)
+        original = self.task_record()
+        self.assertEqual(original['status'], 'FAILED')
+        self.assertEqual(original['verify'][0]['exit'], 17)
+        self.assertEqual(original['observed_head'], self.head(work))
+        self.assertEqual(original['observed_paths'], ['a.txt'])
+        self.assertIsNone(original['integration_sha'])
+        self.assertEqual(self.head(batch), self.head(self.repo))
+
+        for _ in range(2):
+            resumed = self.run_batch(plan, None, '--resume')
+            self.assertEqual(resumed.returncode, 1, resumed.stderr)
+            self.assertEqual(self.task_record(), original)
+            self.assertEqual(self.count_merges(batch, 'HEAD'), 0)
+        self.assertEqual(len(self.opencode_calls()), 1)
+
+    def test_retries_keep_the_original_base_after_an_independent_integration(self):
+        verify = self.verification(
+            'import os, sys; sys.exit(17 if os.getenv("FAIL_T1") else 0)')
+        plan = self.plan([self.task('T1', 'a.txt', verify=verify),
+                          self.task('T2', 'b.txt')])
+        batch = self.root / 'wt-batch'
+        base = self.head(self.repo)
+        first = self.run_batch(plan, {'FAIL_T1': '1'})
+        self.assertEqual(first.returncode, 1, first.stderr + first.stdout)
+        original = self.task_record()
+        candidate = original['observed_head']
+        self.assertEqual(original['status'], 'FAILED')
+        self.assertIsNotNone(candidate)
+        t2 = self.journal_data()['tasks']['T2']
+        self.assertEqual(t2['status'], 'INTEGRATED')
+        self.assertEqual(self.head(batch), t2['integration_sha'])
+        self.assertNotEqual(self.head(batch), base)
+
+        for count in range(2, 4):
+            failed = self.run_batch(plan, {'FAKE_OPENCODE_FAIL': '1'},
+                                    '--retry', 'T1')
+            self.assertEqual(failed.returncode, 1, failed.stderr + failed.stdout)
+            record = self.task_record()
+            self.assertEqual(record['status'], 'FAILED')
+            self.assertEqual(record['attempts'], count)
+            self.assertEqual(record['observed_head'], candidate)
+            self.assertEqual(record['observed_paths'], ['a.txt'])
+            self.assertIsNone(record['integration_sha'])
+            self.assertEqual(record['base'], base)
+            self.assertEqual(record['attempt_history'][0],
+                             original['attempt_history'][0])
+            self.assertNotIn('observation', record['attempt_history'][-1])
+            self.assertEqual(self.head(batch), t2['integration_sha'])
+
+        prompt = self.root / 'retry-prompt.txt'
+        retried = self.run_batch(plan, {'FAKE_PROMPT_FILE': str(prompt),
+                                       'FAKE_EXECUTOR_CONTENT': 'updated'},
+                                 '--retry', 'T1')
+        self.assertEqual(retried.returncode, 0, retried.stderr + retried.stdout)
+        record = self.task_record()
+        self.assertIn(f'BASE_SHA={base}\n', prompt.read_text())
+        self.assertEqual(record['base'], base)
+        self.assertEqual([entry['base'] for entry in record['attempt_history']],
+                         [base] * 4)
+        self.assertEqual(record['attempt_history'][0],
+                         original['attempt_history'][0])
+        self.assertEqual(record['observed_paths'], ['a.txt'])
+        self.assertNotEqual(record['observed_head'], candidate)
+        self.assertEqual(record['observed_head'], self.head(self.root / 'wt-t1'))
+        self.assertEqual(record['integration_sha'], self.head(batch))
+        self.assertEqual(self.head(batch, 'HEAD^1'), t2['integration_sha'])
+        self.assertEqual(self.head(batch, 'HEAD^2'), record['observed_head'])
+        self.assertEqual(self.count_merges(batch, 'HEAD'), 2)
+        self.assertEqual((batch / 'a.txt').read_text().strip(), 'updated')
+        self.assertEqual((batch / 'b.txt').read_text().strip(), 'T2')
+
+        calls = self.opencode_calls()
+        for _ in range(2):
+            resumed = self.run_batch(plan, None, '--resume')
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertEqual(self.task_record(), record)
+            self.assertEqual(self.count_merges(batch, 'HEAD'), 2)
+        self.assertEqual(self.opencode_calls(), calls)
+
+    def test_failed_git_merge_keeps_the_verified_observation_unintegrated(self):
+        batch = self.root / 'wt-batch'
+        verify = self.verification(
+            'import pathlib, subprocess, sys\n'
+            'name = subprocess.check_output(["git", "-C", sys.argv[1], '
+            '"rev-parse", "--path-format=absolute", "--git-path", "index.lock"], '
+            'text=True).strip()\n'
+            'pathlib.Path(name).write_text("held index")', batch)
+        plan = self.plan([self.task('T1', 'a.txt', verify=verify)])
+        first = self.run_batch(plan)
+        self.assertEqual(first.returncode, 1, first.stderr + first.stdout)
+        record = self.task_record()
+        self.assertIn('Git could not integrate T1', record['error'])
+        self.assertIn('index.lock', record['error'])
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertEqual(record['verify'][0]['exit'], 0)
+        self.assertEqual(record['observed_head'], self.head(self.root / 'wt-t1'))
+        self.assertEqual(record['observed_paths'], ['a.txt'])
+        self.assertIsNone(record['integration_sha'])
+        self.assertEqual(self.head(batch), self.head(self.repo))
+        resumed = self.run_batch(plan, None, '--resume')
+        self.assertEqual(resumed.returncode, 1, resumed.stderr)
+        self.assertEqual(self.task_record(), record)
+        self.assertEqual(self.count_merges(batch, 'HEAD'), 0)
+        self.assertEqual(len(self.opencode_calls()), 1)
+
+    def test_git_merge_without_its_journal_save_blocks_repeated_recovery(self):
+        batch = self.root / 'wt-batch'
+        snapshot = self.root / 'before-integration.json'
+        verify = self.verification(
+            'import pathlib, sys\n'
+            'pathlib.Path(sys.argv[2]).write_bytes('
+            'pathlib.Path(sys.argv[1]).read_bytes())', self.journal, snapshot)
+        plan = self.plan([self.task('T1', 'a.txt', verify=verify)])
+        first = self.run_batch(plan)
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        actual_merge = self.head(batch)
+        self.journal.write_bytes(snapshot.read_bytes())
+        prior = self.task_record()
+        self.assertEqual(self.head(batch, 'HEAD^2'), prior['observed_head'])
+        self.assertIsNone(prior['integration_sha'])
+
+        for _ in range(2):
+            resumed = self.run_batch(plan, None, '--resume')
+            self.assertEqual(resumed.returncode, 1, resumed.stderr)
+            self.assertIn('does not match the recorded successful integrations',
+                          resumed.stderr)
+            record = self.task_record()
+            self.assertEqual(record['status'], 'BLOCKED')
+            self.assertEqual(record['observed_head'], prior['observed_head'])
+            self.assertEqual(record['observed_paths'], prior['observed_paths'])
+            self.assertIsNone(record['integration_sha'])
+            self.assertEqual(self.head(batch), actual_merge)
+        self.assertEqual(self.count_merges(batch, 'HEAD'), 1)
+        self.assertEqual(len(self.opencode_calls()), 1)
+
+    def test_failed_verification_cannot_prove_a_real_merge_commit(self):
+        verify = self.verification('raise SystemExit(17)')
+        plan = self.plan([self.task('T1', 'a.txt', verify=verify)])
+        self.assertEqual(self.run_batch(plan).returncode, 1)
+        state = self.journal_data()
+        record = state['tasks']['T1']
+        batch = self.root / 'wt-batch'
+        _git(batch, 'merge', '--no-ff', record['observed_head'], '-m',
+             'test unverified merge')
+        record.update(status='INTEGRATED', integration_sha=self.head(batch))
+        # An "ok" summary cannot override the real failing verification.
+        record['attempt_history'][0]['result'] = 'ok'
+        self.journal.write_text(json.dumps(state))
+        resumed = self.run_batch(plan, None, '--resume')
+        self.assertEqual(resumed.returncode, 1, resumed.stderr)
+        self.assertIn('no successful verification', resumed.stderr)
+        self.assertEqual(self.task_record(), record)
+        self.assertEqual(self.count_merges(batch, 'HEAD'), 1)
+        self.assertEqual(len(self.opencode_calls()), 1)
+
+    def test_retry_rejects_branch_movement_or_unproven_legacy_observation(self):
+        verify = self.verification('raise SystemExit(17)')
+        plan = self.plan([self.task('T1', 'a.txt', verify=verify)])
+        self.assertEqual(self.run_batch(plan).returncode, 1)
+        initial = self.journal.read_bytes()
+        observed = self.task_record()['observed_head']
+        work = self.root / 'wt-t1'
+        for case in ('branch moved', 'legacy missing observation',
+                     'legacy lost attempt bases'):
+            with self.subTest(case=case):
+                self.journal.write_bytes(initial)
+                state = self.journal_data()
+                record = state['tasks']['T1']
+                if case == 'branch moved':
+                    _git(work, 'reset', '--hard', record['base'])
+                    reason = 'branch head does not match'
+                else:
+                    _git(work, 'reset', '--hard', observed)
+                    record.pop('observed_head')
+                    record.pop('observed_paths')
+                    attempt = record['attempt_history'][0]
+                    attempt.pop('base')
+                    attempt.pop('observation')
+                    if case == 'legacy missing observation':
+                        record.update(head=None, changed_paths=[])
+                        reason = 'branch head does not match'
+                    else:
+                        second = dict(attempt, index=2, id='attempt-legacy-second')
+                        record['attempt_history'].append(second)
+                        record['attempts'] = 2
+                        reason = 'inconsistent attempt base'
+                self.journal.write_text(json.dumps(state))
+                read = self.cli('status', '--journal', str(self.journal), '--json')
+                self.assertEqual(read.returncode, 0, read.stderr)
+                blocked = self.run_batch(plan, None, '--retry', 'T1')
+                self.assertEqual(blocked.returncode, 1, blocked.stderr)
+                self.assertIn(reason, blocked.stderr)
+                after = self.task_record()
+                for key in ('head', 'observed_head', 'observed_paths', 'base',
+                            'attempt_history'):
+                    self.assertEqual(after.get(key), record.get(key))
+                self.assertEqual(after['status'], 'FAILED')
+                self.assertIsNone(after['integration_sha'])
+        self.assertEqual(len(self.opencode_calls()), 1)
+
+    def test_retry_reuses_a_consistent_single_attempt_legacy_record(self):
+        verify = self.verification(
+            'import os, sys; sys.exit(17 if os.getenv("FAIL_T1") else 0)')
+        plan = self.plan([self.task('T1', 'a.txt', verify=verify)])
+        self.assertEqual(self.run_batch(plan, {'FAIL_T1': '1'}).returncode, 1)
+        state = self.journal_data()
+        record = state['tasks']['T1']
+        record.pop('observed_head')
+        record.pop('observed_paths')
+        legacy = record['attempt_history'][0]
+        legacy.pop('base')
+        legacy.pop('observation')
+        self.journal.write_text(json.dumps(state))
+        retried = self.run_batch(plan, None, '--retry', 'T1')
+        self.assertEqual(retried.returncode, 0, retried.stderr + retried.stdout)
+        accepted = self.task_record()
+        self.assertEqual(accepted['attempt_history'][0], legacy)
+        self.assertEqual(accepted['attempt_history'][1]['base'], record['base'])
+        self.assertEqual(accepted['observed_head'], record['head'])
+        self.assertEqual(accepted['observed_paths'], record['changed_paths'])
+        resumed = self.run_batch(plan, None, '--resume')
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(self.count_merges(self.root / 'wt-batch', 'HEAD'), 1)
+
+    def test_unobserved_branch_at_new_batch_head_is_not_a_retry_base(self):
+        plan = self.plan([self.task('T1', 'a.txt'), self.task('T2', 'b.txt')])
+        first = self.run_batch(plan, {'FAKE_OPENCODE_FAIL': '1'}, '--only', 'T1')
+        self.assertEqual(first.returncode, 1, first.stderr + first.stdout)
+        self.assertIsNone(self.task_record()['observed_head'])
+        self.assertEqual(self.run_batch(plan, None, '--only', 'T2').returncode, 1)
+        batch = self.root / 'wt-batch'
+        _git(self.root / 'wt-t1', 'reset', '--hard', self.head(batch))
+        calls = self.opencode_calls()
+        retried = self.run_batch(plan, None, '--retry', 'T1')
+        self.assertEqual(retried.returncode, 1, retried.stderr)
+        self.assertIn('branch head does not match', retried.stderr)
+        self.assertEqual(self.task_record()['base'], self.head(self.repo))
+        self.assertEqual(self.opencode_calls(), calls)
+        self.assertEqual(self.count_merges(batch, 'HEAD'), 1)
+
+    def test_recovery_blocks_a_stale_approval_even_with_the_same_diff(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        reviewed = self.finalize(plan, None, '--review')
+        self.assertEqual(reviewed.returncode, 0, reviewed.stderr)
+        approved = self.journal_data()['review']
+        batch = self.root / 'wt-batch'
+        _git(batch, 'commit', '--allow-empty', '-m', 'change reviewed head')
+        calls = self.opencode_calls()
+        resumed = self.run_batch(plan, None, '--resume')
+        self.assertEqual(resumed.returncode, 1, resumed.stderr)
+        self.assertIn('the approval no longer applies', resumed.stderr)
+        self.assertEqual(self.journal_data()['review'], approved)
+        self.assertEqual(self.opencode_calls(), calls)
+        self.assertEqual(self.count_merges(batch, 'HEAD'), 1)
+
+    def test_recovery_rejects_a_missing_task_record(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        state = self.journal_data()
+        missing = state['tasks'].pop('T1')
+        self.journal.write_text(json.dumps(state))
+        resumed = self.run_batch(plan, None, '--resume')
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertIn('missing or invalid task records', resumed.stderr)
+        self.assertEqual(self.head(self.root / 'wt-batch'),
+                         missing['integration_sha'])
+        self.assertEqual(len(self.opencode_calls()), 1)
+
+    def test_task_branch_move_during_verification_cannot_be_integrated(self):
+        verify = self.verification(
+            'import subprocess\n'
+            'subprocess.run(["git", "switch", "-c", "other-task-branch"], check=True)')
+        plan = self.plan([self.task('T1', 'a.txt', verify=verify)])
+        failed = self.run_batch(plan)
+        self.assertEqual(failed.returncode, 1, failed.stderr + failed.stdout)
+        record = self.task_record()
+        self.assertIn('changed the task branch', record['error'])
+        self.assertEqual(record['observed_head'], self.head(self.root / 'wt-t1'))
+        self.assertEqual(record['observed_paths'], ['a.txt'])
+        self.assertIsNone(record['integration_sha'])
+        self.assertEqual(self.count_merges(self.root / 'wt-batch', 'HEAD'), 0)
+
+
 class ExecutorLifecycleTests(BatchCase):
     """S1 rows of the Issue #265 state matrix: attempt history and stop proof.
 
@@ -3708,6 +4013,46 @@ class AdapterTransportTests(BatchCase):
         record = self.journal_data()['tasks']['T1']
         self.assertEqual(record['status'], 'FAILED')
         self.assertIsNone(record['integration_sha'])
+
+    def test_attached_verification_failure_keeps_its_candidate_for_retry(self):
+        verify = [[PY, '-c',
+                   'import os, sys; sys.exit(17 if os.getenv("FAIL_T1") else 0)']]
+        plan = self.host_plan([self.task('T1', 'a.txt', verify=verify)])
+        self.assertEqual(self.run_batch(plan).returncode, 3)
+        path = self.write_plan(plan)
+        request, first_request = self._pending()
+        result = self._execution_result(request)
+        failed = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result),
+                          extra={'FAIL_T1': '1'})
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        record = self.journal_data()['tasks']['T1']
+        candidate = record['observed_head']
+        self.assertEqual(record['status'], 'FAILED')
+        self.assertEqual(record['observed_paths'], ['a.txt'])
+        self.assertEqual(candidate, self.head(Path(first_request['worktree'])))
+        self.assertEqual(record['verify'][0]['exit'], 17)
+        self.assertIsNone(record['integration_sha'])
+
+        retried = self.run_batch(plan, None, '--retry', 'T1')
+        self.assertEqual(retried.returncode, 3, retried.stderr)
+        request, next_request = self._pending()
+        self.assertEqual(next_request['base_sha'], first_request['base_sha'])
+        self.assertEqual(self.journal_data()['tasks']['T1']['observed_head'],
+                         candidate)
+        result = self._execution_result(request, commit=False,
+                                        session='host-exec-2')
+        accepted = self.cli('attach', '--plan', str(path), '--journal',
+                            str(self.journal), '--result', str(result))
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        record = self.journal_data()['tasks']['T1']
+        batch = self.root / 'wt-batch'
+        self.assertEqual(record['status'], 'INTEGRATED')
+        self.assertEqual(record['observed_head'], candidate)
+        self.assertEqual(record['integration_sha'], self.head(batch))
+        self.assertEqual(self.head(batch, 'HEAD^2'), candidate)
+        self.assertEqual(self.count_merges(batch, 'HEAD'), 1)
+        self.assertTrue(record['adapter_history'][-1]['integrated'])
 
     def test_dirty_attached_worktree_is_rejected(self):
         plan = self.host_plan([self.task('T1', 'a.txt')])
