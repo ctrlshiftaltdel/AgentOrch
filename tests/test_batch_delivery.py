@@ -2135,6 +2135,7 @@ class GitHubSuccessorHandoffTests(SuccessorCase):
             'prs': [], 'calls': [], 'carriers': {
                 '250': {'number': 250, 'state': 'OPEN', 'body': ''},
                 '251': {'number': 251, 'state': 'OPEN',
+                        'labels': [{'name': 'status:ready'}],
                         'body': '## 依赖\n- #250\n'},
             }}), encoding='utf-8')
 
@@ -2179,6 +2180,26 @@ class GitHubSuccessorHandoffTests(SuccessorCase):
         self.assertIsNone(self.read_child()['dispatch'])
         self.assertNotIn('next_plan_result', self.journal_data())
         self.interrupt_finalize("""
+create = delivery._github_pr
+def interrupted_pr(plan, *args):
+    pr = create(plan, *args)
+    if plan['batch']['id'] == 'batch-251':
+        os._exit(89)
+    return pr
+delivery._github_pr = interrupted_pr
+""", '--resume')
+        self.assertIsNone(self.read_child()['pr'])
+        github = json.loads(self.gh_state.read_text(encoding='utf-8'))
+        github['prs'][1]['state'] = 'CLOSED'
+        self.gh_state.write_text(json.dumps(github), encoding='utf-8')
+        denied = self.finalize(self.front, None, '--resume')
+        self.assertEqual(denied.returncode, 1)
+        self.assertIn('does not match the recorded progress', denied.stderr)
+        github = json.loads(self.gh_state.read_text(encoding='utf-8'))
+        self.assertEqual(len(github['prs']), 2)
+        github['prs'][1]['state'] = 'OPEN'
+        self.gh_state.write_text(json.dumps(github), encoding='utf-8')
+        self.interrupt_finalize("""
 merge = delivery._merge_github
 def interrupted_merge(plan, *args):
     commit = merge(plan, *args)
@@ -2195,6 +2216,8 @@ delivery._merge_github = interrupted_merge
         calls = self.gh_calls()
         self.assertEqual(sum(call.startswith('pr create ') for call in calls), 2)
         self.assertEqual(sum(call.startswith('pr merge ') for call in calls), 2)
+        self.assertTrue(all('--repo owner/name' in call for call in calls
+                            if call.startswith(('pr create ', 'pr merge '))))
         self.assertEqual(sum(call.startswith('issue edit 251 ') for call in calls), 2)
         self.assertEqual(len(self.session_files('exec')), 2)
         self.assertEqual(len(self.session_files('rev')), 2)
@@ -2217,6 +2240,12 @@ delivery._merge_github = interrupted_merge
         self.assertEqual(done.returncode, 1)
         self.assertIn('registry status does not match', done.stderr)
         self.change_registry(250, 'VERIFIED')
+        github = json.loads(self.gh_state.read_text(encoding='utf-8'))
+        github['carriers']['251']['labels'] = []
+        self.gh_state.write_text(json.dumps(github), encoding='utf-8')
+        done = self.finalize(self.front, None, '--resume')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('no authoritative READY status', done.stderr)
         self.change_registry(251, 'NEEDS_HUMAN_DECISION')
         done = self.finalize(self.front, None, '--resume')
         self.assertEqual(done.returncode, 1)

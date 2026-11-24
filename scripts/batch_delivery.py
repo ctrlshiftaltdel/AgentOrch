@@ -2981,8 +2981,9 @@ def _open_pr_conflicts(plan, batch_branch):
     if plan['edition'] != 'github':
         return {}
     repo = plan['batch']['repo']
+    scope = _github_repo_args(plan)
     payload = _gh_json(['pr', 'list', '--state', 'open', '--limit', '1000',
-                        '--json', 'number,headRefName,files'], repo)
+                        '--json', 'number,headRefName,files', *scope], repo)
     if not isinstance(payload, list):
         raise BatchError('gh pr list returned an unexpected payload')
     if len(payload) >= 1000:
@@ -3010,7 +3011,7 @@ def _open_pr_conflicts(plan, batch_branch):
                                              f'({head}) touches {name}')
                     break
     issues = _gh_json(['issue', 'list', '--state', 'open', '--limit', '1000',
-                       '--json', 'number,body'], repo)
+                       '--json', 'number,body', *scope], repo)
     if not isinstance(issues, list):
         raise BatchError('gh issue list returned an unexpected payload')
     if len(issues) >= 1000:
@@ -3261,9 +3262,7 @@ def _dispatch_github(plan, state, journal):
     now = _now()
     if status in ('DISPATCHED', 'IN_PROGRESS') and branch == batch['branch'] \
             and _registry_value(inner, 'mode') == 'batch':
-        locked_raw = _registry_value(inner, 'locked_paths') or ''
-        locked = sorted({item.strip().rstrip('/') for item in locked_raw.split(',')
-                         if item.strip() and item.strip() != '(none)'})
+        locked = _registry_paths(inner)
         planned = sorted({name for spec in plan['tasks'] for name in spec['paths']})
         if locked != planned:
             raise BatchError(
@@ -5258,6 +5257,12 @@ def _registry_value(inner, name):
     return match.group(1) if match else None
 
 
+def _registry_paths(inner):
+    return sorted({item.strip().rstrip('/')
+                   for item in (_registry_value(inner, 'locked_paths') or '').split(',')
+                   if item.strip() not in ('', '(none)')})
+
+
 def _registry_text(fields):
     lines = ['<!-- ORCH-TASK-REGISTRY']
     lines += [f'{name}: {value}' for name, value in fields]
@@ -5507,29 +5512,56 @@ def _pr_from_item(plan, item, head):
             'head': item.get('headRefOid') or head, 'base': base}
 
 
+def _github_repo_args(plan):
+    slug = plan['batch']['issue_repo']
+    return ['--repo', slug] if slug else []
+
+
+def _github_branch_pr(plan):
+    batch = plan['batch']
+    branch = batch['branch']
+    payload = _gh_json(['pr', 'list', '--state', 'all', '--head', branch,
+                        '--limit', '2', '--json',
+                        'number,url,state,headRefName,headRefOid,baseRefName,'
+                        'mergeCommit,isCrossRepository', *_github_repo_args(plan)],
+                       batch['repo'])
+    if not isinstance(payload, list) or len(payload) > 1:
+        raise BatchError(f'batch branch {branch!r} has ambiguous PRs')
+    if not payload:
+        return None
+    pr = payload[0]
+    if (not isinstance(pr, dict) or pr.get('isCrossRepository') is True
+            or pr.get('headRefName') != branch
+            or not isinstance(pr.get('number'), int)):
+        raise BatchError(f'batch branch {branch!r} has an unproven PR identity')
+    return pr
+
+
 def _github_pr(plan, state, head):
     repo = plan['batch']['repo']
     branch = plan['batch']['branch']
-    fields = 'number,url,headRefOid,state,baseRefName'
-    payload = _gh_json(['pr', 'list', '--state', 'open', '--head', branch, '--json',
-                        fields], repo)
-    if not isinstance(payload, list):
-        raise BatchError('gh pr list returned an unexpected payload')
-    if payload:
-        return _pr_from_item(plan, payload[0], head)
-    body = _comment(state, plan, state['merge'].get('commit') or head)
-    result = _gh(['pr', 'create', '--base', plan['batch']['base'], '--head', branch,
-                  '--title', f'batch {plan["batch"]["id"]}: '
-                             f'{plan["batch"]["title"]}', '--body-file', '-'],
-                 repo, input_text=body)
-    if result.returncode != 0:
-        raise BatchError('gh pr create failed: '
-                         f'{(result.stderr or "").strip()[:300]}')
-    payload = _gh_json(['pr', 'list', '--state', 'open', '--head', branch, '--json',
-                        fields], repo)
-    if not isinstance(payload, list) or not payload:
+    pr = _github_branch_pr(plan)
+    if pr is None:
+        if state.get('pr'):
+            raise BatchError('the recorded pull request cannot be found')
+        body = _comment(state, plan, state['merge'].get('commit') or head)
+        result = _gh(['pr', 'create', '--base', plan['batch']['base'], '--head', branch,
+                      '--title', f'batch {plan["batch"]["id"]}: '
+                                 f'{plan["batch"]["title"]}', '--body-file', '-',
+                      *_github_repo_args(plan)], repo, input_text=body)
+        if result.returncode != 0:
+            raise BatchError('gh pr create failed: '
+                             f'{(result.stderr or "").strip()[:300]}')
+        pr = _github_branch_pr(plan)
+    if pr is None:
         raise BatchError('the created pull request cannot be found')
-    return _pr_from_item(plan, payload[0], head)
+    if pr.get('state') != 'OPEN':
+        raise BatchError(f'PR #{pr["number"]} is {pr.get("state")!r}; '
+                         'a replacement pull request will not be opened')
+    saved = (state.get('pr') or {}).get('number')
+    if saved is not None and saved != pr['number']:
+        raise BatchError(f'PR #{pr["number"]} differs from saved PR #{saved}')
+    return _pr_from_item(plan, pr, head)
 
 
 def _authoritative_checks(plan):
@@ -5579,7 +5611,8 @@ def _authoritative_checks(plan):
 def _recheck_pr(plan, pr, head):
     repo = plan['batch']['repo']
     view = _gh_json(['pr', 'view', str(pr['number']), '--json',
-                     'headRefOid,baseRefName,mergeable,state'], repo)
+                     'headRefOid,baseRefName,mergeable,state',
+                     *_github_repo_args(plan)], repo)
     if not isinstance(view, dict):
         raise BatchError('gh pr view returned an unexpected payload')
     if view.get('headRefOid') != head:
@@ -5696,24 +5729,14 @@ def _reconcile_github_merge(plan, state):
     if pr:
         try:
             view = _gh_json(['pr', 'view', str(pr['number']), '--json',
-                             'state,mergeCommit,url,headRefOid'], repo)
+                             'state,mergeCommit,url,headRefOid',
+                             *_github_repo_args(plan)], repo)
         except BatchError:
             view = None
     else:
-        try:
-            payload = _gh_json(['pr', 'list', '--state', 'all', '--head',
-                                plan['batch']['branch'], '--json',
-                                'number,url,state,mergeCommit,headRefOid'], repo)
-        except BatchError:
-            payload = []
-        if isinstance(payload, list):
-            merged = [item for item in payload
-                      if isinstance(item, dict) and item.get('state') == 'MERGED']
-            if merged:
-                view = merged[0]
-                state['pr'] = {'number': view.get('number'),
-                               'url': view.get('url'),
-                               'head': view.get('headRefOid')}
+        view = _github_branch_pr(plan)
+        if view and view.get('state') == 'MERGED':
+            state['pr'] = _pr_from_item(plan, view, view.get('headRefOid'))
     if not isinstance(view, dict) or view.get('state') != 'MERGED':
         return False
     merge = view.get('mergeCommit') or {}
@@ -5730,13 +5753,14 @@ def _merge_github(plan, state, pr, head, authorization, timeout):
     if state['merge'].get('state') == 'merged':
         return state['merge']['commit']
     method = plan['finalize']['merge_method']
+    scope = _github_repo_args(plan)
     args = ['pr', 'merge', str(pr['number']), f'--{method}', '--delete-branch',
-            '--match-head-commit', head]
+            '--match-head-commit', head, *scope]
     result = _gh(args, repo)
     if result.returncode != 0:
         try:
             view = _gh_json(['pr', 'view', str(pr['number']), '--json',
-                             'state,mergeCommit,url,headRefOid'], repo)
+                             'state,mergeCommit,url,headRefOid', *scope], repo)
         except BatchError:
             view = None
         if isinstance(view, dict) and view.get('state') == 'MERGED':
@@ -5748,7 +5772,7 @@ def _merge_github(plan, state, pr, head, authorization, timeout):
         raise BatchError('gh pr merge failed: '
                          f'{(result.stderr or "").strip()[:300]}')
     view = _gh_json(['pr', 'view', str(pr['number']), '--json',
-                     'state,mergeCommit,url,headRefOid'], repo)
+                     'state,mergeCommit,url,headRefOid', *scope], repo)
     merge = (view or {}).get('mergeCommit') or {}
     commit = merge.get('oid') if isinstance(merge, dict) else merge
     if not commit:
@@ -6007,7 +6031,7 @@ def _successor_plan(plan, state, journal, args):
 def _github_handoff_issue(plan, number):
     repo = plan['batch']['issue_repo']
     issue = _gh_json(['issue', 'view', str(number), '--repo', repo,
-                      '--json', 'number,body,state'], plan['batch']['repo'])
+                      '--json', 'number,body,state,labels'], plan['batch']['repo'])
     if (not isinstance(issue, dict) or issue.get('number') != number
             or not isinstance(issue.get('body'), str)
             or issue.get('state') not in ('OPEN', 'CLOSED')):
@@ -6096,7 +6120,13 @@ def _prove_handoff_complete(plan, state):
             and _ancestor(repo, verified, f'refs/heads/{base}')):
         raise BatchError(f'batch {batch["id"]} verified commit is absent from '
                          f'{base!r} or does not contain the recorded merge')
-    reviewed = (state.get('review') or {}).get('head')
+    review = state.get('review')
+    if (not isinstance(review, dict)
+            or review.get('verdict') not in ('APPROVE', 'NOT_REQUIRED_L0')
+            or not isinstance(review.get('head'), str)
+            or not SHA_RE.fullmatch(review['head'])):
+        raise BatchError(f'batch {batch["id"]} lacks its approved merge head')
+    reviewed = review['head']
     if plan['edition'] == 'local':
         if _commit_parents(repo, commit) != [state['base_sha'], reviewed]:
             raise BatchError(f'batch {batch["id"]} recorded local merge does not '
@@ -6116,6 +6146,9 @@ def _prove_handoff_complete(plan, state):
             if _registry_value(registry, field) != str(expected[field]):
                 raise BatchError(f'issue #{batch["issue"]} registry {field} '
                                  'does not match the VERIFIED batch')
+        if _registry_paths(registry) != expected['locked_paths'].split(', '):
+            raise BatchError(f'issue #{batch["issue"]} scope differs from the '
+                             'VERIFIED batch')
         view = _gh_json(['pr', 'view', str(pr), '--repo', batch['issue_repo'],
                          '--json', 'state,mergeCommit,headRefName,headRefOid,'
                          'baseRefName'], repo)
@@ -6134,7 +6167,7 @@ def _prove_handoff_complete(plan, state):
 
 def _check_successor_github(plan, state):
     batch = plan['batch']
-    number, repo = batch['issue'], batch['repo']
+    number = batch['issue']
     issue, registry = _github_handoff_issue(plan, number)
     status = _registry_value(registry, 'status')
     branch = _registry_value(registry, 'branch')
@@ -6146,9 +6179,13 @@ def _check_successor_github(plan, state):
                          f'registry status {status!r}; dispatch is not authorized')
     if registry and not status:
         raise BatchError(f'successor issue #{number} lacks a registry status')
-    locked = sorted({name.strip().rstrip('/') for name in
-                     (_registry_value(registry, 'locked_paths') or '').split(',')
-                     if name.strip() not in ('', '(none)')})
+    labels = issue.get('labels')
+    if status is None and not (
+            isinstance(labels, list)
+            and any(isinstance(label, dict) and label.get('name') == 'status:ready'
+                    for label in labels)):
+        raise BatchError(f'successor issue #{number} has no authoritative READY status')
+    locked = _registry_paths(registry)
     planned_paths = sorted({name for spec in plan['tasks'] for name in spec['paths']})
     if locked and locked != planned_paths:
         raise BatchError(f'successor issue #{number} paths differ from its authorization')
@@ -6170,24 +6207,15 @@ def _check_successor_github(plan, state):
         if _registry_value(record, 'status') != 'VERIFIED':
             raise BatchError(f'successor issue #{number} dependency #{dep} '
                              'is not VERIFIED')
-    prs = _gh_json(['pr', 'list', '--repo', batch['issue_repo'], '--state', 'all',
-                    '--head', batch['branch'], '--limit', '2',
-                    '--json', 'number,state,headRefName,headRefOid,baseRefName,'
-                    'mergeCommit,isCrossRepository'], repo)
+    pr = _github_branch_pr(plan)
     saved = ((state or {}).get('pr') or {}).get('number')
-    if not isinstance(prs, list) or len(prs) > 1:
-        raise BatchError(f'successor branch {batch["branch"]!r} has ambiguous PRs')
-    if not prs:
+    if pr is None:
         if saved or status in ('MERGED', 'VERIFIED'):
             raise BatchError(f'successor issue #{number} records a missing PR')
         return
-    pr = prs[0]
     reviewed = ((state or {}).get('review') or {}).get('head')
-    if (not isinstance(pr, dict) or state is None
+    if (state is None
             or pr.get('state') not in ('OPEN', 'MERGED')
-            or not isinstance(pr.get('number'), int)
-            or pr.get('isCrossRepository') is True
-            or pr.get('headRefName') != batch['branch']
             or pr.get('baseRefName') != batch['base']
             or not reviewed or pr.get('headRefOid') != reviewed
             or (saved and saved != pr.get('number'))):
