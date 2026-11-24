@@ -6328,6 +6328,28 @@ class IsolatedEntryCommandsTest(unittest.TestCase):
         self.assertEqual(bare.returncode, 2, bare.stdout + bare.stderr)
         self.assertIn('--layout', bare.stderr)
 
+    def test_documented_github_init_plan_uses_the_shipped_isolated_layout(self):
+        import subprocess
+
+        agentorch = self._complete_tree()
+        (self.host / 'docs' / 'PROJECT.md').write_text(
+            '- `edition`: `local`\n', encoding='utf-8')
+        (agentorch / 'docs').mkdir()
+        (agentorch / 'docs' / 'PROJECT.md').write_text(
+            '- `edition`: `github`\n', encoding='utf-8')
+        template = (agentorch / 'templates' / 'plan.md').read_bytes()
+        before = object_snapshot(self.host)
+
+        command = [sys.executable, 'agentorch/scripts/orchestrator.py',
+                   '--layout', 'isolated', 'init-plan']
+        result = subprocess.run(command, cwd=self.host, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Created docs/PLAN.md from templates/plan.md', result.stdout)
+        self.assertEqual((agentorch / 'docs' / 'PLAN.md').read_bytes(), template)
+        self.assertEqual(object_snapshot(self.host), {
+            **before, 'agentorch/docs/PLAN.md': ('file', hashlib.sha256(template).hexdigest()),
+        })
+
     def test_flat_package_self_check_and_flat_commands_are_not_rejected(self):
         import subprocess
         from scripts import validate_kit

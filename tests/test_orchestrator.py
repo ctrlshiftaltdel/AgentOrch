@@ -931,12 +931,19 @@ class PlanDocumentInitTests(unittest.TestCase):
     def write_template(self, data):
         target=self.root/'templates'; target.mkdir(exist_ok=True)
         (target/'plan.md').write_bytes(data)
-    def run_init(self):
+    def run_init(self, command='init'):
         out,err=io.StringIO(),io.StringIO()
-        with mock.patch.object(sys,'argv',['orchestrator.py','--root',str(self.root),'init']), \
+        with mock.patch.object(sys,'argv',['orchestrator.py','--root',str(self.root),command]), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc=orch.main()
         return rc,out.getvalue(),err.getvalue()
+
+    def declare_github(self):
+        (self.root/'docs/PROJECT.md').write_text('- `edition`: `github`\n', encoding='utf-8')
+
+    def snapshot(self):
+        return {path.relative_to(self.root).as_posix(): None if path.is_dir() else path.read_bytes()
+                for path in self.root.rglob('*')}
 
     def test_init_creates_plan_byte_for_byte_from_template(self):
         # CRLF + non-ASCII bytes prove the copy is a byte copy, not a re-render.
@@ -999,6 +1006,171 @@ class PlanDocumentInitTests(unittest.TestCase):
         self.assertIn('ERROR:',err)
         self.assertIn('read-only file system',err)
         self.assertFalse((self.root/'docs'/'PLAN.md').exists())
+
+    def test_github_init_plan_only_seeds_the_plan_and_keeps_owner_edits(self):
+        self.declare_github()
+        data = '# 设计目标\r\n\r\n- 演示\r\n'.encode('utf-8')
+        self.write_template(data)
+        (self.root/'.git/info').mkdir(parents=True)
+        (self.root/'.git/info/exclude').write_bytes(b'# project rules\nprivate/\n')
+        (self.root/'.gitignore').write_bytes(b'build/\n')
+        before = self.snapshot()
+
+        rc, out, err = self.run_init('init-plan')
+        self.assertEqual(rc, 0, err)
+        self.assertIn('Created docs/PLAN.md from templates/plan.md', out)
+        self.assertEqual(self.snapshot(), {**before, 'docs/PLAN.md': data})
+
+        (self.root/'docs/PLAN.md').write_bytes(b'# owner design goals\n')
+        before = self.snapshot()
+        rc, out, err = self.run_init('init-plan')
+        self.assertEqual(rc, 0, err)
+        self.assertIn('PLAN.md already present, kept unchanged: docs/PLAN.md', out)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_github_init_plan_requires_an_explicit_github_edition(self):
+        self.write_template(b'# template\n')
+        project = self.root/'docs/PROJECT.md'
+        cases = (
+            ('- `edition`: `local`', 'requires github'),
+            ('- `edition`: `cloud`', "unsupported value '`cloud`'"),
+            ('# no edition', 'missing required key `edition`'),
+            (None, 'file not found'),
+        )
+        for contents, diagnostic in cases:
+            with self.subTest(contents=contents):
+                if contents is None:
+                    project.unlink()
+                else:
+                    project.write_text(contents, encoding='utf-8')
+                before = self.snapshot()
+                rc, out, err = self.run_init('init-plan')
+                self.assertEqual(rc, 1, out + err)
+                self.assertIn('docs/PROJECT.md', err)
+                self.assertIn(diagnostic, err)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_github_init_plan_reports_legacy_plan_and_missing_template(self):
+        self.declare_github()
+        before = self.snapshot()
+        rc, out, err = self.run_init('init-plan')
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn('PLAN.md not created: template missing at templates/plan.md', out)
+        self.assertEqual(self.snapshot(), before)
+
+        self.write_template(b'# template\n')
+        (self.root/'PLAN.md').write_bytes(b'# legacy design goals\n')
+        before = self.snapshot()
+        rc, out, err = self.run_init('init-plan')
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn('git mv PLAN.md docs/PLAN.md', out)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_github_init_plan_rejects_non_file_plan_paths(self):
+        self.declare_github()
+        (self.root/'templates').mkdir()
+        for relative in ('docs/PLAN.md', 'templates/plan.md'):
+            with self.subTest(path=relative):
+                path = self.root/relative
+                path.mkdir()
+                before = self.snapshot()
+                rc, out, err = self.run_init('init-plan')
+                self.assertEqual(rc, 1, out + err)
+                self.assertIn(f'{relative} is not a regular file', err)
+                self.assertEqual(self.snapshot(), before)
+                path.rmdir()
+
+    def test_github_init_plan_refuses_linked_destination_and_docs_directory(self):
+        self.declare_github()
+        self.write_template(b'# template\n')
+        docs = self.root/'docs'
+        outside = self.root/'elsewhere'
+        outside.mkdir()
+        unexpected = outside/'PLAN.md'
+        target = docs/'PLAN.md'
+        def assert_refused():
+            rc, out, err = self.run_init('init-plan')
+            self.assertEqual(rc, 1, out + err)
+            self.assertIn('docs/PLAN.md must not use a linked path', err)
+            self.assertFalse(unexpected.exists())
+            self.assertFalse((self.root/'.orchestration').exists())
+
+        try:
+            target.symlink_to(unexpected)
+        except OSError as exc:
+            if getattr(exc, 'winerror', None) != 1314:
+                raise
+            # A Windows account may not be allowed to create the fixture link.
+            # Exercise the same redirected resolution without that privilege.
+            resolve_path = Path.resolve
+            def resolve_redirect(path, *args, **kwargs):
+                if path == target:
+                    return unexpected
+                return resolve_path(path, *args, **kwargs)
+            before = self.snapshot()
+            with mock.patch.object(Path, 'resolve', resolve_redirect):
+                assert_refused()
+            self.assertEqual(self.snapshot(), before)
+            return
+        assert_refused()
+        self.assertTrue(target.is_symlink())
+
+        target.unlink()
+        (docs/'PROJECT.md').rename(outside/'PROJECT.md')
+        docs.rmdir()
+        docs.symlink_to(outside, target_is_directory=True)
+        assert_refused()
+        self.assertTrue(docs.is_symlink())
+
+    def test_github_init_plan_reports_a_write_error(self):
+        self.declare_github()
+        self.write_template(b'# template\n')
+        before = self.snapshot()
+        open_path = Path.open
+        def refuse_plan(path, mode='r', *args, **kwargs):
+            if path == self.root/'docs/PLAN.md' and mode == 'xb':
+                raise PermissionError('read-only file system')
+            return open_path(path, mode, *args, **kwargs)
+
+        with mock.patch.object(Path, 'open', refuse_plan):
+            rc, out, err = self.run_init('init-plan')
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn('ERROR: read-only file system', err)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_github_init_plan_leaves_an_existing_archive_and_backup_intact(self):
+        rc, out, err = self.run_init()
+        self.assertEqual(rc, 0, out + err)
+        task = SimpleNamespace(id='TASK-0279', title='archive sample', description='',
+                               paths=['src/'], depends=[], acceptance=['sample'])
+        with contextlib.redirect_stdout(io.StringIO()):
+            orch.task_add(self.root, task)
+        self.declare_github()
+        source = self.root/'.orchestration/state.sqlite3'
+        with contextlib.closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True)) as con:
+            original = list(con.iterdump())
+        rc, out, err = self.run_init('backup')
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn('Backup created:', out)
+        backups = list((self.root/'.orchestration/backups').glob('*.sqlite3'))
+        self.assertEqual(len(backups), 1)
+        for database in (source, backups[0]):
+            with contextlib.closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as con:
+                self.assertEqual(list(con.iterdump()), original)
+
+        self.write_template(b'# template\n')
+        before = self.snapshot()
+        rc, out, err = self.run_init('init-plan')
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.snapshot(), {**before, 'docs/PLAN.md': b'# template\n'})
+
+    def test_backup_without_a_database_still_refuses_without_writing(self):
+        self.declare_github()
+        before = self.snapshot()
+        rc, out, err = self.run_init('backup')
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn('task database is not initialized', err)
+        self.assertEqual(self.snapshot(), before)
 
 # Real multi-process competitor: it waits for a shared start time, then opens its
 # own SQLite connection and races the same resource set. It never retries an

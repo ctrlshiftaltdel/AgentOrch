@@ -60,6 +60,8 @@
 
 > 编辑 docs/PROJECT.md：这是待填模板，把所有 FILL_IN 换成实际内容，edition 填 local。然后运行初始化，生成 docs/PLAN.md，把 config show 和 task list 的完整输出给我看。
 
+使用 `github` 底座时，按第 4 节路径一中的 GitHub 初始化步骤生成设计计划。
+
 **第 3 步 · 登记并派发第一条任务**：
 
 > 登记 ID 为 TASK-0001 的示例任务：标题"建立项目骨架"，可改路径 src/，验收两条——最小入口可运行；验证命令退出码为 0。然后把它置为 READY 再 DISPATCH，把生成的任务包完整展示给我。提醒：DISPATCH 只登记状态并占用路径锁，不会启动任何 Agent，任务包要交给真实的执行会话去做。
@@ -220,6 +222,28 @@ uv run python -m unittest discover -s tests
 3. 在 Master Agent 会话中加载 [editions/local/master.md](../editions/local/master.md)，按提示词澄清目标、产出章程、拆出 1–3 个最小任务。
 4. 若想法本身还很模糊，先走 [templates/project-charter.md](../templates/project-charter.md) 的章程引导流程，再进入任务拆解。
 
+#### GitHub 项目初始化设计计划
+
+在套件的 `docs/PROJECT.md` 中明确写入 `` - `edition`: `github` ``，然后用 `init-plan` 生成设计计划。这个入口适用于新项目，也适用于需要补齐设计计划的已有 GitHub 项目。
+
+平铺安装使用下列命令，工作目录为项目根目录。
+
+```bash
+python scripts/orchestrator.py init-plan
+```
+
+隔离安装使用下列命令，工作目录为宿主仓库根目录。
+
+```bash
+python agentorch/scripts/orchestrator.py --layout isolated init-plan
+```
+
+命令的写入范围仅限套件所在目录下的 `docs/PLAN.md`。首次生成逐字节复制 `templates/plan.md`，输出 `Created docs/PLAN.md from templates/plan.md`。计划已存在时输出 `kept unchanged`。这两种结果的退出码均为 0。
+
+缺少有效的 GitHub 底座声明、模板缺失或路径不可写时，命令打印诊断并以退出码 1 结束。生成前发现历史根 `PLAN.md` 时，按第 10.6 节的提示迁移，退出码也是 1。
+
+需要初始化本地 SQLite 任务库的 `local` 安装继续使用 `init`。GitHub 项目生成设计计划后，可按底座手册准备项目章程和 Issue。 [GitHub 底座手册](../editions/github/master.md)
+
 ### 路径二：接入已有仓库
 
 目标：在不破坏既有规则、**不覆盖旧项目任何重要文件**的前提下接入套件，恢复真实进度，再继续推进。对 Agent 说的话术见快速上手「第 1 步 B」，本节是它背后的完整步骤：
@@ -336,6 +360,7 @@ Edit .orchestration/config.json to change retry_cap or local_dir; invalid values
 | 命令 | `local` | `github` | `edition` 缺失 / 非法 |
 | --- | --- | --- | --- |
 | `init` | 可用 | 可用（只建本地库，不选底座） | 可用 |
+| `init-plan` | 拒绝，并提示使用 `init` | 可用（仅初始化设计计划） | 拒绝，并给出诊断与修复位置 |
 | `backup` | 可用 | 可用 | 可用 |
 | `config show` | 可用，退出码 0 | 可用，退出码 0 | 打印诊断，退出码 1 |
 | `task list` / `task show` / `task resources` | 可用 | 可用（只读归档；`task resources` 只列出已有记录，不做过期迁移） | 可用（只读） |
