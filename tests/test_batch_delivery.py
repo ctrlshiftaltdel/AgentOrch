@@ -2259,6 +2259,8 @@ delivery._merge_github = interrupted_merge
         self.assertEqual(self.journal_data()['phase'], 'verified')
 
     def test_legacy_start_proves_dependencies_and_preserves_conflict_locks(self):
+        self.child['tasks'].append(self.task('T3', 'c.txt', depends=['T2']))
+        self.child_path.write_text(json.dumps(self.child), encoding='utf-8')
         self.finish_front_then_interrupt()
         legacy = self.journal_data()
         del legacy['successor']
@@ -2268,7 +2270,11 @@ delivery._merge_github = interrupted_merge
         self.assertIn('legacy journal lacks a successor plan digest', done.stderr)
         self.assertFalse(self.child_journal.exists())
         github = json.loads(self.gh_state.read_text(encoding='utf-8'))
-        github['carriers']['251']['body'] = '## Dependencies\n- #250\n- #252\n'
+        github['carriers']['251']['body'] = (
+            '## Dependencies\n- #250\n'
+            '- [Other prerequisite](https://github.com/owner/name/issues/252)\n'
+            '- Both issues must pass verification on the main branch.\n'
+            '## T3\n### 依赖\nT2（批内依赖）\n')
         github['carriers']['252'] = {
             'number': 252, 'state': 'OPEN',
             'body': delivery._registry_text([('status', 'MERGED'),
@@ -2287,7 +2293,10 @@ delivery._merge_github = interrupted_merge
         self.assertEqual(len(self.session_files('exec')), 1)
         done = self.finalize(self.front, None, '--resume')
         self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
-        self.assertEqual(self.read_child()['phase'], 'verified')
+        child = self.read_child()
+        self.assertEqual(child['phase'], 'verified')
+        self.assertEqual({task['status'] for task in child['tasks'].values()},
+                         {'VERIFIED'})
 
     def test_attached_successor_reuses_pending_request(self):
         self.child['executor_adapter'] = {

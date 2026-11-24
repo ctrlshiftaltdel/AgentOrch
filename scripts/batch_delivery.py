@@ -6046,32 +6046,42 @@ def _github_handoff_issue(plan, number):
     return issue, registry
 
 
-def _handoff_issue_dependencies(body, issue_repo, issue):
+def _handoff_issue_dependencies(body, plan):
+    issue = plan['batch']['issue']
+    issue_repo = plan['batch']['issue_repo']
     body = _HTML_REGISTRY.sub('', _FENCED_REGISTRY.sub('', body))
     sections = re.findall(
         r'^#{2,6}[ \t]+(?:依赖|Dependencies)[ \t]*\r?\n(.*?)'
         r'(?=^#{1,6}[ \t]|^---[ \t]*\r?$|\Z)', body, re.I | re.M | re.S)
     if not sections or any(not section.strip() for section in sections):
         raise BatchError(f'issue #{issue} has no readable Dependencies section')
+    internal = {dep for spec in plan['tasks'] for dep in spec['depends']}
     dependencies = set()
     for section in sections:
-        for line in section.splitlines():
-            text = line.strip().removeprefix('- ').strip()
-            if not text or text.rstrip('.。').casefold() in ('无', 'none'):
-                continue
-            references = re.findall(
-                r'https://[^/\s]+/([\w.-]+/[\w.-]+)/issues/([1-9]\d*)\b'
-                r'|(?<![\w/])([\w.-]+/[\w.-]+)#([1-9]\d*)\b'
-                r'|(?<![\w/-])#([1-9]\d*)\b', text)
-            if not references:
+        references = re.findall(
+            r'https://[^/\s]+/([\w.-]+/[\w.-]+)/issues/([1-9]\d*)\b'
+            r'|(?<![\w/])([\w.-]+/[\w.-]+)#([1-9]\d*)\b'
+            r'|(?<![\w/-])#([1-9]\d*)\b', section)
+        if not references:
+            # Task subsections can describe the plan's in-batch dependencies.
+            # The normal task DAG still enforces them at execution time.
+            tokens = re.findall(
+                r'^[ \t]*(?:[-*+][ \t]+)?\x60?([A-Za-z0-9][A-Za-z0-9._-]*)',
+                section, re.M)
+            first = re.sub(r'^[-*+][ \t]+', '', section.strip().splitlines()[0])
+            first = first.rstrip('.。').casefold()
+            none = ('无', '无外部依赖', 'none', 'no dependencies',
+                    'no external dependencies')
+            if not internal.intersection(tokens) and first not in none:
                 raise BatchError(f'issue #{issue} has an unrecognized dependency '
-                                 'entry; list same-repository issue numbers or 无')
-            for linked_repo, linked_id, qualified_repo, qualified_id, local_id in references:
-                repo = linked_repo or qualified_repo
-                if repo and repo.casefold() != issue_repo.casefold():
-                    raise BatchError(f'issue #{issue} names an external repository '
-                                     'in Dependencies')
-                dependencies.add(int(linked_id or qualified_id or local_id))
+                                 'section; list same-repository issue numbers, '
+                                 'planned in-batch dependencies, or 无')
+        for linked_repo, linked_id, qualified_repo, qualified_id, local_id in references:
+            repo = linked_repo or qualified_repo
+            if repo and repo.casefold() != issue_repo.casefold():
+                raise BatchError(f'issue #{issue} names an external repository '
+                                 'in Dependencies')
+            dependencies.add(int(linked_id or qualified_id or local_id))
     return dependencies
 
 
@@ -6200,8 +6210,7 @@ def _check_successor_github(plan, state):
           or branch not in (None, '(none)', batch['branch'])):
         raise BatchError(f'successor issue #{number} no longer records the '
                          'expected dispatch or branch')
-    dependencies = _handoff_issue_dependencies(issue['body'], batch['issue_repo'],
-                                                number)
+    dependencies = _handoff_issue_dependencies(issue['body'], plan)
     for dep in sorted(dependencies):
         _, record = _github_handoff_issue(plan, dep)
         if _registry_value(record, 'status') != 'VERIFIED':
