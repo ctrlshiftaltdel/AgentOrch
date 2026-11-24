@@ -231,6 +231,13 @@ def _merge_in_progress(where):
     return True
 
 
+def _require_no_merge(where, *, verify=None):
+    if _merge_in_progress(where):
+        raise BatchError('the batch worktree has an unfinished Git merge '
+                         '(MERGE_HEAD). Reconcile it before continuing',
+                         halt_reason=GIT_HALT_REASON, verify=verify)
+
+
 def _ancestor(where, ancestor, descendant):
     return _git_ok(where, 'merge-base', '--is-ancestor', ancestor, descendant)
 
@@ -2904,9 +2911,7 @@ def _prepare_batch_worktree(plan, base_sha, execute):
             raise BatchError(f'batch worktree is not a Git worktree root: {path}')
         if _branch(path) != branch:
             raise BatchError(f'batch worktree is on {_branch(path)!r}, not {branch!r}')
-        if _merge_in_progress(path):
-            raise BatchError('the batch worktree has an unfinished Git merge '
-                             '(MERGE_HEAD). Reconcile it before resuming')
+        _require_no_merge(path)
         if not _clean(path):
             raise BatchError('the batch worktree is not clean')
         head = _head(path)
@@ -3648,9 +3653,7 @@ def _merge_failure(batch, branch, before, ident, merge):
 def _integrate(plan, spec, head, expected_batch_head):
     batch = Path(plan['batch']['worktree'])
     branch = plan['batch']['branch']
-    if _merge_in_progress(batch):
-        raise BatchError('the batch worktree has an unfinished Git merge '
-                         '(MERGE_HEAD)', halt_reason=GIT_HALT_REASON)
+    _require_no_merge(batch)
     if not _clean(batch):
         raise BatchError('the batch worktree is not clean before integration',
                          halt_reason=GIT_HALT_REASON)
@@ -4640,6 +4643,7 @@ def _acceptance_evidence(plan, state, work, head, digest, timeout):
                      'status': 'PASS' if result['exit'] == 0
                                and not result['timeout'] else 'FAIL'}
             entries.append(entry)
+            _require_no_merge(work)
             if _head(work) != head:
                 raise BatchError(f'acceptance check for {spec["id"]} AC-{index} '
                                  'moved HEAD', status='REVIEW_REJECTED')
@@ -4837,6 +4841,7 @@ def _attach_review(plan, state, journal, result_path):
         if workdir != work:
             raise BatchError('the reviewer ran in a different directory',
                              status='BLOCKED')
+        _require_no_merge(work)
         if data.get('edit_denied') is not True:
             raise BatchError('the review result must declare that editing was '
                              'denied', status='BLOCKED')
@@ -4928,6 +4933,8 @@ def _attach_review(plan, state, journal, result_path):
 
 
 def _review(plan, state, journal, args, base, head, digest, risk):
+    work = Path(plan['batch']['worktree'])
+    _require_no_merge(work)
     _prove_task_integration(plan, state, base, head)
     existing = state.get('review') or {}
     if (existing.get('head') == head
@@ -4943,7 +4950,6 @@ def _review(plan, state, journal, args, base, head, digest, risk):
                               for spec in plan['tasks'])
         attestation = getattr(args, 'acceptance_attestation', None)
         if checks_complete and attestation:
-            work = Path(plan['batch']['worktree'])
             evidence = _acceptance_evidence(plan, state, work, head, digest,
                                             args.timeout)
             decisions, attestation_digest = _load_attestation(
@@ -4993,7 +4999,6 @@ def _review(plan, state, journal, args, base, head, digest, risk):
             'transport. No review, push or merge was attempted',
             status='BLOCKED')
     diff, _ = _diff_for_review(plan['batch']['repo'], base, head)
-    work = Path(plan['batch']['worktree'])
     before_head, before_clean = _head(work), _clean(work)
     profiles_before = _agent_profiles(work)
     profile = profiles_before.get(plan['reviewer_agent'])
@@ -5049,6 +5054,7 @@ def _review(plan, state, journal, args, base, head, digest, risk):
                          'same fenced verdict', status='REVIEW_REJECTED')
     if _head(work) != before_head or _clean(work) != before_clean:
         raise BatchError('the reviewer changed the batch worktree', status='REVIEW_REJECTED')
+    _require_no_merge(work)
     problem = _verdict_problem(stream, plan, base, head, digest, risk)
     if problem:
         state['review'] = {'head': head, 'diff_sha256': digest,
@@ -5392,7 +5398,8 @@ def _carrier_github(state, plan, merge_commit):
 
 
 def _verify_guarded(work, commands, timeout, *, expected_head, label,
-                    expected_branch=None, merge_commit=None):
+                    expected_branch=None, merge_commit=None,
+                    check_pending_merge=False):
     """Run commands while proving they cannot move or dirty the reviewed tree."""
     if _head(work) != expected_head:
         raise BatchError(f'{label} started on the wrong head: expected '
@@ -5401,6 +5408,8 @@ def _verify_guarded(work, commands, timeout, *, expected_head, label,
         raise BatchError(f'{label} started on the wrong branch', status='BLOCKED')
     if not _clean(work):
         raise BatchError(f'{label} started with a dirty worktree', status='BLOCKED')
+    if check_pending_merge:
+        _require_no_merge(work)
     entries = []
     for command in commands:
         result = _run_process(command, work, timeout)
@@ -5409,6 +5418,8 @@ def _verify_guarded(work, commands, timeout, *, expected_head, label,
                  'exit': result['exit'], 'tail': result['tail'],
                  'timeout': bool(result['timeout'])}
         entries.append(entry)
+        if check_pending_merge:
+            _require_no_merge(work, verify=entries)
         if result['timeout'] or result['exit'] != 0:
             raise BatchError(
                 f'{label} failed: {" ".join(command)} '
@@ -5964,6 +5975,7 @@ def _finalize_body(plan, state, journal, args):
     batch = Path(plan['batch']['worktree'])
     if not batch.is_dir() or _repo_root(batch) != batch.resolve():
         raise BatchError('the batch worktree is missing')
+    _require_no_merge(batch)
     if not _clean(batch):
         raise BatchError('the batch worktree is not clean')
     if _branch(batch) != plan['batch']['branch']:
@@ -5978,10 +5990,14 @@ def _finalize_body(plan, state, journal, args):
         state['merge'].update(state='merged', commit=_head(plan['batch']['repo']))
     merge_done = state['merge'].get('state') == 'merged'
     if not merge_done:
-        state['batch_verify'] = _verify_guarded(
-            batch, plan['finalize']['verify'], args.timeout,
-            expected_head=head, label='batch verification',
-            expected_branch=plan['batch']['branch'])
+        try:
+            state['batch_verify'] = _verify_guarded(
+                batch, plan['finalize']['verify'], args.timeout,
+                expected_head=head, label='batch verification',
+                expected_branch=plan['batch']['branch'], check_pending_merge=True)
+        except BatchError as exc:
+            state['batch_verify'] = exc.verify
+            raise
         after_verify = _head(batch)
         if after_verify != head:
             raise BatchError('batch verification moved the reviewed head',

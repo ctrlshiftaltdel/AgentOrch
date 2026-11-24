@@ -692,6 +692,12 @@ class BatchCase(unittest.TestCase):
     def head(self, where, ref='HEAD'):
         return _git(where, 'rev-parse', ref).stdout.decode().strip()
 
+    def empty_batch_merge_target(self):
+        batch = self.root / 'wt-batch'
+        return _git(batch, 'commit-tree', self.head(batch, 'HEAD^{tree}'),
+                    '-p', self.head(batch, 'HEAD^2'), '-m',
+                    'empty divergent commit').stdout.decode().strip()
+
     def count_commits(self, where, ref):
         return int(_git(where, 'rev-list', '--count', ref).stdout.decode().strip())
 
@@ -2485,6 +2491,60 @@ class ObservedIntegratedHeadTests(BatchCase):
         self.assertIsNone(record['integration_sha'])
         self.assertEqual(self.count_merges(self.root / 'wt-batch', 'HEAD'), 0)
 
+    def test_finalize_refuses_clean_worktree_with_unfinished_merge(self):
+        called = self.root / 'batch-verify-called'
+        plan = self.plan([self.task('T1', 'a.txt')])
+        plan['finalize']['verify'] = self.verification(
+            'import pathlib, sys; pathlib.Path(sys.argv[1]).touch()', called)
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        batch = self.root / 'wt-batch'
+        head = self.head(batch)
+        target = self.empty_batch_merge_target()
+        _git(batch, 'merge', '--no-ff', '--no-commit', target)
+        self.assertEqual(_git(batch, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.head(batch, 'MERGE_HEAD'), target)
+        calls = self.gh_calls()
+
+        done = self.finalize(plan, None, '--review', '--push', '--merge',
+                             '--authorization', AUTH, '--checks-timeout', '5')
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('unfinished Git merge (MERGE_HEAD)', done.stderr)
+        self.assertFalse(called.exists())
+        self.assertEqual(self.gh_calls(), calls)
+        self.assertEqual(self.head(batch), head)
+        self.assertEqual(self.head(batch, 'MERGE_HEAD'), target)
+        self.assertEqual(self.journal_data()['phase'], 'blocked')
+
+    def test_finalize_stops_after_a_verifier_leaves_clean_pending_merge(self):
+        target_file = self.root / 'merge-target'
+        other_verify = self.root / 'other-verify-called'
+        plan = self.plan([self.task('T1', 'a.txt')])
+        plan['finalize']['verify'] = self.verification(
+            'import pathlib, subprocess, sys\n'
+            'target = pathlib.Path(sys.argv[1]).read_text()\n'
+            'subprocess.run(["git", "merge", "--no-ff", "--no-commit", target], '
+            'check=True)', target_file) + self.verification(
+                'import pathlib, sys; pathlib.Path(sys.argv[1]).touch()', other_verify)
+        self.assertEqual(self.run_batch(plan).returncode, 0)
+        batch = self.root / 'wt-batch'
+        head = self.head(batch)
+        target = self.empty_batch_merge_target()
+        target_file.write_text(target)
+
+        done = self.finalize(plan, None, '--review', '--push', '--merge',
+                             '--authorization', AUTH, '--checks-timeout', '5')
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('unfinished Git merge (MERGE_HEAD)', done.stderr)
+        self.assertEqual(_git(batch, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.head(batch), head)
+        self.assertEqual(self.head(batch, 'MERGE_HEAD'), target)
+        self.assertFalse(other_verify.exists())
+        self.assertEqual(self.session_files('rev'), [])
+        self.assertFalse(any('pr create' in call for call in self.gh_calls()))
+        state = self.journal_data()
+        self.assertEqual(state['phase'], 'blocked')
+        self.assertEqual([entry['exit'] for entry in state['batch_verify']], [0])
+
 
 class ExecutorLifecycleTests(BatchCase):
     """S1 rows of the Issue #265 state matrix: attempt history and stop proof.
@@ -4262,6 +4322,28 @@ class AdapterTransportTests(BatchCase):
         self.assertEqual(attach.returncode, 1, attach.stderr)
         self.assertIn('different diff', attach.stderr)
         self.assertEqual(self.journal_data()['review']['verdict'], 'BLOCKED')
+
+    def test_attached_review_rejects_clean_worktree_with_unfinished_merge(self):
+        plan = self.host_plan([self.task('T1', 'a.txt')])
+        path, request_path = self._pending_review(plan)
+        result = self._review_result(request_path)
+        batch = self.root / 'wt-batch'
+        head = self.head(batch)
+        target = self.empty_batch_merge_target()
+        _git(batch, 'merge', '--no-ff', '--no-commit', target)
+        self.assertEqual(_git(batch, 'status', '--porcelain').stdout, b'')
+        self.assertEqual(self.head(batch, 'MERGE_HEAD'), target)
+
+        attach = self.cli('attach', '--plan', str(path), '--journal',
+                          str(self.journal), '--result', str(result))
+        self.assertEqual(attach.returncode, 1, attach.stderr)
+        self.assertIn('unfinished Git merge (MERGE_HEAD)', attach.stderr)
+        state = self.journal_data()
+        self.assertEqual(state['review']['verdict'], 'BLOCKED')
+        self.assertFalse(state['review_history'][-1]['accepted'])
+        self.assertEqual(self.head(batch), head)
+        self.assertEqual(self.head(batch, 'MERGE_HEAD'), target)
+        self.assertFalse(any('pr merge' in call for call in self.gh_calls()))
 
     # -- I/O failure and attached invariants ---------------------------
     def test_agent_io_error_kills_and_reports_the_stop_proof(self):
