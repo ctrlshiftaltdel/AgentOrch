@@ -226,6 +226,12 @@ def body_from_stdin():
     return ''
 
 
+def carrier(state, number):
+    if 'carriers' in state:
+        return state['carriers'].get(str(number))
+    return state.setdefault('issue', {{}})
+
+
 args = sys.argv[1:]
 state = load()
 state.setdefault('calls', []).append(' '.join(args))
@@ -389,7 +395,8 @@ if args[:2] == ['pr', 'merge']:
 
 if args[:2] == ['issue', 'list']:
     state = load()
-    issues = state.get('issues')
+    issues = (list(state['carriers'].values()) if 'carriers' in state
+              else state.get('issues'))
     if issues is None:
         issues = [state.get('issue', {{}})]
     out([{{'number': item.get('number'), 'body': item.get('body') or ''}}
@@ -399,13 +406,15 @@ if args[:2] == ['issue', 'list']:
 
 if args[:2] == ['issue', 'view']:
     state = load()
-    out(state.get('issue', {{}}))
+    issue = carrier(state, args[2])
+    if issue is None:
+        raise SystemExit(1)
+    out(issue)
     raise SystemExit(0)
 
 if args[:2] == ['issue', 'comment']:
     state = load()
-    state.setdefault('issue', {{}}).setdefault('comments', []).append(
-        body_from_stdin())
+    carrier(state, args[2]).setdefault('comments', []).append(body_from_stdin())
     save(state)
     print('commented')
     raise SystemExit(0)
@@ -415,7 +424,7 @@ if args[:2] == ['issue', 'edit']:
         print('issue edit failed by test', file=sys.stderr)
         raise SystemExit(1)
     state = load()
-    state.setdefault('issue', {{}})['body'] = body_from_stdin()
+    carrier(state, args[2])['body'] = body_from_stdin()
     save(state)
     print('edited')
     raise SystemExit(0)
@@ -2068,6 +2077,431 @@ class LocalBatchTests(BatchCase):
         self.assertIn('authorization', wrong.stderr)
         self.assertEqual(self.count_commits(self.repo, 'HEAD'), 1)
         self.assertEqual(self.journal_data()['merge']['state'], 'none')
+
+
+class SuccessorCase(BatchCase):
+    merge_flags = ('--review', '--merge', '--authorization', AUTH)
+    crash_after_dispatch = """
+save = delivery._atomic_json
+def interrupted_save(path, state):
+    if state.get('batch_id') == 'batch-251' and state.get('dispatch'):
+        os._exit(89)
+    return save(path, state)
+delivery._atomic_json = interrupted_save
+"""
+
+    def setUp(self):
+        super().setUp()
+        self.env['USERPROFILE'] = str(self.home)
+        self.child_journal = self.home / '.cache' / 'agentorch' / 'batch-batch-251.json'
+        self.child_path = self.root / 'successor.json'
+        self.front = self.plan([self.task('T1', 'a.txt')])
+        self.child = self.plan([self.task('T2', 'b.txt')])
+        self.child['batch'].update(id='batch-251', branch='task/batch-251',
+                                   worktree=str(self.root / 'wt-next'), issue=251)
+        self.child['finalize']['authorization'] = 'authorization for batch 251'
+        self.child_path.write_text(json.dumps(self.child), encoding='utf-8')
+
+    def interrupt_finalize(self, hook, *args):
+        code = ('import os, sys\n'
+                'sys.path.insert(0, sys.argv[1])\n'
+                'from scripts import batch_delivery as delivery\n'
+                f'{hook}\n'
+                'sys.exit(delivery.main(sys.argv[2:]))\n')
+        result = subprocess.run(
+            [PY, '-c', code, str(SCRIPT.parents[1]), 'finalize',
+             '--plan', str(self.write_plan(self.front)), '--journal',
+             str(self.journal), *args], cwd=self.root, env=self.env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, timeout=180)
+        self.assertEqual(result.returncode, 89, result.stderr + result.stdout)
+
+    def finish_front_then_interrupt(self):
+        run = self.run_batch(self.front)
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        self.interrupt_finalize('delivery._continue_successor = lambda *a: os._exit(89)',
+                                *self.merge_flags, '--next-plan', str(self.child_path))
+        self.assertEqual(self.journal_data()['phase'], 'verified')
+        self.assertFalse(self.child_journal.exists())
+
+    def read_child(self):
+        return json.loads(self.child_journal.read_text(encoding='utf-8'))
+
+
+class GitHubSuccessorHandoffTests(SuccessorCase):
+    def setUp(self):
+        super().setUp()
+        self.gh_state.write_text(json.dumps({
+            'prs': [], 'calls': [], 'carriers': {
+                '250': {'number': 250, 'state': 'OPEN', 'body': ''},
+                '251': {'number': 251, 'state': 'OPEN',
+                        'labels': [{'name': 'status:ready'}],
+                        'body': '## 依赖\n- #250\n'},
+            }}), encoding='utf-8')
+
+    def change_registry(self, number, status):
+        state = json.loads(self.gh_state.read_text(encoding='utf-8'))
+        issue = state['carriers'][str(number)]
+        body = issue['body']
+        if delivery._registry_blocks(body):
+            previous = delivery._registry_value(delivery._registry_inner(body), 'status')
+            issue['body'] = body.replace('status: ' + previous, 'status: ' + status)
+        else:
+            issue['body'] += '\n' + delivery._registry_text([('status', status)])
+        self.gh_state.write_text(json.dumps(state), encoding='utf-8')
+
+    def assert_front_verified_without_successor(self):
+        state = self.journal_data()
+        self.assertEqual(state['phase'], 'verified')
+        self.assertEqual(state['tasks']['T1']['status'], 'VERIFIED')
+        self.assertIsNone(state['error'])
+        merge = state['merge']
+        self.assertEqual(merge['commit'], self.head(self.repo, 'main'))
+        self.assertEqual(merge['verified_sha'], merge['commit'])
+        self.assertEqual([check['exit'] for check in merge['post_verify']], [0])
+        github = json.loads(self.gh_state.read_text(encoding='utf-8'))
+        registry = delivery._registry_inner(github['carriers']['250']['body'])
+        self.assertEqual(delivery._registry_value(registry, 'status'), 'VERIFIED')
+        self.assertEqual(delivery._registry_value(registry, 'head_sha'), merge['commit'])
+        calls = self.gh_calls()
+        self.assertEqual(sum(call.startswith('pr merge ') for call in calls), 1)
+        self.assertFalse(any(call.startswith(('issue edit 251 ', 'issue comment 251 '))
+                             for call in calls))
+        self.assertFalse(self.child_journal.exists())
+        self.assertFalse((self.root / 'wt-next').exists())
+        self.assertEqual(len(self.session_files('exec')), 1)
+
+    def test_missing_successor_keeps_front_finalization_and_can_resume(self):
+        authorized = self.child_path.read_bytes()
+        self.child_path.unlink()
+        self.front['finalize']['next_plan'] = str(self.child_path)
+        run = self.run_batch(self.front)
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        reviewed = self.finalize(self.front, None, '--review')
+        self.assertEqual(reviewed.returncode, 0, reviewed.stderr + reviewed.stdout)
+        self.assertEqual(self.journal_data()['phase'], 'review')
+        done = self.finalize(self.front, None, *self.merge_flags)
+        self.assertEqual(done.returncode, 2, done.stderr + done.stdout)
+        self.assertIn('cannot read the batch plan', done.stderr)
+        self.assert_front_verified_without_successor()
+        state = self.journal_data()
+        self.assertNotIn('successor', state)
+        self.assertIsNone(state['next_plan'])
+        result = state['next_plan_result']
+        self.assertEqual(result['plan'], str(self.child_path))
+        self.assertIn('cannot read the batch plan', result['error'])
+
+        self.child_path.write_bytes(authorized)
+        pending = self.finalize(self.front, None, '--resume')
+        self.assertEqual(pending.returncode, 1, pending.stderr + pending.stdout)
+        self.assertIn('lacks a successor plan digest', pending.stderr)
+        self.assert_front_verified_without_successor()
+        corrected = self.root / 'corrected-successor.json'
+        corrected.write_bytes(authorized)
+        done = self.finalize(self.front, None, '--resume', '--next-plan',
+                             str(corrected))
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual(self.read_child()['phase'], 'verified')
+        self.assertEqual(sum(call.startswith('pr merge ') for call in self.gh_calls()), 2)
+        self.assertEqual(Path(self.journal_data()['next_plan']).resolve(),
+                         corrected.resolve())
+
+    def test_changed_successor_keeps_front_carrier_recovery(self):
+        authorized = self.child_path.read_bytes()
+        run = self.run_batch(self.front)
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        self.interrupt_finalize('delivery._carrier_github = lambda *a: os._exit(89)',
+                                *self.merge_flags, '--next-plan', str(self.child_path))
+        merged = self.journal_data()
+        self.assertEqual(merged['phase'], 'post_merge')
+        self.assertEqual(merged['merge']['state'], 'merged')
+        self.assertIsNone(merged['carrier'])
+
+        self.child['finalize']['authorization'] = 'changed authorization'
+        self.child_path.write_text(json.dumps(self.child), encoding='utf-8')
+        done = self.finalize(self.front, None, '--resume')
+        self.assertEqual(done.returncode, 2, done.stderr + done.stdout)
+        self.assertIn('authorization changed', done.stderr)
+        self.assert_front_verified_without_successor()
+        verified = self.journal_data()
+        self.assertEqual(verified['merge']['commit'], merged['merge']['commit'])
+        self.assertEqual(verified['successor'], merged['successor'])
+        self.assertIn('authorization changed', verified['next_plan_result']['error'])
+
+        self.child_path.write_bytes(authorized)
+        done = self.finalize(self.front, None, '--resume')
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual(self.read_child()['phase'], 'verified')
+        self.assertEqual(sum(call.startswith('pr merge ') for call in self.gh_calls()), 2)
+
+    def test_review_pr_and_failed_post_merge_do_not_dispatch_successor(self):
+        self.front['finalize']['post_merge_verify'] = [[
+            PY, '-c', 'import os; raise SystemExit(int(os.environ.get("POST_FAIL", 0)))']]
+        self.front['finalize']['next_plan'] = str(self.child_path)
+        run = self.run_batch(self.front)
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        for flags, env, phase, code in (
+                (('--review',), {}, 'review', 0),
+                (('--push', '--checks-timeout', '0'),
+                 {'FAKE_GH_CHECK_RUNS': '[]'}, 'blocked', 1),
+                (('--push',), {}, 'pr', 0),
+                (self.merge_flags, {'POST_FAIL': '1'}, 'blocked', 1)):
+            with self.subTest(flags=flags, env=env):
+                result = self.finalize(self.front, env, *flags)
+                self.assertEqual(result.returncode, code, result.stderr + result.stdout)
+                self.assertEqual(self.journal_data()['phase'], phase)
+                self.assertFalse(self.child_journal.exists())
+                self.assertFalse(any(call.startswith('issue edit 251')
+                                     for call in self.gh_calls()))
+        self.assertEqual(self.journal_data()['merge']['state'],
+                         'merged_but_post_verify_failed')
+        self.assertEqual(len(self.session_files('exec')), 1)
+
+    def test_recovers_before_and_after_registration_and_after_remote_merge(self):
+        self.finish_front_then_interrupt()
+        self.assertNotIn('next_plan_result', self.journal_data())
+        self.interrupt_finalize(self.crash_after_dispatch, '--resume')
+        self.assertIsNone(self.read_child()['dispatch'])
+        self.assertNotIn('next_plan_result', self.journal_data())
+        self.interrupt_finalize("""
+create = delivery._github_pr
+def interrupted_pr(plan, *args):
+    pr = create(plan, *args)
+    if plan['batch']['id'] == 'batch-251':
+        os._exit(89)
+    return pr
+delivery._github_pr = interrupted_pr
+""", '--resume')
+        self.assertIsNone(self.read_child()['pr'])
+        github = json.loads(self.gh_state.read_text(encoding='utf-8'))
+        github['prs'][1]['state'] = 'CLOSED'
+        self.gh_state.write_text(json.dumps(github), encoding='utf-8')
+        denied = self.finalize(self.front, None, '--resume')
+        self.assertEqual(denied.returncode, 1)
+        self.assertIn('does not match the recorded progress', denied.stderr)
+        github = json.loads(self.gh_state.read_text(encoding='utf-8'))
+        self.assertEqual(len(github['prs']), 2)
+        github['prs'][1]['state'] = 'OPEN'
+        self.gh_state.write_text(json.dumps(github), encoding='utf-8')
+        self.interrupt_finalize("""
+merge = delivery._merge_github
+def interrupted_merge(plan, *args):
+    commit = merge(plan, *args)
+    if plan['batch']['id'] == 'batch-251':
+        os._exit(89)
+    return commit
+delivery._merge_github = interrupted_merge
+""", '--resume')
+        self.assertEqual(self.read_child()['phase'], 'pr')
+        for _ in range(2):
+            done = self.finalize(self.front, None, '--resume')
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            self.assertEqual(self.read_child()['phase'], 'verified')
+        calls = self.gh_calls()
+        self.assertEqual(sum(call.startswith('pr create ') for call in calls), 2)
+        self.assertEqual(sum(call.startswith('pr merge ') for call in calls), 2)
+        self.assertTrue(all('--repo owner/name' in call for call in calls
+                            if call.startswith(('pr create ', 'pr merge '))))
+        self.assertEqual(sum(call.startswith('issue edit 251 ') for call in calls), 2)
+        self.assertEqual(len(self.session_files('exec')), 2)
+        self.assertEqual(len(self.session_files('rev')), 2)
+        self.assertEqual(self.read_child()['tasks']['T2']['attempts'], 1)
+        self.assertEqual(self.journal_data()['next_plan_result']['merge_commit'],
+                         self.head(self.repo))
+
+    def test_requires_post_merge_evidence_carrier_and_unchanged_authorization(self):
+        self.finish_front_then_interrupt()
+        verified_state = self.journal_data()
+        missing = self.journal_data()
+        missing['merge']['post_verify'] = []
+        self.journal.write_text(json.dumps(missing), encoding='utf-8')
+        done = self.finalize(self.front, None, '--resume')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('post-merge evidence', done.stderr)
+        self.journal.write_text(json.dumps(verified_state), encoding='utf-8')
+        self.change_registry(250, 'MERGED')
+        done = self.finalize(self.front, None, '--resume')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('registry status does not match', done.stderr)
+        self.change_registry(250, 'VERIFIED')
+        github = json.loads(self.gh_state.read_text(encoding='utf-8'))
+        github['carriers']['251']['labels'] = []
+        self.gh_state.write_text(json.dumps(github), encoding='utf-8')
+        done = self.finalize(self.front, None, '--resume')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('no authoritative READY status', done.stderr)
+        self.change_registry(251, 'NEEDS_HUMAN_DECISION')
+        done = self.finalize(self.front, None, '--resume')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('NEEDS_HUMAN_DECISION', done.stderr)
+        self.child['finalize']['authorization'] = 'another authorization'
+        self.child_path.write_text(json.dumps(self.child), encoding='utf-8')
+        done = self.finalize(self.front, None, '--resume')
+        self.assertEqual(done.returncode, 2)
+        self.assertIn('authorization changed', done.stderr)
+        self.assertFalse(self.child_journal.exists())
+        self.assertEqual(self.journal_data()['phase'], 'verified')
+
+    def test_legacy_start_proves_dependencies_and_preserves_conflict_locks(self):
+        self.child['tasks'].append(self.task('T3', 'c.txt', depends=['T2']))
+        self.child_path.write_text(json.dumps(self.child), encoding='utf-8')
+        self.finish_front_then_interrupt()
+        legacy = self.journal_data()
+        del legacy['successor']
+        self.journal.write_text(json.dumps(legacy), encoding='utf-8')
+        done = self.finalize(self.front, None, '--resume')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('legacy journal lacks a successor plan digest', done.stderr)
+        self.assertFalse(self.child_journal.exists())
+        github = json.loads(self.gh_state.read_text(encoding='utf-8'))
+        github['carriers']['251']['body'] = (
+            '## Dependencies\n- #250\n'
+            '- [Other prerequisite](https://github.com/owner/name/issues/252)\n'
+            '- Both issues must pass verification on the main branch.\n'
+            '## T3\n### 依赖\nT2（批内依赖）\n')
+        github['carriers']['252'] = {
+            'number': 252, 'state': 'OPEN',
+            'body': delivery._registry_text([('status', 'MERGED'),
+                                            ('locked_paths', 'b.txt')])}
+        self.gh_state.write_text(json.dumps(github), encoding='utf-8')
+        flags = ('--resume', '--next-plan', str(self.child_path))
+        done = self.finalize(self.front, None, *flags)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('dependency #252 is not VERIFIED', done.stderr)
+        self.assertFalse(self.child_journal.exists())
+        self.change_registry(252, 'VERIFIED')
+        done = self.finalize(self.front, {'FAKE_GH_OPEN_PR_FILES': '["b.txt"]'}, *flags)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('open PR #90', done.stderr)
+        self.assertFalse(self.child_journal.exists())
+        self.assertEqual(len(self.session_files('exec')), 1)
+        done = self.finalize(self.front, None, '--resume')
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        child = self.read_child()
+        self.assertEqual(child['phase'], 'verified')
+        self.assertEqual({task['status'] for task in child['tasks'].values()},
+                         {'VERIFIED'})
+
+    def test_attached_successor_reuses_pending_request(self):
+        self.child['executor_adapter'] = {
+            'transport': 'attached', 'name': 'test-host',
+            'capabilities': {f'C{index}': 'PASS' for index in range(1, 5)},
+            'capability_evidence': 'https://example.invalid/probe'}
+        self.child_path.write_text(json.dumps(self.child), encoding='utf-8')
+        self.finish_front_then_interrupt()
+        first = self.finalize(self.front, None, '--resume')
+        self.assertEqual(first.returncode, 3, first.stderr + first.stdout)
+        pending = self.read_child()['tasks']['T2']['awaiting_host']
+        self.assertTrue(Path(pending['request_path']).is_file())
+        second = self.finalize(self.front, None, '--resume')
+        self.assertEqual(second.returncode, 3, second.stderr + second.stdout)
+        self.assertEqual(self.read_child()['tasks']['T2']['awaiting_host'], pending)
+        self.assertEqual(self.read_child()['tasks']['T2']['attempts'], 1)
+        self.assertEqual(len(self.session_files('exec')), 1)
+        self.assertEqual(sum(call.startswith('pr create ') for call in self.gh_calls()), 1)
+
+
+class LocalSuccessorHandoffTests(SuccessorCase):
+    edition = 'local'
+
+    def _repository(self):
+        super()._repository()
+        (self.repo / 'scripts').mkdir()
+        source = SCRIPT.with_name('orchestrator.py')
+        (self.repo / 'scripts' / source.name).write_bytes(source.read_bytes())
+        (self.repo / 'docs' / 'PLAN.md').write_text('# Fixture project plan\n')
+        _git(self.repo, 'add', 'scripts/orchestrator.py', 'docs/PLAN.md')
+        _git(self.repo, 'commit', '-q', '-m', 'add fixture task carrier')
+
+    def orchestrate(self, *args):
+        completed = subprocess.run(
+            [PY, str(self.repo / 'scripts' / 'orchestrator.py'), *args],
+            cwd=self.repo, env=self.env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+        return completed.stdout
+
+    def add_record(self, task, *deps):
+        self.orchestrate('task', 'add', '--id', task['id'], '--title', task['title'],
+                         '--paths', *task['paths'], '--acceptance', *task['acceptance'],
+                         '--depends', *deps)
+
+    def setUp(self):
+        super().setUp()
+        self.orchestrate('init')
+        self.add_record(self.front['tasks'][0])
+        self.add_record(self.child['tasks'][0], 'T1')
+
+    def test_unreadable_successor_keeps_local_front_finalization(self):
+        self.child_path.write_text('{', encoding='utf-8')
+        run = self.run_batch(self.front)
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        done = self.finalize(self.front, None, *self.merge_flags,
+                             '--next-plan', self.child_path.name)
+        self.assertEqual(done.returncode, 2, done.stderr + done.stdout)
+        self.assertIn('cannot read the batch plan', done.stderr)
+        state = self.journal_data()
+        self.assertEqual(state['phase'], 'verified')
+        self.assertEqual(state['tasks']['T1']['status'], 'VERIFIED')
+        self.assertIsNone(state['error'])
+        self.assertIsNone(state['next_plan'])
+        self.assertNotIn('successor', state)
+        merge = state['merge']
+        self.assertEqual(merge['state'], 'merged')
+        self.assertEqual(merge['commit'], self.head(self.repo, 'main'))
+        self.assertEqual(merge['verified_sha'], merge['commit'])
+        self.assertEqual([check['exit'] for check in merge['post_verify']], [0])
+        # The recorded attempt is absolutized without expanding symlinks; the
+        # operator passed a name relative to the repository root.
+        recorded = state['next_plan_result']['plan']
+        self.assertTrue(Path(recorded).is_absolute())
+        self.assertEqual(Path(recorded).resolve(), self.child_path.resolve())
+        self.assertIn('cannot read the batch plan', state['next_plan_result']['error'])
+        self.assertIn('Status: VERIFIED', self.orchestrate('task', 'show', 'T1'))
+        self.assertIn('Status: PLANNED', self.orchestrate('task', 'show', 'T2'))
+        self.assertFalse(self.child_journal.exists())
+        self.assertEqual(self.count_merges(self.repo, 'main'), 2)
+        self.assertEqual(len(self.session_files('exec')), 1)
+
+    def test_recovers_real_sqlite_dispatch_without_taking_lock_twice(self):
+        other = self.task('T3', 'b.txt')
+        self.add_record(other)
+        self.orchestrate('task', 'ready', 'T3')
+        self.orchestrate('task', 'dispatch', 'T3')
+        self.finish_front_then_interrupt()
+        done = self.finalize(self.front, None, '--resume')
+        self.assertEqual(done.returncode, 1)
+        self.assertIsNone(self.read_child()['dispatch'])
+        self.assertIn('Status: PLANNED', self.orchestrate('task', 'show', 'T2'))
+        self.assertIn('locks: b.txt', self.orchestrate('task', 'list'))
+        self.orchestrate('task', 'status', 'T3', 'CANCELED',
+                         '--note', 'release the fixture conflict')
+        self.interrupt_finalize(self.crash_after_dispatch, '--resume')
+        self.assertIn('Status: DISPATCHED', self.orchestrate('task', 'show', 'T2'))
+        self.assertIsNone(self.read_child()['dispatch'])
+        for _ in range(2):
+            done = self.finalize(self.front, None, '--resume')
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        note = self.orchestrate('task', 'show', 'T2')
+        self.assertIn('Status: VERIFIED', note)
+        self.assertEqual(note.count('TASK_DISPATCHED'), 1)
+        self.assertEqual(len(self.session_files('exec')), 2)
+        self.assertEqual(self.count_merges(self.repo, 'main'), 4)
+        self.assertFalse(self.gh_state.exists())
+
+    def test_local_external_dependency_blocks_before_dispatch(self):
+        self.add_record(self.task('T3', 'c.txt'))
+        third = self.task('T4', 'd.txt')
+        self.add_record(third, 'T3')
+        self.child['tasks'].append(third)
+        self.child_path.write_text(json.dumps(self.child), encoding='utf-8')
+        self.finish_front_then_interrupt()
+        done = self.finalize(self.front, None, '--resume')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('local dependency T3 is not VERIFIED', done.stderr)
+        self.assertFalse(self.child_journal.exists())
+        self.assertIn('Status: PLANNED', self.orchestrate('task', 'show', 'T2'))
+        self.assertEqual(len(self.session_files('exec')), 1)
 
 
 class ReviewDiffTests(BatchCase):
