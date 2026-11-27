@@ -1,8 +1,7 @@
 # 批次工具终止流与工作树边界契约
 
-> **状态**：冻结候选（`FROZEN-CANDIDATE`）：契约文本由 Issue #263 提交冻结审查，合并到 `main` 后才生效；开放决定见 §7。
-> **实现状态**：`NOT_IMPLEMENTED`。除标注 `CURRENT` 的规则外，本文要求的行为尚未在 `main` 上实现；不得把本文当作“已实现”或“#261/#262 已修复”的证据。
-> **证据基线**：`main` @ `490d31e87aa2f715e95a68fb3b7be358cf90b8c0`。代码位置均相对该 SHA 的 `scripts/batch_delivery.py`。
+> **状态**：Issue #263 冻结的契约已合入 `main`。Windows 进程树停止证明已由 #267 交付，见 §1.6。开放决定见 §7。 [#263 冻结记录](https://github.com/ctrlshiftaltdel/AgentOrch/issues/263)
+> **证据基线**：未另注明版本的代码位置和实现状态均引用 #263 冻结时采用的 `490d31e87aa2f715e95a68fb3b7be358cf90b8c0` 基线。#267 的 Windows 证明引用合入提交 `598d806a06feeefab6ab34c829e25b011656effb`。 [#267 验收记录](https://github.com/ctrlshiftaltdel/AgentOrch/issues/267#issuecomment-7105358952)
 > **设计输入**：Issue #263 正文；#261 的 5 轮审查 findings；#262 的 5 轮审查 findings。Issue #261 / #262 已取消，**不是**待修复对象。
 > **文本约束**：本文只凭文字成立，不依赖图片；所有规则都给出可观察输入与要求结果。
 
@@ -12,14 +11,14 @@
 
 | 标记 | 含义 |
 |---|---|
-| `CURRENT` | `main` 当前代码已实现，且可由代码位置或命令输出观察。 |
-| `REQUIRED` | 本契约要求、但 `main` 当前代码**未实现**；由后续切片实现，不得提前声称完成。 |
+| `CURRENT` | 在所引用的代码基线上已实现，可由代码位置或命令输出观察。 |
+| `REQUIRED` | 契约要求在所引用的基线上尚未实现。后续交付以对应任务的验收证据为准。 |
 | `NEEDS_HUMAN_DECISION` | 现有证据不足以判定语义，或会改变产品行为 / 权限 / 锁 / 状态机；由项目所有者决定，执行者不得自行选择。 |
 
 ### 0.2 总原则
 
 1. **失败关闭（fail-closed）**：任何无法逐字节、逐字段判定为成功的结果，一律按失败处理；`UNKNOWN`、`NOT_RUN`、`BLOCKED`、超时、空输出、不可解析输入都不等于成功。
-2. **证据绑定 head**：本文的 `CURRENT` 判断只绑定 `490d31e` 的代码；`head` 变化后必须重新核对，不得把旧结论套到新 head。
+2. **证据绑定 head**。`CURRENT` 判断只适用于所引用的代码基线。待审 head 变化后必须重新核对。
 3. **契约不授权实现**：本文冻结“输入满足什么条件才算成功、边界如何证明”，不新增命令、不改变状态机、不授权自动合并。
 4. **不可判定即拒绝**：字段缺失、重复、未知、分隔符不完整、编码无法还原、路径无法证明包含关系时，要求结果是失败，而不是“尽力解析”。
 
@@ -109,13 +108,20 @@
 
 | ID | 可观察输入 | 要求结果 | 来源 | 状态 |
 |---|---|---|---|---|
-| STOP-18 | 子进程超过 timeout，`_kill_group` 已发出 kill（POSIX `killpg(SIGKILL)`；Windows `taskkill /F /T /PID`） | 记录“终止尝试已发出”；不得因此判成功 | `scripts/batch_delivery.py:983-1003、1022-1026` | `CURRENT` |
+| STOP-18 | 子进程超过 timeout 后发出终止请求（POSIX `killpg(SIGKILL)`，Windows 对已绑定的 Job 调用 `TerminateJobObject`） | 单独记录终止尝试。停止证明按 STOP-19 或 STOP-24 判定。 | POSIX 冻结基线 `scripts/batch_delivery.py:983-1003、1022-1026`；[#267 Windows 终止路径](https://github.com/ctrlshiftaltdel/AgentOrch/blob/598d806a06feeefab6ab34c829e25b011656effb/scripts/batch_delivery.py#L2486-L2548) | `CURRENT` |
 | STOP-19 | `communicate()` 在宽限期内返回，且 POSIX 上 `killpg(pgid, 0)` 抛 `ProcessLookupError` | 才可记“终止已证明”（`stopped = True`） | `scripts/batch_delivery.py:1006-1019` | `CURRENT`（POSIX） |
 | STOP-20 | 直接子进程已退出，但进程组仍存在；或只删除了 pid 文件；或只看 return code | **不得**视为终止已证明；必须继续按未证明处理 | #261 第 5 轮 finding 2；`_prove_stopped:1011-1019` | `REQUIRED`（当前实现未覆盖“子进程退出但同组后台进程存活”的全部路径） |
 | STOP-21 | `stopped = True` 的超时 | 任务记 `FAILED`；不得记成功；不得把已产生的 stdout 当作可采纳流 | `_agent:1075-1080`；`_execute_task:1736-1738`；`_verify_task:1699-1703` | `CURRENT` |
-| STOP-22 | `stopped = False` 或无法证明（含 Windows 当前恒不可证明） | 任务 `FAILED`，并 halt：所有仍 `PENDING` 的任务转 `BLOCKED`；在证明终止前不得复用该 worktree、不得 `--resume`、不得 `--retry` | `_execute_task:1736-1738`；`_verify_task:1700-1703`；`command_run:1933-1937、1952-1958`；`_prove_stopped:1011-1012`（Windows 返回 False） | `CURRENT`（halt 语义）；`REQUIRED`（retry/resume 的前置证明，见 S1） |
+| STOP-22 | 当前执行或验证 attempt 未能证明终止（含 Windows Job 证明失败，见 STOP-24） | 任务 `FAILED`，并 halt。所有仍 `PENDING` 的任务转 `BLOCKED`。复用守卫在缺证时拒绝 worktree 复用、`--resume` 和 `--retry`，保留原 attempt 记录。 | 冻结基线 `_execute_task:1736-1738`、`_verify_task:1700-1703`、`command_run:1933-1937、1952-1958`；[#267 验收](https://github.com/ctrlshiftaltdel/AgentOrch/issues/267#issuecomment-7105358952)、[复用守卫](https://github.com/ctrlshiftaltdel/AgentOrch/blob/598d806a06feeefab6ab34c829e25b011656effb/scripts/batch_delivery.py#L2309-L2320) | `CURRENT`（halt 规则及 #267 Windows 复用守卫） |
 | STOP-23 | 超时同时 stdout 中出现 `stop` | 仍失败；超时判定优先于流内容 | `_agent:1075-1080`；`_classify_stream` 未被调用 | `CURRENT` |
-| STOP-24 | Windows 上 `_prove_stopped` 的当前实现 | 恒返回 `False`；所有超时都按“未能证明终止”处理（halt）。这是平台限制，不是成功 | `scripts/batch_delivery.py:1011-1012` | `CURRENT`；平台证明能力 `NEEDS_HUMAN_DECISION` |
+| STOP-24 | Windows 上由工具启动的 executor / verifier | 创建启用 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的具名 Job Object，挂起绑定子进程并持久化 Job 名称、pid 和身份 token 后才允许运行。超时时终止 Job 并在回收直接子进程后复查，查得 `ActiveProcesses == 0` 才证明已绑定进程树停止。 | [#267 绑定与记录](https://github.com/ctrlshiftaltdel/AgentOrch/blob/598d806a06feeefab6ab34c829e25b011656effb/scripts/batch_delivery.py#L1494-L1566)、[终止与证明](https://github.com/ctrlshiftaltdel/AgentOrch/blob/598d806a06feeefab6ab34c829e25b011656effb/scripts/batch_delivery.py#L2486-L2548) | `CURRENT`（#267 Windows） |
+
+**Windows 复用复查（#267）**。复用已有 worktree、`--resume` 或 `--retry` 前，按原 attempt 的 `executor.job` 和 `verifiers[].job` 记录检查相应进程树。
+
+- 具名 Job 仍可打开时，查询的 `ActiveProcesses` 必须为 0。终止调用成功、直接子进程退出或 PID 枚举结果为空时，仍须证明进程树停止。批次工具为自己启动的进程记录 Job。附着执行的 Agent 仍由宿主管理。 [#267 合入前审查](https://github.com/ctrlshiftaltdel/AgentOrch/pull/282#issuecomment-7104451817)
+- `OpenJobObjectW` 只在返回 `ERROR_FILE_NOT_FOUND` 时把具名 Job 视为已销毁。该结果可复查已有的停止证明，也适用于 Job 已绑定而协调器中断、尚未尝试证明的记录，此时最后一个句柄关闭触发内核终止。若此前的查询已记录仍有成员或未能证明停止，Job 名称消失后仍按缺证处理。 [Job 复查实现](https://github.com/ctrlshiftaltdel/AgentOrch/blob/598d806a06feeefab6ab34c829e25b011656effb/scripts/batch_delivery.py#L2041-L2105)
+- 查询失败、活跃进程数非零、Job 证明记录缺失或损坏时，按 STOP-22 处置。已有执行记录的旧 Windows journal 缺少 Job 记录时保持阻断。 [旧 journal 用例](https://github.com/ctrlshiftaltdel/AgentOrch/blob/598d806a06feeefab6ab34c829e25b011656effb/tests/test_batch_delivery.py#L2887-L2915)
+- 绑定失败时，停止证明依赖从未入 Job 的挂起子进程已终止并被回收的单独记录。复用仍须通过原守卫。 [未绑定子进程回收实现](https://github.com/ctrlshiftaltdel/AgentOrch/blob/598d806a06feeefab6ab34c829e25b011656effb/scripts/batch_delivery.py#L1453-L1479)
 
 **处置顺序**：先判超时；超时即失败。只有非超时才读取 stdout 并进入 §1.2–§1.5。`stopped` 只决定“是否允许继续使用 worktree 和是否 halt”，从不决定流是否成功。
 
@@ -128,9 +134,9 @@
 | STOP-27 | 终止后的任何重放 | 每次 `--resume` / `--retry` 都创建新 attempt，`attempts` 递增；旧 attempt 的证据保留，不得清空后假装没有发生 | 复用旧 session 结果；把旧 head 当作新 head 的通过证据；用 `--resume` 绕过失败流 | #261 第 5 轮 finding 4/5；`command_run:1939-1940` | `CURRENT`（`attempts` 递增）；attempt 历史 `REQUIRED`（S1） |
 | STOP-28 | 失败流后的任何继续 | 只有在 §1.5 判定失败后，才允许把任务标为 `FAILED`；不得以“stdout 有 stop 片段”或“进程退出 0”翻案 | 把 `FAILED` 写成 `INTEGRATED`；把失败流的正文当作交付内容 | `_execute_task:1739-1741`；#261 第 5 轮 finding 6 | `CURRENT` |
 
-**关键约束**：`--resume` 与 `--retry` 都**不能**让一条违反 §1.2–§1.5 的流变成成功。它们只能开启新的 attempt；新 attempt 必须重新产生合法流。
+**关键约束**：`--resume` 与 `--retry` 都**不能**让一条违反 §1.2–§1.5 的流变成成功。它们只能开启新的 attempt；新 attempt 必须重新产生合法流。Windows 上的停止前置条件见 STOP-22 与 STOP-24。
 
-### 1.8 OpenCode 终止后事件与语义未决项
+### 1.8 终止流的决定与未决项
 
 | ID | 问题 | 现有证据 | 处置 |
 |---|---|---|---|
@@ -138,7 +144,7 @@
 | STOP-HD-2 | 是否只允许 `retry` 生命周期事件（#262 T1 的实现方向）？ | #262 第 4 轮判定 T1 AC-1/2/3 PASS，但第 5 轮仍因工作树边界失败；该放宽未合并。第 3 轮同时指出 `retry`-only 不足以覆盖真实继续序列 | `NEEDS_HUMAN_DECISION`：不得把“retry-only”写成已冻结契约或已修复。 |
 | STOP-HD-3 | `step_finish.reason` 是否还有 `stop` / `tool-calls` / `tool_calls` 之外的合法值？ | 现有代码只接受这三个值（`_classify_stream:962-965`）；未对全部 provider / 版本穷举 | `NEEDS_HUMAN_DECISION`：新增值必须由真实流证据 + 新契约冻结引入；当前按未知 finish reason 失败（STOP-10）。 |
 | STOP-HD-4 | 一次调用是否可能出现多个 `stop`？ | 现有代码在第二个终止事件处失败（STOP-14）；未观察到合法多 stop | 当前契约要求恰好一个；若真实运行出现多 stop，按失败处理，需所有者决定是否改契约。 |
-| STOP-HD-5 | Windows 上如何“证明”进程组终止？ | 当前 `_prove_stopped` 对 Windows 恒返回 False（`1011-1012`）；没有平台级证明 | `NEEDS_HUMAN_DECISION`：是否实现 Windows 证明、使用何种句柄/作业对象；在此之前 Windows 超时一律 halt。 |
+| STOP-HD-5 | Windows 上如何证明进程树终止？ | #267 已实现并验证 Job Object 证明。真实 Windows 测试覆盖直接子进程退出后的孤儿孙进程。 [#267 PR CI](https://github.com/ctrlshiftaltdel/AgentOrch/actions/runs/45193902290) [#267 验收](https://github.com/ctrlshiftaltdel/AgentOrch/issues/267#issuecomment-7105358952) | 已决定（HD-2）。按 STOP-24 证明停止，缺证按 STOP-22 halt。 |
 
 ---
 
@@ -324,6 +330,8 @@ worktree D:/Users/.../AgentOrch<NUL>HEAD 490d31e...<NUL>branch refs/heads/main<N
 
 ## 4. 可追溯矩阵
 
+未注明 #267 的代码行号与实现状态均沿用 #263 冻结时的基线。
+
 | Finding / 证据 | 本文规则 | 说明 |
 |---|---|---|
 | #262 第 3 轮：`stop` 后仍有后台 shell 结果与第二个 assistant 响应；`retry`-only 不足 | STOP-14、STOP-16、STOP-HD-1、STOP-HD-2 | 终止后任何非空事件失败；放宽需人工决定。 |
@@ -343,21 +351,22 @@ worktree D:/Users/.../AgentOrch<NUL>HEAD 490d31e...<NUL>branch refs/heads/main<N
 | #261 第 3 轮 finding 1：执行器存活未证明 | STOP-22、S1 | 存活证明。 |
 | #261 第 3 轮 finding 2：head 未在验证前落盘 | S2 不变量 2、4 | 观测证据保留。 |
 | 当前代码 `_classify_stream:918-977` | STOP-01–STOP-17 | 已实现的流判定。 |
-| 当前代码 `_stop_timed_out:1022-1026` / `_prove_stopped:1006-1019` | STOP-18–STOP-24 | 终止尝试与证明。 |
+| 冻结基线 `_stop_timed_out:1022-1026` / `_prove_stopped:1006-1019` | STOP-18–STOP-24 | 原终止尝试与 POSIX 证明。Windows 当时缺少平台级证明。 |
 | 当前代码 `_prepare_batch_worktree:1206-1231` / `_prepare_task_worktree:1638-1668` | WT-12、S1/S2 前置条件 | 现有 worktree 身份检查；不解析完整 porcelain。 |
 | 当前代码 `_apply_retry:1765-1793` | STOP-26、S2 | 现有 retry 条件。 |
 | 当前代码 `_normalize_interrupted:1812-1825` | STOP-25 | 现有 resume 条件。 |
 | 当前代码 `_resolve_journal:805-819` | WT-29、WT-31 | 现有 journal 边界只覆盖 repo / worktree 路径，未覆盖 linked worktree 与 common dir。 |
-| 当前代码 `_agent:1059-1081` | STOP-18–STOP-24、WT-33 | argv prompt 与 timeout。 |
+| 冻结基线 `_agent:1059-1081` | STOP-18–STOP-24、WT-33 | argv prompt 与原 timeout 路径。 |
+| [#267 合入前审查](https://github.com/ctrlshiftaltdel/AgentOrch/pull/282#issuecomment-7104451817)、[真实 Windows CI](https://github.com/ctrlshiftaltdel/AgentOrch/actions/runs/45193902290)、[合并后验收](https://github.com/ctrlshiftaltdel/AgentOrch/issues/267#issuecomment-7105358952) | STOP-18、STOP-22、STOP-24、STOP-HD-5、HD-2 | Windows Job 在子进程运行前绑定。进程树终止可复查，缺证继续 halt。 |
 
 ---
 
 ## 5. 明确不声称的事项
 
 1. 本文**不**声称 #261 / #262 的任何 finding 已修复。两 Issue 均 `CANCELED`；其分支 head 不是本契约的实现证据。
-2. 本文**不**声称 #250 AC5 已完成。AC5 仍为 `OPEN` / 未完成；S1、S2 均未派发、未实现。
+2. §3 保留 #263 冻结时的 S1 / S2 切片定义。#250 AC5 的整体验收仍需连续批次与恢复证据。 [#250 进度记录](https://github.com/ctrlshiftaltdel/AgentOrch/issues/250#issuecomment-7142671710)
 3. 本文**不**新增或改变任务状态机、锁、journal、分支或证据格式；不改 `AGENTS.md`、`kit/`、`editions/`、`templates/`、CI 或发行包。
-4. 本文的 `CURRENT` 只对 `490d31e` 的代码负责。任何 head 前进都必须重新核对行号与行为。
+4. `CURRENT` 的行号与行为应按所标基线核对。任何 head 前进都必须重新取证。
 5. 本文的 `REQUIRED` 规则在实现前不得被引用为“工具已具备该能力”。
 
 ---
@@ -382,6 +391,7 @@ worktree D:/Users/.../AgentOrch<NUL>HEAD 490d31e...<NUL>branch refs/heads/main<N
 - 把“已修复”写成结论但没有当前 head 证据。
 - 把 AC5 写成一个大切片，或让 S1 / S2 混入工具修复。
 - 用 `--resume` / `--retry` 把失败流翻成成功。
+- 在 Windows 上把 Job 查询失败、非零活跃进程数或旧 journal 缺证当作可复用。
 
 ### 6.3 migration_cases
 
@@ -402,12 +412,12 @@ worktree D:/Users/.../AgentOrch<NUL>HEAD 490d31e...<NUL>branch refs/heads/main<N
 
 ---
 
-## 7. 需要所有者决定的事项汇总
+## 7. 所有者决定与开放事项
 
-| ID | 问题 | 选项 | 推荐 |
+| ID | 问题 | 选项 | 推荐或决定 |
 |---|---|---|---|
 | HD-1 | `stop` 之后是否允许任何事件（尤其 `retry` 生命周期事件）？ | A. 全部拒绝（本文当前规则）；B. 只允许 `retry`；C. 允许特定继续序列 | A，最保守；若选 B/C，必须先提供真实流 fixture 并改契约。 |
-| HD-2 | Windows 上如何证明进程组终止？ | A. 维持“不可证明即 halt”；B. 引入作业对象 / 句柄证明 | A 可立即保持安全边界；B 需要单独设计与测试。 |
+| HD-2 | Windows 上如何证明进程树终止？ | A. 缺证即 halt，#265 S1 阶段因此禁用 Windows 复用。B. 所有者指定 Job Object 作为 P0 后续。 | B 已由 #267 实现并验证。Windows 复用须先满足 §1.6 的停止证明，缺证继续按 STOP-22 halt。 [所有者决定](https://github.com/ctrlshiftaltdel/AgentOrch/issues/265#issuecomment-7055045574) [#267 验收](https://github.com/ctrlshiftaltdel/AgentOrch/issues/267#issuecomment-7105358952) |
 | HD-3 | bare 仓库是否纳入 prompt 临时文件边界？ | A. 失败关闭；B. 定义 bare 专用边界 | A，直到有真实使用场景。 |
 | HD-4 | Windows 真实路径 / 大小写 / reparse point 的包含判断规则 | A. 不可证明即失败；B. 冻结具体 API 与大小写规则 | A，先失败关闭；B 作为后续平台任务。 |
 | HD-5 | S1 / S2 的实现顺序与是否允许并行 | A. 串行 S1 → S2；B. 允许并行（同一文件，不建议） | A；两片改同一文件，路径锁要求串行。 |
