@@ -6530,7 +6530,33 @@ def command_finalize(args):
         raise InputError(f'no batch journal at {journal}; run the batch first')
     with _Lock(journal):
         state = _read_batch_journal(journal, plan)
-        selected = _successor_plan(plan, state, journal, args)
+        # Bind valid plans before the merge so a restart can find the same plan.
+        # A successor selection error is recorded separately: it must not block
+        # the front batch from finishing on its own evidence and authorization.
+        selection_error = None
+        try:
+            selected = _successor_plan(plan, state, journal, args)
+        except (InputError, BatchError, OSError, subprocess.SubprocessError,
+                ValueError, RuntimeError) as exc:
+            selected = None
+            if isinstance(exc, (ValueError, RuntimeError)):
+                selection_error = InputError(
+                    f'cannot inspect the successor plan: {exc}')
+            else:
+                selection_error = exc
+            # Record the attempted path only in the result, never as the
+            # journal's plan: an unvalidated path must stay replaceable by a
+            # corrected --next-plan (the front plan digest pins the default).
+            attempted = (state.get('next_plan') or args.next_plan
+                         or plan['finalize']['next_plan'])
+            if attempted is not None:
+                try:
+                    attempted = str(Path(attempted).expanduser().resolve())
+                except (OSError, ValueError, RuntimeError):
+                    attempted = str(attempted)
+            state['next_plan_result'] = {'plan': attempted,
+                                         'error': str(selection_error)}
+            _atomic_json(journal, state)
         if (selected and state.get('successor') is None
                 and (args.next_plan or (state.get('phase') != 'verified'
                                        and not state.get('next_plan')))):
@@ -6538,11 +6564,15 @@ def command_finalize(args):
             state.update(next_plan=str(path), successor=identity)
             _atomic_json(journal, state)
         code = _finish_batch(plan, state, journal, args)
-        if code or state.get('phase') != 'verified' or not selected:
+        if code or state.get('phase') != 'verified':
             return code
+        if selection_error is not None:
+            raise selection_error
+        if not selected:
+            return 0
         try:
             code, result = _continue_successor(plan, state, journal, selected, args)
-        except (BatchError, InputError) as exc:
+        except (BatchError, InputError, OSError, subprocess.SubprocessError) as exc:
             state['next_plan_result'] = {'plan': str(selected[0]), 'error': str(exc)}
             _atomic_json(journal, state)
             raise

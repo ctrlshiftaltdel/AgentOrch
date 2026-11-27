@@ -2150,6 +2150,89 @@ class GitHubSuccessorHandoffTests(SuccessorCase):
             issue['body'] += '\n' + delivery._registry_text([('status', status)])
         self.gh_state.write_text(json.dumps(state), encoding='utf-8')
 
+    def assert_front_verified_without_successor(self):
+        state = self.journal_data()
+        self.assertEqual(state['phase'], 'verified')
+        self.assertEqual(state['tasks']['T1']['status'], 'VERIFIED')
+        self.assertIsNone(state['error'])
+        merge = state['merge']
+        self.assertEqual(merge['commit'], self.head(self.repo, 'main'))
+        self.assertEqual(merge['verified_sha'], merge['commit'])
+        self.assertEqual([check['exit'] for check in merge['post_verify']], [0])
+        github = json.loads(self.gh_state.read_text(encoding='utf-8'))
+        registry = delivery._registry_inner(github['carriers']['250']['body'])
+        self.assertEqual(delivery._registry_value(registry, 'status'), 'VERIFIED')
+        self.assertEqual(delivery._registry_value(registry, 'head_sha'), merge['commit'])
+        calls = self.gh_calls()
+        self.assertEqual(sum(call.startswith('pr merge ') for call in calls), 1)
+        self.assertFalse(any(call.startswith(('issue edit 251 ', 'issue comment 251 '))
+                             for call in calls))
+        self.assertFalse(self.child_journal.exists())
+        self.assertFalse((self.root / 'wt-next').exists())
+        self.assertEqual(len(self.session_files('exec')), 1)
+
+    def test_missing_successor_keeps_front_finalization_and_can_resume(self):
+        authorized = self.child_path.read_bytes()
+        self.child_path.unlink()
+        self.front['finalize']['next_plan'] = str(self.child_path)
+        run = self.run_batch(self.front)
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        reviewed = self.finalize(self.front, None, '--review')
+        self.assertEqual(reviewed.returncode, 0, reviewed.stderr + reviewed.stdout)
+        self.assertEqual(self.journal_data()['phase'], 'review')
+        done = self.finalize(self.front, None, *self.merge_flags)
+        self.assertEqual(done.returncode, 2, done.stderr + done.stdout)
+        self.assertIn('cannot read the batch plan', done.stderr)
+        self.assert_front_verified_without_successor()
+        state = self.journal_data()
+        self.assertNotIn('successor', state)
+        self.assertIsNone(state['next_plan'])
+        result = state['next_plan_result']
+        self.assertEqual(result['plan'], str(self.child_path))
+        self.assertIn('cannot read the batch plan', result['error'])
+
+        self.child_path.write_bytes(authorized)
+        pending = self.finalize(self.front, None, '--resume')
+        self.assertEqual(pending.returncode, 1, pending.stderr + pending.stdout)
+        self.assertIn('lacks a successor plan digest', pending.stderr)
+        self.assert_front_verified_without_successor()
+        corrected = self.root / 'corrected-successor.json'
+        corrected.write_bytes(authorized)
+        done = self.finalize(self.front, None, '--resume', '--next-plan',
+                             str(corrected))
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual(self.read_child()['phase'], 'verified')
+        self.assertEqual(sum(call.startswith('pr merge ') for call in self.gh_calls()), 2)
+        self.assertEqual(self.journal_data()['next_plan'], str(corrected))
+
+    def test_changed_successor_keeps_front_carrier_recovery(self):
+        authorized = self.child_path.read_bytes()
+        run = self.run_batch(self.front)
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        self.interrupt_finalize('delivery._carrier_github = lambda *a: os._exit(89)',
+                                *self.merge_flags, '--next-plan', str(self.child_path))
+        merged = self.journal_data()
+        self.assertEqual(merged['phase'], 'post_merge')
+        self.assertEqual(merged['merge']['state'], 'merged')
+        self.assertIsNone(merged['carrier'])
+
+        self.child['finalize']['authorization'] = 'changed authorization'
+        self.child_path.write_text(json.dumps(self.child), encoding='utf-8')
+        done = self.finalize(self.front, None, '--resume')
+        self.assertEqual(done.returncode, 2, done.stderr + done.stdout)
+        self.assertIn('authorization changed', done.stderr)
+        self.assert_front_verified_without_successor()
+        verified = self.journal_data()
+        self.assertEqual(verified['merge']['commit'], merged['merge']['commit'])
+        self.assertEqual(verified['successor'], merged['successor'])
+        self.assertIn('authorization changed', verified['next_plan_result']['error'])
+
+        self.child_path.write_bytes(authorized)
+        done = self.finalize(self.front, None, '--resume')
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual(self.read_child()['phase'], 'verified')
+        self.assertEqual(sum(call.startswith('pr merge ') for call in self.gh_calls()), 2)
+
     def test_review_pr_and_failed_post_merge_do_not_dispatch_successor(self):
         self.front['finalize']['post_merge_verify'] = [[
             PY, '-c', 'import os; raise SystemExit(int(os.environ.get("POST_FAIL", 0)))']]
@@ -2347,6 +2430,33 @@ class LocalSuccessorHandoffTests(SuccessorCase):
         self.orchestrate('init')
         self.add_record(self.front['tasks'][0])
         self.add_record(self.child['tasks'][0], 'T1')
+
+    def test_unreadable_successor_keeps_local_front_finalization(self):
+        self.child_path.write_text('{', encoding='utf-8')
+        run = self.run_batch(self.front)
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        done = self.finalize(self.front, None, *self.merge_flags,
+                             '--next-plan', self.child_path.name)
+        self.assertEqual(done.returncode, 2, done.stderr + done.stdout)
+        self.assertIn('cannot read the batch plan', done.stderr)
+        state = self.journal_data()
+        self.assertEqual(state['phase'], 'verified')
+        self.assertEqual(state['tasks']['T1']['status'], 'VERIFIED')
+        self.assertIsNone(state['error'])
+        self.assertIsNone(state['next_plan'])
+        self.assertNotIn('successor', state)
+        merge = state['merge']
+        self.assertEqual(merge['state'], 'merged')
+        self.assertEqual(merge['commit'], self.head(self.repo, 'main'))
+        self.assertEqual(merge['verified_sha'], merge['commit'])
+        self.assertEqual([check['exit'] for check in merge['post_verify']], [0])
+        self.assertEqual(state['next_plan_result']['plan'], str(self.child_path))
+        self.assertIn('cannot read the batch plan', state['next_plan_result']['error'])
+        self.assertIn('Status: VERIFIED', self.orchestrate('task', 'show', 'T1'))
+        self.assertIn('Status: PLANNED', self.orchestrate('task', 'show', 'T2'))
+        self.assertFalse(self.child_journal.exists())
+        self.assertEqual(self.count_merges(self.repo, 'main'), 2)
+        self.assertEqual(len(self.session_files('exec')), 1)
 
     def test_recovers_real_sqlite_dispatch_without_taking_lock_twice(self):
         other = self.task('T3', 'b.txt')
