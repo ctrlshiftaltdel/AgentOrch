@@ -2203,7 +2203,8 @@ class GitHubSuccessorHandoffTests(SuccessorCase):
         self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
         self.assertEqual(self.read_child()['phase'], 'verified')
         self.assertEqual(sum(call.startswith('pr merge ') for call in self.gh_calls()), 2)
-        self.assertEqual(self.journal_data()['next_plan'], str(corrected))
+        self.assertEqual(Path(self.journal_data()['next_plan']).resolve(),
+                         corrected.resolve())
 
     def test_changed_successor_keeps_front_carrier_recovery(self):
         authorized = self.child_path.read_bytes()
@@ -2450,7 +2451,11 @@ class LocalSuccessorHandoffTests(SuccessorCase):
         self.assertEqual(merge['commit'], self.head(self.repo, 'main'))
         self.assertEqual(merge['verified_sha'], merge['commit'])
         self.assertEqual([check['exit'] for check in merge['post_verify']], [0])
-        self.assertEqual(state['next_plan_result']['plan'], str(self.child_path))
+        # The recorded attempt is absolutized without expanding symlinks; the
+        # operator passed a name relative to the repository root.
+        recorded = state['next_plan_result']['plan']
+        self.assertTrue(Path(recorded).is_absolute())
+        self.assertEqual(Path(recorded).resolve(), self.child_path.resolve())
         self.assertIn('cannot read the batch plan', state['next_plan_result']['error'])
         self.assertIn('Status: VERIFIED', self.orchestrate('task', 'show', 'T1'))
         self.assertIn('Status: PLANNED', self.orchestrate('task', 'show', 'T2'))

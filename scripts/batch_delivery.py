@@ -6547,11 +6547,13 @@ def command_finalize(args):
             # Record the attempted path only in the result, never as the
             # journal's plan: an unvalidated path must stay replaceable by a
             # corrected --next-plan (the front plan digest pins the default).
+            # Absolute only, without resolving symlinks: the journal records the
+            # path the operator named, and symlinked temp roots must round-trip.
             attempted = (state.get('next_plan') or args.next_plan
                          or plan['finalize']['next_plan'])
             if attempted is not None:
                 try:
-                    attempted = str(Path(attempted).expanduser().resolve())
+                    attempted = str(Path(attempted).expanduser().absolute())
                 except (OSError, ValueError, RuntimeError):
                     attempted = str(attempted)
             state['next_plan_result'] = {'plan': attempted,
