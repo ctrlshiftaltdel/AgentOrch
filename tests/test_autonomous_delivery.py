@@ -337,9 +337,22 @@ class DeliveryCase(unittest.TestCase):
             + body, paths)
 
     def _hook(self, marker):
+        """A real pre-commit hook; Git itself runs it inside ``git commit``.
+
+        The hook is a POSIX shell wrapper that execs ``PY`` on the fixture
+        script. A shebang naming a native executable directly is not portable:
+        Git for Windows hands the hook to the MSYS shell, which cannot start
+        the interpreter from that shebang and fails the commit silently. A
+        shell shebang goes through that same shell on the normal path on every
+        platform, so the wrapper keeps the fixture genuinely executed while
+        the interpreter is passed explicitly.
+        """
+        script = self.root / 'pre-commit-hook.py'
+        script.write_text(f'import pathlib\n'
+                          f'pathlib.Path({str(marker)!r}).write_text("x")\n')
         hook = self.repo / '.git' / 'hooks' / 'pre-commit'
-        hook.write_text(f'#!{PY}\nimport pathlib\n'
-                        f'pathlib.Path({str(marker)!r}).write_text("x")\n')
+        hook.write_text(f'#!/bin/sh\nexec {_shell_command(PY, str(script))}\n',
+                        newline='\n')
         hook.chmod(0o755)
         return hook
 
