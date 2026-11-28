@@ -2289,11 +2289,15 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
             created = sorted(p.name for p in
                              (root / '.orchestration' / 'backups').glob('*.sqlite3'))
             self.assertEqual(len(created), 1)
-            flats.append((self.snapshot(root), created,
-                          (root / '.orchestration' / 'config.json').read_bytes()))
-        self.assertEqual(sorted(flats[0][0]), sorted(flats[1][0]))
+            # The backup name carries a second-granularity timestamp, so two
+            # invocations may legitimately differ by one second; compare the
+            # shape (name pattern, payload, state layout), not the wall clock.
+            self.assertRegex(created[0], r'^state-\d{8}-\d{6}\.sqlite3$')
+            layout = sorted(key.replace(created[0], 'state-<ts>.sqlite3')
+                            for key in self.snapshot(root))
+            flats.append((layout, (root / '.orchestration' / 'config.json').read_bytes()))
+        self.assertEqual(flats[0][0], flats[1][0])
         self.assertEqual(flats[0][1], flats[1][1])
-        self.assertEqual(flats[0][2], flats[1][2])
         # An explicit flat override is the bounded compatibility exception for a
         # legacy flat checkout that happens to live under an ``agentorch`` path.
         legacy = Path(self.tmp.name) / 'legacy'

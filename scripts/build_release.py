@@ -543,13 +543,29 @@ def run_self_check(zip_path, required, top_dir, extra_patterns=()):
         if rc != 0:
             failures.append(f'(d) unit tests failed inside package (exit {rc}):\n{indent(out)}')
 
-        # (e) orchestrator smoke: init then task list
-        rc, out = run([sys.executable, str(pkg_root / 'scripts' / 'orchestrator.py'), 'init'], pkg_root)
-        if rc != 0:
-            failures.append(f'(e) orchestrator.py init failed inside package (exit {rc}):\n{indent(out)}')
-        rc, out = run([sys.executable, str(pkg_root / 'scripts' / 'orchestrator.py'), 'task', 'list'], pkg_root)
-        if rc != 0:
-            failures.append(f'(e) orchestrator.py task list failed inside package (exit {rc}):\n{indent(out)}')
+        # (e) orchestrator smoke inside the package: the shipped CLI is plan-only
+        # and refuses scheduling, so a github project gets a readable config and
+        # a clear retirement refusal for `task add`. No task database appears.
+        with tempfile.TemporaryDirectory() as smoke_dir:
+            smoke = Path(smoke_dir)
+            (smoke / 'docs').mkdir()
+            (smoke / 'docs' / 'PROJECT.md').write_text(
+                '# Project configuration\n\n- `edition`: `github`\n', encoding='utf-8')
+            orchestrator = str(pkg_root / 'scripts' / 'orchestrator.py')
+            rc, out = run([sys.executable, orchestrator, '--root', str(smoke),
+                           'config', 'show'], pkg_root)
+            if rc != 0 or 'github' not in out:
+                failures.append('(e) orchestrator.py config show failed inside '
+                                f'package (exit {rc}):\n{indent(out)}')
+            rc, out = run([sys.executable, orchestrator, '--root', str(smoke),
+                           'task', 'add', '--id', 'T-E', '--title', 't',
+                           '--paths', 'a.py', '--acceptance', 'works'], pkg_root)
+            if rc != 1 or 'issue-template.md' not in out:
+                failures.append('(e) orchestrator.py task add was not refused with '
+                                f'Issue guidance inside package (exit {rc}):\n{indent(out)}')
+            if (smoke / '.orchestration').exists():
+                failures.append('(e) orchestrator.py wrote task state inside the '
+                                'package smoke root')
 
         # (f) non-essential information scan over every text file
         for rel in sorted(packaged):

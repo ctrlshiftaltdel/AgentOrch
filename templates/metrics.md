@@ -74,7 +74,7 @@ Per-metric `status`:
 | `no_data` | No eligible task in the window | `no data` (never `0`) |
 | `unknown` | The source does not record the events this metric needs | `unknown` + the missing collection item |
 
-`collection` in the report states, per record kind, whether the source can produce it. A historical `local` task library (Release `v2.0.0` only) records `resource` conflicts and rejected path locks as a `CONFLICT_RECORDED` event (`data.kind=path`) when `task dispatch` refuses; a `task ready` preflight refusal is written as `PATH_PREFLIGHT_REFUSED` for audit and is not counted by M4. It does **not** record checks, acceptance rows or regressions, so those metrics report `unknown` there — never a fabricated `0`. On this mainline `github` is the only carrier; it can supply all five from the PR timeline once wired, and until then an event sample is the only source.
+`collection` in the report states, per record kind, whether the source can produce it. A historical `local` task library (Release `v2.0.0` only) records `resource` conflicts and records rejected path locks as a `CONFLICT_RECORDED` event (`data.kind=path`) when `task dispatch` refuses; a `task ready` preflight refusal is written as `PATH_PREFLIGHT_REFUSED` for audit and is not counted by M4. It does **not** record checks, acceptance rows or regressions, so those metrics report `unknown` there — never a fabricated `0`. On this mainline `github` is the only carrier; it can supply all five from the PR timeline once wired, and until then an event sample is the only source.
 
 ## Report contract
 
