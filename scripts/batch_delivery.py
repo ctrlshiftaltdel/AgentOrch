@@ -2352,10 +2352,24 @@ def _attempt_problems(record, ignore=()):
                                 'executor pid; the previous process cannot be '
                                 'proven stopped')
         elif attempt.get('result') in ('timeout', 'unproven_stop'):
-            if executor.get('stopped') is not True:
-                problems.append(f'attempt #{position} ended as '
-                                f'{attempt.get("result")} and its process group '
-                                'was not proven stopped')
+            # Rule A (Issue #269): a timeout / unproven stop is reusable only
+            # when every process that actually started carries a
+            # ``stopped=True`` post-exit proof -- the executor and each
+            # verifier with a recorded pid, under the same rule. A verifier
+            # that never started (no pid record) keeps the pre-existing
+            # per-row semantics, and the executor row keeps its historical
+            # requirement because a spawn / bind / resume failure can still
+            # have left a child behind. The live probe above remains
+            # authoritative, so the recorded proof is necessary, never
+            # sufficient.
+            failure = attempt.get('result')
+            for role, pid, _pgid, _token, stopped, _job in _attempt_processes(
+                    attempt):
+                if role != 'executor' and pid is None:
+                    continue
+                if stopped is not True:
+                    problems.append(f'attempt #{position} ended as {failure} '
+                                    f'and {role} was not proven stopped')
         elif attempt.get('result') == 'adapter_rejected':
             problems.append(f'attempt #{position} ended as adapter_rejected; the '
                             'attached result was not accepted, so the worktree '
