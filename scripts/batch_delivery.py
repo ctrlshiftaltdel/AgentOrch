@@ -76,6 +76,16 @@ TERMINAL_BAD = ('FAILED', 'BLOCKED', 'SKIPPED')
 INTEGRATED = ('INTEGRATED', 'VERIFIED')
 PROCESS_HALT_REASON = 'the run stopped after an unproven process kill'
 GIT_HALT_REASON = 'the run stopped because batch merge reconciliation is unproven'
+# A BLOCKED record written only because the lifecycle guard could not prove the
+# previous executor/verifier stopped carries this marker, so ``--retry`` may
+# recheck exactly that block (Issue #268). Any other BLOCKED reason stays
+# terminal for ``--retry``.
+LIFECYCLE_BLOCK = 'lifecycle_guard'
+# The text ``_reuse_guard`` has always raised. It is only a migration hint for
+# journals written before the marker existed; a recheck always re-runs the full
+# guard instead of trusting it.
+LIFECYCLE_GUARD_MARK = ('cannot reuse its worktree: the previous executor or '
+                        'verifier lifetime is not proven stopped')
 ATTEMPT_STATES = ('STARTED', 'ENDED')
 ATTEMPT_RESULTS = ('ok', 'failed', 'timeout', 'unproven_stop', 'spawn_failed',
                    'interrupted', 'error', 'adapter_rejected')
@@ -2369,6 +2379,46 @@ def _reuse_guard(spec, record, *, ignore=()):
         status='BLOCKED', halt=True)
 
 
+def _last_executor(record):
+    """Return the newest attempt's executor record, or an empty mapping."""
+    history = record.get('attempt_history')
+    if not isinstance(history, list) or not history:
+        return {}
+    attempt = history[-1]
+    executor = attempt.get('executor') if isinstance(attempt, dict) else None
+    return executor if isinstance(executor, dict) else {}
+
+
+def _mark_lifecycle_block(record, error):
+    """Record a lifecycle-guard block so ``--retry`` may recheck it."""
+    record.update(status='BLOCKED', error=error, blocked_by=LIFECYCLE_BLOCK)
+
+
+def _lifecycle_blocked(record):
+    """True only when the lifecycle guard is what blocked this record.
+
+    The marker is written by every guard block. Journals from before Issue #268
+    only carry the guard message, which is accepted as a migration hint; the
+    caller still re-runs the whole guard, so an old text never releases a task
+    on its own.
+    """
+    if record.get('status') != 'BLOCKED':
+        return False
+    if record.get('blocked_by') == LIFECYCLE_BLOCK:
+        return True
+    detail = record.get('retry_blocked') or record.get('error')
+    return isinstance(detail, str) and LIFECYCLE_GUARD_MARK in detail
+
+
+def _reuse_evidence_problem(record, head):
+    """Return why recorded execution evidence forbids reuse, or ``None``."""
+    if (head is not None or record.get('integration_sha') is not None
+            or _last_executor(record).get('session')):
+        return ('an interrupted attempt has recorded execution or commit '
+                'evidence; reconcile the batch and task branches before reuse')
+    return None
+
+
 # ------------------------------------------------------------------- process I/O
 
 def _binary_argv(env, default):
@@ -4217,18 +4267,38 @@ def _apply_retry(state, plan, ids, batch_head, save=None):
         record = state['tasks'].get(ident)
         if record is None:
             raise InputError(f'--retry names a task with no journal record: {ident}')
-        if record.get('status') != 'FAILED':
-            raise InputError(f'--retry only accepts FAILED tasks; {ident} is '
+        recheck = _lifecycle_blocked(record)
+        if record.get('status') != 'FAILED' and not recheck:
+            raise InputError(f'--retry only accepts FAILED tasks or BLOCKED tasks '
+                             f'the lifecycle guard stopped; {ident} is '
                              f'{record.get("status")}')
         if record.get('integration_sha'):
             raise InputError(f'{ident} is already integrated and cannot be retried')
         try:
             _reuse_guard(spec, record)
+        except BatchError as exc:
+            record['error'] = str(exc)
+            record['retry_blocked'] = str(exc)
+            if recheck:
+                # The recheck failed closed: the task stays BLOCKED with its
+                # marker so the guard can be rechecked again later.
+                record['blocked_by'] = LIFECYCLE_BLOCK
+            if save is not None:
+                save()
+            raise
+        try:
             base, head, _ = _task_evidence(plan, spec, record, batch_head)
+            if recheck:
+                problem = _reuse_evidence_problem(record, head)
+                if problem:
+                    raise BatchError(problem, status='BLOCKED')
             _check_recovery_branch(plan, spec, base, head, batch_head)
         except BatchError as exc:
             record['error'] = str(exc)
             record['retry_blocked'] = str(exc)
+            # This block is not a lifecycle-guard verdict, so a later recheck
+            # must not treat the old guard text or marker as a release.
+            record.pop('blocked_by', None)
             if save is not None:
                 save()
             raise
@@ -4239,6 +4309,7 @@ def _apply_retry(state, plan, ids, batch_head, save=None):
         _settle_interrupted(record, save)
         record.update(status='PENDING', error=None)
         record.pop('retry_blocked', None)
+        record.pop('blocked_by', None)
     _reset_dependents(state, plan, ids)
 
 
@@ -4272,25 +4343,32 @@ def _normalize_interrupted(state, plan, batch_head, resume, save=None):
             spec = next(task for task in plan['tasks'] if task['id'] == ident)
             try:
                 _reuse_guard(spec, record)
+            except BatchError as exc:
+                # Issue #268: mark the guard verdict so ``--retry`` can re-run
+                # it once the stopped state becomes provable. Other ``BLOCKED``
+                # reasons below never carry this marker.
+                _mark_lifecycle_block(record, str(exc))
+                halt = halt or exc.halt
+                continue
+            try:
                 base, head, _ = _task_evidence(plan, spec, record, batch_head)
-                executor = record['attempt_history'][-1]['executor']
-                if (head is not None or record.get('integration_sha') is not None
-                        or executor.get('session')):
-                    raise BatchError(
-                        'an interrupted attempt has recorded execution or commit evidence; '
-                        'reconcile the batch and task branches before reuse',
-                        status='BLOCKED')
+                problem = _reuse_evidence_problem(record, head)
+                if problem:
+                    raise BatchError(problem, status='BLOCKED')
                 _check_recovery_branch(plan, spec, base, head, batch_head)
             except BatchError as exc:
                 record.update(status='BLOCKED', error=str(exc))
+                record.pop('blocked_by', None)
                 halt = halt or exc.halt
                 continue
             _settle_interrupted(record, save)
             record.update(status='PENDING', error=None)
+            record.pop('blocked_by', None)
         else:
             record.update(status='BLOCKED', error=(
                 'the attempt was interrupted; reconcile its recorded evidence '
                 'before starting another attempt'))
+            record.pop('blocked_by', None)
     return halt
 
 
@@ -4439,6 +4517,17 @@ def _run_batch(plan, journal, args, *, locked=False):
                 raise BatchError(detail, status='BLOCKED')
             try:
                 _reuse_guard(spec, record)
+            except BatchError as exc:
+                record.update(status=exc.record_status, error=str(exc))
+                if exc.record_status == 'BLOCKED':
+                    # Issue #268: a guard block stays recheckable through
+                    # ``--retry``; the guard itself is never relaxed.
+                    record['blocked_by'] = LIFECYCLE_BLOCK
+                save()
+                if exc.halt:
+                    halt_reason = exc.halt_reason or PROCESS_HALT_REASON
+                continue
+            try:
                 if record.get('base') is not None or record.get('attempts'):
                     base, observed, _ = _task_evidence(plan, spec, record,
                                                         batch_head)
@@ -4447,6 +4536,7 @@ def _run_batch(plan, journal, args, *, locked=False):
                     base = batch_head
             except BatchError as exc:
                 record.update(status=exc.record_status, error=str(exc))
+                record.pop('blocked_by', None)
                 save()
                 if exc.halt:
                     halt_reason = exc.halt_reason or PROCESS_HALT_REASON
