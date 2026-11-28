@@ -3017,17 +3017,29 @@ def _gh(args, cwd, *, input_text=None, timeout=300):
         'env': dict(os.environ, GIT_TERMINAL_PROMPT='0'),
         'stdout': subprocess.PIPE,
         'stderr': subprocess.PIPE,
-        'text': True,
         'timeout': timeout,
     }
     if input_text is None:
         kwargs['stdin'] = subprocess.DEVNULL
+        kwargs['text'] = True
     else:
-        kwargs['input'] = input_text
+        # ``text=True`` wraps the stdin pipe in a writer created with
+        # ``newline=None``, which translates every '\n' into os.linesep; on
+        # Windows that turned the ORCH-TASK-REGISTRY block into CRLF, and the
+        # parse kept the '\r' in the value so each later write added another
+        # orphan CR.  Encode the payload ourselves so the carrier always keeps
+        # LF line endings on every platform.
+        kwargs['input'] = input_text.encode('utf-8')
     try:
-        return subprocess.run(argv, **kwargs)
+        result = subprocess.run(argv, **kwargs)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise BatchError(f'gh {" ".join(args)} unavailable: {exc}') from None
+    if input_text is not None:
+        return subprocess.CompletedProcess(
+            result.args, result.returncode,
+            stdout=(result.stdout or b'').decode('utf-8', 'replace'),
+            stderr=(result.stderr or b'').decode('utf-8', 'replace'))
+    return result
 
 
 def _gh_json(args, cwd, *, input_text=None, timeout=300):
@@ -5358,7 +5370,10 @@ def _now():
 def _registry_value(inner, name):
     match = re.search(r'^[ \t]*' + re.escape(name) + r'[ \t]*:[ \t]*(.*?)[ \t]*$',
                       inner or '', re.M)
-    return match.group(1) if match else None
+    # A CRLF carrier leaves the line's '\r' inside the capture group because
+    # '.' matches it and '$' matches before the '\n'.  Strip trailing
+    # whitespace only, so real value differences still fail closed.
+    return match.group(1).rstrip() if match else None
 
 
 def _registry_paths(inner):
