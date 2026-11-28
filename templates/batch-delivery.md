@@ -17,7 +17,7 @@
 
 - 沙箱。Worktree、提示词和路径检查都不会限制 Agent 运行时的文件系统、shell、网络或凭据访问。
 - 审查的替代品。批次审查仍要逐条核对验收标准；CI 绿灯不能替代验收。
-- 自动改主分支的授权。合并仍要求项目所有者给出的授权文本，且必须与计划中的 `finalize.authorization` 完全一致。
+- 自动改主分支的授权。Master 负责核对适用于本批次的授权记录，并按 `kit/orchestration.md` 第 4 节决定是否合并。
 - 跨项目写入授权。批次只处理本仓库的计划与路径。
 
 ## 2. 计划文件
@@ -71,7 +71,7 @@ python scripts/batch_delivery.py status   --journal JOURNAL [--json]
     "post_merge_verify": [["python", "-m", "unittest", "discover", "-s", "tests"]],
     "required_checks": ["checks (Python 3.12)"],
     "merge_method": "merge",
-    "authorization": "exact owner authorization text",
+    "authorization": "applicable recorded authorization text or reference",
     "next_plan": null
   }
 }
@@ -90,7 +90,7 @@ python scripts/batch_delivery.py status   --journal JOURNAL [--json]
 - 授权载体是必需的：`github` 批次必须有 `batch.issue` 与 `batch.issue_repo`，并在任何 Agent 启动前写入 `ORCH-TASK-REGISTRY`（`status: DISPATCHED`）；`local` 批次必须有 `scripts/orchestrator.py` 与每个任务的记录，并在任何 Agent 启动前完成 `READY` / `DISPATCHED`。载体缺失时批次阻塞，不会以 `not_applicable` 假装交付。**`local` 的任务库依赖仍要求 `VERIFIED`；本工具不支持在任务库中登记批内依赖**：遇到这种组合会保持记录不变并阻塞，要求改用单任务/人工流程或等待批次感知的本地派发。`github` 与计划 DAG 的批内 `INTEGRATED` 例外不受影响。
 - 密钥形态的路径（如 `.env`、`*.pem`、`*token*`）在预检阶段直接拒绝。
 - `merge_method` 取 `merge`、`squash` 或 `rebase`。
-- `--merge` 时 `--authorization` 必须与 `finalize.authorization` 完全相等且非空；缺失或不等是预检错误，不会先推送再失败。
+- `--merge` 时 `--authorization` 必须与 `finalize.authorization` 完全相等且非空；缺失或不等是预检错误，不会先推送再失败。两个字段可使用同一份仍有效、覆盖本批次的常设授权文本或可定位引用。Master 负责核实来源、范围和有效性。
 - 项目底座由 `docs/PROJECT.md` 的 `edition` 唯一决定。`local` 只在本地合并，不调用 `gh`；`github` 使用 `gh` 的 PR、检查和合并流程。
 - 项目允许/禁止路径从 `docs/PROJECT.md` 的「允许改动路径」「永远禁止改动路径」读取。缺失该节时不会声称检查过；journal 记录 `project_paths: unknown`，只做计划级路径检查。journal 同时绑定 `docs/PROJECT.md` 的 SHA-256；run / finalize 之间该文件变化即拒绝继续，必须重新对齐计划。
 - `github` 的必需检查来自 `gh api repos/{owner}/{repo}/rules/branches/{base}` 的有效规则，而不是检查运行结果：计划里的 context 必须全部出现在有效规则中。每个 context 还必须在该 head 上有同名 check run，`app.id` 与规则中的 `integration_id` 一致、`status == completed`、`conclusion == success`；检查运行失败、缺失、app 不符或列表被截断（`total_count > len(check_runs)`）都阻塞。推送和合并使用审查过的确切 SHA，并在合并前重新核对 PR base、head、`mergeable == MERGEABLE` 以及 `origin/<base>` 是否仍为已审查 head 的祖先。
