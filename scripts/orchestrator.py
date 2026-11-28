@@ -99,9 +99,10 @@ def connect(root, state_root=None):
     if not p.exists():
         # The flat message keeps its historical absolute path. An isolated
         # rejection must not expose the host path in public evidence.
-        raise RuntimeError('task database not initialized; run `init` first'
+        raise RuntimeError('task database not initialized; the local task registry is a legacy '
+                           'read-only archive (Release v2.0.0) and this CLI never creates it'
                            if state_root is not None
-                           else f'task database not initialized: {p}; run `init` first')
+                           else f'task database not initialized: {p}; the local task registry is a legacy read-only archive (Release v2.0.0) and this CLI never creates it')
     con=sqlite3.connect(p, timeout=15, isolation_level=None)
     con.row_factory=sqlite3.Row
     con.execute('PRAGMA foreign_keys=ON')
@@ -117,7 +118,21 @@ def connect(root, state_root=None):
 # A missing file, a missing key, or an invalid value falls back to the default so
 # the historical hard-coded behaviour (3 rounds) is preserved for existing roots.
 RETRY_CAP_DEFAULT = 3
-EDITIONS = ('local','github')
+# The mainline and every next-generation install package ship the github edition
+# only. `local` is a retired legacy value: every entry point must fail closed with
+# the same retention / migration guidance instead of scheduling SQLite again.
+EDITIONS = ('github',)
+LEGACY_EDITIONS = ('local',)
+LEGACY_EDITION_GUIDANCE = (
+    'edition `local` is not supported by this kit: the mainline and every next-generation '
+    'install package provide the `github` edition only, and the SQLite task scheduler has '
+    'been retired from the CLI, batch and release entry points. Nothing was written. '
+    'To keep an existing local install running, stay on the verified Release v2.0.0 '
+    '(tag v2.0.0) and do not upgrade this kit. To move forward, either stay on v2.0.0 or '
+    'run the one-time approved local -> github migration in kit/orchestration.md section 6, '
+    'then set "- `edition`: github" in docs/PROJECT.md. To roll back after upgrading, '
+    'reinstall the v2.0.0 release package; this mainline never writes SQLite state again.'
+)
 # `.orchestration/config.json` holds local CLI runtime parameters only. It never
 # selects the edition: that key lives in <root>/docs/PROJECT.md, which is
 # the single authority (see read_project_edition). Keeping the edition out of this
@@ -187,23 +202,25 @@ def read_project_edition(root, isolated=False):
     try:
         text=path.read_text(encoding='utf-8')
     except FileNotFoundError:
-        raise EditionError(f'{PROJECT_CONFIG}: file not found at {shown}; add the key `edition` with value local or github') from None
+        raise EditionError(f'{PROJECT_CONFIG}: file not found at {shown}; add the key `edition` with value github') from None
     except (OSError,UnicodeDecodeError) as exc:
         detail=_public_diagnostic(exc, root) if isolated else str(exc)
         raise EditionError(f'{PROJECT_CONFIG}: cannot read {shown} ({detail}); repair the file so its `edition` key is readable') from None
     matches=list(EDITION_LINE.finditer(text))
     if not matches:
-        raise EditionError(f'{PROJECT_CONFIG}: missing required key `edition` in {shown}; add one line "- `edition`: local" or "- `edition`: github"')
+        raise EditionError(f'{PROJECT_CONFIG}: missing required key `edition` in {shown}; add one line "- `edition`: github"')
     if len(matches)>1:
         where=', '.join(str(text.count('\n',0,m.start())+1) for m in matches)
         raise EditionError(f'{PROJECT_CONFIG}: key `edition` is declared {len(matches)} times (lines {where}) in {shown}; keep exactly one declaration')
     raw=matches[0].group('value').strip()
     value=raw.strip('`').strip()
     if not value:
-        raise EditionError(f'{PROJECT_CONFIG}: key `edition` is empty in {shown}; allowed values are local, github')
+        raise EditionError(f'{PROJECT_CONFIG}: key `edition` is empty in {shown}; the only allowed value is github')
+    if value in LEGACY_EDITIONS:
+        raise EditionError(f'{PROJECT_CONFIG}: key `edition` is {value!r} in {shown}; {LEGACY_EDITION_GUIDANCE}')
     if value not in EDITIONS:
         raise EditionError(f"{PROJECT_CONFIG}: key `edition` has unsupported value {raw!r} in {shown}; "
-                           f"allowed values are {', '.join(EDITIONS)} (write the value alone, with no extra text)")
+                           f"the only allowed value is github (write the value alone, with no extra text)")
     return value
 
 def read_config(root, state_root=None):
@@ -229,24 +246,26 @@ def read_retry_cap(root, state_root=None):
     """
     return _runtime_config(root, state_root)['retry_cap']
 
-def require_local_scheduler(root, action, state_root=None):
-    """Refuse to write local task state unless the project declares the local edition.
+def retire_scheduling(root, action, state_root=None):
+    """Refuse every scheduling command before any state write.
 
-    The CLI implements the local edition only. Under a github (or broken) edition
-    it must fail loudly and name the next step instead of quietly behaving like
-    local: github task state lives in Issues and PRs, and writing the SQLite
-    registry would create a second, conflicting source of truth.
+    The mainline no longer schedules any carrier. A retired `local` project gets
+    the retention / migration guidance (pin Release v2.0.0 or migrate); a valid
+    `github` project is pointed at Issues and PRs; a missing or illegal edition
+    still fails closed with the actual value and the file to fix. This runs
+    before any read or write of task state, so no refusal can leave SQLite or
+    carrier changes behind.
     """
     isolated=state_root is not None
     edition=read_project_edition(root, isolated=isolated)
-    if edition=='local': return
     where=PROJECT_CONFIG if isolated else project_config_path(root)
     raise EditionError(
-        f'edition is {edition!r} ({where}); this CLI cannot run `{action}` for the {edition} edition: '
-        f'it writes the local SQLite task registry, which is a read-only archive under {edition}. '
-        'Next: create or update the task as a GitHub Issue using editions/github/issue-template.md, record the '
-        'ORCH-TASK-REGISTRY block before starting, and drive the PR per editions/github/execution.md. '
-        'init, backup, config show, task list, task show and task resources stay available.'
+        f'this CLI cannot run `{action}`: the local SQLite task scheduler has been retired '
+        f'from the mainline (edition is {edition!r} in {where}). '
+        'Scheduling lives on GitHub: create or update the task as an Issue using '
+        'editions/github/issue-template.md, record the ORCH-TASK-REGISTRY block before '
+        'starting, and drive the PR per editions/github/execution.md. '
+        'init, init-plan, backup, config show, task list and task show stay available.'
     )
 
 def config_show(root, state_root=None):
@@ -281,9 +300,9 @@ def config_show(root, state_root=None):
     if error:
         print(f'ERROR: {_public_diagnostic(error, root) if isolated else error}',file=sys.stderr)
         return 1
-    if edition!='local':
-        print(f'Scheduling commands (task add/ready/dispatch/status/workspace/amend/unlock) are refused under the '
-              f'{edition} edition; this CLI maintains the local task registry only (matrix: README.md 6.2).')
+    print('Scheduling commands (task add/ready/dispatch/status/workspace/amend/unlock/resources/renew/'
+          'reclaim/reconcile) are refused: the SQLite task scheduler was retired and tasks live on '
+          'GitHub Issues and PRs (matrix: README.md 6.2).')
     return 0
 
 def safe_rollback(con):
@@ -491,7 +510,7 @@ def _validate_git_exclude_target(root):
         raise LayoutError('.git/info exists but is not a directory; refusing to write state '
                           'because the Git exclude rule cannot be recorded')
 
-def init(root, state_root=None):
+def init_task_store(root, state_root=None):
     state_rel=None
     if state_root is not None:
         # The CLI validated the isolated tree before dispatch, but a direct
@@ -568,7 +587,6 @@ def get_task(con, task_id):
     return row
 
 def task_add(root, args, state_root=None):
-    require_local_scheduler(root,'task add',state_root=state_root)
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{1,63}',args.id): raise ValueError('task ID must be 2-64 chars: letters, digits, dot, underscore, hyphen')
     paths=sorted(set(normalize_path(p) for p in args.paths))
     if not paths: raise ValueError('at least one allowed path is required')
@@ -667,7 +685,6 @@ def dependency_check(con, row):
         if d['status']!='VERIFIED': raise RuntimeError(f'dependency {dep} is {d["status"]}, expected VERIFIED')
 
 def task_ready(root, task_id, state_root=None):
-    require_local_scheduler(root,'task ready',state_root=state_root)
     con=connect(root, state_root)
     try:
         con.execute('BEGIN IMMEDIATE'); r=get_task(con,task_id)
@@ -702,7 +719,6 @@ def default_holder():
     return f'{socket.gethostname()}:{os.getpid()}'
 
 def task_dispatch(root, task_id, options=None, state_root=None):
-    require_local_scheduler(root,'task dispatch',state_root=state_root)
     # The holder is only validated when the task declares resources, so a
     # path-lock-only dispatch keeps its previous behaviour byte for byte.
     holder=getattr(options,'holder',None) or default_holder()
@@ -760,7 +776,6 @@ def task_dispatch(root, task_id, options=None, state_root=None):
     print('Now pass the self-contained task packet to a real Execution Agent. This command does not launch agents.')
 
 def set_workspace(root, args, state_root=None):
-    require_local_scheduler(root,'task workspace',state_root=state_root)
     con=connect(root, state_root)
     try:
         con.execute('BEGIN IMMEDIATE'); r=get_task(con,args.id)
@@ -783,7 +798,6 @@ def set_workspace(root, args, state_root=None):
     print(f'{args.id}: workspace updated')
 
 def task_status(root, args, state_root=None):
-    require_local_scheduler(root,'task status',state_root=state_root)
     dest=args.status.upper()
     if dest not in TRANSITIONS: raise ValueError(f'unknown status: {dest}')
     con=connect(root, state_root)
@@ -864,7 +878,6 @@ def task_amend(root, args, state_root=None):
       the lock rewrite happen in one BEGIN IMMEDIATE, so a half lock set can
       never be committed.
     """
-    require_local_scheduler(root,'task amend',state_root=state_root)
     raw_paths=getattr(args,'paths',None)
     if raw_paths is not None and (args.merge_sha or '').strip():
         raise RuntimeError('amend accepts either --paths or --merge-sha, not both')
@@ -948,7 +961,6 @@ def find_task_resource_lock(con, task_id, reference):
     return rows[0]
 
 def unlock(root, args, state_root=None):
-    require_local_scheduler(root,'task unlock',state_root=state_root)
     con=connect(root, state_root)
     resource=getattr(args,'resource',None)
     try:
@@ -1029,7 +1041,6 @@ def task_resources(root, args, state_root=None):
     finally: con.close()
 
 def task_renew(root, args, state_root=None):
-    require_local_scheduler(root,'task renew',state_root=state_root)
     holder=validate_holder(getattr(args,'holder',None) or default_holder())
     con=connect(root, state_root)
     try:
@@ -1044,7 +1055,6 @@ def task_renew(root, args, state_root=None):
     print(f'{args.id}: renewed {len(renewed)} resource lock(s) for {ttl}s as holder {holder}')
 
 def task_reclaim(root, args, state_root=None):
-    require_local_scheduler(root,'task reclaim',state_root=state_root)
     grace=resource_config(root,require_grace=True,state_root=state_root)[LEASE_GRACE_KEY]
     con=connect(root, state_root)
     try:
@@ -1060,7 +1070,6 @@ def task_reclaim(root, args, state_root=None):
 
 def task_reconcile(root, args, state_root=None):
     """Rebuild lock facts without trusting memory; quarantine what cannot be proven."""
-    require_local_scheduler(root,'task reconcile',state_root=state_root)
     con=connect(root, state_root)
     try:
         con.execute('BEGIN IMMEDIATE')
@@ -1680,7 +1689,10 @@ def backup(root, state_root=None):
         # Direct library callers bypass the CLI's up-front validation; refuse a
         # linked state slot here, before SQLite opens it and writes the WAL.
         _validate_isolated_components(root, state_root)
-    if not src.exists(): raise RuntimeError('task database is not initialized')
+    if not src.exists():
+        # Maintenance boundary: `backup` only ever writes next to an existing archive.
+        raise RuntimeError('task database is not initialized; `backup` only maintains an existing '
+                           'legacy archive and refuses to create one (no `init`)')
     outdir=state_dir(root, state_root)/'backups'
     if state_root is not None:
         # Isolated layout only. The destination name has one-second granularity,
@@ -1850,9 +1862,9 @@ def main(argv=None):
     parser.add_argument('--root',default='.',action=_RootOptionAction,
                         help='project root (default: current directory)')
     sub=parser.add_subparsers(dest='cmd',required=True)
-    sub.add_parser('init',help='initialize the local task database and .orchestration/config.json (retry_cap, local_dir); seed docs/PLAN.md from templates/plan.md when absent')
-    sub.add_parser('init-plan',help='seed docs/PLAN.md for an explicit github project without initializing a task database')
-    sub.add_parser('backup',help='create a consistent SQLite backup')
+    sub.add_parser('init',help='seed docs/PLAN.md from templates/plan.md for a github project (same as init-plan; never creates a task database)')
+    sub.add_parser('init-plan',help='seed docs/PLAN.md for an explicit github project (never creates a task database)')
+    sub.add_parser('backup',help='create a consistent copy of an existing legacy archive (refuses when absent)')
     cf=sub.add_parser('config',help='inspect runtime configuration'); cs=cf.add_subparsers(dest='configcmd',required=True)
     cs.add_parser('show',help='print effective config values and their source')
     t=sub.add_parser('task',help='task operations'); ts=t.add_subparsers(dest='taskcmd',required=True)
@@ -1908,28 +1920,20 @@ def main(argv=None):
             print(f'ERROR: {_public_diagnostic(e, base)}',file=sys.stderr); return 2
         raise
     try:
-        if args.cmd=='init': init(root,state_root=state)
-        elif args.cmd=='init-plan':
-            edition=read_project_edition(root, isolated=state is not None)
-            if edition!='github':
-                raise EditionError(f'{PROJECT_CONFIG}: `edition` is {edition!r}; '
-                                   '`init-plan` requires github. Use `init` to initialize a local project.')
+        # Every command that could create or move task state is routed to the
+        # retirement guard, so an old `edition: local` project is told how to
+        # stay on Release v2.0.0 or migrate, and a `github` project is pointed at
+        # Issues and PRs. Neither branch writes anything.
+        if args.cmd in ('init','init-plan'):
+            read_project_edition(root, isolated=state is not None)
             return 0 if init_plan(root, plan_only=True) in ('created', 'kept') else 1
         elif args.cmd=='backup': backup(root,state_root=state)
         elif args.cmd=='config': return config_show(root,state_root=state)
-        elif args.taskcmd=='add': task_add(root,args,state_root=state)
         elif args.taskcmd=='list': task_list(root,args,state_root=state)
         elif args.taskcmd=='show': task_show(root,args.id,state_root=state)
-        elif args.taskcmd=='ready': task_ready(root,args.id,state_root=state)
-        elif args.taskcmd=='dispatch': task_dispatch(root,args.id,args,state_root=state)
-        elif args.taskcmd=='status': task_status(root,args,state_root=state)
-        elif args.taskcmd=='amend': task_amend(root,args,state_root=state)
-        elif args.taskcmd=='workspace': set_workspace(root,args,state_root=state)
-        elif args.taskcmd=='unlock': unlock(root,args,state_root=state)
-        elif args.taskcmd=='resources': task_resources(root,args,state_root=state)
-        elif args.taskcmd=='renew': task_renew(root,args,state_root=state)
-        elif args.taskcmd=='reclaim': task_reclaim(root,args,state_root=state)
-        elif args.taskcmd=='reconcile': task_reconcile(root,args,state_root=state)
+        elif args.taskcmd in ('add','ready','dispatch','status','amend','workspace','unlock',
+                              'resources','renew','reclaim','reconcile'):
+            retire_scheduling(root,f'task {args.taskcmd}',state_root=state)
     except Exception as e:
         message=_public_diagnostic(e, root) if state is not None else str(e)
         print(f'ERROR: {message}',file=sys.stderr); return 1

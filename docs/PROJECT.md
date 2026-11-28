@@ -45,12 +45,13 @@
 - `verification_profile`：`risk_pilot`
 - 上面 `verification_profile` 的回退：改回 `strict` 或删除该键（2026-10-31 起，Issue #188）。
 - （可选）`architecture_contract_path`：架构契约文件路径，默认 `docs/architecture/contract.json`。**不配置等价于 `OFF`（只读诊断，不阻断）**；配置了但文件缺失属于配置错误，检查器失败关闭。检查器与能力边界见 `docs/self-improvement/architecture-checker.md`。
-- 本地 CLI 边界：`scripts/orchestrator.py` 只维护 `local` 任务库。声明 `github` 时，`task add` / `task ready` / `task dispatch` / `task status` / `task workspace` / `task amend` / `task unlock` 会拒绝执行并给出下一步指引；`init`、`backup`、`config show`、`task list`、`task show` 仍可用。`edition` 缺失、为空、非法字符串、类型错误或文件不可读时同样拒绝调度，并报出实际值与修复位置（本文件 + 键名）。完整矩阵见 `README.md` 6.2。
+- 本地 CLI 边界：`scripts/orchestrator.py` 不再调度任何底座。`task add` / `task ready` / `task dispatch` / `task status` / `task workspace` / `task amend` / `task unlock` 一律拒绝执行并指向 Issue / PR；`init`（只生成 `docs/PLAN.md`）、`init-plan`、`backup`、`config show`、`task list`、`task show` 作为 GitHub-only 兼容的维护入口保留，其中 `task list` / `task show` / `backup` 只服务既有只读归档库。`edition` 缺失、为空、非法字符串、类型错误或文件不可读时拒绝并报出实际值与修复位置（本文件 + 键名）；`edition: local` 是已退场的旧配置：调度命令与 `init` 得到固定 Release `v2.0.0` 或一次性迁移的指引且不写入任何状态；`backup`、`config show`、`task list`、`task show` 仍可用于维护 / 只读既有归档。完整矩阵见 `README.md` 6.2。
 - 并发策略：**按机器余量动态决定，不设固定上限**。派发前观察 CPU / 内存 / 磁盘 / 测试资源争用，有余量即可并行；同一 worktree 同一时刻只允许一个测试进程。把「本机实测可承载并发」作为参考记录，而不是规则常量。
 - 本地私有目录：`.local/`（`.env`、机器信息、发布扫描规则），永不入库、永不打包。
 
 ## 底座切换记录
 
+- 2026-11-29：`local` 底座从主线与下一代安装包退场（项目所有者 2026-11-23 决定，Issue #280）。主线 CLI、批次入口与发行入口不再提供 SQLite 任务调度；受支持的底座只有 `github`。既有 local 安装固定在 Release `v2.0.0`，迁移/回退见 `kit/orchestration.md` 第 6 节。本仓库的 `.orchestration/state.sqlite3` 仍是只读归档，「维护写入边界」与 `backup` 行为不变。
 - 2026-10-22：`local` → `github`（一次性、单向；切换后只写 Issue / PR，不双写）。
   - 切换点：`main` @ `60252f2805cfd9a7f04e99732711467a79c2ac3f`。
   - 决定与执行：项目所有者在 Issue #4 决定；Master 执行切换，具体改动由 Issue #4 的任务分支 `task/4-edition-authority` 的 PR 落地。

@@ -53,6 +53,11 @@ SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
 
 CORE = 'kit/orchestration.md'
 PROJECT_OWNED_CONTRACT = 'docs/orchestration.md'
+# Files the mainline retired together with the `local` edition. The published
+# v1.7.0 updater treats any baseline file that vanished from the target as a
+# blocking removal, so this release is *expected* to be refused by it: the owner
+# keeps local installs on Release v2.0.0 instead of upgrading them.
+RETIRED_EDITION_FILES = ('editions/local/execution.md', 'editions/local/master.md')
 
 
 def semantic_manifest_digest(entries):
@@ -187,30 +192,44 @@ class PublishedV170ClassifierCompatibilityTests(unittest.TestCase):
         self.assertTrue(any('size is not a positive integer' in error for error in errors),
                         errors)
 
-    # -- positive: today's release classifies cleanly ---------------------- #
+    # -- the retired edition is the only removal, and it stays blocking --- #
 
-    def test_published_classifier_plans_this_release_without_a_block(self):
+    def test_published_classifier_plans_this_release_with_the_retirement_blocked(self):
+        """Retired expectation: the v1.7.0 updater planned this tree cleanly.
+
+        The mainline now removes `editions/local/`. The published classifier
+        treats a vanished baseline file as a blocking removal, so the *correct*
+        outcome is a refusal with exactly those two removals, no renames, no
+        conflicts, and an untouched core contract. The owner path is to stay on
+        Release v2.0.0 or migrate, not to force the upgrade.
+        """
+        self.assertEqual(set(self.baseline) - set(self.target),
+                         set(RETIRED_EDITION_FILES))
         result = self.classify.classify_files(
             self.baseline, dict(self.baseline), self.target, mode='PLAN')
-        self.assertFalse(result.blocked)
-        self.assertEqual(result.removals, [])
+        self.assertTrue(result.blocked)
+        self.assertEqual(sorted(result.removals), sorted(RETIRED_EDITION_FILES))
         self.assertEqual(result.renames, [])
         self.assertEqual(result.conflicts, [])
-        self.assertEqual(result.counts['UPSTREAM_REMOVAL'], 0)
+        self.assertEqual(result.counts['UPSTREAM_REMOVAL'], len(RETIRED_EDITION_FILES))
         self.assertEqual(result.counts['UPSTREAM_RENAME'], 0)
         self.assertEqual(result.counts['THREE_WAY_CONFLICT'], 0)
-        self.assertEqual(set(self.baseline) - set(self.target), set())
         core = self.entries(result)[CORE]
         self.assertEqual(core['class'], 'UPSTREAM_UNCHANGED')
         self.assertEqual(core['decision'], 'DEFERRED')
 
-    def test_published_classifier_applies_this_release_without_a_block(self):
+    def test_published_classifier_blocks_applying_this_release(self):
         result = self.classify.classify_files(
             self.baseline, dict(self.baseline), self.target, mode='APPLY')
-        self.assertFalse(result.blocked)
+        self.assertTrue(result.blocked)
+        self.assertEqual(sorted(result.removals), sorted(RETIRED_EDITION_FILES))
         core = self.entries(result)[CORE]
         self.assertEqual(core['class'], 'UPSTREAM_UNCHANGED')
-        self.assertEqual(core['decision'], 'APPLIED')
+        # Nothing about the retired edition is applied silently.
+        applied = [item['path'] for item in result.files
+                   if item['decision'] == 'APPLIED']
+        for rel in RETIRED_EDITION_FILES:
+            self.assertNotIn(rel, applied)
 
     # -- negative: the publishable failure modes stay blocked -------------- #
 
@@ -220,7 +239,8 @@ class PublishedV170ClassifierCompatibilityTests(unittest.TestCase):
         result = self.classify.classify_files(
             self.baseline, dict(self.baseline), target, mode='APPLY')
         self.assertTrue(result.blocked)
-        self.assertEqual(result.removals, [CORE])
+        self.assertEqual(sorted(result.removals),
+                         sorted([CORE, *RETIRED_EDITION_FILES]))
         entry = self.entries(result)[CORE]
         self.assertEqual(entry['class'], 'UPSTREAM_REMOVAL')
         self.assertEqual(entry['decision'], 'KEPT_LOCAL')
@@ -234,7 +254,7 @@ class PublishedV170ClassifierCompatibilityTests(unittest.TestCase):
         result = self.classify.classify_files(
             self.baseline, dict(self.baseline), target, mode='APPLY')
         self.assertTrue(result.blocked)
-        self.assertEqual(result.removals, [])
+        self.assertEqual(sorted(result.removals), sorted(RETIRED_EDITION_FILES))
         self.assertEqual(result.renames, [CORE])
         entries = self.entries(result)
         self.assertEqual(entries[CORE]['class'], 'UPSTREAM_RENAME')
@@ -245,7 +265,9 @@ class PublishedV170ClassifierCompatibilityTests(unittest.TestCase):
         target[PROJECT_OWNED_CONTRACT] = hashlib.sha256(b'local contract').hexdigest()
         result = self.classify.classify_files(
             self.baseline, dict(self.baseline), target, mode='APPLY')
-        self.assertFalse(result.blocked)
+        # The only block left is the retired edition removal; the docs contract
+        # itself is still recognized as project-owned and never applied.
+        self.assertEqual(sorted(result.removals), sorted(RETIRED_EDITION_FILES))
         entry = self.entries(result)[PROJECT_OWNED_CONTRACT]
         self.assertEqual(entry['class'], 'PROJECT_OWNED')
         self.assertEqual(entry['decision'], 'KEPT_LOCAL')

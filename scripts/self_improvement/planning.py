@@ -1879,8 +1879,13 @@ def build_proposal(lesson, spec, *, edition, dependency_state=None, coverage=Non
     Git claim blocks with a concrete next step instead of becoming a false owner
     question.
     """
-    if edition not in ('local', 'github'):
-        raise ValueError(f'unknown edition {edition!r}')
+    if edition == 'local':
+        raise ValueError(
+            'edition `local` is retired: the mainline ships the `github` edition only. '
+            'Keep an existing local install on Release v2.0.0 or run the one-time '
+            'local -> github migration in kit/orchestration.md section 6 first.')
+    if edition != 'github':
+        raise ValueError(f'unknown edition {edition!r}; expected github')
     proposal = _proposal_from_spec(lesson, spec, edition)
 
     path_errors = _path_policy_errors(proposal.get('allowed_paths'))
@@ -2131,8 +2136,12 @@ def render_github_issue_body(proposal):
 
 
 def render_packet(proposal, edition):
-    if edition == 'local':
-        return render_local_task_packet(proposal)
+    # The local task-packet renderer is kept for reading historical proposals
+    # (Release v2.0.0); this mainline only routes new proposals to github.
     if edition == 'github':
         return render_github_issue_body(proposal)
-    raise ValueError(f'unknown edition {edition!r}')
+    if edition == 'local':
+        raise ValueError(
+            'edition `local` is retired: only the github carrier is rendered by this '
+            'mainline. Stay on Release v2.0.0 or migrate per kit/orchestration.md section 6.')
+    raise ValueError(f'unknown edition {edition!r}; expected github')

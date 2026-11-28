@@ -89,7 +89,7 @@ class SelfImprovementTriggerTests(unittest.TestCase):
         carrier = loop_support.RecordingCarrier()
         from agentorch_self_improvement import orchestration
         outcome = orchestration.run_loop(
-            request_text='自我完善机制是什么', edition='local',
+            request_text='自我完善机制是什么', edition='github',
             state=loop_support.state(), carrier=carrier,
             scan_report=loop_support.scan_report())
         self.assertEqual(outcome.status, 'NOT_TRIGGERED')

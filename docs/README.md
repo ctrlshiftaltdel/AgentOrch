@@ -6,7 +6,7 @@
 
 **把「需求 → 任务 → 执行 → 独立审查 → 合并 → 验证」固化成一条可执行、可核验的流程。**
 
-它由两部分组成：一份与任务载体解耦的核心契约，以及两个可互换的底座（`local` / `github`）。核心契约规定谁可以做什么、任务如何流转、合并前必须过哪些门、什么才算证据；底座只决定任务状态写到哪里、证据从哪里取。配套的 Python 脚本负责登记任务、占用路径锁、做结构自检与打包，全部只用标准库。
+它由两部分组成：一份与任务载体解耦的核心契约，以及当前唯一受支持的 `github` 底座。核心契约规定谁可以做什么、任务如何流转、合并前必须过哪些门、什么才算证据；底座只决定任务状态写到哪里、证据从哪里取。配套的 Python 脚本负责计划初始化、只读归档维护、结构自检与打包，全部只用标准库。
 
 目标是成为**通用软件项目的启动与推进工具**：因此自检覆盖必需文件、底座结构、治理概念与相对链接，配置允许按项目调整范围、验证命令、重试上限与私有目录，而不是把某一类项目的假设写死。
 
@@ -35,7 +35,7 @@
 
 ## 快速上手（5 分钟）
 
-前提：Git 与 [uv](https://docs.astral.sh/uv/)（本项目统一用 `uv run python` 执行脚本）；脚本只用标准库，**无第三方依赖**；`local` 底座完全离线可用。
+前提：Git、GitHub CLI（`gh`，已登录目标仓库）与 [uv](https://docs.astral.sh/uv/)（本项目统一用 `uv run python` 执行脚本）；脚本只用标准库，**无第三方依赖**。
 
 **用法一句话：把下面的话术原样复制给你的 Agent（WorkBuddy、Claude Code、Cursor… 都行），它会自己识别要做什么、执行对应命令，并把输出与退出码带回来给你。** 命令不需要你手打；想知道 Agent 到底会跑什么，见第 3 节的「话术 → 命令」对照表。Agent 第一次接入本项目时，先让它读 [kit/orchestration.md](../kit/orchestration.md) 与 [AGENTS.md](../AGENTS.md)——那是它的行为契约，话术只负责"点菜"。
 
@@ -51,14 +51,14 @@
 **第 1 步 B · 引入旧项目**（旧项目专用，代替第 1 步 A；发行包解压到项目外的临时目录，细节见第 4 节路径二）：
 
 > 这是把 Agent-Orchestration 套件引入我的旧项目，分四步做，全程不许覆盖我项目的现有文件：
-> 1. 先把发行包解压到项目外的临时目录（不要解压进我的项目根），再读解压包里的 kit/orchestration.md 的会话入口、AGENTS.md，以及 editions/local/master.md 或 editions/github/master.md 的「已有项目接入」章节；给我用三句话概括这套流程的角色分工与合并门。
+> 1. 先把发行包解压到项目外的临时目录（不要解压进我的项目根），再读解压包里的 kit/orchestration.md 的会话入口、AGENTS.md，以及 editions/github/master.md 的「已有项目接入」章节；给我用三句话概括这套流程的角色分工与合并门。
 > 2. 用上一步解压出的包对照发行包文件清单（AGENTS.md、LICENSE.md、VERSION.md、kit/orchestration.md、editions/、templates/、scripts/、tests/）逐个检查我的项目里哪些位置会重名或被覆盖，输出冲突清单给我。
 > 3. 经我确认后引入：无冲突的文件直接复制到位；与我已有文件重名的（尤其 AGENTS.md、LICENSE.md 和 docs/、scripts/、tests/ 里的同名文件），先给我看两边内容，按我决定的合并方式写入；套件的 scripts/ 与 tests/ 不得混进我项目自有的同名目录下已有的文件。
 > 4. 引入完成后列出项目根的最新状态给我复核。
 
 **第 2 步 · 选底座并初始化**：
 
-> 编辑 docs/PROJECT.md：这是待填模板，把所有 FILL_IN 换成实际内容，edition 填 local。然后运行初始化，生成 docs/PLAN.md，把 config show 和 task list 的完整输出给我看。
+> 编辑 docs/PROJECT.md：这是待填模板，把所有 FILL_IN 换成实际内容，edition 填 github。然后运行初始化，生成 docs/PLAN.md，把 config show 的完整输出给我看。
 
 使用 `github` 底座时，按第 4 节路径一中的 GitHub 初始化步骤生成设计计划。
 
@@ -75,7 +75,7 @@
 | 我想… | 去哪 |
 | --- | --- |
 | 知道它是什么、解决什么问题、适不适合我 | 第 1 节 |
-| 选 `local` 还是 `github`，什么时候迁移 | 第 2 节 |
+| 确认底座、`local` 退场后的旧版与迁移去向 | 第 2 节 |
 | 看话术对应哪些命令、每条命令的完整输出 | 第 3 节 |
 | 空目录从零开始 / 接入已有仓库 / 迁到 GitHub | 第 4 节 |
 | 看目录里每个文件是干什么的 | 第 5 节 |
@@ -89,42 +89,34 @@
 | 让 ETR / 评价可信度参与 Execution / Reviewer 候选排序，并确认 Master 仍手动 | [下一阶段治理与 Agent 性能设计 §7–§9](design/next-phase-governance-and-agent-performance.md) |
 | 找各治理文档入口 | 第 12 节 |
 
-## 2. 两种底座怎么选
+## 2. 受支持的底座与 local 退场
 
-两个底座共用同一份核心契约，角色权限、审查门、禁改路径、证据标准完全一致，**只有任务载体与证据来源不同**。底座由 [docs/PROJECT.md](PROJECT.md) 的 `edition` 决定，取值只能是 `local` 或 `github`；缺失或非法时必须停止调度并报告，不得猜测或按默认值继续。本地 CLI 只维护 `local` 任务库：声明 `github` 时调度命令会被明确拒绝并给出下一步指引，而不是静默按 `local` 执行（支持矩阵见 6.2）。
+主线和下一代安装包**只提供 `github` 底座**：Issue 任务单 + Draft PR + CI。核心契约与底座无关，角色权限、审查门、禁改路径与证据标准完全一致，只有任务载体与证据来源由底座决定。底座由 [docs/PROJECT.md](PROJECT.md) 的 `edition` 决定，**唯一受支持的取值是 `github`**；缺失、为空、重复声明、非法字符串或文件不可读时停止执行并报告实际值与修复位置，不得猜测或按默认值继续。
 
-| 维度 | `local`（[说明](../editions/local/master.md)） | `github`（[说明](../editions/github/master.md)） |
-| --- | --- | --- |
-| 形态 | 离线单机，不依赖托管平台 | 托管平台，Issue + Draft PR + CI |
-| 任务载体 | SQLite 任务库 `.orchestration/state.sqlite3` | 每个任务一个 Issue，正文五节 |
-| 锁 / 防冲突 | `task dispatch` 原子路径锁；可选具名资源锁（同一数据库文件 + 单机范围内原子） | Issue 内 `ORCH-TASK-REGISTRY` 登记块 + 开放 PR 同文件检查；具名资源只能协作登记，不具原子性 |
-| 主要证据 | 本地命令输出、退出码、head SHA | CI 结果、PR 评论、head SHA |
-| 协作范围 | 一位操作者、一台机器 | 多人、多地点，可异地接手 |
-| 外部依赖 | Python 3 + Git，无需联网 | GitHub 仓库、平台权限、CI 工作流 |
-| 适合 | 完全离线、单机、规模较小、内部项目 | 协作频繁、规模增长、需要公开可核验证据 |
-| 主要代价 | 状态只在本机，无平台强制门 | 依赖平台可用性，公开内容必须脱敏 |
+| 维度 | `github`（[说明](../editions/github/master.md)） |
+| --- | --- |
+| 形态 | 托管平台，Issue + Draft PR + CI |
+| 任务载体 | 每个任务一个 Issue，正文五节 |
+| 锁 / 防冲突 | Issue 内 `ORCH-TASK-REGISTRY` 登记块 + 开放 PR 同文件检查；具名资源只能协作登记，不具原子性 |
+| 主要证据 | CI 结果、PR 评论、head SHA |
+| 协作范围 | 多人、多地点，可异地接手 |
+| 外部依赖 | GitHub 仓库、平台权限、CI 工作流 |
+| 主要代价 | 依赖平台可用性，公开内容必须脱敏 |
 
-**选择判据：**
+### `local` 退场与旧版留存
 
-- 只有一台机器、可以完全离线、任务数量有限、审查记录只需内部可见：选 `local`。
-- 需要异地接手、多人同时推进、需要平台强制的分支保护与必需检查、审查证据要对第三方可见：选 `github`。
-- 拿不准时先 `local`；等协作需求明确后再迁移，不要一开始就为想象中的规模付出平台成本。
+`local`（SQLite 任务库 `.orchestration/state.sqlite3`、原子路径锁）已按项目所有者 2026-11-23 的决定从主线与下一代安装包退场：主线 CLI、批次入口与发行入口不再提供 SQLite 任务调度，发行包也不再包含 `editions/local/`。既有 local 安装有两条明确去向：
 
-**什么时候该迁移：**
+- **固定旧版（推荐用于仍在运行的旧项目）**：留在被验证的 Release `v2.0.0`（tag `v2.0.0`）上继续运行，不要升级本套件。旧的 local 命令、任务库与原子路径锁都以该版本为准。
+- **跟进主线**：按 [kit/orchestration.md 第 6 节](../kit/orchestration.md#6-底座切换与-local-退场) 做**一次性、单向、禁止双写**的 `local` → `github` 迁移，由项目所有者批准；迁移完成前旧库保持只读归档。
 
-- 项目变大，任务数量、并行度或参与人数超出单机人工协调能力。
-- 需要异地接手，或状态不能只留在某一台机器上。
-- 需要公开、可独立核验的过程证据，或需要平台强制的合并门。
-
-> 从 `local` 迁移到 `github` 是**授权决策**，不是偏离：多地协同开发时 GitHub 的优势明显，项目逐步变大后 `github` 底座更合适。
-
-“先 `local` 后 `github`”是常见路径。迁移必须由项目所有者批准，**单向执行、一次性完成、禁止双写**：同一任务不能同时在任务库和 Issue 中维护状态。四步概览见 [kit/orchestration.md 第 6 节「底座切换」](../kit/orchestration.md#6-底座切换)，落地路径见本文第 4 节。
+**单次回退**：已经升级到本主线后要回到旧行为，只能整体回退到 Release `v2.0.0`（重新安装该 Release 的发行包并按该版本手册恢复任务库）。主线不提供 `github` → `local` 的同步回退，也不把 Issue / PR 状态导回 SQLite。
 
 并发不设固定数量：**按当前机器性能动态判断**，只要任务可并行且 CPU / 内存 / 磁盘 / 测试资源仍有余量，就可以并行；同一 Worktree 同一时刻只允许一个测试进程。
 
-## 3. 上手命令详解（local）
+## 3. 上手命令详解（GitHub）
 
-这是「快速上手」的完整版：话术对应哪些命令、每条命令的真实输出、退出码与逐条解释。所有命令都通过 `uv run python` 执行（uv 会自动选择合适的解释器）。
+这是「快速上手」的完整版：话术对应哪些命令、预期证据与退出码。所有 Python 命令通过 `uv run python` 执行（uv 会自动选择合适的解释器）。
 
 ### 3.0 话术 → 命令对照表
 
@@ -133,81 +125,44 @@
 | 话术（对 Agent 说） | Agent 执行的命令 | 预期证据 |
 | --- | --- | --- |
 | "把套件装进我的项目…" | 从 Releases 下载发行包并解压，把包内顶层目录（`AgentOrch-<X.Y>/` 或 `agentorch-YYYYMMDD/`）内容复制到项目根 | 顶层目录清单：`scripts/`、`editions/`、`templates/`、`docs/PROJECT.md` 等 |
-| "编辑 docs/PROJECT.md…然后运行初始化" | 编辑 `docs/PROJECT.md`；`uv run python scripts/orchestrator.py init` | 退出码 0；输出含 `Created docs/PLAN.md from <项目根>\templates\plan.md`；`.orchestration/state.sqlite3` 出现 |
-| "把 config show 和 task list 的完整输出给我看" | `uv run python scripts/orchestrator.py config show`、`task list` | 退出码 0；`edition = local`；任务库为空 |
-| "登记 ID 为 TASK-0001 的示例任务…" | `uv run python scripts/orchestrator.py task add --id TASK-0001 --title "建立项目骨架" --paths src/ --acceptance "最小入口可运行" "验证命令退出码为 0"` | 输出 `TASK-0001: created in PLANNED` |
-| "置为 READY 再 DISPATCH" | `uv run python scripts/orchestrator.py task ready TASK-0001`、`task dispatch TASK-0001` | 退出码 0；`DISPATCHED; locks acquired for src`；任务包生成并展示 |
-| "运行结构自检并告诉我退出码" | `uv run python scripts/validate_kit.py` | 退出码 0；`Kit validation passed (133 required files checked; …)` |
-| "把示例任务置为 CANCELED" | `uv run python scripts/orchestrator.py task status TASK-0001 CANCELED --note "冒烟结束"` | 退出码 0；路径锁释放 |
+| "编辑 docs/PROJECT.md…然后初始化设计计划" | 编辑 `docs/PROJECT.md`（`edition: github`）；`uv run python scripts/orchestrator.py init-plan` | 退出码 0；输出含 `Created docs/PLAN.md from templates/plan.md`（已存在时 `kept unchanged`） |
+| "把 config show 的完整输出给我看" | `uv run python scripts/orchestrator.py config show` | 退出码 0；`edition = github`、来源为 `docs/PROJECT.md` |
+| "创建并登记第一个任务" | `gh issue create --title … --body-file …`，在正文写入完整任务包；开工前写入 `ORCH-TASK-REGISTRY` 登记块 | Issue 编号与 URL；登记块含 `status` / `locked_paths` / `branch` / `head_sha` |
+| "检查是否有路径冲突" | `gh pr list --state open --json number,headRefName,files` | 开放 PR 列表；与本次 `locked_paths` 相交即为冲突，派发失败 |
+| "运行结构自检并告诉我退出码" | `uv run python scripts/validate_kit.py` | 退出码 0；`Kit validation passed (… required files checked; …)` |
 
 ### 3.1 放入套件
 
-**直接使用发行版，不要 clone 本仓库。** 本仓库是套件自我开发与完善的现场——阶段计划、任务记录、审计与设计过程材料都在里面，不面向使用者；面向使用者的只有 Releases 里的发行包。发行包只含可复用产出（核心契约、两套底座、模板、脚本与自检），并经隐私自检：无个人路径、无凭据痕迹、无任务记录与过程残留。
+**直接使用发行版，不要 clone 本仓库。** 本仓库是套件自我开发与完善的现场——阶段计划、任务记录、审计与设计过程材料都在里面，不面向使用者；面向使用者的只有 Releases 里的发行包。发行包只含可复用产出（核心契约、`github` 底座、模板、脚本与自检），并经隐私自检：无个人路径、无凭据痕迹、无任务记录与过程残留。
 
 ```bash
-# 从 Releases 下载正式发行包（如 AgentOrch-1.7.0.zip；日期构建为 agentorch-YYYYMMDD.zip）后解压，
+# 从 Releases 下载正式发行包（如 AgentOrch-2.0.0.zip；日期构建为 agentorch-YYYYMMDD.zip）后解压，
 # 把包内顶层目录内容复制进你的项目根；zip 名与顶层目录名相同
-unzip /path/to/AgentOrch-1.7.0.zip -d /tmp/agentorch-kit
-cp -r /tmp/agentorch-kit/AgentOrch-1.7.0/. your-project/ && cd your-project
+unzip /path/to/AgentOrch-2.0.0.zip -d /tmp/agentorch-kit
+cp -r /tmp/agentorch-kit/AgentOrch-2.0.0/. your-project/ && cd your-project
 ```
 
-随后编辑 `docs/PROJECT.md`，至少填好 `edition: local`、允许 / 禁改路径和验证命令；发行包里的该文件是带 `FILL_IN` 的待填模板。
+随后编辑 `docs/PROJECT.md`，至少填好 `edition: github`、允许 / 禁改路径和验证命令；发行包里的该文件是带 `FILL_IN` 的待填模板。
 
 **旧项目注意**：本节命令适用于新建项目；已有代码的仓库**不要**在项目根直接解压覆盖（可能盖掉你自己的 README / LICENSE / docs / scripts），改走第 4 节路径二的"先读方法、临时解压、冲突盘点、不覆盖引入"流程。
 
 ### 3.2 最小命令序列
 
 ```bash
-uv run python scripts/orchestrator.py init
+uv run python scripts/orchestrator.py init-plan
 uv run python scripts/orchestrator.py config show
-uv run python scripts/orchestrator.py task add --id TASK-0001 --title "建立项目骨架" --paths README.md src/ --acceptance "有最小可运行入口" "测试命令退出码为 0"
-uv run python scripts/orchestrator.py task ready TASK-0001
-uv run python scripts/orchestrator.py task dispatch TASK-0001
-uv run python scripts/orchestrator.py task list
+gh issue create --title "建立项目骨架" --body-file .github/task-body.md
 uv run python scripts/validate_kit.py
 uv run python -m unittest discover -s tests
 ```
 
-`--paths`、`--depends`、`--acceptance`、`--resources` 都是多值选项：一次给多个值（如上例）或重复写同一个选项（如 `--acceptance "AC-1" --acceptance "AC-2"`）都会合并保留；`--acceptance` 保持给定顺序，`--paths` / `--depends` 仍排序去重。
+`init-plan` 只生成 `docs/PLAN.md`（已存在时不覆盖），不会创建任何任务库；任务载体是 GitHub Issue，`task add` / `ready` / `dispatch` 等本地调度命令在本主线一律拒绝执行并指向 Issue / PR。
 
-关键输出（为便于阅读，绝对路径以 `<项目根>` 代替，分隔符随平台变化、示例为 Windows 写法；路径末尾的 `/` 会被规范化为 `src`）：
+`docs/PROJECT.md` 中的 `edition` 只能写 `github`，值要单独成行、不要追加其它文字。旧格式报错示例（退出码 1）：
 
 ```text
-.
-├── AGENTS.md                          # 核心契约：角色、权限、Git 纪律、安全（唯一权威，人打开）
-├── LICENSE.md                         # 许可证
-├── VERSION.md                         # 套件名、Format version 与 Release 版本
-├── editions/
-│   ├── local/                         # master.md（Master 手册）+ execution.md（执行提示词）
-│   └── github/                        # 同上 + issue/pr/active-task-registry 三个载体模板
-├── templates/                         # 全部小写、可复制模板（任务包、设计契约、审计、清单…）
-│   └── self-improvement/              # 提案 / 任务包 / 闭环报告 / 注册表示例 / 包内操作说明
-├── docs/                              # 仓库文档（发行包不打包任何 docs/ 文件）
-│   ├── orchestration.md               # 不随包的路径指针；唯一可编辑契约在 kit/orchestration.md
-│   ├── README.md                      # 本文件（GitHub 仓库首页仍会渲染它）
-│   ├── PROJECT.md                     # 项目配置：edition、允许/禁改路径、验证命令
-│   ├── PLAN.md                        # 设计目标权威（init 从 templates/plan.md 生成）
-│   ├── implementation-plan.md         # 阶段计划（状态唯一落点）
-│   ├── charter.md / upgrade.md / drift.md / metrics.md
-│   ├── self-improvement/              # 自我完善与更新安全的仓库文档（不随包）
-│   ├── design/resource-locks.md       # 冻结契约
-│   ├── testing/delivery-regression-scenarios.md
-│   └── images/                        # 设计配图（按需查看、图文双写）
-├── scripts/                           # orchestrator / validate_kit / check_drift / report_metrics / run_delivery_scenarios
-│   ├── self_improvement/              # 来源注册表、采集、Lesson、规划与闭环
-│   └── update_agentorch/              # 安全更新引擎与「更新 AgentOrch」入口
-├── tests/                             # 随包自检用单元测试（docs/ 专属用例保留为 repository-only）
-└── release/                           # 构建产物（gitignore）与发布标准 README.md
+ERROR: docs/PROJECT.md: key `edition` has unsupported value 'local' in <项目根>/docs/PROJECT.md; edition `local` is not supported by this kit: ...
 ```
-
-说明：
-
-- `init` 创建 `.orchestration/state.sqlite3` 与 `.orchestration/config.json`，并把 `.orchestration/` 写入当前克隆的 `.git/info/exclude`（若存在 Git），不会覆盖项目的 `.gitignore`。
-- `init` 还会在 `docs/PLAN.md` 缺失且不存在 1.3 之前的根 `PLAN.md` 时，创建 `docs/` 并从 `templates/plan.md` **逐字节复制**一份到 `docs/PLAN.md`；发现旧根 `PLAN.md` 时不自动迁移，只提示 `git mv PLAN.md docs/PLAN.md`（见 10.6）；`docs/PLAN.md` 已存在时保持原样、只打印提示，重复执行不产生差异。模板缺失时给出提示但 `init` 仍以退出码 0 结束（其余初始化照常完成）；写入失败（例如目录只读）会报 `ERROR` 并以退出码 1 结束，不会假装成功。
-- **计划分两层**：`docs/PLAN.md` 是**设计目标权威**（为什么做、做到什么程度、原则与边界），任务方向必须与它一致；阶段目标、任务顺序与状态写在 `docs/` 的阶段计划里，需要时把 `templates/implementation-plan.md` 复制到 `docs/`（`init` 不创建阶段计划）。两者冲突时以 `docs/PLAN.md` 的设计目标为准，停下对齐，不得各写一套。`templates/plan.md` 只用于初始化复制，不要直接把它当项目计划。**设计文档可配图**：图放 `docs/images/`、正文相对引用；Agent 只按文中指引看图、不批量读取；设计意图必须文字自足（规则见 [AGENTS.md](../AGENTS.md) 第 8 条）。
-- `dispatch` 只登记状态并占用路径锁，**不会启动 Agent**。拿到锁后，把自包含任务包交给真实执行实例；没有真实 spawn 能力时，由操作者另开会话执行。
-- 单元测试会大量打印临时任务库日志，属正常现象；退出码为 0 即通过。
-- 冒烟完成后可取消这条示例任务并释放锁：`uv run python scripts/orchestrator.py task status TASK-0001 CANCELED --note "快速开始冒烟结束"`。
 
 ## 4. 三条落地路径
 
@@ -217,9 +172,9 @@ uv run python -m unittest discover -s tests
 
 目标：从一句想法走到项目章程、首批任务与第一个可运行切片。
 
-1. 按第 3 节把套件放入空目录，`docs/PROJECT.md` 填 `edition: local`。
-2. 运行 `uv run python scripts/orchestrator.py init` 与 `uv run python scripts/orchestrator.py task list`：`init` 会从 `templates/plan.md` 复制出 `docs/PLAN.md`，先在这份**设计目标**文件里写清问题、目标、原则、边界与全局验收，再确认任务库可用且为空。需要阶段计划时把 `templates/implementation-plan.md` 复制到 `docs/`，在那里写阶段目标、任务顺序与状态。
-3. 在 Master Agent 会话中加载 [editions/local/master.md](../editions/local/master.md)，按提示词澄清目标、产出章程、拆出 1–3 个最小任务。
+1. 按第 3 节把套件放入空目录，`docs/PROJECT.md` 填 `edition: github`。
+2. 运行 `uv run python scripts/orchestrator.py init-plan` 与 `uv run python scripts/orchestrator.py config show`：`init-plan` 会从 `templates/plan.md` 复制出 `docs/PLAN.md`，先在这份**设计目标**文件里写清问题、目标、原则、边界与全局验收，再确认 `edition = github`。需要阶段计划时把 `templates/implementation-plan.md` 复制到 `docs/`，在那里写阶段目标、任务顺序与状态。
+3. 在 Master Agent 会话中加载 [editions/github/master.md](../editions/github/master.md)，按提示词澄清目标、产出章程、拆出 1–3 个最小任务。
 4. 若想法本身还很模糊，先走 [templates/project-charter.md](../templates/project-charter.md) 的章程引导流程，再进入任务拆解。
 
 #### GitHub 项目初始化设计计划
@@ -242,29 +197,29 @@ python agentorch/scripts/orchestrator.py --layout isolated init-plan
 
 缺少有效的 GitHub 底座声明、模板缺失或路径不可写时，命令打印诊断并以退出码 1 结束。生成前发现历史根 `PLAN.md` 时，按第 10.6 节的提示迁移，退出码也是 1。
 
-需要初始化本地 SQLite 任务库的 `local` 安装继续使用 `init`。GitHub 项目生成设计计划后，可按底座手册准备项目章程和 Issue。 [GitHub 底座手册](../editions/github/master.md)
+`init` 与 `init-plan` 在本主线是同一件事：只生成 `docs/PLAN.md`，不创建任务库。生成设计计划后，按 [GitHub 底座手册](../editions/github/master.md) 准备项目章程和 Issue。旧 `local` 安装固定使用 Release `v2.0.0`，本主线不为它初始化任务库。
 
 ### 路径二：接入已有仓库
 
 目标：在不破坏既有规则、**不覆盖旧项目任何重要文件**的前提下接入套件，恢复真实进度，再继续推进。对 Agent 说的话术见快速上手「第 1 步 B」，本节是它背后的完整步骤：
 
-1. **Agent 先读方法，再动手**：读 [kit/orchestration.md](../kit/orchestration.md) 的会话入口、[AGENTS.md](../AGENTS.md) 与 [editions/local/master.md](../editions/local/master.md)（github 底座为 [editions/github/master.md](../editions/github/master.md)）的「已有项目接入」章节，理解角色分工、合并门与证据要求后，才允许改你的项目。
+1. **Agent 先读方法，再动手**：读 [kit/orchestration.md](../kit/orchestration.md) 的会话入口、[AGENTS.md](../AGENTS.md) 与 [editions/github/master.md](../editions/github/master.md) 的「已有项目接入」章节，理解角色分工、合并门与证据要求后，才允许改你的项目。
 2. **受限新安装与同来源升级**：仅当目标是专属、干净的 Git linked worktree、没有其他写入者且调用者显式声明时，隔离入口才允许把经官方 Release 校验的字节写入 `agentorch/`，并在根 `AGENTS.md` 追加唯一受管区块。升级只在“同来源且可重新认证”时可用：安装器按本地清单的 Format 提示取回旧版官方 Release，并要求已安装文件逐项匹配后才写入差异；本地 `MANIFEST.json` 与哈希不单独授权写入。声明是前提，不是强制隔离证明；显式跨进程回滚只在绑定记录复核通过时恢复，否则失败关闭，且不声称同 UID 强隔离。
 3. **旧根布局（受限迁移切片）**：默认保留旧文件，不自动删除、移动或覆盖；本地清单及哈希不能独立证明文件归属。唯一例外是旧根每个发布成员（含根 `MANIFEST.json`）与 APPLY 内重新获取并校验的官方历史 Release 逐字节一致、无本地修改、目标 `agentorch/` 不存在或为空且目标版本不低于历史版本：此时只新增 `agentorch/`，旧根保留原路径原字节（包括不写旧根 `AGENTS.md` 的受管区块）。任一不匹配、缺历史资产、目标冲突、符号链接 / 非普通文件或路径越界都保持 `STOPPED_CONFLICT` 且零写入。旧入口的直接调用不在支持范围，本套件不声称已在技术上阻止这类调用。真实官方历史 Release 资产、真实下游与跨平台的跨进程回滚、普通非 linked worktree 与跨平台能力仍未完成，AC-9 未通过。
 4. **人工评估接入**：盘点宿主规则与文件冲突，并由项目所有者决定后续；[升级指南](upgrade.md)记录当前限制。计划结果不是安装安全、并发隔离、真实运行时入口或跨平台回滚成功的证明。
 
 ### 路径三：从 `local` 迁移到 `github`
 
-目标：把任务状态从本机任务库迁到 Issue / PR / CI，切换后只保留一个事实来源。
+目标：把任务状态从本机任务库迁到 Issue / PR / CI，切换后只保留一个事实来源。适用于仍停留在 Release `v2.0.0` 上、决定跟进主线的项目。
 
-入口：[kit/orchestration.md 第 6 节「底座切换」](../kit/orchestration.md#6-底座切换)。四步概览：
+入口：[kit/orchestration.md 第 6 节「底座切换与 local 退场」](../kit/orchestration.md#6-底座切换与-local-退场)。四步概览：
 
 1. **冻结写入并导出 Issue**：停止 `local` 派发与状态变更，记录切换点的主分支 SHA 与任务库备份位置；每个未完成任务按 [ISSUE-TEMPLATE.md](../editions/github/issue-template.md) 的五节导出一个 Issue，已完成任务只归档摘要。
 2. **建立平台保护与 CI**：配置默认分支保护、必需检查与 PR 模板，使合并门由平台强制执行。
 3. **登记块接管锁**：开工前在 Issue 写 `ORCH-TASK-REGISTRY` 登记块，并检查所有开放 PR 的变更文件是否与 `locked_paths` 相交；两者都通过才算取得锁。
 4. **切换点一次性完成**：状态映射、证据迁移、合并后主分支重验一次做完；迁移后所有状态只写入 Issue / PR，任务库转为只读归档。
 
-迁移完成后，按 `github` 底座的启动提示词继续：[master.md 的“新项目启动”章节](../editions/github/master.md) 或 [master.md 的“已有项目接入”章节](../editions/github/master.md)。迁移是单向的，本套件不提供自动回退；确需回退时由项目所有者单独立项。
+迁移完成后，按 `github` 底座的启动提示词继续：[master.md 的“新项目启动”章节](../editions/github/master.md) 或 [master.md 的“已有项目接入”章节](../editions/github/master.md)。迁移是单向的，本套件不提供 `github` → `local` 的自动回退；确需回退只能整体回到已验证的 Release `v2.0.0`。
 
 ## 5. 目录结构
 
@@ -283,16 +238,15 @@ python agentorch/scripts/orchestrator.py --layout isolated init-plan
 ├── kit/
 │   └── orchestration.md               # 核心编排契约（随包分发）：会话入口、状态机、G1–G6、C1–C4、底座切换、通用验收程序
 ├── editions/
-│   ├── local/                         # local 增量：SQLite 命令、路径锁、启动提示词
 │   └── github/                        # github 增量：Issue / PR 模板、登记块、启动提示词
 ├── templates/                         # 任务包、设计契约与决策日志、阶段收口审计、审查清单等可复制模板
 ├── scripts/
-│   ├── orchestrator.py                # local 任务库与原子路径锁 CLI
-│   ├── report_metrics.py              # 只读指标报告：任务库事件 → 七项指标（人类摘要 / JSON）
+│   ├── orchestrator.py                # 计划初始化与只读归档维护 CLI（不再调度）；旧任务库只在 v2.0.0 上可写
+│   ├── report_metrics.py              # 只读指标报告：事件样本 → 七项指标（人类摘要 / JSON）
 │   ├── validate_kit.py                # 结构 / 概念 / 链接自检，同时是发布清单
 │   ├── check_drift.py                 # 生成 MANIFEST.json + 下游只读漂移诊断
 │   └── build_release.py               # 发布构建（仅仓库内，不随包发布）
-├── tests/                             # orchestrator 的单元测试
+├── tests/                             # 套件自检与 CLI 的单元测试
 ├── .github/workflows/ci.yml           # PR / main 推送时跑登记检查与发布打包自检（github 底座 G4 证据；仅本仓库，不随包发布）
 ├── release/README.md                  # 发布标准与发布清单（产物不入库）
 └── .local/                            # 本机私有文件（除说明文件外不入库）
@@ -300,7 +254,7 @@ python agentorch/scripts/orchestrator.py --layout isolated init-plan
 
 发行包只包含 `scripts/validate_kit.py` 的 `REQUIRED` 清单所列文件：1.7.1 桥接包与 2.0.0 候选都**不打包任何 `docs/` 文件**，核心契约随包放在 `kit/orchestration.md`；其余 `docs/` 内容（设计稿、阶段计划、升级说明等）都不打包。
 
-**核心只有一份，底座只做增量。** `AGENTS.md` 与核心契约 `kit/orchestration.md`（1.7.1 桥接包与 2.0.0 候选；仓库里的 `docs/orchestration.md` 只是路径指针）定义与底座无关的契约；`editions/local/` 与 `editions/github/` 只能细化命令、模板和载体操作，不得复制或改写出另一套核心条款。底座手册与核心契约冲突时，以核心契约为准。
+**核心只有一份，底座只做增量。** `AGENTS.md` 与核心契约 `kit/orchestration.md`（1.7.1 桥接包与 2.0.0 候选；仓库里的 `docs/orchestration.md` 只是路径指针）定义与底座无关的契约；现行 `editions/github/` 只能细化命令、模板和载体操作，不得复制或改写出另一套核心条款。底座手册与核心契约冲突时，以核心契约为准。
 
 ## 6. 配置
 
@@ -310,7 +264,7 @@ python agentorch/scripts/orchestrator.py --layout isolated init-plan
 
 | 字段 | 作用 |
 | --- | --- |
-| `edition` | 底座的**唯一权威来源**，只能 `local` 或 `github`，且只写取值、不加说明文字；缺失、为空、非法字符串或类型错误时阻断调度，并报出实际值与修复位置（文件 + 键名） |
+| `edition` | 底座的**唯一权威来源**，唯一受支持的取值是 `github`，且只写取值、不加说明文字；缺失、为空、非法字符串或类型错误时阻断执行，并报出实际值与修复位置（文件 + 键名）；`local` 按已退场处理 |
 | 允许改动路径 / 永远禁止改动路径 | 任务默认范围与硬边界；任务只能进一步收窄 |
 | 验证命令 | 审查门 G4 要求的测试、静态检查、构建命令；必须可真实执行 |
 | 并发策略 | 不写固定数字，按机器余量动态判断 |
@@ -342,13 +296,13 @@ python agentorch/scripts/orchestrator.py --layout isolated init-plan
 uv run python scripts/orchestrator.py config show
 ```
 
-`source` 为 `config.json` 表示来自运行时文件，为 `default` 表示回落到内置默认；`edition` 的来源固定是 `docs/PROJECT.md`。示例（合法覆盖 + 合法 `local` 声明）：
+`source` 为 `config.json` 表示来自运行时文件，为 `default` 表示回落到内置默认；`edition` 的来源固定是 `docs/PROJECT.md`。示例（合法运行时覆盖 + 合法 `github` 声明）：
 
 ```text
 Config file: <项目根>\.orchestration\config.json
   retry_cap  = 5          (source: config.json)
   local_dir  = .private   (source: config.json)
-  edition    = local      (source: docs/PROJECT.md)
+  edition    = github     (source: docs/PROJECT.md)
 Edition is selected only by `edition` in <项目根>\docs/PROJECT.md; config.json holds local CLI runtime parameters (retry_cap, local_dir) and never selects an edition.
 Edit .orchestration/config.json to change retry_cap or local_dir; invalid values there fall back to defaults.
 ```
@@ -357,17 +311,16 @@ Edit .orchestration/config.json to change retry_cap or local_dir; invalid values
 
 #### 底座与命令支持矩阵
 
-| 命令 | `local` | `github` | `edition` 缺失 / 非法 |
+| 命令 | `edition: github` | `edition: local`（已退场） | `edition` 缺失 / 非法 |
 | --- | --- | --- | --- |
-| `init` | 可用 | 可用（只建本地库，不选底座） | 可用 |
-| `init-plan` | 拒绝，并提示使用 `init` | 可用（仅初始化设计计划） | 拒绝，并给出诊断与修复位置 |
-| `backup` | 可用 | 可用 | 可用 |
-| `config show` | 可用，退出码 0 | 可用，退出码 0 | 打印诊断，退出码 1 |
-| `task list` / `task show` / `task resources` | 可用 | 可用（只读归档；`task resources` 只列出已有记录，不做过期迁移） | 可用（只读） |
-| `task add` / `ready` / `dispatch` / `status` / `workspace` / `amend` / `unlock` | 可用 | 拒绝，并给出 Issue / PR 指引 | 拒绝，并给出实际值与修复位置 |
-| `task renew` / `task reclaim` / `task reconcile` | 可用 | 拒绝，并给出 Issue / PR 指引 | 拒绝，并给出实际值与修复位置 |
+| `init` / `init-plan` | 可用（只生成 `docs/PLAN.md`，不建任务库） | 拒绝，并给出固定 `v2.0.0` / 迁移指引 | 拒绝，并给出诊断与修复位置 |
+| `backup` | 可用；仅当归档库已存在时运行，缺库拒绝且不 `init` | 可用（维护既有归档，不调度） | 可用（维护既有归档，不调度） |
+| `config show` | 可用，退出码 0 | 打印 `edition = local` 并给出退场指引，退出码 1 | 打印诊断，退出码 1 |
+| `task list` / `task show` | 可用（只读归档；库不存在时报错） | 可用（只读归档，不调度） | 可用（只读归档，不调度） |
+| `task add` / `ready` / `dispatch` / `status` / `workspace` / `amend` / `unlock` | 拒绝，并给出 Issue / PR 指引 | 拒绝，并给出固定 `v2.0.0` / 迁移指引 | 拒绝，并给出实际值与修复位置 |
+| `task resources` / `renew` / `reclaim` / `reconcile` | 拒绝，并给出 Issue / PR 指引 | 拒绝，并给出固定 `v2.0.0` / 迁移指引 | 拒绝，并给出实际值与修复位置 |
 
-`github` 底座的调度由 Issue / PR 承载：新建任务按 [editions/github/issue-template.md](../editions/github/issue-template.md) 写 Issue，执行按 [editions/github/execution.md](../editions/github/execution.md) 推进。本地 CLI **不**声称支持 github 调度，也不会把状态写进本地库。
+`github` 底座的调度由 Issue / PR 承载：新建任务按 [editions/github/issue-template.md](../editions/github/issue-template.md) 写 Issue，执行按 [editions/github/execution.md](../editions/github/execution.md) 推进。本地 CLI **不**声称支持任何底座的调度，也不会把状态写进本地库；`backup` 的维护写入边界不变（仅在归档库已存在时写一致性副本，缺库拒绝，不 `init`）。
 
 ### 6.3 私有目录：`.local/`
 
@@ -409,7 +362,7 @@ uv run python scripts/orchestrator.py task show TASK-0002 # 本任务的资源�
 - **人工动作必须留痕**：`task unlock <ID> --resource <id> --reason <text> --force` 需要理由，非终局任务还需 `--authorized-by`；`task reclaim` 需要过期、冷却期已过和证据引用；两者都会写审计事件。强制解锁后原任务再续租会得到 `LOCK_NOT_HELD`。
 - **恢复不靠记忆**：`task reconcile` 只读锁表与审计事件重建事实，缺事件、持有者不可定位、任务需人工决策的记录进入隔离（`QUARANTINED`），既不当有效持有，也不当空闲。
 - **配置**：声明资源前在 `.orchestration/config.json` 显式写入 `resource_lease_ttl` 与 `resource_reclaim_grace`（见 6.2），没有内置默认值。
-- **底座边界**：`local` 的原子性只覆盖“同一数据库文件 + 单机（或受支持的一致性共享文件系统）”，不覆盖跨主机或网络文件系统；`github` 只有 Issue 登记块里的协作性占用（可选 `locked_resources`），检查与写入之间存在 TOCTOU 窗口，**不得表述为“原子锁”或“并发已保证”**。详见契约第 7 节。
+- **底座边界**：`github` 只有 Issue 登记块里的协作性占用（可选 `locked_resources`），检查与写入之间存在 TOCTOU 窗口，**不得表述为“原子锁”或“并发已保证”**。详见契约第 7 节；历史 `local` 的原子性只在 Release `v2.0.0` 上成立，不适用于本主线。
 
 ## 7. 自检
 
@@ -426,13 +379,13 @@ uv run python scripts/report_metrics.py --gold-sample --since 2026-01-01 --until
 
 `validate_kit.py` 检查：
 
-- **133 项必需文件**是否齐全（`REQUIRED` 列表同时是发布包清单，只有一份来源）。
+- **131 项必需文件**是否齐全（`REQUIRED` 列表同时是发布包清单，只有一份来源；`editions/local/` 已随 local 底座退场移除）。
 - **合约模板是否仍问对问题**：`templates/design.md`、`templates/milestone-audit.md`、`templates/contract-decision-log.md` 的必备章节缺一即失败，模板内的相对链接断链也失败（章节缺失会被静默当成“不需要回答”，因此单列一项检查）。
 - **能力登记与指标模板是否仍问对问题**：`templates/runtime-capability.md` 的身份 / 能力矩阵 / 扩展边界 / `UNKNOWN` 与重测 / 权限范围 / 证据与限制，以及 `templates/metrics.md` 的阅读规则 / 公共定义 / 指标定义 / 缺失与覆盖率 / 报告契约 / 金样本 / 限制，缺章节同样失败。
 - **发行包清单是否自洽**：根目录存在 `MANIFEST.json`（发行包内）时，校验其结构、分类、路径可解析与 `REQUIRED` 集合一致；SHA-256 与大小在纯净包与上游 checkout 严格比较，在下游项目只校验结构（见下方“三种树”）。仓库根目录没有该文件，检查自动跳过，不误报。
-- **两底座结构是否一致**：`editions/local` 与 `editions/github` 共享 2 个文件（`master.md`、`execution.md`），`github` 额外提供 3 个载体模板（`issue-template.md`、`pr-template.md`、`active-task-registry.md`）；任一侧缺失或出现多余文件都会失败。
+- **发行底座结构**：`editions/github` 必须提供 5 个文件（`master.md`、`execution.md`、`issue-template.md`、`pr-template.md`、`active-task-registry.md`）；缺失或出现多余文件都会失败，`editions/local` 不得留在发行包或仓库中。
 - **治理概念是否真实存在**：核心编排文档必须出现 `PR_OPEN`、合并门 G1–G6、运行时能力契约 C1–C4；文档整体必须出现主要状态名。
-- **`edition` 是否合法**：`docs/PROJECT.md` 必须有该键，且值为 `local` 或 `github`。
+- **`edition` 是否合法**：`docs/PROJECT.md` 必须有该键，且值为 `github`；`local` 或其它值都判为失败。
 - **相对链接是否可解析**：扫描所有 Markdown 链接，断链即失败（外部 URL 与锚点除外）。
 - **可选架构契约检查器是否随包发布**：`scripts/architecture/` 与 `templates/architecture/` 进入 `REQUIRED`（发行包清单），缺失即失败。检查器本身不猜模块：没有 `docs/architecture/contract.json` 时等价 `OFF`，只输出只读盘点并以 0 退出；配置契约后才按 `ERROR` / `WARNING` / `UNKNOWN` / `NOT_RUN` 报告并绑定 head SHA。用法见 [`templates/architecture/README.md`](../templates/architecture/README.md)。
 
@@ -502,14 +455,14 @@ uv run python scripts/report_metrics.py --gold-sample --since 2026-01-01 --until
 # 固定合成样本：成功 / 失败 / 取消 / 阻塞 / 重试 / 缺事件都覆盖
 uv run python scripts/report_metrics.py --gold-sample --since 2026-01-01 --until 2026-02-01
 
-# 真实 local 任务库（只读打开；不会写状态、不释放锁）
-uv run python scripts/report_metrics.py .orchestration/state.sqlite3 --json
+# 显式事件样本（JSON）
+uv run python scripts/report_metrics.py --events path/to/events.json --json
 ```
 
 - **能力登记**按 [templates/runtime-capability.md](../templates/runtime-capability.md) 填写：运行时名称与精确版本、底座、执行模式、探测时间（UTC）、C1–C4 逐条结论、更细的边界（spawn 句柄、隔离、wait-collect、终局分类、取消、文件 / 命令 / CI 权限、工具与测试环境、证据、限制）。未探测、证据失效或运行时升级一律写 `UNKNOWN`，先降级再重测。**记录只说明观察到的事实，不授予权限，也不替代 G1–G6。**
-- **指标口径**只在 [templates/metrics.md](../templates/metrics.md) 定义：七项指标各自写明起止事件、时区（UTC）、排除项与缺失处理；报告只读任务库事件与证据引用，不读凭据、提示词或消息正文。
+- **指标口径**只在 [templates/metrics.md](../templates/metrics.md) 定义：七项指标各自写明起止事件、时区（UTC）、排除项与缺失处理；报告只读事件与证据引用，不读凭据、提示词或消息正文。
 - **读数纪律**：任何统计值都要带样本量、窗口与缺失率；空数据输出 `no data`（coverage 0），缺事件记 `missing`，来源未采集记 `unknown` —— 三者都不等于 0。指标不用于没有上下文的 Agent 排名。
-- **未完成的采集项**：`local` 任务库目前只记录状态事件与资源冲突；检查结果、路径冲突、回归与验收行尚未写入，因此对应指标显示 `unknown`。这是原型，不宣称已自动采集。
+- **未完成的采集项**：历史 `local` 任务库（仅 Release `v2.0.0`）只记录状态事件与资源冲突；检查结果、路径冲突、回归与验收行尚未写入，因此对应指标显示 `unknown`。这是原型，不宣称已自动采集。
 
 ### 7.3 合成回归场景（重大变更必跑）
 
@@ -525,7 +478,7 @@ uv run python scripts/run_delivery_scenarios.py --json --output "$TEMP/delivery-
 - **正负组口径**：负向场景“通过”表示拦截门真的触发了（缺陷被拦下），不是任务真的成功了；`totals.negative_passed == totals.negative` 且至少一个正向控制组 `PASS` 才算有效证据。
 - **单场景不结束运行**：任何场景抛出非断言异常都会记为 `ERROR` 并保留堆栈，其余场景继续执行；这是运行器自身被测试的行为。
 - **只读仓库**：fixture 在一次性临时目录里生成，运行器不读写仓库文件（`--output` 指定的报告路径除外，建议写到仓库外）；无网络、无凭据、无外部模型。
-- **边界**：场景只覆盖套件自身的门禁语义；`github` 底座的 Issue / PR / 登记块 / CI 端到端无法离线验证，未实际运行即标 `BLOCKED`，不得用 `local` 结果替代；也不得据此宣称对任何外部产品项目做过真实数据或自动化验证。
+- **边界**：场景只覆盖套件自身的门禁语义；`github` 底座的 Issue / PR / 登记块 / CI 端到端无法离线验证，未实际运行即标 `BLOCKED`，不得用离线结果替代；也不得据此宣称对任何外部产品项目做过真实数据或自动化验证。
 
 
 
@@ -574,7 +527,7 @@ uv run python scripts/check_drift.py <项目根> --json   # stdout 只有 JSON�
 
 ## 9. 版本与兼容
 
-> **2026-11-16 注记**：本节下方的版本记录保持原样；其中"CI 在 macOS / Windows 上运行"与"在每个 PR 上跑打包自检"的描述属于**变更前**的历史口径。自 2026-11-16 起 `.github/workflows/ci.yml` 为风险分层：`risk` 作业按真实 Diff 给出 `L0`–`L3`，`L0` 只跑定向结构检查，`L1` 跑完整 Ubuntu 检查但不跑发布打包，`L2` / `L3`、push 到 `main` 与 `workflow_dispatch` 才跑发布打包自检与 macOS / Windows；必需 context 仍是 `checks (Python 3.12)` 与 `checks (Python 3.13)`（见 7.1 节）。同一后续 HEAD 在已发布 2.0.0 之外新增 3 个随包文件（`scripts/batch_delivery.py`、`scripts/delivery_risk.py`、`templates/batch-delivery.md`），当前 `REQUIRED` 为 133 个；`tests/test_batch_delivery.py` 与 `tests/test_delivery_risk.py` 仍为仓库专属、不随包发布。尚未发布新 Release；2.0.0 的 131 个包内文件记录只描述那个已发布 tag。
+> **2026-11-16 注记**：本节下方的版本记录保持原样；其中"CI 在 macOS / Windows 上运行"与"在每个 PR 上跑打包自检"的描述属于**变更前**的历史口径。自 2026-11-16 起 `.github/workflows/ci.yml` 为风险分层：`risk` 作业按真实 Diff 给出 `L0`–`L3`，`L0` 只跑定向结构检查，`L1` 跑完整 Ubuntu 检查但不跑发布打包，`L2` / `L3`、push 到 `main` 与 `workflow_dispatch` 才跑发布打包自检与 macOS / Windows；必需 context 仍是 `checks (Python 3.12)` 与 `checks (Python 3.13)`（见 7.1 节）。同一后续 HEAD 在已发布 2.0.0 之外新增 3 个随包文件（`scripts/batch_delivery.py`、`scripts/delivery_risk.py`、`templates/batch-delivery.md`），当前 `REQUIRED` 为 131 个（`editions/local/` 的两个文件随 local 退场移除，见 #280）；`tests/test_batch_delivery.py` 与 `tests/test_delivery_risk.py` 仍为仓库专属、不随包发布。尚未发布新 Release；2.0.0 的 131 个包内文件记录只描述那个已发布 tag。
 
 - [VERSION.md](../VERSION.md) 记录套件名、支持底座、**Format version**（当前 `1.7`）与**对外 Release 版本**（当前候选 `2.0.0`，未发布；仅作记录）；格式变更时同步更新模板与校验清单。
 - **Format 版本与 Release 版本是两条序列，不要混读**：最新已发布的是 Release `1.7.1`（tag `v1.7.1`、资产 `AgentOrch-1.7.1.zip`），它是给已发布 v1.7.0 更新器的桥接发行，契约仍在 `kit/orchestration.md`。当前候选是 **Release `2.0.0`（未发布）**，`Format version` 仍为 `1.7`：`tag_matches_format('v2.0.0', '1.7')` 为假，所以已发布的 v1.7.0 更新器会拒绝它；只有带显式兼容矩阵 `DECLARED_SUPPORTED_FORMATS = ('1.7',)` 的新更新器（含已发布的 v1.7.1）可通过 `VERSION_MATCH`。`VERSION_MATCH` 通过不等于安装或升级成功。`v1.7.1` 只是版本匹配层的必要桥接候选：已发布的 v1.7.1 CLI 与「更新 AgentOrch」入口固定请求 `/releases/latest`，CLI 没有 tag 参数，一旦 `v2.0.0` 成为 latest 就无法用它选择 `v1.7.1`；因此 ≤1.7.0 的实际迁移方案尚未验证，不得用未经验证的手工覆盖代替。真实 `v1.7.1 → 2.0.0` 升级为 `NOT_RUN`。这一 MAJOR 的破坏性变化：`scripts/self_improvement/orchestration.py` 的 `restore_state()` 现在要求 `base_sha`（v1.7.1 可省略），LOW/READY 自动路径停用（提案停在 `BLOCKED` / `NEEDS_EVIDENCE` 或 `NEEDS_HUMAN_DECISION`）。包内文件集合与 v1.7.1 相同（131 个 = 130 `REQUIRED` + `MANIFEST.json`），`format_version` 仍为 `1.7`。上一个已发布版本是 Release `1.7.0`（tag `v1.7.0`、资产 `AgentOrch-1.7.0.zip`）。`1.7.0` 是 **Phase D 的功能发行**，同时把 `Format version` 从 `1.6` 升到 `1.7`：更新引擎的 `VERSION_MATCH` 要求 tag 的 major.minor 等于清单 `format_version`，`v1.7.0` 必须配 Format `1.7` 才会被接受；包内 118 个文件（117 `REQUIRED` + `MANIFEST.json`）。上一个正式发布是 Release `1.6.3`（tag `v1.6.3`、资产 `AgentOrch-1.6.3.zip`），它是 `1.6.2` 的补丁发行，包含 #99–#104 的路径冲突记账、`task amend --paths`、`check_scope.py` 与文档口径修复，Format 仍为 `1.6`；再往前是 Release `1.6.2`（tag `v1.6.2`、资产 `AgentOrch-1.6.2.zip`），它是 `1.6.1` 的补丁发行（#93 重复多值选项修复）；更早是 Release `1.6.1`（tag `v1.6.1`、资产 `AgentOrch-1.6.1.zip`），它是 `1.6.0` 的补丁发行（#85 下游包修复）；最早是 Release `1.6`（tag `v1.6`、资产 `AgentOrch-1.6.zip`），它同时把 `Format version` 从 `1.5` 升到 `1.6`（新增自我完善 / 安全更新资产，见 `release/README.md` §5.2）。`MANIFEST.json` 的 `format_version` 只由 `Format version:` 一行生成（`1.7`），`Release version` 行不参与解析；下游判断兼容性看 `format_version`。
@@ -763,7 +716,7 @@ uv run python -m scripts.update_agentorch.entry --project . \
 ```
 
 - 入口先识别 `edition`、当前 Format / 版本、工作区状态与已安装基线，再调用安全更新引擎；默认 `PLAN` 只读，`APPLY` 只在隔离分支 / Worktree 准备变更，不提交、不合并。
-- `local` 只返回任务包 + 分支交付，不写任务库；`github` 只返回 Issue / Draft PR payload，不调用 `gh`。两者门禁相同。
+- 入口只返回 Issue / Draft PR payload，不调用 `gh`，也不写任何任务库；`local` 配置在入口处按已退场处理。门禁不变。
 - 冲突、上游删除 / 重命名、无基线、未提交改动、网络不可用都默认停止并报告；1.3 的根文件改名按 `HD-09` 交人工决策，不自动删除。
 - 1.1 / 1.2 没有 `MANIFEST.json`，先按 10.4 登记基线；不支持的情况标 `NOT_RUN` / `UNKNOWN`。完整矩阵、回退与未实测范围见仓库文档 `docs/upgrade.md` 第 13 节（`docs/` 不随包发布）。
 
@@ -796,7 +749,7 @@ uv run python -m scripts.update_agentorch.entry --project . \
 | [docs/architecture/repository-map.md](architecture/repository-map.md) | 判断某个文件 / 目录归谁负责、是否随包发布、当前是否权威 | 按地图定位权威文件；承担规则时回到对应权威位置 |
 | [docs/architecture/document-lifecycle.md](architecture/document-lifecycle.md) | 新增、修改、弃用、迁移、归档或删除文档之前 | 按状态转换与 `outdated` 条件登记；不凭印象改状态 |
 | [docs/PROJECT.md](PROJECT.md) | 初始化项目或调整范围 / 验证命令时 | 填好 `edition`、路径边界、验证命令与并发策略 |
-| [editions/local/master.md](../editions/local/master.md) / [editions/github/master.md](../editions/github/master.md) | 当前底座的日常操作 | 按底座手册创建、派发、审查、合并任务 |
+| [editions/github/master.md](../editions/github/master.md) | 当前底座的日常操作 | 按底座手册创建、派发、审查、合并任务 |
 | [editions/github/issue-template.md](../editions/github/issue-template.md) | 在 `github` 底座创建任务单时 | 按五节写 Issue，缺一节不得进入 `READY` |
 | [templates/project-charter.md](../templates/project-charter.md) | 想法模糊、涉及新方向 / 多文件 / 新依赖 / 不可逆操作时 | 先澄清并签署项目章程，再拆任务 |
 | [templates/design.md](../templates/design.md) / [templates/contract-decision-log.md](../templates/contract-decision-log.md) | 冻结或修改跨模块契约之前 | 填冻结契约、登记决策（含影响任务与证据），再让下游任务依赖 |

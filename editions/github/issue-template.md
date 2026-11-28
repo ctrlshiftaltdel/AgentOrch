@@ -1,6 +1,6 @@
 # ISSUE-TEMPLATE.md — github 底座任务单
 
-每个 Issue 的正文按下列五节填写。五节与 `local` 底座的任务包字段一一对应，缺任一节不得进入 `READY`。字段名与判定规则只在 `kit/orchestration.md` 4.1 节定义，本模板只说明证据放在哪里、如何取回。
+每个 Issue 的正文按下列五节填写。五节与通用任务包字段一一对应，缺任一节不得进入 `READY`。字段名与判定规则只在 `kit/orchestration.md` 4.1 节定义，本模板只说明证据放在哪里、如何取回。
 
 **批次（可选）**：一个任务可以属于一个交付批次。批次归属不新增必填字段，也不改变本 Issue 的五节、验收标准或证据矩阵；批次 ID、集成分支与最终 PR 记在 `ORCH-TASK-REGISTRY` 登记块（`mode: batch`），不要为此改写任务目标、扩大 Issue 或省略本任务的证据。
 
@@ -25,10 +25,10 @@
 | `AC-1` | 命令 / 测试 / 人工检查 | 期望结果 | 实际结果 | `PASS`（其余取值见 4.1 节） | 运行时与版本、底座、分支 | 等于矩阵 head SHA 的完整 commit | PR 评论 / CI 日志 / Diff 路径 | 备注；`NOT_APPLICABLE` 必填理由 |
 
 - 矩阵必须声明一个 head SHA（= PR 最新 commit）；head 变化后重新取证，旧行只能作为历史。
-- 列顺序固定（与 `local` 任务包一致）：`ac_id`、`method`、`expected`、`actual`、`status`、`environment`、`commit_sha`、`evidence_ref`、`notes`；字段含义与判定规则见 `kit/orchestration.md` 4.1 节。
+- 列顺序固定（与 `templates/task-packet.md` 一致）：`ac_id`、`method`、`expected`、`actual`、`status`、`environment`、`commit_sha`、`evidence_ref`、`notes`；字段含义与判定规则见 `kit/orchestration.md` 4.1 节。
 - 结构检查：`uv run python scripts/validate_kit.py --task-packet <填好的任务包路径>` 是本地等价物；PR 评论里的矩阵必须与任务包字段同名同义。
 
-**结构化场景字段**（与 `local` 任务包同名同义，含义见 `kit/orchestration.md` 4.1 节）：`invariants`、`negative_cases`、`migration_cases`、`integration_paths`、`unverified_assumptions`。
+**结构化场景字段**（与 `templates/task-packet.md` 同名同义，含义见 `kit/orchestration.md` 4.1 节）：`invariants`、`negative_cases`、`migration_cases`、`integration_paths`、`unverified_assumptions`。
 
 小任务允许写 `N/A: <理由>`；留空或只写 `N/A` 视为字段缺失，不得进入 `READY`。
 
@@ -54,7 +54,7 @@
 - `ORCH-TASK-REGISTRY` 可选写 `locked_resources`，格式 `<resource_id>:<mode>[:<ttl>]`，逗号分隔（例：`db:test/mysql-main:exclusive,svc:build/win-01:shared:600`）；留空表示本任务不占用具名资源。
 - 同一登记块可写 `resource_lease_until` 作为最新租约的记账值；平台不会因为它的日期过去而拒绝任何写入。
 - 这两项是**协作性占用登记**：正确性依赖“同一时刻只有一个 Master 在派发”和每次派发前重读登记块与开放 PR 快照。GitHub 不提供跨 Issue / 跨评论的事务，检查与写入之间存在 TOCTOU 窗口，因此这里写的是“已登记”，不是“已取得原子锁”；冲突后的处理权在人工（串行化、改资源或明确接受风险并记录）。
-- 字段含义只在 `docs/design/resource-locks.md` 定义，本模板不重述；`local` 底座的资源锁才在单库单主机范围内具备原子性。
+- 字段含义只在 `docs/design/resource-locks.md` 定义，本模板不重述；登记块只是协作性占用，**不具原子性**。
 - 结构检查：`uv run python scripts/validate_kit.py --task-packet <任务包路径>` 会校验本字段的格式；留空不会被判为失败。
 
 ---

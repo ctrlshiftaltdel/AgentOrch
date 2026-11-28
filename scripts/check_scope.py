@@ -16,7 +16,8 @@ the same question into a set judgement:
   and every untracked file (``--exclude-standard``). Rename detection is off, so
   a rename reports both the deleted and the added path, and a deletion is never
   lost.
-* **allowed paths** - ``paths_json`` of one task in the local task database.
+* **allowed paths** - ``paths_json`` of one task in the legacy local task database
+  (a read-only archive on Release `v2.0.0`; the mainline no longer schedules through it).
   "One task" is resolved as: ``--task <id>`` when given (any status, so an
   archived task can be audited), otherwise the single task whose status is in
   ``scripts.orchestrator.ACTIVE``. Zero or several active tasks is exit 1 with
@@ -522,8 +523,8 @@ def load_tasks(roots):
         _validate_isolated_store(roots)
     if _inspect_regular_file(path, 'task database')[0] is None:
         raise ScopeError(
-            f'task database not found: {display}; this check reads the local registry '
-            f'({DB_DIR}/{DB_NAME}) and never creates it')
+            f'task database not found: {display}; this check reads the legacy local '
+            f'archive ({DB_DIR}/{DB_NAME}) and never creates it')
     wal = path.with_name(path.name + '-wal')
     journal = path.with_name(path.name + '-journal')
     if os.path.lexists(wal):

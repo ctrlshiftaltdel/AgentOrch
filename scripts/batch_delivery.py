@@ -31,8 +31,8 @@ Limitations, stated honestly:
 * external project changes are not authorized. The plan's paths are checked
   against ``docs/PROJECT.md`` when its policy sections exist; a missing section
   is recorded as ``project_paths: unknown`` and is never claimed as checked.
-* the journal, lock and local task library are writable by the same user. The
-  coordinator narrows recovery windows; it cannot make them atomic.
+* the journal and lock are writable by the same user. The coordinator narrows
+  recovery windows; it cannot make them atomic.
 
 Only the Python standard library is used. No shell, no network in any test
 path; ``gh`` and OpenCode are optional executables reached through
@@ -119,7 +119,8 @@ REGISTRY_STATUSES = ('READY', 'DISPATCHED', 'IN_PROGRESS', 'PR_OPEN',
                      'CANCELED')
 RELEASED_REGISTRY_STATUSES = ('VERIFIED', 'CANCELED')
 MERGE_METHODS = ('merge', 'squash', 'rebase')
-VALID_EDITIONS = ('local', 'github')
+VALID_EDITIONS = ('github',)
+RETIRED_EDITIONS = ('local',)
 SECRET_PATTERNS = ('.env', '.env.*', '*secret*', '*token*', '*.pem', '*.key',
                    'credentials*')
 SECRET_EXCEPTIONS = ('.env.example',)
@@ -370,8 +371,9 @@ def project_config(repo):
     """Read the edition and path policy from ``docs/PROJECT.md``.
 
     The edition rule is the kit's strict one-line rule: exactly one declaration
-    whose value is ``local`` or ``github``. A missing, duplicate, empty or
-    invalid declaration is a preflight error, never a default.
+    whose value is ``github``. A missing, duplicate, empty or invalid declaration
+    is a preflight error, never a default. ``local`` is a retired edition and is
+    refused with retention / migration guidance instead of being scheduled.
     """
     path = Path(repo) / 'docs' / 'PROJECT.md'
     if not path.is_file():
@@ -494,10 +496,22 @@ def _secret_patterns(text):
 
 
 def _require_edition(config, expected=None):
+    if (config.get('edition_count') == 1
+            and config.get('edition') in RETIRED_EDITIONS):
+        raise InputError(
+            'docs/PROJECT.md declares `edition: local`, which is not supported by '
+            'this kit: the mainline and every next-generation install package '
+            'provide the `github` edition only, and the local SQLite batch carrier '
+            'has been retired. Nothing was written. To keep an existing local '
+            'install running, stay on the verified Release v2.0.0 (tag v2.0.0) and '
+            'do not upgrade this kit. To move forward, either stay on v2.0.0 or run '
+            'the one-time approved local -> github migration in kit/orchestration.md '
+            'section 6, then set "- `edition`: github" in docs/PROJECT.md. To roll '
+            'back after upgrading, reinstall the v2.0.0 release package.')
     if config.get('edition_count') != 1 or config.get('edition') not in VALID_EDITIONS:
         raise InputError(
-            'docs/PROJECT.md must declare exactly one `edition` of `local` or '
-            f'`github`; found {config.get("edition_count")} declaration(s), values '
+            'docs/PROJECT.md must declare exactly one `edition` of `github`; '
+            f'found {config.get("edition_count")} declaration(s), values '
             f'{config.get("edition_values")!r}')
     if expected is not None and config['edition'] != expected:
         raise InputError(f'docs/PROJECT.md switched edition from {expected!r} to '
@@ -3054,8 +3068,6 @@ def _gh_json(args, cwd, *, input_text=None, timeout=300):
 
 
 def _open_pr_conflicts(plan, batch_branch):
-    if plan['edition'] != 'github':
-        return {}
     repo = plan['batch']['repo']
     scope = _github_repo_args(plan)
     payload = _gh_json(['pr', 'list', '--state', 'open', '--limit', '1000',
@@ -3135,185 +3147,6 @@ def _open_pr_conflicts(plan, batch_branch):
     return conflicts
 
 
-def _task_status(text):
-    match = re.search(r'^Status:\s*([A-Za-z_]+)\s*$', text or '', re.M)
-    return match.group(1) if match else None
-
-
-def _parse_task_show(text):
-    record = {'status': _task_status(text), 'paths': [], 'dependencies': [],
-              'acceptance': []}
-    section = None
-    for line in (text or '').splitlines():
-        stripped = line.strip()
-        if stripped.startswith('Merge SHA:'):
-            record['merge_sha'] = stripped.partition(':')[2].strip()
-        if stripped.startswith('Allowed paths:'):
-            section = 'paths'
-            continue
-        if stripped.startswith('Dependencies:'):
-            section = 'dependencies'
-            continue
-        if stripped.startswith('Acceptance criteria:'):
-            section = 'acceptance'
-            continue
-        if stripped.startswith(('Status:', 'Description:', 'Branch:', 'Worktree:',
-                                'Head SHA:', 'Approved SHA:', 'Merge SHA:',
-                                'Retries:', 'Last note:')):
-            section = None
-            continue
-        if section and stripped.startswith('- '):
-            item = stripped[2:].strip()
-            if item.lower() in ('none', '(none)'):
-                continue
-            if section == 'acceptance':
-                item = re.sub(r'^\[[ xX]\]\s*', '', item)
-            record[section].append(item)
-    return record
-
-
-def _parse_task_list(text):
-    records = {}
-    current = None
-    for line in (text or '').splitlines():
-        if line and not line.startswith((' ', '\t')) and '\t' in line:
-            fields = line.split('\t')
-            if len(fields) >= 2:
-                current = {'status': fields[1].strip(), 'paths': [], 'locks': []}
-                records[fields[0].strip()] = current
-            continue
-        if current is None:
-            continue
-        stripped = line.strip()
-        for key in ('paths', 'locks'):
-            if stripped.startswith(key + ':'):
-                value = stripped.split(':', 1)[1].strip()
-                if value and value not in ('(none)', 'None'):
-                    current[key] = [item.strip() for item in value.split(',')
-                                    if item.strip()]
-    return records
-
-
-def _dispatch_local(plan, state, journal):
-    repo = plan['batch']['repo']
-    script = Path(repo) / 'scripts' / 'orchestrator.py'
-    if not script.is_file():
-        raise BatchError(
-            'local batches require scripts/orchestrator.py and a task record for '
-            'every task before an agent may start; the local carrier is absent. '
-            'Create the task records, then rerun. Any locks already taken keep '
-            'their contract and must be released through the normal CLI',
-            status='BLOCKED')
-    previous = state.get('dispatch') or {}
-    now = _now()
-    calls = list(previous.get('calls') or [])
-    statuses = dict(previous.get('tasks') or {})
-    retained = ('DISPATCHED', 'IN_PROGRESS', 'FAILED', 'BLOCKED', 'RUNNING',
-                'UNKNOWN')
-    task_ids = {spec['id'] for spec in plan['tasks']}
-    shown = {}
-    for spec in plan['tasks']:
-        ident = spec['id']
-        show = _run_orchestrator(repo, ['task', 'show', ident])
-        calls.append({'argv': ['task', 'show', ident], 'exit': show.returncode,
-                      'at': _now()})
-        if show.returncode != 0:
-            raise BatchError(
-                f'task {ident} is not in the local task library, so dispatch is '
-                'not authoritative; no agent was started. Any locks already taken '
-                'stay in force; inspect with `task show` and release only through '
-                'the normal CLI before retrying', status='BLOCKED')
-        record = _parse_task_show(show.stdout)
-        if record['status'] is None:
-            raise BatchError(f'task {ident} has no readable Status line',
-                             status='BLOCKED')
-        if sorted(record['paths']) != sorted(spec['paths']):
-            raise BatchError(
-                f'task {ident} registered allowed paths {record["paths"]!r} do not '
-                f'match the plan paths {spec["paths"]!r}; dispatch is not '
-                'authoritative', status='BLOCKED')
-        if record['acceptance'] != spec['acceptance']:
-            raise BatchError(
-                f'task {ident} registered acceptance criteria do not match the plan '
-                'exactly; dispatch is not authoritative', status='BLOCKED')
-        internal = sorted(set(record['dependencies']) & task_ids)
-        if internal:
-            raise BatchError(
-                f'task {ident} records in-batch dependency {", ".join(internal)} in '
-                'the local task library. This coordinator does not support local '
-                'batch-internal dependencies recorded in the task library. Keep the '
-                'task record intact; deliver the dependent task through a '
-                'single-task/manual workflow or wait for a batch-aware local '
-                'dispatch. The plan DAG does not replace task records',
-                status='BLOCKED')
-        if (record['status'] in ('VERIFIED', 'MERGED', 'CANCELED')
-                and (state['tasks'].get(ident) or {}).get('status') != 'VERIFIED'):
-            raise BatchError(
-                f'task {ident} is {record["status"]} in the local library while the '
-                'batch journal still expects work; refusing to treat a terminal '
-                'task as dispatchable', status='BLOCKED')
-        shown[ident] = record
-    for spec in plan['tasks']:
-        ident = spec['id']
-        current = shown[ident]['status']
-        if ident in statuses:
-            statuses[ident] = statuses[ident] or 'DISPATCHED'
-            continue
-        if (current in retained
-                and (state['tasks'].get(ident) or {}).get('status')
-                in ('RUNNING', 'FAILED', 'BLOCKED', 'INTEGRATED', 'VERIFIED')):
-            statuses[ident] = current
-            continue
-        if current in ('VERIFIED', 'MERGED', 'CANCELED'):
-            statuses[ident] = current
-            continue
-        if current == 'PLANNED':
-            ready = _run_orchestrator(repo, ['task', 'ready', ident])
-            calls.append({'argv': ['task', 'ready', ident],
-                          'exit': ready.returncode, 'at': _now()})
-            if ready.returncode != 0:
-                raise BatchError(
-                    f'task {ident} could not move PLANNED -> READY; no agent was '
-                    'started and any locks stay in force', status='BLOCKED')
-            current = 'READY'
-        if current == 'READY':
-            dispatch = _run_orchestrator(repo, ['task', 'dispatch', ident])
-            calls.append({'argv': ['task', 'dispatch', ident],
-                          'exit': dispatch.returncode, 'at': _now()})
-            if dispatch.returncode != 0:
-                raise BatchError(
-                    f'task {ident} could not be dispatched (possibly a batch '
-                    'dependency the local CLI refuses); no agent was started and '
-                    'any locks stay in force', status='BLOCKED')
-            current = 'DISPATCHED'
-        if current not in ('DISPATCHED', 'IN_PROGRESS'):
-            raise BatchError(f'task {ident} is {current!r}, which is not an active '
-                             'dispatch state and has no retained lock recorded; '
-                             'refusing to start an agent', status='BLOCKED')
-        statuses[ident] = current
-    listed = _run_orchestrator(repo, ['task', 'list'])
-    calls.append({'argv': ['task', 'list'], 'exit': listed.returncode,
-                  'at': _now()})
-    if listed.returncode != 0:
-        raise BatchError('task list failed; the local path locks cannot be proved',
-                         status='BLOCKED')
-    locks = _parse_task_list(listed.stdout)
-    for spec in plan['tasks']:
-        ident = spec['id']
-        entry = locks.get(ident)
-        if entry is None:
-            raise BatchError(f'task {ident} is missing from task list; its path '
-                             'locks cannot be proved', status='BLOCKED')
-        if sorted(set(entry['locks'])) != sorted(set(spec['paths'])):
-            raise BatchError(
-                f'task {ident} currently holds locks {entry["locks"]!r}, not the '
-                f'plan paths {spec["paths"]!r}; the authoritative path lock is not '
-                'held, so no agent may start', status='BLOCKED')
-    state['dispatch'] = {'edition': 'local', 'at': previous.get('at') or now,
-                         'calls': calls, 'tasks': statuses}
-    _atomic_json(journal, state)
-
-
 def _dispatch_github(plan, state, journal):
     batch = plan['batch']
     if not batch.get('issue') or not batch.get('issue_repo'):
@@ -3368,10 +3201,9 @@ def _dispatch_github(plan, state, journal):
 
 
 def _dispatch_batch(plan, state, journal):
-    if plan['edition'] == 'github':
-        _dispatch_github(plan, state, journal)
-    else:
-        _dispatch_local(plan, state, journal)
+    # The batch carrier is GitHub only; the retired local carrier is refused by
+    # _require_edition before any plan can reach this point.
+    _dispatch_github(plan, state, journal)
 
 
 # ------------------------------------------------------------- execution stage
@@ -5294,75 +5126,6 @@ def _batch_report(state, plan, reason):
             'carrier': {'state': 'not_applicable', 'reason': reason}}
 
 
-def _run_orchestrator(repo, arguments):
-    script = Path(repo) / 'scripts' / 'orchestrator.py'
-    argv = [sys.executable, str(script), *arguments]
-    result = subprocess.run(argv, cwd=str(repo), stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, timeout=300)
-    return result
-
-
-def _current_task_status(repo, ident):
-    result = _run_orchestrator(repo, ['task', 'show', ident])
-    if result.returncode != 0:
-        return None
-    match = re.search(r'^Status:\s*([A-Za-z_]+)\s*$', result.stdout, re.M)
-    return match.group(1) if match else None
-
-
-def _carrier_local(state, plan, journal, merge_commit):
-    repo = plan['batch']['repo']
-    script = Path(repo) / 'scripts' / 'orchestrator.py'
-    calls = []
-    if not script.is_file():
-        reason = 'no local task library (scripts/orchestrator.py is absent)'
-        report = _batch_report(state, plan, reason)
-        report['carrier'] = {'state': 'blocked', 'reason': reason}
-        _atomic_json(journal.parent / 'batch-report.json', report)
-        state['carrier'] = {'state': 'blocked', 'reason': reason}
-        raise BatchError(
-            'the local carrier is absent after merge, so delivery cannot be '
-            'recorded: restore scripts/orchestrator.py and the task records, then '
-            'rerun finalize. The merge and post-merge evidence stay in the journal; '
-            'tasks are not VERIFIED', status='BLOCKED')
-    for spec in plan['tasks']:
-        current = _current_task_status(repo, spec['id'])
-        if current is None:
-            reason = (f'task {spec["id"]} is not in the local task library; a '
-                      'batch report was written instead of claiming a SQLite update')
-            report = _batch_report(state, plan, reason)
-            report['carrier'] = {'state': 'blocked', 'reason': reason}
-            _atomic_json(journal.parent / 'batch-report.json', report)
-            state['carrier'] = {'state': 'blocked', 'reason': reason}
-            raise BatchError(
-                f'task {spec["id"]} is missing from the local library, so the '
-                'carrier update cannot be proven; tasks are not VERIFIED. Recreate '
-                'the task record and rerun finalize', status='BLOCKED')
-        if current not in CHAIN:
-            raise BatchError(f'task {spec["id"]} has unrecognized status {current!r}')
-        start = CHAIN.index(current)
-        for target in CHAIN[start + 1:]:
-            if target == 'READY':
-                arguments = ['task', 'ready', spec['id']]
-            elif target == 'DISPATCHED':
-                arguments = ['task', 'dispatch', spec['id']]
-            else:
-                arguments = ['task', 'status', spec['id'], target,
-                             '--note', f'batch {plan["batch"]["id"]}']
-                if target == 'IN_PROGRESS' and state['tasks'][spec['id']].get('head'):
-                    arguments += ['--head-sha', state['tasks'][spec['id']]['head']]
-                if target == 'MERGED':
-                    arguments += ['--merge-sha', merge_commit]
-            result = _run_orchestrator(repo, arguments)
-            calls.append({'argv': arguments, 'exit': result.returncode})
-            if result.returncode != 0:
-                raise BatchError(
-                    f'local carrier update failed for {spec["id"]} at {target}: '
-                    f'{(result.stderr or "")[:300]}')
-    state['carrier'] = {'state': 'updated', 'calls': calls}
-
-
 def _now():
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
@@ -5950,29 +5713,6 @@ def _post_merge_github(plan, state, merge_commit, timeout):
         raise
 
 
-def _post_merge_local(plan, state, merge_commit, timeout):
-    repo = plan['batch']['repo']
-    if _branch(repo) != plan['batch']['base']:
-        state['merge']['state'] = 'merged_but_post_verify_failed'
-        _block_tasks(state, plan)
-        raise BatchError('the repository is not on the base branch')
-    if not _clean(repo):
-        state['merge']['state'] = 'merged_but_post_verify_failed'
-        _block_tasks(state, plan)
-        raise BatchError('the repository worktree is not clean')
-    try:
-        head = _head(repo)
-        state['merge']['post_verify'] = _verify_guarded(
-            repo, plan['finalize']['post_merge_verify'], timeout,
-            expected_head=head, label='post-merge verification',
-            expected_branch=plan['batch']['base'], merge_commit=merge_commit)
-        state['merge']['verified_sha'] = _head(repo)
-    except BatchError:
-        state['merge']['state'] = 'merged_but_post_verify_failed'
-        _block_tasks(state, plan)
-        raise
-
-
 def _github_flow(plan, state, journal, args, base, head, digest, risk,
                  recheck=None):
     repo = plan['batch']['repo']
@@ -6045,49 +5785,6 @@ def _github_flow(plan, state, journal, args, base, head, digest, risk,
     _atomic_json(journal, state)
 
 
-def _local_flow(plan, state, journal, args, base, head, digest, risk,
-                recheck=None):
-    repo = plan['batch']['repo']
-    if _branch(repo) != plan['batch']['base']:
-        raise BatchError(f'the repository is not on {plan["batch"]["base"]!r}')
-    if not _clean(repo):
-        raise BatchError('the repository worktree is not clean')
-    if not _ancestor(repo, base, head):
-        raise BatchError('the base is not an ancestor of the batch head')
-    _prove_review_current(state, plan, head, digest)
-    if not args.merge:
-        state['phase'] = 'review'
-        _atomic_json(journal, state)
-        return
-    if _head(repo) != state['base_sha']:
-        raise BatchError('base moved; integrate, verify and review on the new '
-                         'base before merging', status='BLOCKED')
-    if recheck is not None:
-        recheck(state)
-    result = _git(repo, 'merge', '--no-ff', head, '-m',
-                  f'batch {plan["batch"]["id"]}: {plan["batch"]["title"]}')
-    if result.returncode != 0:
-        _git(repo, 'merge', '--abort')
-        raise BatchError('the local merge failed: '
-                         f'{(result.stderr or "").strip()[:300]}')
-    commit = _head(repo)
-    state['merge'].update(state='merged', commit=commit,
-                          authorization=args.authorization)
-    state['phase'] = 'merge'
-    _atomic_json(journal, state)
-    _post_merge_local(plan, state, commit, args.timeout)
-    state['phase'] = 'post_merge'
-    _atomic_json(journal, state)
-    _carrier_local(state, plan, journal, commit)
-    if (state.get('carrier') or {}).get('state') != 'updated':
-        raise BatchError('the local carrier did not record VERIFIED; tasks are not '
-                         'VERIFIED', status='BLOCKED')
-    for spec in plan['tasks']:
-        state['tasks'][spec['id']]['status'] = 'VERIFIED'
-    state['phase'] = 'verified'
-    _atomic_json(journal, state)
-
-
 def _successor_plan(plan, state, journal, args):
     requested = args.next_plan or plan['finalize']['next_plan']
     recorded = state.get('next_plan')
@@ -6117,15 +5814,11 @@ def _successor_plan(plan, state, journal, args):
         raise InputError('the successor must name a different batch on the same base')
     if successor['finalize']['next_plan']:
         raise InputError('a next plan may not itself name a next plan')
-    if plan['edition'] == 'github':
-        if (not front['issue_repo'] or not back['issue_repo']
-                or front['issue_repo'].casefold() != back['issue_repo'].casefold()
-                or not back['issue'] or front['issue'] == back['issue']):
-            raise InputError('the successor needs a different carrier issue in '
-                             'the same repository')
-    elif {spec['id'] for spec in plan['tasks']} & {
-            spec['id'] for spec in successor['tasks']}:
-        raise InputError('local batches must have distinct task records')
+    if (not front['issue_repo'] or not back['issue_repo']
+            or front['issue_repo'].casefold() != back['issue_repo'].casefold()
+            or not back['issue'] or front['issue'] == back['issue']):
+        raise InputError('the successor needs a different carrier issue in '
+                         'the same repository')
     for prior in [front, *plan['tasks']]:
         for following in [back, *successor['tasks']]:
             if (prior['branch'] == following['branch']
@@ -6204,19 +5897,6 @@ def _handoff_issue_dependencies(body, plan):
     return dependencies
 
 
-def _handoff_local_task(plan, ident):
-    repo = plan['batch']['repo']
-    if not (Path(repo) / 'scripts' / 'orchestrator.py').is_file():
-        raise BatchError('the local task carrier is absent')
-    result = _run_orchestrator(repo, ['task', 'show', ident])
-    if result.returncode != 0:
-        raise BatchError(f'cannot read task {ident} from the local carrier')
-    record = _parse_task_show(result.stdout)
-    if not record['status']:
-        raise BatchError(f'task {ident} has no readable local carrier status')
-    return record
-
-
 def _prove_handoff_complete(plan, state):
     batch = plan['batch']
     repo, base = batch['repo'], batch['base']
@@ -6256,16 +5936,7 @@ def _prove_handoff_complete(plan, state):
             or not SHA_RE.fullmatch(review['head'])):
         raise BatchError(f'batch {batch["id"]} lacks its approved merge head')
     reviewed = review['head']
-    if plan['edition'] == 'local':
-        if _commit_parents(repo, commit) != [state['base_sha'], reviewed]:
-            raise BatchError(f'batch {batch["id"]} recorded local merge does not '
-                             'join its base and reviewed head')
-        for spec in plan['tasks']:
-            ident = spec['id']
-            task = _handoff_local_task(plan, ident)
-            if task['status'] != 'VERIFIED' or task.get('merge_sha') != commit:
-                raise BatchError(f'local task {ident} is not VERIFIED at {commit}')
-    else:
+    if True:
         pr = (state.get('pr') or {}).get('number')
         if not pr or not batch['issue_repo'] or not batch['issue']:
             raise BatchError(f'batch {batch["id"]} has no authoritative issue or PR')
@@ -6362,48 +6033,6 @@ def _check_successor_github(plan, state):
         raise BatchError(f'successor issue #{number} records a different VERIFIED merge')
 
 
-def _check_successor_local(plan, state):
-    ids = {spec['id'] for spec in plan['tasks']}
-    dependencies = set()
-    active = {}
-    for spec in plan['tasks']:
-        ident = spec['id']
-        task = _handoff_local_task(plan, ident)
-        allowed = CHAIN if state else ('PLANNED', 'READY')
-        if (task['status'] not in allowed
-                or sorted(task['paths']) != sorted(spec['paths'])
-                or task['acceptance'] != spec['acceptance']):
-            raise BatchError(f'successor local task {ident} status {task["status"]!r}, '
-                             'allowed paths or acceptance disagree with dispatch')
-        if task['status'] in ('MERGED', 'VERIFIED'):
-            commit = (state.get('merge') or {}).get('commit')
-            if not commit or task.get('merge_sha') != commit:
-                raise BatchError(f'successor local task {ident} has a different merge')
-        if state and ident in ((state.get('dispatch') or {}).get('tasks') or {}):
-            if task['status'] in ('PLANNED', 'READY'):
-                raise BatchError(f'successor local task {ident} no longer records '
-                                 'its dispatch')
-        if task['status'] not in ('PLANNED', 'READY', 'VERIFIED'):
-            active[ident] = sorted(set(spec['paths']))
-        dependencies.update(task['dependencies'])
-    if ids & dependencies:
-        raise BatchError('successor local carrier declares an unsupported '
-                         'batch-internal dependency: ' + ', '.join(sorted(ids & dependencies)))
-    for dep in sorted(dependencies):
-        if _handoff_local_task(plan, dep)['status'] != 'VERIFIED':
-            raise BatchError(f'successor local dependency {dep} is not VERIFIED')
-    if active:
-        result = _run_orchestrator(plan['batch']['repo'], ['task', 'list'])
-        if result.returncode != 0:
-            raise BatchError('the successor local path locks could not be read')
-        locks = _parse_task_list(result.stdout)
-        for ident, expected in active.items():
-            held = sorted(set(locks.get(ident, {}).get('locks', [])))
-            if held != expected:
-                raise BatchError(f'successor local task {ident} holds {held!r}, '
-                                 f'expected path locks {expected!r}')
-
-
 def _check_successor_progress(plan, state, verified):
     batch = plan['batch']
     repo = batch['repo']
@@ -6419,22 +6048,18 @@ def _check_successor_progress(plan, state, verified):
                     or os.path.lexists(entry['worktree'])):
                 raise BatchError(f'successor branch {entry["branch"]!r} or its '
                                  'worktree already exists without a matching journal')
-        if plan['edition'] == 'github':
-            remote = _git(repo, 'ls-remote', '--heads', 'origin',
-                          f'refs/heads/{batch["branch"]}')
-            if remote.returncode != 0 or remote.stdout.strip():
-                raise BatchError('the successor remote branch is present or '
-                                 'unreadable and has no matching journal')
-    if plan['edition'] == 'github':
-        _check_successor_github(plan, state)
-        if (not state or (state.get('phase') != 'verified'
-                          and not _is_post_merge_state(state))):
-            conflicts = _open_pr_conflicts(plan, batch['branch'])
-            if conflicts:
-                raise BatchError('successor lock conflict: '
-                                 + '; '.join(sorted(conflicts.values())))
-    else:
-        _check_successor_local(plan, state)
+        remote = _git(repo, 'ls-remote', '--heads', 'origin',
+                      f'refs/heads/{batch["branch"]}')
+        if remote.returncode != 0 or remote.stdout.strip():
+            raise BatchError('the successor remote branch is present or '
+                             'unreadable and has no matching journal')
+    _check_successor_github(plan, state)
+    if (not state or (state.get('phase') != 'verified'
+                      and not _is_post_merge_state(state))):
+        conflicts = _open_pr_conflicts(plan, batch['branch'])
+        if conflicts:
+            raise BatchError('successor lock conflict: '
+                             + '; '.join(sorted(conflicts.values())))
 
 
 def _finalize_body(plan, state, journal, args, recheck=None):
@@ -6448,12 +6073,7 @@ def _finalize_body(plan, state, journal, args, recheck=None):
         raise BatchError('the batch worktree is not on the batch branch')
     head = _head(batch)
     _require_tasks_integrated(state, plan)
-    if plan['edition'] == 'github':
-        _reconcile_github_merge(plan, state)
-    elif state['merge'].get('state') != 'merged' and _ancestor(
-            plan['batch']['repo'], head,
-            _resolve_commit(plan['batch']['repo'], plan['batch']['base'])):
-        state['merge'].update(state='merged', commit=_head(plan['batch']['repo']))
+    _reconcile_github_merge(plan, state)
     merge_done = state['merge'].get('state') == 'merged'
     if not merge_done:
         try:
@@ -6489,12 +6109,8 @@ def _finalize_body(plan, state, journal, args, recheck=None):
         _prove_review_current(state, plan, head, digest)
         _resume_after_merge(plan, state, journal, args)
         return
-    if plan['edition'] == 'github':
-        _github_flow(plan, state, journal, args, state['base_sha'], head, digest,
-                     risk, recheck)
-    else:
-        _local_flow(plan, state, journal, args, state['base_sha'], head, digest,
-                    risk, recheck)
+    _github_flow(plan, state, journal, args, state['base_sha'], head, digest,
+                 risk, recheck)
 
 
 def _is_post_merge_state(state):
@@ -6507,36 +6123,19 @@ def _resume_after_merge(plan, state, journal, args):
     """Re-enter after a merge without redoing integration or review."""
     repo = plan['batch']['repo']
     merge = state['merge']
-    if plan['edition'] == 'github':
-        if merge.get('state') != 'merged':
-            if not _reconcile_github_merge(plan, state):
-                raise BatchError('there is no merged pull request to resume',
-                                 status='BLOCKED')
-        commit = merge.get('commit')
-        if not commit:
-            raise BatchError('the journal records a merge without a commit',
+    if merge.get('state') != 'merged':
+        if not _reconcile_github_merge(plan, state):
+            raise BatchError('there is no merged pull request to resume',
                              status='BLOCKED')
-        _post_merge_github(plan, state, commit, args.timeout)
-    else:
-        if merge.get('state') != 'merged':
-            batch_head = _head(Path(plan['batch']['worktree']))
-            base_head = _head(repo)
-            if not _ancestor(repo, batch_head, base_head):
-                raise BatchError('there is no local merge to resume',
-                                 status='BLOCKED')
-            merge.update(state='merged', commit=base_head)
-        commit = merge.get('commit')
-        if not commit:
-            raise BatchError('the journal records a merge without a commit',
-                             status='BLOCKED')
-        _post_merge_local(plan, state, commit, args.timeout)
+    commit = merge.get('commit')
+    if not commit:
+        raise BatchError('the journal records a merge without a commit',
+                         status='BLOCKED')
+    _post_merge_github(plan, state, commit, args.timeout)
     state['phase'] = 'post_merge'
     _atomic_json(journal, state)
     if (state.get('carrier') or {}).get('state') != 'updated':
-        if plan['edition'] == 'github':
-            _carrier_github(state, plan, commit)
-        else:
-            _carrier_local(state, plan, journal, commit)
+        _carrier_github(state, plan, commit)
     if (state.get('carrier') or {}).get('state') != 'updated':
         raise BatchError('the carrier update did not complete; tasks remain '
                          'unverified', status='BLOCKED')

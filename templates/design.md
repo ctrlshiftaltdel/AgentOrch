@@ -74,7 +74,7 @@
 - Named resources this design needs (`<resource_id>` + mode `shared` / `exclusive`):
 - Why a path lock alone is not enough:
 - What happens on lock conflict, lease expiry and holder crash:
-- Backend limits acknowledged (`local` atomic within one database file; `github` is an advisory registration, never an atomic lock):
+- Backend limits acknowledged (`github` is an advisory registration, never an atomic lock; the retired `local` backend is not an option for new work):
 
 ## Verification strategy
 

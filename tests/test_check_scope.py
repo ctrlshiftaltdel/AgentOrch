@@ -91,7 +91,7 @@ class GitFixture:
 
     def init_db(self):
         with contextlib.redirect_stdout(io.StringIO()):
-            orchestrator.init(self.root)
+            orchestrator.init_task_store(self.root)
         return self
 
     def add_task(self, task_id, paths, status='DISPATCHED', head_sha='', approved_sha=''):
@@ -675,7 +675,7 @@ def init_isolated_store(kit, tasks):
     """Build the real task schema under ``<kit>/.local/orchestration``."""
     state = Path(kit) / '.local' / 'orchestration'
     with contextlib.redirect_stdout(io.StringIO()):
-        orchestrator.init(Path(kit), state)
+        orchestrator.init_task_store(Path(kit), state)
     con = sqlite3.connect(state / 'state.sqlite3')
     try:
         for task_id, status, paths, head_sha in tasks:

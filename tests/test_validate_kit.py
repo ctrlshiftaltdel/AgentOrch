@@ -867,7 +867,7 @@ class TreeModeTests(unittest.TestCase):
     errors in every mode, and `check_drift.py` keeps reporting the byte drift.
     """
 
-    PROJECT_DOC = '# docs/PROJECT.md\n\n- `edition`：`local`\n'
+    PROJECT_DOC = '# docs/PROJECT.md\n\n- `edition`：`github`\n'
     PLAN_DOC = '# PLAN\n\n## 设计目标\n\nx\n'
     UPGRADE_DOC = '# upgrade\n\n## 升级\n\nx\n'
     SUITE = 'Agent-Orchestration Starter Kit'
@@ -1120,9 +1120,9 @@ class TreeModeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self.kit_tree(Path(tmp))
             self.emit_manifest(root)
-            (root / 'editions' / 'local' / 'master.md').unlink()
+            (root / 'editions' / 'github' / 'master.md').unlink()
             errors = validate.check_release_manifest(root)
-        self.assertTrue(any('missing on disk' in e and 'editions/local/master.md' in e
+        self.assertTrue(any('missing on disk' in e and 'editions/github/master.md' in e
                             for e in errors), errors)
 
 
@@ -2196,7 +2196,7 @@ class DocumentGateBoundaryTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / rel, target)
         (root / 'docs').mkdir(parents=True, exist_ok=True)
-        (root / 'docs' / 'PROJECT.md').write_text('# project\n\n- `edition`：`local`\n',
+        (root / 'docs' / 'PROJECT.md').write_text('# project\n\n- `edition`：`github`\n',
                                                   encoding='utf-8')
         (root / 'docs' / 'PLAN.md').write_text('# plan\n\n## 设计目标\n\nx\n', encoding='utf-8')
         return root
@@ -2300,7 +2300,7 @@ class BridgeRegistryReadBoundaryTests(unittest.TestCase):
         self.shipped_tree(root)
         (root / 'docs').mkdir(parents=True, exist_ok=True)
         (root / 'docs' / 'PROJECT.md').write_text(
-            '# project\n\n- `edition`：`local`\n', encoding='utf-8')
+            '# project\n\n- `edition`：`github`\n', encoding='utf-8')
         (root / 'docs' / 'PLAN.md').write_text('# plan\n\n## 设计目标\n\nx\n',
                                                encoding='utf-8')
         # Ordinary project files. None of them is `docs/upgrade.md`, so none may
@@ -2499,11 +2499,19 @@ class BatchCapabilityAssetTests(unittest.TestCase):
 
 
 class BatchDependencyContractConsistencyTests(unittest.TestCase):
+    """Retired: the `local` batch-internal dependency limitation paragraph.
+
+    `editions/local/master.md` no longer ships, so its wording assertions are
+    retired with the edition. The assertion that still protects real task
+    records stays: no core document may tell anyone to remove a recorded
+    dependency, and the surviving contracts must still describe the in-batch
+    `INTEGRATED` exception instead of silently dropping dependencies.
+    """
+
     @unittest.skipUnless(UPSTREAM_CHECKOUT,
                          'repository-only contract consistency check')
-    def test_local_batch_dependency_limitation_keeps_the_task_record(self):
-        names = ('AGENTS.md', 'kit/orchestration.md', 'editions/local/master.md',
-                 'templates/batch-delivery.md')
+    def test_batch_dependency_wording_never_authorizes_deleting_records(self):
+        names = ('AGENTS.md', 'kit/orchestration.md', 'templates/batch-delivery.md')
         texts = {name: (ROOT / name).read_text(encoding='utf-8') for name in names}
         for name in names:
             self.assertTrue(texts[name].strip(), name)
@@ -2514,14 +2522,9 @@ class BatchDependencyContractConsistencyTests(unittest.TestCase):
                     'remove the batch-internal dependency from the task record',
                     'omit the batch-internal dependency from the task record'):
                 self.assertNotIn(forbidden.lower(), lowered, name)
-        for name in ('kit/orchestration.md', 'editions/local/master.md',
-                     'templates/batch-delivery.md'):
-            text = texts[name]
-            self.assertIn('批内依赖', text, name)
-            self.assertTrue('保持' in text and '记录' in text, name)
-            self.assertTrue('单任务' in text or '人工' in text, name)
-            self.assertTrue('批次感知' in text or 'batch-aware' in text.lower(),
-                            name)
+        for name in ('kit/orchestration.md', 'templates/batch-delivery.md'):
+            self.assertIn('批内', texts[name], name)
+        self.assertIn('INTEGRATED', texts['kit/orchestration.md'])
         # AGENTS.md is the core contract and may not repeat every limitation,
         # but it must not instruct anyone to remove a real dependency.
         self.assertNotRegex(texts['AGENTS.md'],
