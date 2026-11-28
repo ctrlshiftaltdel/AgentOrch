@@ -3956,6 +3956,184 @@ class ExecutorLifecycleTests(BatchCase):
         self.assertTrue(any('verifier 1 is ended without a stop proof' in
                             problem for problem in windows), windows)
 
+    # -- #268: a lifecycle-guard block can be rechecked through --retry -----
+    def _lifecycle_record(self, base, executor):
+        """A journal record exactly as ``--resume`` leaves it after the guard."""
+        attempt = self._attempt(state='STARTED', result=None,
+                                executor=executor)
+        attempt['base'] = base
+        return {
+            'status': 'BLOCKED', 'blocked_by': delivery.LIFECYCLE_BLOCK,
+            'error': ('T1 cannot reuse its worktree: '
+                      + delivery.LIFECYCLE_GUARD_MARK
+                      + ' (previous executor is still running)'),
+            'base': base, 'head': None, 'changed_paths': [],
+            'observed_head': None, 'observed_paths': [],
+            'attempts': 1, 'attempt_history': [attempt],
+        }
+
+    def _lifecycle_plan(self):
+        return {'tasks': [{'id': 'T1', 'depends': [],
+                           'branch': 'task/batch-t1'}],
+                'batch': {'repo': str(self.repo)}}
+
+    def test_recheck_releases_a_transient_unknown_once_the_stop_is_proven(self):
+        # AC-5 row 1: at T1 the process state is unknown, so the recheck allows
+        # nothing; at T2 the same journal proves the process stopped, and the
+        # recheck releases the task without appending another attempt.
+        base = self.head(self.repo)
+        executor = {'state': 'running', 'pid': 424242, 'pgid': None,
+                    'token': None, 'exit': None, 'stopped': None,
+                    'session': None}
+        record = self._lifecycle_record(base, executor)
+        state = {'tasks': {'T1': record}, 'base_sha': base}
+        plan = self._lifecycle_plan()
+        with mock.patch.object(delivery, '_proven_process_state',
+                               lambda *args, **kwargs: 'unknown'), \
+                mock.patch.object(delivery, '_job_proof_status',
+                                  lambda job: ('unknown', 'the Job Object '
+                                               'could not be opened or '
+                                               'queried')):
+            with self.assertRaises(delivery.BatchError) as caught:
+                delivery._apply_retry(state, plan, ['T1'], base)
+        self.assertEqual(caught.exception.status, 'BLOCKED')
+        self.assertTrue(caught.exception.halt)
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertEqual(record['blocked_by'], delivery.LIFECYCLE_BLOCK)
+        self.assertIn('retry_blocked', record)
+        self.assertEqual(record['attempts'], 1)
+        with mock.patch.object(delivery, '_proven_process_state',
+                               lambda *args, **kwargs: 'stopped'), \
+                mock.patch.object(delivery, '_job_proof_status',
+                                  lambda job: ('absent', 'the Job Object no '
+                                               'longer exists')):
+            delivery._apply_retry(state, plan, ['T1'], base)
+        self.assertEqual(record['status'], 'PENDING')
+        self.assertIsNone(record['error'])
+        self.assertNotIn('blocked_by', record)
+        self.assertNotIn('retry_blocked', record)
+        self.assertEqual(record['attempts'], 1)
+        self.assertEqual(len(record['attempt_history']), 1)
+        self.assertEqual(record['attempt_history'][0]['result'], 'interrupted')
+        # AC-4: a second recheck of the released record starts nothing.
+        with self.assertRaises(delivery.InputError):
+            delivery._apply_retry(state, plan, ['T1'], base)
+        self.assertEqual(record['attempts'], 1)
+
+    def test_recheck_of_a_live_process_stays_blocked_without_spawn(self):
+        # AC-2/AC-5 row 2: the explicit negative stop proof keeps the task
+        # BLOCKED; no agent starts and no attempt is appended, twice.
+        script = self.root / 'verify_t1.py'
+        script.write_text(
+            'import os, sys\n'
+            'raise SystemExit(1 if os.environ.get("FAIL_T1") == "1" else 0)\n')
+        plan = self.plan([self.task('T1', 'a.txt', verify=[[PY, str(script)]])])
+        self.assertEqual(self._fail_t1(plan).returncode, 1)
+        state = self.journal_data()
+        record = state['tasks']['T1']
+        record['attempt_history'][0]['verifiers'] = [{
+            'state': 'ended', 'pid': os.getpid(), 'pgid': None, 'exit': 0,
+            'stopped': False}]
+        record.update(status='BLOCKED', blocked_by=delivery.LIFECYCLE_BLOCK,
+                      error=('T1 cannot reuse its worktree: '
+                             + delivery.LIFECYCLE_GUARD_MARK))
+        self.journal.write_text(json.dumps(state))
+        before = len(self.opencode_calls())
+        for attempt in range(2):
+            retry = self.cli('run', '--plan', str(self.write_plan(plan)),
+                             '--journal', str(self.journal), '--execute',
+                             '--retry', 'T1')
+            self.assertEqual(retry.returncode, 1, retry.stderr)
+            self.assertIn('cannot reuse', retry.stderr)
+            self.assertEqual(len(self.opencode_calls()), before)
+            record = self.journal_data()['tasks']['T1']
+            self.assertEqual(record['status'], 'BLOCKED')
+            self.assertEqual(record['attempts'], 1)
+            self.assertEqual(record['blocked_by'], delivery.LIFECYCLE_BLOCK)
+            self.assertIn('retry_blocked', record)
+
+    def test_recheck_of_a_corrupt_record_fails_closed_without_spawn(self):
+        # AC-5 row 3: damage fails closed; the guard is never relaxed.
+        script = self.root / 'verify_t1.py'
+        script.write_text(
+            'import os, sys\n'
+            'raise SystemExit(1 if os.environ.get("FAIL_T1") == "1" else 0)\n')
+        plan = self.plan([self.task('T1', 'a.txt', verify=[[PY, str(script)]])])
+        self.assertEqual(self._fail_t1(plan).returncode, 1)
+        state = self.journal_data()
+        record = state['tasks']['T1']
+        record.update(status='BLOCKED', blocked_by=delivery.LIFECYCLE_BLOCK,
+                      error=('T1 cannot reuse its worktree: '
+                             + delivery.LIFECYCLE_GUARD_MARK))
+        record['attempt_history'] = 'corrupt'
+        self.journal.write_text(json.dumps(state))
+        before = len(self.opencode_calls())
+        retry = self.cli('run', '--plan', str(self.write_plan(plan)),
+                         '--journal', str(self.journal), '--execute',
+                         '--retry', 'T1')
+        self.assertEqual(retry.returncode, 1, retry.stderr)
+        self.assertIn('attempt_history', retry.stderr)
+        self.assertEqual(len(self.opencode_calls()), before)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertEqual(record['attempts'], 1)
+        self.assertEqual(record['blocked_by'], delivery.LIFECYCLE_BLOCK)
+
+    def test_recheck_releases_a_legacy_guard_block_and_clears_the_reason(self):
+        # AC-1/AC-3/AC-5: a journal written before #268 only carries the guard
+        # text. The recheck re-runs the whole guard, releases the task through
+        # PENDING, and runs exactly one new attempt.
+        plan = self.plan([self.task('T1', 'a.txt')])
+        self.assertEqual(
+            self.run_batch(plan, {'FAKE_OPENCODE_FAIL': '1'}).returncode, 1)
+        state = self.journal_data()
+        record = state['tasks']['T1']
+        self.assertIsNone(record['head'])
+        record.pop('blocked_by', None)
+        record.pop('retry_blocked', None)
+        record.update(status='BLOCKED',
+                      error=('T1 cannot reuse its worktree: '
+                             + delivery.LIFECYCLE_GUARD_MARK
+                             + ' (the previous executor was not proven stopped)'))
+        self.journal.write_text(json.dumps(state))
+        retry = self.cli('run', '--plan', str(self.write_plan(plan)),
+                         '--journal', str(self.journal), '--execute',
+                         '--retry', 'T1')
+        self.assertEqual(retry.returncode, 0, retry.stderr + retry.stdout)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['status'], 'INTEGRATED')
+        self.assertEqual(record['attempts'], 2)
+        self.assertNotIn('blocked_by', record)
+        self.assertNotIn('retry_blocked', record)
+        self.assertIsNone(record['error'])
+        self.assertEqual([entry['trigger'] for entry in
+                          record['attempt_history']], ['fresh', 'retry'])
+
+    def test_retry_refuses_a_blocked_reason_that_is_not_the_guard(self):
+        # AC-2 scope: only a lifecycle-guard block is recheckable.
+        script = self.root / 'verify_t1.py'
+        script.write_text(
+            'import os, sys\n'
+            'raise SystemExit(1 if os.environ.get("FAIL_T1") == "1" else 0)\n')
+        plan = self.plan([self.task('T1', 'a.txt', verify=[[PY, str(script)]])])
+        self.assertEqual(self._fail_t1(plan).returncode, 1)
+        state = self.journal_data()
+        record = state['tasks']['T1']
+        record.pop('blocked_by', None)
+        record.pop('retry_blocked', None)
+        record.update(status='BLOCKED', error='dependency failed')
+        self.journal.write_text(json.dumps(state))
+        before = len(self.opencode_calls())
+        retry = self.cli('run', '--plan', str(self.write_plan(plan)),
+                         '--journal', str(self.journal), '--execute',
+                         '--retry', 'T1')
+        self.assertEqual(retry.returncode, 2, retry.stderr)
+        self.assertIn('only accepts FAILED tasks', retry.stderr)
+        self.assertEqual(len(self.opencode_calls()), before)
+        record = self.journal_data()['tasks']['T1']
+        self.assertEqual(record['status'], 'BLOCKED')
+        self.assertEqual(record['attempts'], 1)
+
 
 class WindowsJobObjectTests(unittest.TestCase):
     """#267 AC-1/AC-3/AC-5: the real Job Object proof and its failure branches."""
