@@ -222,7 +222,10 @@ def git(*args, check=False):
 
 def body_from_stdin():
     if opt('--body-file') == '-':
-        return sys.stdin.read()
+        # Read raw bytes: text mode uses universal newlines, which would hide
+        # the carrier's real line endings before the coordinator parses them
+        # (Issue #295).
+        return sys.stdin.buffer.read().decode('utf-8')
     return ''
 
 
@@ -2502,6 +2505,212 @@ class LocalSuccessorHandoffTests(SuccessorCase):
         self.assertFalse(self.child_journal.exists())
         self.assertIn('Status: PLANNED', self.orchestrate('task', 'show', 'T2'))
         self.assertEqual(len(self.session_files('exec')), 1)
+
+
+class RegistryNewlineTests(unittest.TestCase):
+    """The registry writer and parser must agree on carrier line endings.
+
+    Issue #295: on Windows the writer produced CRLF and the parser kept the
+    line's trailing '\\r' in the value, so every later write stacked another
+    orphan CR until the VERIFIED handoff check and the successor re-dispatch
+    authorization refused a registry whose field values were actually correct.
+    """
+
+    def test_lf_carrier_values_are_unchanged(self):
+        inner = ('status: VERIFIED\nbranch: task/batch-250\n'
+                 'head_sha: ' + 'a' * 40 + '\n')
+        self.assertEqual(delivery._registry_value(inner, 'status'), 'VERIFIED')
+        self.assertEqual(delivery._registry_value(inner, 'branch'),
+                         'task/batch-250')
+        self.assertEqual(delivery._registry_value(inner, 'head_sha'), 'a' * 40)
+
+    def test_crlf_carrier_values_drop_the_carriage_return(self):
+        inner = ('status: VERIFIED\r\nmode: batch\r\n'
+                 'branch: task/batch-250\r\nrunner: builder\r\n')
+        self.assertEqual(delivery._registry_value(inner, 'status'), 'VERIFIED')
+        self.assertEqual(delivery._registry_value(inner, 'mode'), 'batch')
+        self.assertEqual(delivery._registry_value(inner, 'branch'),
+                         'task/batch-250')
+        self.assertEqual(delivery._registry_value(inner, 'runner'), 'builder')
+
+    def test_repeated_carriage_returns_do_not_leak_into_the_value(self):
+        inner = ('dispatched_at: 2026-11-27T19:29:54Z\r\r\r\r\n'
+                 'status: DISPATCHED\r\n')
+        self.assertEqual(delivery._registry_value(inner, 'dispatched_at'),
+                         '2026-11-27T19:29:54Z')
+        self.assertEqual(delivery._registry_value(inner, 'status'), 'DISPATCHED')
+
+    def test_absent_field_still_reads_as_none(self):
+        self.assertIsNone(delivery._registry_value('status: VERIFIED\r\n', 'pr'))
+
+
+class CarrierNewlineTests(BatchCase):
+    """End-to-end carrier line endings and fail-closed comparisons (#295)."""
+
+    def test_gh_payload_is_written_as_lf_bytes(self):
+        probe = [PY, '-c',
+                 'import sys; sys.stdout.write(sys.stdin.buffer.read().hex())']
+        payload = 'status: VERIFIED\nmode: batch\n'
+        with mock.patch.dict(os.environ, {'BATCH_GH': json.dumps(probe)}):
+            result = delivery._gh(['issue', 'edit', '1', '--body-file', '-'],
+                                  self.root, input_text=payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), payload.encode('utf-8').hex())
+        self.assertEqual(result.stderr, '')
+
+    def test_registry_update_replaces_a_crlf_block_with_lf(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        state = {'pr': {'number': 7}, 'tasks': {'T1': {'status': 'VERIFIED'}}}
+        body = ('# 250\r\n\r\n<!-- ORCH-TASK-REGISTRY\r\n'
+                'status: DISPATCHED\r\nmode: batch\r\n'
+                'dispatched_at: 2026-11-27T19:29:54Z\r\r\r\r\n-->\r\n')
+        updated = delivery._update_registry(body, state, plan, 'b' * 40)
+        block = delivery._registry_inner(updated)
+        self.assertNotIn('\r', block)
+        self.assertEqual(delivery._registry_value(block, 'status'), 'VERIFIED')
+        self.assertEqual(delivery._registry_value(block, 'dispatched_at'),
+                         '2026-11-27T19:29:54Z')
+
+    def test_repeated_updates_do_not_accumulate_orphan_carriage_returns(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
+        state = {'pr': {'number': 7}, 'tasks': {'T1': {'status': 'VERIFIED'}}}
+        body = ('# 250\r\n\r\n<!-- ORCH-TASK-REGISTRY\r\n'
+                'status: DISPATCHED\r\ndispatched_at: '
+                '2026-11-27T19:29:54Z\r\r\r\r\n-->\r\n')
+        for _ in range(4):
+            body = delivery._update_registry(body, state, plan, 'b' * 40)
+        block = delivery._registry_inner(body)
+        self.assertNotIn('\r', block)
+        self.assertEqual(delivery._registry_value(block, 'dispatched_at'),
+                         '2026-11-27T19:29:54Z')
+
+    def test_dispatch_recognizes_a_crlf_registry_and_writes_lf(self):
+        crlf = ('## 250\r\n\r\n<!-- ORCH-TASK-REGISTRY\r\n'
+                'status: READY\r\nmode: batch\r\nlocked_paths: a.txt\r\n'
+                'branch: task/batch-250\r\nrunner: builder\r\n-->\r\n')
+        self.seed_issue(crlf)
+        plan = self.plan([self.task('T1', 'a.txt')])
+        run = self.run_batch(plan)
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        written = self.gh_issue()['body']
+        registry = delivery._registry_inner(written)
+        self.assertNotIn('\r', registry)
+        self.assertEqual(delivery._registry_value(registry, 'status'),
+                         'DISPATCHED')
+        self.assertEqual(delivery._registry_value(registry, 'branch'),
+                         'task/batch-250')
+        self.assertRegex(delivery._registry_value(registry, 'dispatched_at'),
+                         r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
+
+    def test_existing_crlf_dispatch_is_not_rewritten(self):
+        body = ('## 250\r\n\r\n<!-- ORCH-TASK-REGISTRY\r\n'
+                'status: DISPATCHED\r\nmode: batch\r\nlocked_paths: a.txt\r\n'
+                'branch: task/batch-250\r\nrunner: builder\r\npr: (none)\r\n'
+                'dispatched_at: 2026-11-27T19:29:54Z\r\n'
+                'updated_at: 2026-11-27T19:29:54Z\r\n'
+                'head_sha: (none)\r\nblocked_reason: (none)\r\n-->\r\n')
+        self.seed_issue(body)
+        plan = self.plan([self.task('T1', 'a.txt')])
+        run = self.run_batch(plan)
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        self.assertEqual([call for call in self.gh_calls()
+                          if call.startswith('issue edit')], [])
+        self.assertEqual(self.gh_issue()['body'], body)
+
+    # -- the two strict checks that the CRLF carrier used to break ----------
+    def _successor_plan(self):
+        return self.plan([self.task('T1', 'a.txt')])
+
+    def _successor_check(self, registry, state):
+        issue = {'state': 'OPEN', 'body': '', 'labels': []}
+        with mock.patch.object(delivery, '_github_handoff_issue',
+                               return_value=(issue, registry)), \
+                mock.patch.object(delivery, '_github_branch_pr',
+                                  return_value=None), \
+                mock.patch.object(delivery, '_handoff_issue_dependencies',
+                                  return_value=set()):
+            return delivery._check_successor_github(self._successor_plan(), state)
+
+    def test_successor_authorization_accepts_a_crlf_registry(self):
+        registry = ('status: DISPATCHED\r\nmode: batch\r\n'
+                    'locked_paths: a.txt\r\nbranch: task/batch-250\r\n'
+                    'runner: builder\r\n')
+        state = {'phase': 'dispatched', 'dispatch': {'at': 'now'}, 'pr': None}
+        self.assertIsNone(self._successor_check(registry, state))
+
+    def test_successor_authorization_still_rejects_a_different_value(self):
+        registry = ('status: MERGED\r\nmode: batch\r\n'
+                    'locked_paths: a.txt\r\nbranch: task/batch-250\r\n'
+                    'runner: builder\r\n')
+        state = {'phase': 'dispatched', 'dispatch': {'at': 'now'}, 'pr': None}
+        with self.assertRaises(delivery.BatchError) as caught:
+            self._successor_check(registry, state)
+        self.assertIn('records a missing PR', str(caught.exception))
+        self.assertNotIn('\r', str(caught.exception))
+
+    def test_successor_authorization_reports_a_clean_unknown_status(self):
+        registry = ('status: BOGUS\r\nmode: batch\r\nlocked_paths: a.txt\r\n'
+                    'branch: task/batch-250\r\nrunner: builder\r\n')
+        state = {'phase': 'dispatched', 'dispatch': {'at': 'now'}, 'pr': None}
+        with self.assertRaises(delivery.BatchError) as caught:
+            self._successor_check(registry, state)
+        self.assertIn("registry status 'BOGUS'", str(caught.exception))
+        self.assertNotIn('\r', str(caught.exception))
+
+    def _handoff_state(self, plan):
+        command = ['check']
+        plan['edition'] = 'github'
+        plan['finalize']['post_merge_verify'] = [command]
+        state = {
+            'phase': 'verified',
+            'merge': {'state': 'merged', 'commit': 'a' * 40,
+                      'verified_sha': 'b' * 40,
+                      'post_verify': [{
+                          'exit': 0, 'timeout': False,
+                          'argv_sha256': hashlib.sha256(
+                              json.dumps(command).encode()).hexdigest()}]},
+            'carrier': {'state': 'updated'},
+            'tasks': {'T1': {'status': 'VERIFIED'}},
+            'review': {'verdict': 'APPROVE', 'head': 'c' * 40},
+            'base_sha': 'd' * 40,
+            'pr': {'number': 7},
+        }
+        return state
+
+    def _handoff_check(self, registry):
+        view = {'state': 'MERGED', 'mergeCommit': {'oid': 'a' * 40},
+                'headRefName': 'task/batch-250', 'headRefOid': 'c' * 40,
+                'baseRefName': 'main'}
+        plan = self.plan([self.task('T1', 'a.txt')])
+        state = self._handoff_state(plan)
+        with mock.patch.object(delivery, '_ancestor', return_value=True), \
+                mock.patch.object(delivery, '_github_handoff_issue',
+                                  return_value=({'state': 'OPEN'}, registry)), \
+                mock.patch.object(delivery, '_gh_json', return_value=view), \
+                mock.patch.object(delivery, '_git', return_value=subprocess
+                                  .CompletedProcess([], 0, b'', b'')):
+            return delivery._prove_handoff_complete(plan, state)
+
+    def test_handoff_verified_check_accepts_a_crlf_registry(self):
+        registry = ('\nstatus: VERIFIED\r\nmode: batch\r\n'
+                    'locked_paths: a.txt\r\nbranch: task/batch-250\r\n'
+                    'pr: 7\r\nrunner: builder\r\n'
+                    'dispatched_at: 2026-11-27T19:29:54Z\r\n'
+                    'updated_at: 2026-11-27T20:00:00Z\r\n'
+                    'head_sha: ' + 'a' * 40 + '\r\n'
+                    'blocked_reason: (none)\r\n')
+        self.assertEqual(self._handoff_check(registry), 'b' * 40)
+
+    def test_handoff_verified_check_still_rejects_another_status(self):
+        registry = ('\nstatus: MERGED\r\nmode: batch\r\n'
+                    'locked_paths: a.txt\r\nbranch: task/batch-250\r\n'
+                    'pr: 7\r\nrunner: builder\r\n'
+                    'head_sha: ' + 'a' * 40 + '\r\n')
+        with self.assertRaises(delivery.BatchError) as caught:
+            self._handoff_check(registry)
+        self.assertIn('registry status does not match the VERIFIED batch',
+                      str(caught.exception))
+        self.assertNotIn('\r', str(caught.exception))
 
 
 class ReviewDiffTests(BatchCase):
