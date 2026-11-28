@@ -47,16 +47,15 @@
 - **本机角色表现反馈与可解释校准（Phase D S4）**：把 Master / Execution / Reviewer 在**当前 scope** 内的真实任务表现（任务类别、首次验收、返工轮次、合并后回归缺陷、真实可采集的耗时 / 成本；Reviewer 的确认问题、误报与需要独立对照的漏报；Master 的计划遗漏与拆分返工）追加记录到 `.local/agent-orch/<scope-id>/observed-performance.md`。报告只给可解释建议：每项指标带样本量、窗口、任务类别、缺失值与 coverage；样本不足、模型 / Runtime 身份变化或证据过期时标 `UNKNOWN` / `STALE` 且不排名；不自动改提示词、权限或模型配置，也不把聊天记忆、自评、合并成功或 CI 绿灯当质量证据。
 - **会话入口接线与端到端回归（Phase D S5）**：`docs/orchestration.md` 的会话入口按「C1–C4 先决 → 实际工具事实 → scope / 记录 → 发现与匹配 → 可选模型数据 → 可选本机反馈」串起 S1–S4，两个底座的 Master / Execution 手册同步同一套角色约束与结果语义；缺少角色、不能真实 spawn、数据过期或本地写入失败时输出具体原因并降级，任何选择都不读作“已派发”。合成回归新增 E 组（E1 正向 + E2–E13 负向），全部使用模拟 Runtime、固定模型目录与临时目录，不访问真实网络 / Key / `.local`。
 
-## 两种协作底座
+## 受支持的底座
 
-核心角色、状态语义、审查门和证据标准在两个底座中保持一致；不同的是任务记录与证据的存放位置。
+主线和下一代安装包只提供 <code>github</code> 底座：Issue、Draft PR、PR 评论与 CI 是任务记录与证据的载体。核心角色、状态语义、审查门和证据标准不因载体而降低。
 
 | 底座 | 任务载体 | 适合场景 | 主要边界 |
 | --- | --- | --- | --- |
-| **<code>local</code>** | SQLite 任务库；本地命令输出和 Git 状态作为证据 | 单人、单机、可离线运行 | 原子锁只在同一数据库与主机范围内成立 |
 | **<code>github</code>** | Issue、Draft PR、PR 评论与 CI | 多人协作、跨机器接手、公开可核验的交付 | Issue 登记块和 PR 路径检查是协作性防冲突，不是跨请求原子锁 |
 
-如果你不确定选哪一种，先阅读 [底座选择与迁移说明](docs/README.md)。从 <code>local</code> 迁移到 <code>github</code> 是一次性、单向的授权决策，不能同时双写两套状态。
+`local`（SQLite 任务库）已从主线与下一代安装包退场。既有 local 安装固定在被验证的 Release <code>v2.0.0</code> 上继续运行、不要升级本套件；要跟进主线，按 [核心编排契约](kit/orchestration.md) 第 6 节做一次性迁移，或整体回退到 <code>v2.0.0</code>。详见 [底座与迁移说明](docs/README.md)。
 
 ## 工作流概览
 
@@ -97,7 +96,7 @@ AgentOrch 的自我完善不等于“让模型自由修改仓库”。它有明�
 **推荐通过 [GitHub Releases](https://github.com/ctrlshiftaltdel/AgentOrch/releases/latest) 获取发行包。** 发行包是面向下游项目的可复用内容；源仓库还包含 AgentOrch 自身的开发记录、契约、审计与发布材料。
 
 1. **新项目**：将发行包解压到项目根目录，按实际情况填写 <code>docs/PROJECT.md</code>，尤其是 <code>edition</code>、允许 / 禁改路径和验证命令。
-2. **选择底座**：将 <code>edition</code> 设为 <code>local</code> 或 <code>github</code>，只能有一个权威值。
+2. **确认底座**：将 <code>edition</code> 设为 <code>github</code>（唯一受支持的取值）；<code>local</code> 是已退场的旧配置，会得到固定 <code>v2.0.0</code> 或迁移的指引。
 3. **恢复规则**：先阅读 <code>AGENTS.md</code> 和 <code>docs/orchestration.md</code>，然后使用对应底座的 Master 手册开始工作。
 4. **已有项目**：不要直接把发行包解压覆盖到现有仓库。隔离接入提供受限新安装（需官方 Release 校验字节、专属且干净的 Git linked worktree、调用者显式声明无其他写入者，且目标 `agentorch/` 为空或不存在）、同来源且可重新认证的升级（安装器取回旧版官方 Release 并逐文件比对；本地清单只作候选 tag 提示），以及受限旧根迁移切片（旧根与重新获取并校验的官方历史 Release 逐字节一致、无本地修改、目标为空或不存在时，只新增 `agentorch/` 并保留旧根原路径原字节，不移动、不删除）。真实官方历史 Release 资产、真实下游与跨平台的跨进程回滚、普通非 linked worktree 与跨平台能力仍未完成，AC-9 未通过。调用者声明不是强制隔离证明，实际接入、升级或迁移前仍须人工评估。
 
@@ -122,7 +121,6 @@ uv run python scripts/run_delivery_scenarios.py --json</code></pre>
 | 快速上手、底座选择与已有项目接入 | [完整用户指南](docs/README.md) |
 | 设计目标与原则 | [设计目标](docs/PLAN.md) |
 | 阶段计划与当前项目状态 | [阶段计划](docs/implementation-plan.md) |
-| 本地协作手册 | [local Master 手册](editions/local/master.md) |
 | GitHub 协作手册 | [github Master 手册](editions/github/master.md) |
 | 自我完善闭环 | [自我完善文档](docs/self-improvement/README.md) |
 | 版本升级、安全更新与回滚 | [升级指南](docs/upgrade.md) |

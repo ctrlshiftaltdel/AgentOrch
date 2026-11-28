@@ -87,11 +87,11 @@ python scripts/batch_delivery.py status   --journal JOURNAL [--json]
 - `acceptance_checks`（可选）是逐条验收标准对应的 argv 列表，长度必须与 `acceptance` 相同。`acceptance_decisions` 只作为可选的计划期上下文，**不能**单独满足 L0 合并门。L0 自动合并必须同时具备完整 `acceptance_checks` 和 `finalize --acceptance-attestation PATH` 提供的执行后 Master 证明；证明文件格式为 `{"schema":"batch-acceptance/1","head":"<sha>","diff_sha256":"<sha>","tasks":{"T1":[{"id":"AC-1","status":"PASS","evidence":"..."}]}}`，head/diff 必须与已审查内容完全一致，每个 AC 都是 PASS 且有可定位证据。缺失、head/diff 不符或任务集合不符时，只能走独立审查或阻塞。
 - 任务路径不得覆盖 `docs/PROJECT.md`：项目配置在 journal 中以 SHA-256 绑定，批次内修改会让恢复失效。请把配置变更作为单任务或批次外工作交付。本地任务库中的 batch 内依赖是明确不支持的限制：计划 DAG 不是任务记录，也不能替代任务记录。
 - `docs/PROJECT.md` 的 `## 验证命令` 按阶段解析：所有声明的快速测试、静态检查、完整回归与合并后命令都必须在 `finalize.post_merge_verify`；它们也可以同时出现在 `finalize.verify`。同一标签行上的多个完整命令全部生效；占位符/散文片段被忽略，但标签行无法解释时直接阻塞。`python`、`python3`、`sys.executable` 视为同一程序，前导 `uv run` 会被忽略。该节不存在时 journal 记录 `project_verification: absent`。
-- 授权载体是必需的：`github` 批次必须有 `batch.issue` 与 `batch.issue_repo`，并在任何 Agent 启动前写入 `ORCH-TASK-REGISTRY`（`status: DISPATCHED`）；`local` 批次必须有 `scripts/orchestrator.py` 与每个任务的记录，并在任何 Agent 启动前完成 `READY` / `DISPATCHED`。载体缺失时批次阻塞，不会以 `not_applicable` 假装交付。**`local` 的任务库依赖仍要求 `VERIFIED`；本工具不支持在任务库中登记批内依赖**：遇到这种组合会保持记录不变并阻塞，要求改用单任务/人工流程或等待批次感知的本地派发。`github` 与计划 DAG 的批内 `INTEGRATED` 例外不受影响。
+- 授权载体是必需的：批次必须有 `batch.issue` 与 `batch.issue_repo`，并在任何 Agent 启动前写入 `ORCH-TASK-REGISTRY`（`status: DISPATCHED`），同时对开放 PR 做路径冲突检查。载体缺失时批次阻塞，不会以 `not_applicable` 假装交付。`local` 任务库已随底座退场，本工具不提供 `local` 批次；`local` 与计划 DAG 的批内 `INTEGRATED` 例外只在 `v2.0.0` 上适用。
 - 密钥形态的路径（如 `.env`、`*.pem`、`*token*`）在预检阶段直接拒绝。
 - `merge_method` 取 `merge`、`squash` 或 `rebase`。
 - `--merge` 时 `--authorization` 必须与 `finalize.authorization` 完全相等且非空；缺失或不等是预检错误，不会先推送再失败。两个字段可使用同一份仍有效、覆盖本批次的常设授权文本或可定位引用。Master 负责核实来源、范围和有效性。
-- 项目底座由 `docs/PROJECT.md` 的 `edition` 唯一决定。`local` 只在本地合并，不调用 `gh`；`github` 使用 `gh` 的 PR、检查和合并流程。
+- 项目底座由 `docs/PROJECT.md` 的 `edition` 唯一决定；唯一受支持的值是 `github`，使用 `gh` 的 PR、检查和合并流程。`edition: local` 失败关闭并给出固定 `v2.0.0` 或迁移指引。
 - 项目允许/禁止路径从 `docs/PROJECT.md` 的「允许改动路径」「永远禁止改动路径」读取。缺失该节时不会声称检查过；journal 记录 `project_paths: unknown`，只做计划级路径检查。journal 同时绑定 `docs/PROJECT.md` 的 SHA-256；run / finalize 之间该文件变化即拒绝继续，必须重新对齐计划。
 - `github` 的必需检查来自 `gh api repos/{owner}/{repo}/rules/branches/{base}` 的有效规则，而不是检查运行结果：计划里的 context 必须全部出现在有效规则中。每个 context 还必须在该 head 上有同名 check run，`app.id` 与规则中的 `integration_id` 一致、`status == completed`、`conclusion == success`；检查运行失败、缺失、app 不符或列表被截断（`total_count > len(check_runs)`）都阻塞。推送和合并使用审查过的确切 SHA，并在合并前重新核对 PR base、head、`mergeable == MERGEABLE` 以及 `origin/<base>` 是否仍为已审查 head 的祖先。
 
@@ -141,7 +141,7 @@ python scripts/batch_delivery.py status   --journal JOURNAL [--json]
 
 ## 4. 阶段与状态
 
-- `run --execute` 先完成权威派发：`github` 写 Issue 的 `ORCH-TASK-REGISTRY`（保留首次 `dispatched_at`），`local` 走 `task ready` / `task dispatch`；随后才创建/校验任务 Worktree。派发失败时任何 Agent 都不会启动，已取得的锁仍按契约保留并需人工核对。
+- `run --execute` 先完成权威派发：写 Issue 的 `ORCH-TASK-REGISTRY`（保留首次 `dispatched_at`）；随后才创建/校验任务 Worktree。派发失败时任何 Agent 都不会启动，已取得的锁仍按契约保留并需人工核对。
 - `github` 派发前完整枚举开放 PR 与开放 Issue 的登记块（各以 1000 为上限）；任一枚举达到上限即视为不可证明并整体阻塞。每个开放 Issue 必须最多一个可读登记块；活动状态（`DISPATCHED`/`IN_PROGRESS`/`REVIEW_READY`/`MASTER_REVIEW`/`APPROVED`/`BLOCKED`/`NEEDS_HUMAN_DECISION`/`FAILED`）的 `locked_paths` 与本批次并集重叠、或多个/不可读登记块，都整体阻塞；当前批次 Issue 自身除外。恢复时重新执行同一枚举。
 - `run --execute` 按稳定依赖顺序：创建/校验任务 Worktree → 按选定适配器启动执行会话（默认是 `opencode run --standalone --format json --agent ...`；`attached` 则写请求并以退出码 3 等待宿主）→ 检查实际改动是否都在声明路径内 → 用任务命令验证 → 在集成分支上 `git merge --no-ff`。
 - 合并成功只把任务标为 `INTEGRATED`。这是**内部里程碑**：它只说明改动已进入集成分支，不说明外部交付完成。

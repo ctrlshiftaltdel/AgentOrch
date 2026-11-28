@@ -38,7 +38,7 @@
 
 ## Metric definitions
 
-Events come from the task library (`local`: `events` table; `github`: the same event names recorded in the Issue / PR timeline). Only the events named here are read.
+Events come from the task carrier (`github`: the event names recorded in the Issue / PR timeline) or from an explicit event sample passed with `--events`. The retired `local` SQLite task library is historical only: it is readable on Release `v2.0.0`, not on this mainline. Only the events named here are read.
 
 | ID | Metric | Unit | Start event | End event | Timezone | Exclusions | Missing handling | Sample / eligibility |
 |----|--------|------|-------------|-----------|------------|------------------|----------------------|
@@ -74,7 +74,7 @@ Per-metric `status`:
 | `no_data` | No eligible task in the window | `no data` (never `0`) |
 | `unknown` | The source does not record the events this metric needs | `unknown` + the missing collection item |
 
-`collection` in the report states, per record kind, whether the source can produce it. The `local` task library records `resource` conflicts and records rejected path locks as a `CONFLICT_RECORDED` event (`data.kind=path`) when `task dispatch` refuses; a `task ready` preflight refusal is written as `PATH_PREFLIGHT_REFUSED` for audit and is not counted by M4. A library from before those events holds none, so `path_conflicts` stays uncollected there — `unknown`, never a fabricated `0`. The library does **not** record checks, acceptance rows or regressions. Those metrics therefore report `unknown` on such a `local` library until a task records the event — the report never fills the gap by inference. `github` can supply all five from the PR timeline once wired; until then the same rule applies.
+`collection` in the report states, per record kind, whether the source can produce it. A historical `local` task library (Release `v2.0.0` only) records `resource` conflicts and rejected path locks as a `CONFLICT_RECORDED` event (`data.kind=path`) when `task dispatch` refuses; a `task ready` preflight refusal is written as `PATH_PREFLIGHT_REFUSED` for audit and is not counted by M4. It does **not** record checks, acceptance rows or regressions, so those metrics report `unknown` there — never a fabricated `0`. On this mainline `github` is the only carrier; it can supply all five from the PR timeline once wired, and until then an event sample is the only source.
 
 ## Report contract
 
@@ -242,7 +242,7 @@ Reproduce it with `python scripts/report_metrics.py --gold-sample --since 2026-0
 ## Limits
 
 - **Small samples by construction.** A project with a dozen tasks has a dozen samples at best; the numbers describe that project's last few weeks, not the quality of an agent or a model.
-- **Not every metric is collected yet.** Checks, acceptance rows and regression reports are read only when a source records them. On a plain `local` task library they are `unknown`; `github` needs the PR timeline wired before those three become `ok`. The report says so instead of reporting a comfortable `0`.
+- **Not every metric is collected yet.** Checks, acceptance rows and regression reports are read only when a source records them. On the historical `local` task library they are `unknown`; `github` needs the PR timeline wired before those three become `ok`. The report says so instead of reporting a comfortable `0`.
 - **Durations are wall-clock.** A task waiting overnight and a task waiting on a slow reviewer both count as hours. Do not convert them into "effort".
 - **Window choice moves the numbers.** A window that ends right after a batch of merges understates regressions; one that starts mid-task understates elapsed time. Always print the window with the value.
 - **The definitions are a product decision.** Changing a start / end event or an exclusion changes every historical figure; record the change here, with the date, before the next report is quoted.

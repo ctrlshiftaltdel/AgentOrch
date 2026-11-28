@@ -89,7 +89,7 @@
 调度前，Master 必须按**当前实际可用的工具**核验并提交标准化事实，而不是按提示词、模型名称或历史记忆推断：
 
 - 至少记录：文本 / 图像输入是否真实可用、文件读写边界、命令执行、网络访问、是否能真实 spawn / wait / collect 子代理，以及每条事实的来源与核验时间。
-- 运行时无法 introspect 宿主工具时，由 Master 自己核验并写进任务载体（`github`：Issue 评论或 PR 评论；`local`：任务记录）。**进程内 CLI 不能替代这一步**：`scripts/agent_selection/` 只读取被显式提供的事实，不能读取宿主 Agent 的工具列表，也不得声称已读取。
+- 运行时无法 introspect 宿主工具时，由 Master 自己核验并写进任务载体（Issue 评论或 PR 评论）。**进程内 CLI 不能替代这一步**：`scripts/agent_selection/` 只读取被显式提供的事实，不能读取宿主 Agent 的工具列表，也不得声称已读取。
 - 无法核验的能力一律记 `UNKNOWN` 并按不可用处理；`UNKNOWN` / `STALE` 不得当作 `PASS`，也不得解锁自动派发（C1–C4 见 `kit/orchestration.md` 第二部分 §5）。
 
 ### 角色选择（派发前，github）

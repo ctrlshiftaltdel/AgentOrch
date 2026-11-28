@@ -13,7 +13,7 @@
 
 ## 1. 适用对象与迁移路径
 
-适用于还在 `Format version` 1.1 / 1.2、要升到 1.3 的项目，`local` 与 `github` 两种底座都适用（底座差异写在每节的「底座差异」里）。**1.3 → 1.4 的项目只看第 11 节**（根 `PLAN.md` 迁入 `docs/PLAN.md` 与图片规范），第 3–6 节不用重做。
+适用于还在 `Format version` 1.1 / 1.2、要升到 1.3 的项目。本文的历史小节记录当时的双底座（`local` / `github`）实测过程；**当前主线只支持 `github`，`local` 已退场**，见第 17 节。**1.3 → 1.4 的项目只看第 11 节**（根 `PLAN.md` 迁入 `docs/PLAN.md` 与图片规范），第 3–6 节不用重做。
 
 四条路径对应四种旧起点，**命中几条改几条**，彼此独立：
 
@@ -864,3 +864,13 @@ APPLY 后的可核对事实：
 - CI run 43022951858 在提交 `3b1f9cfcce605434247f8252e6c1a48430a6dabf` 上的 `checks (Python 3.12)`、`checks (Python 3.13)`、`checks-macos (Python 3.13)`、`checks-windows (Python 3.13)` 四个 job conclusion 均为 `success`。该结论只覆盖这些 job 的步骤；需要 POSIX `dir_fd` / `O_DIRECTORY` 或 `mkfifo` 的用例在 Windows 上自报 `NOT_RUN` 跳过，**不得**把 Windows job 的 success 读成 FIFO / `dir_fd` 路径已在 Windows 执行。
 
 本节只覆盖一次真实隔离新安装及其零写入的重复 PLAN。真实旧根迁移、本地修改过的旧根、普通非 linked worktree、真实入口链、跨进程回滚在真实下游与跨平台上的表现、同 UID 强隔离与并行进程竞态仍为 `NOT_RUN`。文本成员的 CRLF 折叠保持项目所有者的既有决定（按发行构建器同一套折叠后哈希），本节不改回严格原始字节比较。**AC-9 仍未通过。**
+
+## 17. 迁移十（当前主线）：`local` 底座退场
+
+- **状态：已实施（Issue #280，所有者 2026-11-23 决定）。** 主线与下一代安装包只提供 `github` 底座；`scripts/orchestrator.py` 不再调度任何底座，`scripts/batch_delivery.py` 只实现 `github` 批次，发行清单不再包含 `editions/local/`。
+- **`edition: local` 的去向（二选一）**：
+  1. **固定旧版**：留在被验证的 Release `v2.0.0`（tag `v2.0.0`）上继续运行，不要升级本套件。旧 local 命令、SQLite 任务库、原子路径锁都以该版本为准。
+  2. **跟进主线**：按 [kit/orchestration.md 第 6 节](../kit/orchestration.md#6-底座切换与-local-退场) 做一次性、单向、禁止双写的 `local` → `github` 迁移，由项目所有者批准。迁移完成前旧库保持只读归档。
+- **单次回退**：升级到本主线后要回到旧行为，只能整体回退到 Release `v2.0.0`（重新安装该 Release 的发行包并按该版本手册恢复任务库）。主线不提供 `github` → `local` 的同步回退，也不把 Issue / PR 状态导回 SQLite。
+- **命令差异**：`init` / `init-plan` 只生成 `docs/PLAN.md`；`task add` / `ready` / `dispatch` / `status` / `workspace` / `amend` / `unlock` / `resources` / `renew` / `reclaim` / `reconcile` 一律拒绝执行并指向 Issue / PR。`backup` 的维护写入边界不变：只有在既有归档库存在时才写一致性副本，缺库拒绝且不 `init`；`config show`、`task list`、`task show` 保留为 GitHub-only 兼容的维护入口。
+- **不再适用**：本文第 3–7 节中针对 `local` 任务库的命令与退出码只在 `v2.0.0` 上有效，不得用它们验收当前主线。

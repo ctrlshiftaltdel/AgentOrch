@@ -34,7 +34,6 @@
 | [`README.md`](../../README.md) | `reference` | `ACTIVE` | 仅仓库 | GitHub 首页：产品定位、核心能力与上手指南入口；不定义契约或门禁。 |
 | [`kit/orchestration.md`](../../kit/orchestration.md) | `authoritative` | `ACTIVE` | 发行包 | 核心编排的这一发随包权威：会话入口、任务状态机、锁、合并门 G1–G6、能力契约 C1–C4、验收程序。桥接发行仍放在 `kit/`，已发布更新器才能原地更新。 |
 | [`docs/orchestration.md`](../orchestration.md) | `reference` | `ACTIVE` | 仅仓库 | 不随包发布的路径指针，指向 `kit/orchestration.md`。不是第二份契约。 |
-| [`editions/local/`](../../editions/local/)（`master.md`、`execution.md`） | `authoritative` | `ACTIVE` | 发行包 | `local` 底座的命令、路径锁与启动 / 执行增量；不得定义另一套核心语义。 |
 | [`editions/github/`](../../editions/github/)（`master.md`、`execution.md`、`issue-template.md`、`pr-template.md`、`active-task-registry.md`） | `authoritative` | `ACTIVE` | 发行包 | `github` 底座的 Issue / PR / 登记块与启动 / 执行增量；不得定义另一套核心语义。 |
 | [`templates/`](../../templates/) | `reference` | `ACTIVE` | 发行包 | 可复制模板与起始结构（项目配置、计划、任务包、设计契约、审计、审查、能力、指标、架构、自我完善）。模板只提供结构，不是规则权威。 |
 | [`scripts/`](../../scripts/) | `implementation` | `ACTIVE` | 发行包（例外见下） | CLI、验证器、构建、更新引擎与随包测试支撑。 |

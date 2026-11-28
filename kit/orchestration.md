@@ -14,7 +14,7 @@
 
 按顺序读取：
 
-1. `docs/PROJECT.md` — 读取 `edition`，取值必须是 `local` 或 `github`。
+1. `docs/PROJECT.md` — 读取 `edition`，唯一受支持的取值是 `github`；`local` 是已退场的旧配置，见下方“底座判定规则”。
 2. `AGENTS.md` — 核心协作契约（edition-neutral），含「阅读口径（唯一权威）」段。
 3. `kit/orchestration.md` 第一部分（会话入口）与第二部分（状态机、合并门与能力契约）——**必读**；第三部分（通用验收程序）按需读，见下。
 4. `editions/<edition>/master.md` — 当前底座的 Master 手册。
@@ -25,10 +25,11 @@
 
 **底座判定规则**：
 
-- 从 `docs/PROJECT.md` 的 `edition` 键读取取值，允许值只有 `local`、`github`；该键是底座选择的唯一权威来源，`.orchestration/config.json` 只描述本地 CLI 运行参数，即使残留 `edition` 键也不参与路由。
+- 从 `docs/PROJECT.md` 的 `edition` 键读取取值，**唯一受支持的取值是 `github`**；该键是底座选择的唯一权威来源，`.orchestration/config.json` 只描述本地 CLI 运行参数，即使残留 `edition` 键也不参与路由。
+- `edition: local` 是**不受支持的旧配置**：主线和下一代安装包不再提供 SQLite 任务调度。任何入口读到 `local` 必须在写入任何状态之前失败关闭，并给出同一段指引——既有 local 安装固定在被验证的 Release `v2.0.0`（tag `v2.0.0`）继续运行、不要升级本套件；要跟进主线则按第 6 节做一次性迁移，或整体回退到 `v2.0.0`。
 - 文件缺失、`edition` 键缺失、值为空或不在允许集合内（含类型错误，如 `1`、`true`）：输出明确错误并**停止**，不得猜测、不得按默认值继续、不得自行切换底座。错误信息必须包含缺失项、实际读到的值和建议修复位置。
 - 读取成功后，后续所有路由、命令和证据路径都以该底座为准。
-- 本地 CLI 只服务 `local` 底座：声明 `github` 时，`task add` / `task ready` / `task dispatch` / `task status` / `task workspace` / `task amend` / `task unlock` 会拒绝执行并给出 Issue / PR 指引；`init`、`backup`、`config show`、`task list`、`task show` 仍可用。完整矩阵见 `README.md` 6.2。
+- 本地 CLI 不再调度任何底座：`task add` / `task ready` / `task dispatch` / `task status` / `task workspace` / `task amend` / `task unlock` 等调度命令一律拒绝执行并指向 Issue / PR；`init`（只生成 docs/PLAN.md）、`init-plan`、`backup`、`config show`、`task list`、`task show` 作为 GitHub-only 兼容的维护入口保留。完整矩阵见 `README.md` 6.2。
 
 ### 第二步：恢复状态
 
@@ -40,15 +41,7 @@ git branch --show-current
 git log -1 --oneline
 ```
 
-再按底座执行任务载体查询：
-
-`local`：
-
-```bash
-python scripts/orchestrator.py task list
-```
-
-`github`：
+再执行任务载体查询（`github` 是唯一受支持的底座）：
 
 ```bash
 gh issue list --state open --limit 100
@@ -99,7 +92,7 @@ Master 在把任务推进到 `DISPATCHED` 或交给执行实例**之前**，或�
 - 普通提问（如“自我完善机制是什么”“更新一下文档”）只回答，不启动闭环；`更新 AgentOrch` 属于更新引擎，不进入该闭环。
 - 本节只做路由引用：任务状态机、路径 / 资源锁、证据矩阵与合并门仍只由第二部分与 4.1 节定义，自我完善**不新增、不改写**任何状态、锁或门。
 - 触发不构成对任何具体改动的批准；权限 / 安全 / 锁 / 状态机 / 迁移 / 外部依赖 / 隐私 / 兼容 / 不可逆事项仍按第 5 节与 `docs/self-improvement/entrypoints-and-decisions.md` §5 的 `HD-*` 进入 `NEEDS_HUMAN_DECISION`。
-- 载体操作由 `editions/<edition>/` 的提示词负责：`local` 只写任务库，`github` 只写 Issue / PR，不双写。
+- 载体操作由 `editions/github/` 的提示词负责：只写 Issue / PR，不双写；`local` 任务库只在 `v2.0.0` 上作为旧载体。
 
 ### 更新 AgentOrch 的触发（只路由，不定义流程）
 
@@ -108,7 +101,7 @@ Master 在把任务推进到 `DISPATCHED` 或交给执行实例**之前**，或�
 - **非触发**：“更新一下文档”“更新依赖”“更新这个 Issue”以及只询问版本号等普通请求不启动套件更新。措辞有歧义时先问一次“是更新套件本身还是更新项目内容”，不得默认执行。
 - 入口只做路由、环境识别与载体适配：不重写 #51 的来源校验、逐文件分类、备份 / 回滚语义；默认 `PLAN`，`APPLY` 只在隔离分支 / Worktree 中准备变更，不提交、不合并。
 - 路由规则复用 `scripts/self_improvement/planning.py` 的 `route_request()`；`更新 AgentOrch` 不进入自我完善闭环，自我完善触发也不进入本入口。
-- `local` 只准备任务包 / 分支交付，任务库写入仍由 `scripts/orchestrator.py` 完成；`github` 只准备 Issue / Draft PR，入口不调用 `gh`。两者都不双写，也不假装本地底座支持 GitHub 自动化。
+- 入口只准备 Issue / Draft PR，不调用 `gh`，也不写任何任务库；`local` 配置在更新入口处同样按“已退场”处理并给出固定版本指引。
 - 更新安全语义的唯一权威是 `docs/self-improvement/update-safety.md`（仓库检出中读取）；发行包内以 `templates/self-improvement/README.md` 与引擎报告为准。冲突、上游删除 / 重命名、无基线、未提交改动默认停止并交人工决策。
 
 ## 2. 引导纪律
@@ -123,7 +116,7 @@ Master 在把任务推进到 `DISPATCHED` 或交给执行实例**之前**，或�
 
 # 核心编排细则（Edition-Neutral）
 
-本文件定义两个底座共用的编排契约：状态机、任务锁、合并门、运行时能力探测与切换规则。任务载体和证据来源由 `docs/PROJECT.md` 的 `edition` 决定：`local` 使用 SQLite 任务库与原子路径锁，`github` 使用 Issue 任务单、Draft PR 与 CI。若某项能力依赖运行时支持而当前环境并不具备，必须降级并记录依据，不得假装执行。
+本文件定义与底座无关的编排契约：状态机、任务锁、合并门、运行时能力探测与切换规则。任务载体和证据来源由 `docs/PROJECT.md` 的 `edition` 决定：当前唯一受支持的 `github` 使用 Issue 任务单、Draft PR 与 CI；`local` 的 SQLite 任务库与原子路径锁自 2.0.0 主线起退场，只作为旧 Release `v2.0.0` 的历史载体保留在本文对照表中。若某项能力依赖运行时支持而当前环境并不具备，必须降级并记录依据，不得假装执行。
 
 ## 1. 适用方式
 
@@ -140,9 +133,9 @@ PLANNED → READY → DISPATCHED → IN_PROGRESS → [PR_OPEN] → REVIEW_READY 
 
 - `PLANNED`：任务草稿已登记，但依赖或验收可能尚未齐备。
 - `READY`：目标、路径、验收和依赖均明确；所有依赖任务为 `VERIFIED`。
-- `DISPATCHED`：已取得活动任务锁（`local`：完整路径锁；`github`：Issue 登记块 + 开放 PR 冲突检查），任务包已交给真实执行实例。
+- `DISPATCHED`：已取得活动任务锁（`github`：Issue 登记块 + 开放 PR 冲突检查），任务包已交给真实执行实例。
 - `IN_PROGRESS`：执行实例已开始；应记录分支 / Worktree。
-- **`PR_OPEN`**：Draft PR 已创建并在 Issue 中登记。**仅 github 底座使用**；`local` 底座由 `IN_PROGRESS` 直接进入 `REVIEW_READY`，不存在该状态。
+- **`PR_OPEN`**：Draft PR 已创建并在 Issue 中登记。当前唯一的 `github` 底座使用该状态（历史 `local` 安装由 `IN_PROGRESS` 直接进入 `REVIEW_READY`）。
 - `REVIEW_READY`：实现者交回 Diff、head SHA、验证命令 / 输出和剩余风险；`github` 底座要求 PR 已转为 Ready for review 且 CI 在当前 head 全绿。
 - `MASTER_REVIEW`：Master 独立检查任务、变更范围、证据和风险。
 - `APPROVED`：验收全部通过；批准必须绑定精确 head SHA（`github` 为 PR 最新 commit）。
@@ -153,9 +146,11 @@ PLANNED → READY → DISPATCHED → IN_PROGRESS → [PR_OPEN] → REVIEW_READY 
 - `FAILED`：执行实例失败、超时、取消或产物不可用；**状态未知一律视为未完成**。
 - `CANCELED`：项目所有者或 Master 明确取消；记录原因后释放锁。
 
-### 2.1 两底座状态对照
+### 2.1 状态与载体对照
 
-| 状态 | `local` 载体 | `github` 载体 |
+`local` 一列只描述 v2.0.0 的历史载体，保留用于读写旧归档时对照；主线与发行包只提供 `github` 一列。
+
+| 状态 | `local` 载体（历史，仅 v2.0.0） | `github` 载体（现行） |
 |------|--------------|---------------|
 | `PLANNED` / `READY` | 任务库记录 + 依赖检查 | Issue（正文五节 + label） |
 | `DISPATCHED` | `task dispatch` 原子取得全部路径锁 | Issue 内 `ORCH-TASK-REGISTRY` 块 + 开放 PR 同文件检查 |
@@ -167,9 +162,9 @@ PLANNED → READY → DISPATCHED → IN_PROGRESS → [PR_OPEN] → REVIEW_READY 
 | `MERGED` | `git merge --no-ff`（按项目配置） | 平台合并（策略按项目配置） |
 | `VERIFIED` | 主分支重跑检查 | 主分支重跑检查（不只看 CI） |
 
-状态改变由底座载体记录：`local` 通过 `scripts/orchestrator.py` 写入任务库，不要手工编辑 SQLite；`github` 通过 Issue / PR 状态转换与评论记录。载体提供的是治理记账，不会代替运行时真正派发或运行测试。
+状态改变由载体记录：`github` 通过 Issue / PR 状态转换与评论记录。旧 `local` 归档通过 `v2.0.0` 的 `scripts/orchestrator.py` 读取，不得手工编辑 SQLite。载体提供的是治理记账，不会代替运行时真正派发或运行测试。
 
-批次级阶段（见 2.2 节）映射到同一组载体，不另立载体：`github` 用批次 Issue 的 `ORCH-TASK-REGISTRY`（`mode: batch`）与最终 PR，`local` 用任务记录、分支与最终本地合并。
+批次级阶段（见 2.2 节）映射到同一组载体，不另立载体：`github` 用批次 Issue 的 `ORCH-TASK-REGISTRY`（`mode: batch`）与最终 PR。
 
 ### 2.2 交付批次（Batch）
 
@@ -184,7 +179,7 @@ PLANNED → READY → DISPATCHED/IN_PROGRESS → TASK_VERIFIED → INTEGRATED �
 - `TASK_VERIFIED`（**批次内部**）：该任务自身的验收标准在当前 head 上有完整证据，且任务级验证通过。它是批内里程碑，不是外部 `VERIFIED`。
 - `INTEGRATED`（**批次内部**）：任务已并入集成分支。同批次后续任务可以把它当作已满足的依赖；它不解锁外部依赖，也不构成任何交付声明。
 - `BATCH_REVIEWED`：批次最终 Diff 已按 4.2 节完成该风险等级要求的审查与验证。
-- `PR_OPEN` / `MERGED` / `VERIFIED`：与单一任务一致。`PR_OPEN` 仅 `github` 底座使用；`local` 由 `BATCH_REVIEWED` 直接进入 `MERGED`。`VERIFIED` 只在真实合并后的主分支验证通过时产生。
+- `PR_OPEN` / `MERGED` / `VERIFIED`：与单一任务一致。`PR_OPEN` 由现行 `github` 底座使用（历史 `local` 安装由 `BATCH_REVIEWED` 直接进入 `MERGED`）。`VERIFIED` 只在真实合并后的主分支验证通过时产生。
 - 非成功状态按单一任务状态机记录；单个任务失败不阻塞无依赖、无路径冲突的同批次任务，依赖它的任务保持未开始并记录原因。
 - 旧工具输出的 `PREPARED` 只是过渡态，表示“已准备、待人工或 Master 审查”；它既不是 `INTEGRATED`，也不是 `VERIFIED`，不得据此合并、释放外部依赖或宣称交付。
 
@@ -192,15 +187,7 @@ PLANNED → READY → DISPATCHED/IN_PROGRESS → TASK_VERIFIED → INTEGRATED �
 
 ### 3.1 取得活动任务锁
 
-`local`：
-
-1. 任务先进入 `READY`，然后运行 `python scripts/orchestrator.py task dispatch <ID>`。CLI 使用 SQLite `BEGIN IMMEDIATE` 原子检查锁并登记 `DISPATCHED`。
-2. 锁范围由任务允许路径确定；比较采用路径相同或父子路径重叠的方式。例如 `src/` 与 `src/core.py` 冲突，`src/a.py` 与 `src/b.py` 不冲突。
-3. 只有当全部路径可锁定时才一次性取得全部锁；冲突则整个派发失败，不允许半锁状态。
-4. 任务处于活动状态时，不得修改锁定路径集合。确需扩大范围时，先阻塞任务、记录理由、检查新路径冲突并更新登记。
-5. 仅进入 `VERIFIED` 或 `CANCELED` 自动释放锁。失败、超时、未知状态、审查退回或单纯删除 Worktree 都不自动释放。异常清理需运行显式 `task unlock` 并记录理由；强制解锁可能允许冲突，应先确认原任务已停止。
-
-`github`：
+`github`（唯一受支持的底座）：
 
 1. 任务 `READY` 后，在 Issue 内写入 `ORCH-TASK-REGISTRY` 登记块（字段见 `editions/github/active-task-registry.md`），声明 `status`、`mode`、`locked_paths`、`branch`、`pr`、`runner`、时间戳与 `head_sha`。
 2. 写入登记块前必须列出所有开放 PR 及其变更文件，检查是否与本次 `locked_paths` 相交；相交则整个派发失败，不得“先开工再协调”。
@@ -214,7 +201,7 @@ PLANNED → READY → DISPATCHED/IN_PROGRESS → TASK_VERIFIED → INTEGRATED �
 ### 3.2 依赖与并行
 
 - 依赖应构成有向无环图。依赖必须达到 `VERIFIED`，不能仅因为代码已提交、已合并或 PR 已批准就派发下游任务。
-- **批次内例外**：同一批次内的依赖可以由 `INTEGRATED`（内部里程碑，见 2.2 节）满足；跨批次 / 外部依赖仍必须达到 `VERIFIED`。不得用批内里程碑满足外部依赖，也不得据此提前标记 `VERIFIED`。`local` 的 `task dispatch` 仍要求任务库依赖为 `VERIFIED`；参考实现不支持在任务库中登记批内依赖：遇到这种组合会保持任务记录不变并阻塞，要求改用单任务/人工流程或等待批次感知的本地派发。**不得为了让工具通过而删除或改写任务库中的真实依赖。**
+- **批次内例外**：同一批次内的依赖可以由 `INTEGRATED`（内部里程碑，见 2.2 节）满足；跨批次 / 外部依赖仍必须达到 `VERIFIED`。不得用批内里程碑满足外部依赖，也不得据此提前标记 `VERIFIED`。历史 `local` 安装的 `task dispatch` 依赖规则只在 `v2.0.0` 上适用，不得据此改写旧归档中的真实依赖。
 - 单个任务失败或被阻塞时，无依赖且路径不冲突的任务继续推进；依赖它的任务保持未开始并记录原因。
 - 同一文件或目录前缀冲突的任务串行；不冲突且无依赖的任务可以并行。
 - 并行度按机器余量决定，不写固定数字。派发前观察 CPU / 内存 / 磁盘 / 测试资源争用，有余量即可并行；同一 Worktree 同一时刻只允许一个测试进程。
@@ -227,7 +214,7 @@ PLANNED → READY → DISPATCHED/IN_PROGRESS → TASK_VERIFIED → INTEGRATED �
 3.1 的路径锁只判定“是否改同一批文件”，无法表达测试数据库、共享构建环境等具名资源冲突。具名资源锁的语义（数据模型、冲突矩阵、原子集合获取、租约与恢复、底座能力边界、故障场景）**只在 `docs/design/resource-locks.md` 定义**，本节不重述、不改写；本文件的状态机、门禁与锁取得条件（3.1）保持不变。
 
 - 资源锁是路径锁之外的**增量**判定：两者都通过才可派发；未声明资源的任务行为不变。
-- `local` 可声明“同一数据库文件范围内的原子互斥”；`github` 只能登记协作性占用并做冲突检查，**不得宣称原子锁**（依据见契约第 7 节）。
+- 现行 `github` 只能登记协作性占用并做冲突检查，**不得宣称原子锁**（依据见契约第 7 节）；`local` 的“同一数据库文件范围内的原子互斥”只在 `v2.0.0` 的历史实现中成立。
 - 只有 `VERIFIED` / `CANCELED` 自动释放；`FAILED`、`BLOCKED` 与状态未知保持占用，过期不等于释放。
 - 契约改动必须另开 Issue 重新冻结，实现任务不得在实现 PR 中顺手修改语义。
 
@@ -249,7 +236,7 @@ PLANNED → READY → DISPATCHED/IN_PROGRESS → TASK_VERIFIED → INTEGRATED �
 
 `MASTER_REVIEW` 必须逐门检查。任一门的结论不是“通过”，就退回 `IN_PROGRESS` 或 `BLOCKED`，写明具体缺口；不得用其他门的通过来抵消。
 
-| 门 | 要求 | `local` 证据 | `github` 证据 | 原审查检查项 |
+| 门 | 要求 | `local` 证据（历史，仅 v2.0.0） | `github` 证据（现行） | 原审查检查项 |
 |----|------|--------------|---------------|--------------|
 | **G1 验收逐条通过** | 每条验收标准都有对应证据，部分通过不算通过 | 任务记录 + 命令输出 | Issue 验收清单 + PR 评论逐条结论 | 1 |
 | **G2 范围合规** | 实际变更路径全部属于允许路径，无未授权文件，无夹带重构 | `git diff --name-only` + `git status --short` | PR changed files + 任务允许路径 | 2、3 |
@@ -262,7 +249,7 @@ PLANNED → READY → DISPATCHED/IN_PROGRESS → TASK_VERIFIED → INTEGRATED �
 
 - **G1**：Master 不采信“已完成”的自述，也不把 CI 绿灯当作验收通过；逐条对照验收标准给出依据。逐条依据的记账格式见 4.1 节：验收标准未映射到任何 evidence item 时按未通过处理。
 - **G3**：基线落后时必须先 rebase / merge 最新主分支并重新验证；不得在过期基线上批准。
-- **G4**：检查运行在哪个 SHA 必须可定位。`github` 底座只承认当前 head 的 CI 结果；重跑旧 commit 或本地通过不能替代。`local` 底座不得把“配置里写了命令”当作“命令已通过”。
+- **G4**：检查运行在哪个 SHA 必须可定位。`github` 底座只承认当前 head 的 CI 结果；重跑旧 commit 或本地通过不能替代。任何底座都不得把“配置里写了命令”当作“命令已通过”。
 - **G5**：证据不全会直接退回。任何“历史运行过”的说法都要求能定位到当前 head；无法复现即视为未验证。
 - **G6**：出现数据删除 / 迁移、权限或安全模型变化、新增外部服务、不可逆动作、重大架构取舍、产品语义歧义时，必须先记录选项与影响，进入 `NEEDS_HUMAN_DECISION`，不得由执行者或 Master 单方面决定。
 - **G6 风险填写深度**（`Risks / human decisions` 写到什么程度算够；触发项清单只以上一条 G6 原文为准）：
@@ -276,7 +263,7 @@ PLANNED → READY → DISPATCHED/IN_PROGRESS → TASK_VERIFIED → INTEGRATED �
 
 - `APPROVED` 必须带当前完整 commit SHA。工作树或提交头有任何变化，批准立即失效，需重新审查。
 - 批次交付允许一个批次只开一个最终 PR / 做一次合并；合并前必须在该批次最终 head 上通过必需检查与批次审查（2.2、4.2 节），一个批次 PR 可以包含多个任务 ID。不得用逐任务 PR 的旧规则否定批次交付，也不得用批次合并跳过单任务验收。
-- 只有 Master 可以按 `AGENTS.md` 的角色分工作出并执行合并决定（`local` 例如 `git merge --no-ff <branch>`，`github` 例如平台合并按钮 / `gh pr merge`；具体策略由项目配置决定）。作出决定前，Master 在任务载体记录适用授权的来源和范围，并核对授权仍有效、已解决必须升级的事项、适用的审查及平台门禁已在当前 head 通过。有效常设授权在其范围内可跨会话复用。执行者不得自批自合。
+- 只有 Master 可以按 `AGENTS.md` 的角色分工作出并执行合并决定（`github` 例如平台合并按钮 / `gh pr merge`；具体策略由项目配置决定）。作出决定前，Master 在任务载体记录适用授权的来源和范围，并核对授权仍有效、已解决必须升级的事项、适用的审查及平台门禁已在当前 head 通过。有效常设授权在其范围内可跨会话复用。执行者不得自批自合。
 - 合并前备份或确认可恢复；遇到冲突不自动覆盖他人 / 主分支内容。
 - 合并后运行 `docs/PROJECT.md` 指定的验证命令，保存日志与退出码；全部通过后转 `VERIFIED`。无条件集合是快速测试 + 完整回归 + 静态检查；`backup` 不是无条件项，按 `docs/PROJECT.md` 的「归档备份（条件项）」执行：`.orchestration/state.sqlite3` 存在时必须运行 `python scripts/orchestrator.py backup`，缺库时按维护写入边界拒绝、不得 `init`，合并后验证记 `NOT_APPLICABLE: archive absent`，不计为失败。只有 `verification_profile` 精确为 `risk_pilot` 且调用者显式证明变更为 L0 时，才可以省略完整回归，`validate_kit` 与 `py_compile` 仍必须执行。证明缺失、语义标记为真或路径命中编排器 / `kit/orchestration.md` / CI / `PROJECT.md` / `PLAN.md` / `AGENTS.md` / `editions/` / `scripts/` / `release/` / `templates/` 时不得省略。
 - 批次交付同样要求合并后验证：只有验证通过后才把批次内任务逐个标记 `VERIFIED`；不得把 `INTEGRATED` / `PREPARED` 写成 `VERIFIED`。批次 PR 的描述与证据见 `editions/github/pr-template.md`。
@@ -287,7 +274,7 @@ PLANNED → READY → DISPATCHED/IN_PROGRESS → TASK_VERIFIED → INTEGRATED �
 
 G1 的“逐条验收”以**证据矩阵**记账：每条验收标准（AC）至少映射一条 evidence item，同一 AC 可以有多条（不同方法、不同环境、不同负向场景）。
 
-字段名与判定规则只在本节定义。`templates/task-packet.md`、`editions/github/issue-template.md` 与底座手册只引用这些字段名，并说明证据存放在哪里、如何取回，**不得另写一套定义或改写取值含义**。两个底座的字段完全相同，差异只在载体：`local` 写入任务记录 / 证据文件，`github` 写入 Issue 验收清单与 PR 评论。批次交付不改变这一点：每个任务仍有自己的证据矩阵，批次最终审查在批次 head 上逐任务核对这些矩阵，不得用一张批次汇总表替代。
+字段名与判定规则只在本节定义。`templates/task-packet.md`、`editions/github/issue-template.md` 与底座手册只引用这些字段名，并说明证据存放在哪里、如何取回，**不得另写一套定义或改写取值含义**。字段与载体无关：现行 `github` 写入 Issue 验收清单与 PR 评论（历史 `local` 写入任务记录 / 证据文件）。批次交付不改变这一点：每个任务仍有自己的证据矩阵，批次最终审查在批次 head 上逐任务核对这些矩阵，不得用一张批次汇总表替代。
 
 **证据条目（evidence item）字段** — 唯一权威定义：
 
@@ -320,7 +307,7 @@ G1 的“逐条验收”以**证据矩阵**记账：每条验收标准（AC）�
 5. 证据行 `commit_sha` 与矩阵声明的 head SHA 不一致即为证据过期；head 变化后必须在新 head 上重新取证，旧证据只能作为历史记录。
 6. CI 绿灯、Agent 自述、聊天记录、历史 head 上的运行结果都不是当前 head 的充分证据。
 
-**任务包结构化扩展字段** — 唯一权威定义（`local` 任务包与 `github` Issue 用同一组字段名）：
+**任务包结构化扩展字段** — 唯一权威定义（现行 `github` Issue 使用下列字段名）：
 
 | 字段 | 必填 | 含义 | 填写规则 |
 |------|------|------|----------|
@@ -374,12 +361,12 @@ python3 scripts/delivery_risk.py --repo PATH --base REF --head REF [--json]
 - 退出码：`0` 成功；`1` 部分成功 / 失败 / 阻塞；`2` 输入或前置检查非法（未开始写入）。`1` 与 `2` 都不得当作通过。
 - `--journal` 是本地恢复记录，不是任务库、Issue 登记块或证据矩阵的替代，也不得写在仓库或任务 Worktree 内。恢复判断以 Git 与权威载体为准，journal 只能帮助定位，不能单独证明交付。
 - `--merge` 要求 `--authorization` 与计划中非空的 `finalize.authorization` 逐字一致。Master 负责在调用前核对实际授权及适用范围，可沿用有效的常设授权，并按第 4 节记录。对于这个授权参数，工具只校验文本匹配。合并后仍必须在主分支执行合并后验证，通过后才转 `VERIFIED`（2.2 节）。
-- `run` 在任何 Agent 启动前完成权威派发：`github` 枚举开放 PR、其他活动 Issue 登记块并写入本批次 `mode: batch` 的 `ORCH-TASK-REGISTRY`（`status: DISPATCHED`），`local` 通过 `task ready` / `task dispatch` 取得路径锁并核对任务库的路径、AC 与当前锁。载体缺失、任务记录不一致、枚举截断或派发失败时阻塞，不以 `not_applicable` 代替；已取得的锁按 3.1 节保留。
+- `run` 在任何 Agent 启动前完成权威派发：`github` 枚举开放 PR、其他活动 Issue 登记块并写入本批次 `mode: batch` 的 `ORCH-TASK-REGISTRY`（`status: DISPATCHED`）。载体缺失、任务记录不一致、枚举截断或派发失败时阻塞，不以 `not_applicable` 代替；已取得的锁按 3.1 节保留。
 - `finalize` 以**生效分支规则**（`repos/{owner}/{repo}/rules/branches/{base}`）得到实际必需 contexts 与集成身份，并用审查 head 上的 check-runs 核对名称、app identity、完成状态与 success；计划中的 `required_checks` 只能是实际集合的子集。规则不可读、集合为空、check-run 缺失/失败/身份不符或列表被截断时阻塞，不得用计划自报或 `gh pr checks` 的观测结果代替平台配置。
 - `L0` 自动合并不启动第二模型，但必须有逐条 AC 的机器证据（计划的 `acceptance_checks`）和在**审查 head 上事后生成**的 Master attestation（`--acceptance-attestation`，绑定 head 与 diff、逐条 PASS 且有可定位证据），或独立审查；缺任一项时阻塞。`L1` / `L2` 的审查提示包含逐任务 AC、验证命令与记录，审查者仍须逐条判定。
 - 计划不得修改 `docs/PROJECT.md`：项目配置在 journal 中以 SHA-256 绑定；配置变更作为单任务或批次外工作交付，避免合并后恢复读到不同配置。
 - `docs/PROJECT.md` 的“验证命令”按阶段解析：所有声明的快速测试、静态检查、完整回归与合并后命令都必须在 `post_merge_verify`；它们也可以同时出现在 `verify`。`python` / `python3` / `sys.executable` 等价；缺命令或声明无法安全解析时阻塞。
-- `local` 的任务库依赖仍由 CLI 要求 `VERIFIED`，本参考实现不支持在任务库中登记批内依赖：遇到这种组合会保持任务记录不变并阻塞，要求改用单任务/人工流程或等待批次感知的本地派发。`github` 与计划 DAG 的批内 `INTEGRATED` 例外不受影响。
+- 批次工具只实现 `github` 载体；计划 DAG 的批内 `INTEGRATED` 例外适用。历史 `local` 任务库的依赖规则只在 `v2.0.0` 上适用。
 - 审查后的 head 在验证、推送或合并前发生变化即失效；合并使用审查过的精确 SHA；合并后验证不得改变 HEAD、分支或工作树，否则不得产生 `VERIFIED`，只能记录 `merged_but_post_verify_failed` 并进入恢复。
 - 审查后的 head 在验证、推送或合并前发生变化即失效；合并使用审查过的精确 SHA；合并后验证不得改变 HEAD、分支或工作树，否则不得产生 `VERIFIED`，只能记录 `merged_but_post_verify_failed` 并进入恢复。
 - 命令形式以参考实现为准。当前 head 上未真实执行的命令只能标为待探测（未验证），不得写成已验证；计划格式、恢复语义与限制见随包的 `templates/batch-delivery.md`。
@@ -397,9 +384,9 @@ python3 scripts/delivery_risk.py --repo PATH --base REF --head REF [--json]
 
 探测流程：
 
-1. 在任务记录（`local`：任务库事件；`github`：Issue 评论）写明运行时名称 / 版本、探测时间、探测任务 ID。
+1. 在任务记录（`github`：Issue 评论）写明运行时名称 / 版本、探测时间、探测任务 ID。
 2. 逐条执行 C1–C4，记录命令、返回句柄、取回内容与终局判定。
-3. 任一条不满足，则“由 Master 真实 spawn 并推进到 `DISPATCHED`”的路径**不可达**；必须降级为人工交接（`local` 的多会话交接或 `github` 的人工执行会话），并在任务记录中写明缺失能力、探测证据和降级方式。
+3. 任一条不满足，则“由 Master 真实 spawn 并推进到 `DISPATCHED`”的路径**不可达**；必须降级为人工交接（`github` 的人工执行会话），并在任务记录中写明缺失能力、探测证据和降级方式。
 4. 只有四条全部通过，才可使用子代理驱动路径；后续运行时升级或更换后必须重新探测。
 5. 超时、取消、结果为空、句柄失效或状态不可判定，一律不得推进任务状态。
 
@@ -407,9 +394,14 @@ python3 scripts/delivery_risk.py --repo PATH --base REF --head REF [--json]
 
 **角色选择只消费这些记录。** `scripts/agent_selection/` 的 adapter / discovery / roles 模块把 C1–C8 记录与显式提供的事实作为输入，优先使用运行时的正式 Agent 枚举，无法枚举时回退到当前 scope 的显式注册表（`agent-registry.md`），两者都没有时报告 `NO_ADAPTER` / `EMPTY`。它们不重新定义 C1–C8、不创建或授权 Agent、不扩大任务允许路径；发现不等于推荐，选择不等于派发。任一关键能力 `UNKNOWN` / `STALE` 时不进入自动派发，缺少合格 Execution / Reviewer 时按现有契约人工交接或保持未审查。会话入口的调用顺序与出口规则见第一部分「角色选择入口」。
 
-## 6. 底座切换
+## 6. 底座切换与 local 退场
 
-`local` → `github` 是唯一支持的迁移方向，必须一次性完成并记录切换点。**不允许双写**：同一任务不能同时在任务库和 Issue 中维护状态。
+`local` 已从主线与下一代安装包退场，现行唯一受支持的底座是 `github`。既有 local 安装有两条明确去向，项目所有者只能二选一：
+
+- **固定旧版（留存指引）**：留在被验证的 Release `v2.0.0`（tag `v2.0.0`）上继续运行，不要升级本套件。旧安装的全部 local 能力、SQLite 任务库与原子路径锁都以该版本为准。
+- **单次回退**：已经升级到本主线后要回到旧行为，只能整体回退到 `v2.0.0`（重新安装该 Release 的发行包），并按该版本手册恢复任务库。主线不提供 `github` → `local` 的自动回退，也不会把 Issue / PR 状态导回 SQLite。
+
+跟进主线时，`local` → `github` 是唯一支持的迁移方向，必须一次性完成并记录切换点。**不允许双写**：同一任务不能同时在任务库和 Issue 中维护状态。
 
 迁移清单：
 
@@ -423,9 +415,9 @@ python3 scripts/delivery_risk.py --repo PATH --base REF --head REF [--json]
 
 约束：
 
-- 迁移是单向的。本套件不提供 `github` → `local` 的自动回退；确需回退时由项目所有者单独立项，重新导出为新的任务记录并重新验证。
+- 迁移是单向的。本套件不提供 `github` → `local` 的自动回退；确需回退只能整体回到已验证的 Release `v2.0.0`。
 - 迁移过程中不得让同一任务的旧状态与新状态同时被不同 Agent 当作事实来源；发现双写立即停止并升级为 `NEEDS_HUMAN_DECISION`。
-- 底座切换属于重大架构取舍；执行前必须获得项目所有者批准并登记。
+- 底座切换与 local 退场都属于重大架构取舍；执行前必须获得项目所有者批准并登记。
 
 ## 7. 项目接入与新项目
 
@@ -442,12 +434,12 @@ python3 scripts/delivery_risk.py --repo PATH --base REF --head REF [--json]
 
 # 通用验收程序
 
-每次首次接入、变更调度器 / 提示词，或更换 Agent 运行时后执行。证据必须来自真实命令和当前提交；不能将空模板、历史记录或 CI 绿灯当成已验收。本程序对两个底座通用，底座特有的检查项在标题中标注。修改核心契约、证据字段、模板、校验器、状态机 / 锁语义或发行流程时，除本程序对应段落外，还必须执行 **I 段（合成回归场景）**。
+每次首次接入、变更调度器 / 提示词，或更换 Agent 运行时后执行。证据必须来自真实命令和当前提交；不能将空模板、历史记录或 CI 绿灯当成已验收。本程序与底座无关；仅适用于历史 `local` 安装的检查项只在 `v2.0.0` 上执行。修改核心契约、证据字段、模板、校验器、状态机 / 锁语义或发行流程时，除本程序对应段落外，还必须执行 **I 段（合成回归场景）**。
 
 ## A. 配置与底座识别
 
 - [ ] `docs/PROJECT.md` 中不再有未处理的 `FILL_IN`。
-- [ ] `edition` 取值为 `local` 或 `github`；缺失或非法时引导流程会停止并报错，而不是猜测。
+- [ ] `edition` 取值为 `github`；缺失或非法时引导流程会停止并报错，而不是猜测；`local` 得到明确的“已退场 + 固定 v2.0.0 / 迁移”指引且不写入任何状态。
 - [ ] 底座只由 `docs/PROJECT.md` 的 `edition` 决定；`.orchestration/config.json` 里即使残留 `edition` 键也不影响路由（`config show` 标注为 ignored）。
 - [ ] `edition` 缺失、为空、非法字符串、类型错误或文件不可读时，调度命令（`task add` / `ready` / `dispatch` / `status` / `workspace` / `amend` / `unlock`）以非零退出并报出实际值与修复位置；`init`、`backup`、`config show`、`task list`、`task show` 仍可用。
 - [ ] 声明 `github` 时本地 CLI 拒绝调度并把下一步指向 Issue / PR，不冒充已支持 `github` 调度；`retry_cap` 的非法回退默认 `3` 语义未被牵连改变。
@@ -473,7 +465,7 @@ python3 scripts/delivery_risk.py --repo PATH --base REF --head REF [--json]
 - [ ] 多资源获取是原子集合：任一冲突则整批失败，失败后该任务非 `RELEASED` 锁行数为 `0`；申请顺序为确定性顺序。
 - [ ] 只有 `VERIFIED` / `CANCELED` 自动释放；`FAILED` / `BLOCKED` / 状态未知保持占用，且不把过期当释放。
 - [ ] 强制解锁与回收均有理由、授权与审计事件；无事件的锁记录被判为证据缺失并隔离，而非当作有效或空闲。
-- [ ] `local` 只按契约 §7.1 的范围内声明原子互斥；`github` 的登记块与交付报告中没有“原子锁 / 并发已保证”一类表述。
+- [ ] `github` 的登记块与交付报告中没有“原子锁 / 并发已保证”一类表述（历史 `local` 的原子互斥只在 `v2.0.0` 成立）。
 - [ ] 契约 §9.1 的故障场景（F1–F9）在隔离环境演练过，每个场景有预期行为与证据形式；`FAILED` / 状态未知的自动释放未被演练“修复”为通过。
 - [ ] 锁数据结构新增字段已随实现任务落地：`templates/task-packet.md` 的 `declared_resources` 与 `editions/github/issue-template.md` 的 `locked_resources` 均为**可选**，留空不判失败，填写时只校验 `<id>:<mode>[:<ttl>]` 格式与逗号分隔。
 
@@ -533,7 +525,7 @@ python3 scripts/delivery_risk.py --repo PATH --base REF --head REF [--json]
 ```text
 日期与运行环境：
 项目 / 分支：
-底座（local / github）：
+底座（当前仅支持 github）：
 测试任务 ID：
 任务载体备份 / Issue 链接：
 调度能力实际探测（C1–C4）：
@@ -552,7 +544,7 @@ CI 运行 URL 与 head SHA（`github` 底座）：
 合并后验证命令 / 退出码：
 能力登记位置（`templates/runtime-capability.md`）与记录状态（COMPLETE / PARTIAL / STALE）：
 未探测或已失效的能力（`UNKNOWN`）及对应降级方式：
-指标报告命令、窗口与来源（`scripts/report_metrics.py`，`local` 任务库或事件样本）：
+指标报告命令、窗口与来源（`scripts/report_metrics.py`，事件样本）：
 各指标的样本量 / 缺失率 / coverage（未采集项标 `unknown`）：
 已知限制与未测试项：
 最终结论：通过 / 部分通过 / 未通过
@@ -584,6 +576,6 @@ D 段只回答“C1–C4 是否通过”。本节回答“这些结论记在哪�
 - [ ] `totals.errors` 为 `0`；若不为 `0`，报告必须保留异常类型与堆栈，并且剩余场景仍已执行完（单场景失败不吞掉后续）。
 - [ ] 本次变更涉及的场景已同步更新：场景表的 ID 与运行器注册一致（`tests/test_run_delivery_scenarios.py` 会检查 `| <ID> |` 行）。
 - [ ] 报告的 `generated_at` / `python` / `platform` 与本次证据记录一致；报告用 `--output` 写到仓库外，未提交进仓库。
-- [ ] `local` 可离线完成的范围：A–D 四组的核心门语义（证据矩阵与空 AC、`NOT_RUN` 冒充 `PASS`、旧 head、edition fail-closed、路径锁与具名资源锁冲突、修复轮数、阶段审计 `BLOCKING` / `NEEDS_HUMAN_DECISION`）。
-- [ ] `github` 可离线完成的范围：同一套字段、模板与校验函数；Issue / PR / 登记块 / CI 端到端**无法离线验证**，未实际运行即标 `BLOCKED`，不得用 `local` 结果替代。
+- [ ] 离线可完成的范围：A–D 四组的核心门语义（证据矩阵与空 AC、`NOT_RUN` 冒充 `PASS`、旧 head、edition fail-closed、修复轮数、阶段审计 `BLOCKING` / `NEEDS_HUMAN_DECISION`）。
+- [ ] `github` 可离线完成的范围：同一套字段、模板与校验函数；Issue / PR / 登记块 / CI 端到端**无法离线验证**，未实际运行即标 `BLOCKED`，不得用本地结果替代。
 - [ ] 场景只证明套件自身的门禁；不得据此宣称对任何外部产品项目做过真实数据或自动化验证。

@@ -22,7 +22,7 @@
 |-------|-------|-------|
 | Runtime name | | Product / CLI / service name, not a nickname |
 | Runtime version | | Exact version string as reported by the runtime; "latest" is not a version |
-| Edition (`local` / `github`) | | Must match `docs/PROJECT.md` |
+| Edition | | Must be `github` (the only supported edition) and match `docs/PROJECT.md` |
 | Execution mode | | `spawned-subagent` / `manual-handoff` / `scheduled-job` / other exact mode |
 | Delivery artifacts | | What actually comes back: diff, commit SHA, file, PR, log, exit code |
 | Probe date (UTC) | | `YYYY-MM-DDThh:mm:ssZ`; local time is not acceptable |
@@ -64,7 +64,7 @@ Answer each line; `UNKNOWN` or `N/A: <reason>` are the only alternatives to a me
 ## UNKNOWN and re-probe
 
 - A capability is `UNKNOWN` when it was not probed, when the probe predates the current runtime version, when the runtime or edition changed, when the evidence link no longer resolves, or when the probe result was ambiguous.
-- Re-probe the affected capabilities — not just the changed one — when any of these happens: runtime upgrade or downgrade, edition switch (`local` ↔ `github`), execution-mode change, collection mechanism change (logs, artifacts, API), a failed or cancelled probe, or this record being older than the project's stated review interval.
+- Re-probe the affected capabilities — not just the changed one — when any of these happens: runtime upgrade or downgrade, edition change, execution-mode change, collection mechanism change (logs, artifacts, API), a failed or cancelled probe, or this record being older than the project's stated review interval.
 - An unrelated capability may keep its old verdict only if its own probe date and evidence are still valid; "the rest still applies" is acceptable, "everything still applies" is not.
 - Downgrade a verdict to `UNKNOWN` first and re-probe second. Do not leave a stale `PASS` in place while the re-probe is pending.
 - After a downgrade, the routing decision falls back to manual handoff until the capability is `PASS` again; the record states the fallback, not just the missing capability.
@@ -80,12 +80,12 @@ Answer each line; `UNKNOWN` or `N/A: <reason>` are the only alternatives to a me
 - Every `PASS` row points to evidence that a second person can open without asking the author: a task record, an Issue comment, a CI run URL, a commit SHA plus file path, or a log file committed for the probe.
 - Evidence that only exists inside one chat session is not evidence. If the only copy is in a transcript, write `UNKNOWN`.
 - `Limits` is not optional prose: it carries what the probe did **not** cover, known flakiness, environment differences (OS, network, credentials) and what would invalidate the verdict.
-- Keep the record where the task carrier can find it (`local`: task record or `docs/`; `github`: Issue comment linked from the task). A record nobody can locate is equivalent to `UNKNOWN`.
+- Keep the record where the task carrier can find it (`github`: Issue comment linked from the task). A record nobody can locate is equivalent to `UNKNOWN`.
 
 ```capability-record example
 - Runtime name: example-runtime-cli
 - Runtime version: 2.4.1
-- Edition: local
+- Edition: github
 - Execution mode: spawned-subagent
 - Probe date (UTC): 2026-01-12T09:30:00Z
 - Probe task / run ID: TASK-0007 (task record: events 41-58)
