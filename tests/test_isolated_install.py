@@ -1435,7 +1435,10 @@ pathlib.Path.iterdir = injected
 sys.argv = [script]
 runpy.run_path(script, run_name='__main__')
 '''
-        for edition in ('local', 'github'):
+        # Only `github` ships; `editions/local/` is gone from REQUIRED, so the
+        # synthetic tree cannot contain it. The injection still proves the
+        # enumeration failure is reported and sanitized.
+        for edition in ('github',):
             directory = agentorch / 'editions' / edition
             def check(proc, number):
                 output = proc.stdout + proc.stderr
@@ -4759,7 +4762,10 @@ runpy.run_path(script,run_name='__main__')
                     if resolved == host_agents:
                         host_agents_hits += 1
                 checked += 1
-        self.assertGreaterEqual(checked, 40,
+        # 40 was the floor before `editions/local/` was retired; those two
+        # documents and the links to them are gone, so the floor tracks the
+        # smaller corpus while every resolved target is still asserted below.
+        self.assertGreaterEqual(checked, 35,
                                 'too few relative targets were resolved to be meaningful; '
                                 f'reference definitions found: {references}')
         self.assertGreaterEqual(host_agents_hits, 3,
@@ -4773,8 +4779,7 @@ runpy.run_path(script,run_name='__main__')
         self.assertIn('../../AGENTS.md', core)
         self.assertEqual((agentorch / 'kit' / '../../AGENTS.md').resolve(), host_agents)
         self.assertTrue(host_agents.is_file())
-        for rel in ('editions/local/master.md', 'editions/github/master.md',
-                    'templates/runtime-capability.md'):
+        for rel in ('editions/github/master.md', 'templates/runtime-capability.md'):
             path = agentorch / rel
             inline, definitions = markdown_relative_targets(path.read_text(encoding='utf-8'))
             self.assertTrue(
@@ -6206,13 +6211,18 @@ class IsolatedEntryCommandsTest(unittest.TestCase):
         self.assertIn('--layout isolated', block)
         self.assertIn('agentorch/scripts/orchestrator.py', block)
         self.assertIn('agentorch/.local/orchestration/', block)
-        manual = (ROOT / 'editions' / 'local' / 'master.md').read_text(encoding='utf-8')
+        # The shipped manual is the github one; the retired local manuals are
+        # gone. It must still name the isolated layout and the state directory
+        # that only legacy archive maintenance uses.
+        manual = (ROOT / 'editions' / 'github' / 'master.md').read_text(encoding='utf-8')
         self.assertIn('--layout isolated', manual)
         self.assertIn('agentorch/.local/orchestration/', manual)
         # Flat installs keep the historical bare command.
-        self.assertIn('python scripts/orchestrator.py init', manual)
-        execution = (ROOT / 'editions' / 'local' / 'execution.md').read_text(encoding='utf-8')
-        self.assertIn('--layout isolated', execution)
+        self.assertIn('python scripts/orchestrator.py init-plan', manual)
+        execution = (ROOT / 'editions' / 'github' / 'execution.md').read_text(encoding='utf-8')
+        # The execution prompt points at the master manual for layout details
+        # instead of repeating the isolated command itself.
+        self.assertIn('editions/github/master.md', execution)
         project = (ROOT / 'templates' / 'project.md').read_text(encoding='utf-8')
         self.assertIn('agentorch/.local', project)
 
@@ -6261,24 +6271,27 @@ class IsolatedEntryCommandsTest(unittest.TestCase):
         (flat / 'docs').mkdir()
         (flat / 'docs' / 'PROJECT.md').write_text(
             '# Project\n\n- `edition`: `local`\n', encoding='utf-8')
-        flat_commands = self._run_generated_next_steps(
-            entry._local_next_steps('flat'), flat, 'TASK-153F')
-        self.assertTrue(flat_commands)
-        self.assertTrue(all('--layout' not in command for command in flat_commands))
-        flat_state = flat / '.orchestration'
-        self.assertTrue((flat_state / 'state.sqlite3').is_file())
+        # Retired expectation: these generated steps used to register and
+        # dispatch a real task. The scheduler is gone, so each step must now be
+        # refused with the Release v2.0.0 / migration guidance and write nothing.
+        # This test stays because the update entry still emits the sequence
+        # (`tests/test_update_entry.py` is outside the #280 path list); it pins
+        # the refusal until that entry is retired too.
+        import shlex
+        import subprocess
+        flat_steps = entry._local_next_steps('flat')
+        self.assertTrue(flat_steps)
+        self.assertTrue(all('--layout' not in step for step in flat_steps))
+        for step in flat_steps:
+            argv = shlex.split(step)
+            if argv[:2] != [sys.executable, 'scripts/orchestrator.py'] and \
+                    argv[:2] != ['python', 'scripts/orchestrator.py']:
+                continue
+            proc = subprocess.run(argv, cwd=str(flat), capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 1, f'{step}\n{proc.stdout}{proc.stderr}')
+            self.assertIn('v2.0.0', proc.stderr)
+        self.assertFalse((flat / '.orchestration').exists())
         self.assertFalse((flat / '.local' / 'orchestration').exists())
-        con = sqlite3.connect(flat_state / 'state.sqlite3')
-        try:
-            self.assertEqual(
-                con.execute('SELECT status FROM tasks WHERE id=?',
-                            ('TASK-153F',)).fetchone()[0], 'DISPATCHED')
-            self.assertEqual(
-                [row[0] for row in con.execute(
-                    'SELECT path FROM locks WHERE task_id=?', ('TASK-153F',))],
-                ['src'])
-        finally:
-            con.close()
 
         # Isolated install: the managed block documents the host root as the
         # working directory and agentorch/scripts/orchestrator.py --layout
@@ -6288,38 +6301,37 @@ class IsolatedEntryCommandsTest(unittest.TestCase):
         (agentorch / 'docs').mkdir()
         (agentorch / 'docs' / 'PROJECT.md').write_text(
             '# Project\n\n- `edition`: `local`\n', encoding='utf-8')
-        isolated_commands = self._run_generated_next_steps(
-            entry._local_next_steps('isolated'), self.host, 'TASK-153E')
-        self.assertTrue(isolated_commands)
-        for command in isolated_commands:
-            self.assertEqual(command[1], 'agentorch/scripts/orchestrator.py', command)
-            self.assertEqual(command[2:4], ['--layout', 'isolated'], command)
-        state = agentorch / '.local' / 'orchestration'
-        self.assertTrue((state / 'state.sqlite3').is_file())
+        isolated_steps = entry._local_next_steps('isolated')
+        self.assertTrue(isolated_steps)
+        for step in isolated_steps:
+            argv = shlex.split(step)
+            if argv[:2] != [sys.executable, 'agentorch/scripts/orchestrator.py'] and \
+                    argv[:2] != ['python', 'agentorch/scripts/orchestrator.py']:
+                continue
+            self.assertEqual(argv[2:4], ['--layout', 'isolated'], step)
+            proc = subprocess.run(argv, cwd=str(self.host), capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 1, f'{step}\n{proc.stdout}{proc.stderr}')
+            self.assertIn('v2.0.0', proc.stderr)
+        self.assertFalse((agentorch / '.local' / 'orchestration').exists())
         self.assertFalse((self.host / '.orchestration').exists())
-        con = sqlite3.connect(state / 'state.sqlite3')
-        try:
-            self.assertEqual(
-                con.execute('SELECT status FROM tasks WHERE id=?',
-                            ('TASK-153E',)).fetchone()[0], 'DISPATCHED')
-            self.assertEqual(
-                [row[0] for row in con.execute(
-                    'SELECT path FROM locks WHERE task_id=?', ('TASK-153E',))],
-                ['src'])
-        finally:
-            con.close()
 
-    def test_documented_isolated_init_runs_and_lands_in_kit_local(self):
+    def test_documented_isolated_init_plan_lands_in_kit_docs(self):
+        """Retired: the isolated `init` used to create a task store.
+
+        New: the documented plan-only entry runs from the host root, seeds
+        `agentorch/docs/PLAN.md`, and creates no task state anywhere.
+        """
         import subprocess
         agentorch = self._complete_tree()
+        (agentorch / 'docs').mkdir(exist_ok=True)
+        (agentorch / 'docs' / 'PROJECT.md').write_text(
+            '# Project\n\n- `edition`: `github`\n', encoding='utf-8')
         documented = [sys.executable, 'agentorch/scripts/orchestrator.py',
-                      '--layout', 'isolated', 'init']
+                      '--layout', 'isolated', 'init-plan']
         proc = subprocess.run(documented, cwd=str(self.host), capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        state = agentorch / '.local' / 'orchestration'
-        self.assertTrue((state / 'state.sqlite3').is_file())
-        self.assertTrue((state / 'config.json').is_file())
-        self.assertTrue((state / 'backups').is_dir())
+        self.assertTrue((agentorch / 'docs' / 'PLAN.md').is_file())
+        self.assertFalse((agentorch / '.local' / 'orchestration').exists())
         self.assertFalse((self.host / '.orchestration').exists())
         self.assertFalse((agentorch / '.orchestration').exists())
         bare = subprocess.run(
@@ -6357,13 +6369,16 @@ class IsolatedEntryCommandsTest(unittest.TestCase):
         flat = self.tmp / 'flat-root'
         (flat / 'docs').mkdir(parents=True)
         (flat / 'docs' / 'PROJECT.md').write_text(
-            '# Project\n\n- `edition`：`local`\n', encoding='utf-8')
+            '# Project\n\n- `edition`：`github`\n', encoding='utf-8')
+        (flat / 'templates').mkdir()
+        shutil.copyfile(ROOT / 'templates' / 'plan.md', flat / 'templates' / 'plan.md')
         proc = subprocess.run(
             [sys.executable, str(ROOT / 'scripts' / 'orchestrator.py'),
-             '--root', str(flat), 'init'],
+             '--root', str(flat), 'init-plan'],
             cwd=str(self.tmp), capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertTrue((flat / '.orchestration' / 'state.sqlite3').is_file())
+        self.assertTrue((flat / 'docs' / 'PLAN.md').is_file())
+        self.assertFalse((flat / '.orchestration').exists())
         self.assertFalse((flat / '.local' / 'orchestration').exists())
 
 

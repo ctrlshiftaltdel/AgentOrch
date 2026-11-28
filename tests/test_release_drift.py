@@ -859,9 +859,11 @@ class PackagedDocRuleTests(unittest.TestCase):
         self.assertFalse(any(rel.startswith('docs/') for rel in validate.REQUIRED))
         self.assertNotIn('docs', self.builder.FORBIDDEN_SEGMENTS)
 
-    def test_published_v1_7_0_classifier_would_not_block_this_required_set(self):
+    def test_published_v1_7_0_classifier_blocks_only_the_retired_edition(self):
         """The published updater treats docs/ as project-owned and a missing
-        baseline file as a blocking removal. This release must not create either.
+        baseline file as a blocking removal. This release creates no docs/ entry;
+        the only removals are the retired `editions/local/` files, which is the
+        documented fail-closed path (stay on Release v2.0.0 or migrate).
 
         The published REQUIRED list is frozen here. CI checkouts are shallow and
         do not have the v1.7.0 tag, so this test must not call git.
@@ -874,7 +876,8 @@ class PackagedDocRuleTests(unittest.TestCase):
         )
         shipped_owned = [rel for rel in required if rel.startswith(owned_prefixes)]
         self.assertEqual(shipped_owned, [])
-        self.assertEqual(sorted(set(PUBLISHED_V170_REQUIRED) - required), [])
+        self.assertEqual(sorted(set(PUBLISHED_V170_REQUIRED) - required),
+                         ['editions/local/execution.md', 'editions/local/master.md'])
 
     def test_the_real_package_ships_only_the_contract_from_docs(self):
         files = self.builder.collect_sources(validate.REQUIRED)

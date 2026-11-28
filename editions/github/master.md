@@ -61,6 +61,16 @@
 - **PR 数量大时需度量**：开放 PR 过多会导致冲突与审查积压；需要定期统计开放 PR 数量、存活时间与冲突率，并据此限制并行度。
 - **平台检查不等于验收**：CI 绿灯只满足 G4，不替代 G1 的逐条验收。
 - **通知噪音**：评论与状态变更会通知所有关注者，避免无意义的批量操作。
+- **本地 CLI 只做初始化与归档维护**：`scripts/orchestrator.py` 在本主线只提供计划初始化（`init` / `init-plan`）与既有归档的只读查询 / `backup`。`task add/ready/dispatch/status/workspace/amend/unlock/resources/renew/reclaim/reconcile` 一律拒绝并指向 Issue / PR；`edition: local` 是已退场的旧配置，得到固定 Release `v2.0.0` 或一次性迁移的指引。
+
+## 安装布局与本地命令行
+
+套件支持两种安装布局；两者都只影响 CLI 的根解析与计划文件位置，不影响任务载体（始终是 Issue / PR）。
+
+- **平铺（flat）**：套件内容直接位于项目根，命令行在项目根执行 `python scripts/orchestrator.py init-plan`。
+- **隔离（isolated）**：套件位于 `<host>/agentorch/`，入口手册与契约在 `<host>/AGENTS.md` 的受管区块指向 `agentorch/`。命令行在宿主根执行 `python agentorch/scripts/orchestrator.py --layout isolated init-plan`；裸调用会以退出码 2 拒绝，`--layout isolated` 与 `--layout flat` 都只能显式给出。隔离布局下的本机状态目录（只用于既有归档维护，不再创建）为 `agentorch/.local/orchestration/`，由同一受管区块与 `.git/info/exclude` 覆盖。
+
+`docs/PROJECT.md` 中的 `edition` 必须是 `github`；两种布局都不创建任务库。
 
 
 ## Master 手册（原 MASTER.md）
