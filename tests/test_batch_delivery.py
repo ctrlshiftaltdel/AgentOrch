@@ -2985,6 +2985,23 @@ class ExecutorLifecycleTests(BatchCase):
 
     Rows M01-M20 are covered by name; see the matrix comment on Issue #265 for
     the state x guard x side-effect table these tests execute.
+
+    Issue #269 added the executor/verifier combination rows, where ``S`` means
+    a recorded ``stopped=True`` proof and ``U`` a missing / negative one:
+
+    ====== =========== ============= ========= ===========================
+    Row    executor    verifier      verdict   rule
+    ====== =========== ============= ========= ===========================
+    M21    S           U (gone)      BLOCKED   rule A: executor proof does
+                                              not cover the verifier
+    M22    U (gone)    S             BLOCKED   rule A applies to both sides
+    M23    S           S             allowed   every started process proven
+    M24    U           U             BLOCKED   unadjudicable history fails
+                                              closed
+    ====== =========== ============= ========= ===========================
+
+    The live probe stays authoritative in every row, so a ``stopped=True``
+    record never overrides a live or unknown process (M23 negative sub-case).
     """
 
     def _attempt(self, *, index=1, ident=None, state='ENDED', result='failed',
@@ -3238,6 +3255,72 @@ class ExecutorLifecycleTests(BatchCase):
                                           {112: 'stopped'})
                 self.assertTrue(any('not proven stopped' in problem
                                     for problem in problems), problems)
+
+    # -- M21-M24 (Issue #269, rule A): the executor and every verifier -----
+    #    follow one rule. A timeout / unproven stop is reusable only when
+    #    each process that started carries ``stopped=True``.
+    def _timeout_pair(self, executor_stopped, verifier_stopped):
+        executor = {'state': 'ended', 'pid': 501, 'pgid': 501, 'exit': None,
+                    'stopped': executor_stopped, 'session': None}
+        verifier = {'state': 'ended', 'pid': 502, 'pgid': 502, 'exit': None,
+                    'timeout': True, 'stopped': verifier_stopped}
+        return self._attempt(result='unproven_stop', executor=executor,
+                             verifiers=[verifier])
+
+    def test_m21_executor_proof_does_not_cover_an_unproven_verifier(self):
+        attempt = self._timeout_pair(True, False)
+        problems = self._problems(self._record([attempt]))
+        self.assertTrue(any('verifier 1 was not proven stopped' in problem
+                            for problem in problems), problems)
+        with mock.patch.object(delivery, '_proven_process_state',
+                               lambda *args, **kwargs: 'stopped'):
+            with self.assertRaises(delivery.BatchError) as caught:
+                delivery._reuse_guard({'id': 'T1'}, self._record([attempt]))
+        self.assertEqual(caught.exception.status, 'BLOCKED')
+        self.assertTrue(caught.exception.halt)
+
+    def test_m22_unproven_executor_blocks_even_with_a_proven_verifier(self):
+        attempt = self._timeout_pair(False, True)
+        problems = self._problems(self._record([attempt]))
+        self.assertTrue(any('executor was not proven stopped' in problem
+                            for problem in problems), problems)
+        with mock.patch.object(delivery, '_proven_process_state',
+                               lambda *args, **kwargs: 'stopped'):
+            with self.assertRaises(delivery.BatchError) as caught:
+                delivery._reuse_guard({'id': 'T1'}, self._record([attempt]))
+        self.assertEqual(caught.exception.status, 'BLOCKED')
+        self.assertTrue(caught.exception.halt)
+
+    def test_m23_both_proven_allows_reuse_but_a_live_probe_still_blocks(self):
+        attempt = self._timeout_pair(True, True)
+        # Both gone and both proven: the only combination open to reuse.
+        self.assertEqual(self._problems(self._record([attempt])), [])
+        with mock.patch.object(delivery, '_proven_process_state',
+                               lambda *args, **kwargs: 'stopped'):
+            delivery._reuse_guard({'id': 'T1'}, self._record([attempt]))
+        # The recorded proofs are necessary, never sufficient: a live or
+        # unknown probe still blocks (AC-3, boundary 2).
+        for states in ({501: 'unknown'}, {502: 'running'}, {502: 'unknown'}):
+            with self.subTest(states=states):
+                self.assertTrue(self._problems(self._record([attempt]),
+                                               states), states)
+
+    def test_m24_unadjudicable_history_fails_closed(self):
+        attempt = self._timeout_pair(None, None)
+        problems = self._problems(self._record([attempt]))
+        self.assertTrue(any('executor was not proven stopped' in problem
+                            for problem in problems), problems)
+        self.assertTrue(any('verifier 1 was not proven stopped' in problem
+                            for problem in problems), problems)
+
+    def test_m24_attempts_that_never_started_keep_their_own_rule(self):
+        # Boundary 3: a verifier that never spawned has no process to prove,
+        # so rule A does not invent a ``stopped=True`` requirement for it.
+        attempt = self._timeout_pair(True, None)
+        attempt['verifiers'] = [{
+            'state': 'spawn_failed', 'pid': None, 'pgid': None, 'exit': None,
+            'timeout': False, 'stopped': None}]
+        self.assertEqual(self._problems(self._record([attempt])), [])
 
     def test_m09_unproven_stop_blocks_retry_and_resume_without_spawn(self):
         script = self.root / 'verify_t1.py'
