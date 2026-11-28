@@ -1872,214 +1872,44 @@ class InputErrorTests(BatchCase):
         self.assertEqual(missing.returncode, 2)
 
 
-class LocalBatchTests(BatchCase):
+class RetiredLocalBatchTests(BatchCase):
+    """Retired: `local` batches used the SQLite carrier and local merges.
+
+    Assertion map (retired -> replacement):
+
+    * `LocalBatchTests` (17 checks: local merge + post-verify + carrier chain,
+      absent library, path/acceptance/lock mismatch, terminal task with a
+      pending journal, batch-internal dependency, ready-task dispatch, base
+      moved, retry, resume, authorization, external dependency) were all about
+      `_dispatch_local` / `_carrier_local` / `_local_flow` /
+      `_post_merge_local`. Those code paths are removed with the edition.
+    * `LocalSuccessorHandoffTests` (3 checks) drove a successor through the same
+      deleted local carrier.
+
+    Replacement: one offline check that a plan whose `docs/PROJECT.md` declares
+    `edition: local` is refused at `check` with exit 2, the Release v2.0.0 /
+    migration guidance, and no write. The GitHub carrier keeps its own full
+    suite (`GitHubBatchTests`, `GitHubSuccessorHandoffTests`).
+    """
+
     edition = 'local'
-    orchestrator = True
 
-    @staticmethod
-    def decisions(count=1):
-        return [{'id': f'AC-{index}', 'status': 'PASS',
-                 'evidence': 'local test decision'} for index in range(1, count + 1)]
-
-    def test_local_merge_post_verify_and_carrier_chain(self):
-        def checks(name):
-            return [[PY, '-c',
-                     f'import pathlib; assert pathlib.Path("{name}").exists()']]
-        plan = self.plan([
-            self.task('T1', 'docs/one.md', acceptance_checks=checks('docs/one.md'),
-                      acceptance_decisions=self.decisions()),
-            self.task('T2', 'docs/two.md', depends=['T1'],
-                      acceptance_checks=checks('docs/two.md'),
-                      acceptance_decisions=self.decisions())])
-        run = self.run_batch(plan)
-        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
-        done = self.finalize(plan, None, '--review', '--merge',
-                             '--authorization', AUTH)
-        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
-        state = self.journal_data()
-        self.assertEqual(state['phase'], 'verified')
-        self.assertEqual(state['merge']['state'], 'merged')
-        self.assertTrue((self.repo / 'docs' / 'one.md').is_file())
-        self.assertTrue((self.repo / 'docs' / 'two.md').is_file())
-        self.assertEqual(self.count_merges(self.repo, 'HEAD'), 3)
-        self.assertEqual(state['carrier']['state'], 'updated')
-        calls = [json.loads(line) for line in self.orch_log.read_text().splitlines()]
-        merged = [call for call in calls
-                  if call[:4] == ['task', 'status', 'T1', 'MERGED']]
-        self.assertTrue(merged)
-        self.assertIn('--merge-sha', merged[0])
-        self.assertIn(state['merge']['commit'], merged[0])
-        self.assertTrue(any(call[:4] == ['task', 'status', 'T1', 'VERIFIED']
-                            for call in calls))
-        self.assertFalse(self.gh_state.exists())
-
-    def test_absent_local_library_blocks_before_any_agent(self):
-        (self.repo / 'scripts' / 'orchestrator.py').unlink()
-        _git(self.repo, 'add', '-A')
-        _git(self.repo, 'commit', '-q', '-m', 'remove orchestrator')
-        plan = self.plan([self.task('T1', 'docs/one.md')])
-        run = self.run_batch(plan)
-        self.assertEqual(run.returncode, 1)
-        self.assertIn('scripts/orchestrator.py', run.stderr)
-        self.assertEqual(self.opencode_calls(), [])
-
-    def test_carrier_local_without_library_blocks(self):
-        plan = delivery.validate_plan(
-            self.plan([self.task('T1', 'docs/one.md')]), self.repo)
-        state = delivery._new_journal(plan, self.head(self.repo, 'main'))
-        for spec in plan['tasks']:
-            state['tasks'][spec['id']] = delivery._task_record(
-                spec, plan['executor_agent'])
-        (self.repo / 'scripts' / 'orchestrator.py').unlink()
-        with self.assertRaises(delivery.BatchError) as caught:
-            delivery._carrier_local(state, plan, self.root / 'j.json', '0' * 40)
-        self.assertIn('local carrier is absent', str(caught.exception))
-        self.assertEqual(state['carrier']['state'], 'blocked')
-
-    def test_local_missing_task_blocks_before_any_agent(self):
-        plan = self.plan([self.task('T1', 'docs/one.md')])
-        run = self.run_batch(plan, {'FAKE_ORCH_MISSING': 'T1'})
-        self.assertEqual(run.returncode, 1)
-        self.assertIn('local task library', run.stderr)
-        self.assertEqual(self.opencode_calls(), [])
-
-    def test_local_registered_paths_mismatch_blocks(self):
-        plan = self.plan([self.task('T1', 'docs/one.md')])
-        run = self.run_batch(plan, {'FAKE_ORCH_PATHS': '{"T1": ["other.md"]}'})
-        self.assertEqual(run.returncode, 1)
-        self.assertIn('registered allowed paths', run.stderr)
-        self.assertEqual(self.opencode_calls(), [])
-
-    def test_local_registered_acceptance_mismatch_blocks(self):
-        plan = self.plan([self.task('T1', 'docs/one.md')])
-        run = self.run_batch(
-            plan, {'FAKE_ORCH_ACCEPTANCE': '{"T1": ["different criterion"]}'})
-        self.assertEqual(run.returncode, 1)
-        self.assertIn('acceptance criteria do not match', run.stderr)
-        self.assertEqual(self.opencode_calls(), [])
-
-    def test_local_released_lock_blocks(self):
-        plan = self.plan([self.task('T1', 'docs/one.md')])
-        run = self.run_batch(plan, {'FAKE_ORCH_LOCKS': '{"T1": []}'})
-        self.assertEqual(run.returncode, 1)
-        self.assertIn('currently holds locks', run.stderr)
-        self.assertEqual(self.opencode_calls(), [])
-
-    def test_local_terminal_task_with_pending_journal_blocks(self):
-        plan = self.plan([self.task('T1', 'docs/one.md')])
-        run = self.run_batch(plan, {'FAKE_ORCH_STATUS_MAP': '{"T1": "VERIFIED"}'})
-        self.assertEqual(run.returncode, 1)
-        self.assertIn('terminal task as dispatchable', run.stderr)
-        self.assertEqual(self.opencode_calls(), [])
-
-    def test_local_in_batch_dependency_is_unsupported(self):
-        plan = self.plan([self.task('T1', 'docs/one.md'),
-                          self.task('T2', 'docs/two.md', depends=['T1'])])
+    def test_local_plan_is_refused_with_retirement_guidance(self):
+        plan = self.plan([self.task('T1', 'a.txt')])
         path = self.write_plan(plan)
-        before = path.read_text()
-        run = self.run_batch(plan, {'FAKE_ORCH_DEPS': '{"T2": ["T1"]}'})
-        self.assertEqual(run.returncode, 1)
-        self.assertIn('does not support local batch-internal dependencies',
-                      run.stderr)
-        self.assertEqual(path.read_text(), before)
-        self.assertEqual(self.opencode_calls(), [])
-        calls = [json.loads(line) for line in self.orch_log.read_text().splitlines()]
-        self.assertFalse(any(call[:2] in (['task', 'ready'],
-                                          ['task', 'dispatch']) for call in calls))
-        self.assertIsNone(self.journal_data()['dispatch'])
-
-    def test_local_ready_task_is_dispatched(self):
-        plan = self.plan([self.task('T1', 'docs/one.md')])
-        run = self.run_batch(plan, {'FAKE_ORCH_STATUS': 'READY'})
-        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
-        calls = [json.loads(line) for line in self.orch_log.read_text().splitlines()]
-        self.assertIn(['task', 'dispatch', 'T1'], calls)
-
-    def test_local_base_moved_blocks_the_merge(self):
-        plan = self.plan([self.task(
-            'T1', 'docs/one.md',
-            acceptance_checks=[[PY, '-c',
-                                'import pathlib; assert pathlib.Path("docs/one.md").exists()']],
-            acceptance_decisions=self.decisions())])
-        self.assertEqual(self.run_batch(plan).returncode, 0)
-        _git(self.repo, 'commit', '--allow-empty', '-m', 'move base')
-        done = self.finalize(plan, None, '--review', '--merge',
-                             '--authorization', AUTH)
-        self.assertEqual(done.returncode, 1)
-        self.assertIn('base moved', done.stderr)
-        self.assertNotEqual(self.journal_data()['merge']['state'], 'merged')
-
-    def test_local_retry_does_not_dispatch_again(self):
-        script = self.root / 'verify_t1.py'
-        script.write_text(
-            'import os, sys\n'
-            'raise SystemExit(1 if os.environ.get("FAIL_T1") == "1" else 0)\n')
-        plan = self.plan([
-            self.task('T1', 'docs/one.md', verify=[[PY, str(script)]]),
-            self.task('T2', 'docs/two.md', depends=['T1'])])
-        first = self.run_batch(plan, {'FAIL_T1': '1',
-                                      'FAKE_ORCH_STATUS': 'READY'})
-        self.assertEqual(first.returncode, 1)
-        state = self.journal_data()
-        self.assertEqual(state['tasks']['T1']['status'], 'FAILED')
-        self.assertEqual(state['tasks']['T2']['status'], 'SKIPPED')
-        self.assertIn('T1', state['dispatch']['tasks'])
-        dispatches = sum(
-            1 for line in self.orch_log.read_text().splitlines()
-            if json.loads(line) == ['task', 'dispatch', 'T1'])
-        second = self.cli('run', '--plan', str(self.write_plan(plan)), '--journal',
-                          str(self.journal), '--execute', '--retry', 'T1')
-        state = self.journal_data()
-        # HD-2 B (Issue #267): Windows reuses the worktree exactly like POSIX
-        # once the Job Object proof is recorded.
-        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
-        self.assertEqual(state['tasks']['T1']['status'], 'INTEGRATED')
-        self.assertEqual(state['tasks']['T2']['status'], 'INTEGRATED')
-        self.assertEqual(sum(
-            1 for line in self.orch_log.read_text().splitlines()
-            if json.loads(line) == ['task', 'dispatch', 'T1']), dispatches)
-
-    def test_local_resume_running_without_head(self):
-        plan = self.plan([self.task('T1', 'docs/one.md')])
-        first = self.run_batch(plan, {'FAKE_OPENCODE_FAIL': '1',
-                                      'FAKE_ORCH_STATUS': 'READY'})
-        self.assertEqual(first.returncode, 1)
-        state = self.journal_data()
-        self.assertEqual(state['tasks']['T1']['status'], 'FAILED')
-        self.assertIsNone(state['tasks']['T1']['head'])
-        dispatches = sum(
-            1 for line in self.orch_log.read_text().splitlines()
-            if json.loads(line) == ['task', 'dispatch', 'T1'])
-        self.assertEqual(dispatches, 1)
-        state['tasks']['T1']['status'] = 'RUNNING'
-        state['tasks']['T1']['error'] = None
-        self.journal.write_text(json.dumps(state))
-        second = self.cli('run', '--plan', str(self.write_plan(plan)), '--journal',
-                          str(self.journal), '--execute', '--resume')
-        state = self.journal_data()
-        # HD-2 B (Issue #267): the recorded Job Object is gone after the
-        # coordinator died, so kill-on-close already stopped the whole tree.
-        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
-        self.assertEqual(state['tasks']['T1']['status'], 'INTEGRATED')
-        self.assertEqual(sum(
-            1 for line in self.orch_log.read_text().splitlines()
-            if json.loads(line) == ['task', 'dispatch', 'T1']), dispatches)
-
-    def test_local_merge_requires_exact_authorization(self):
-        plan = self.plan([self.task(
-            'T1', 'docs/one.md',
-            acceptance_checks=[[PY, '-c',
-                                'import pathlib; assert pathlib.Path("docs/one.md").exists()']],
-            acceptance_decisions=self.decisions())])
-        self.assertEqual(self.run_batch(plan).returncode, 0)
-        missing = self.finalize(plan, None, '--merge')
-        self.assertEqual(missing.returncode, 2)
-        self.assertIn('authorization', missing.stderr)
-        wrong = self.finalize(plan, None, '--merge', '--authorization', 'wrong')
-        self.assertEqual(wrong.returncode, 2)
-        self.assertIn('authorization', wrong.stderr)
-        self.assertEqual(self.count_commits(self.repo, 'HEAD'), 1)
-        self.assertEqual(self.journal_data()['merge']['state'], 'none')
+        journal = self.root / 'journal.json'
+        before = sorted(p.name for p in self.root.iterdir())
+        result = self.cli('check', '--plan', str(path), '--repo', str(self.repo))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('retired', result.stderr)
+        self.assertIn('v2.0.0', result.stderr)
+        self.assertIn('kit/orchestration.md section 6', result.stderr)
+        run = self.cli('run', '--plan', str(path), '--journal', str(journal),
+                       '--repo', str(self.repo))
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertIn('retired', run.stderr)
+        self.assertFalse(journal.exists(), 'a refused local plan wrote a journal')
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), before)
 
 
 class SuccessorCase(BatchCase):
@@ -2402,109 +2232,6 @@ delivery._merge_github = interrupted_merge
         self.assertEqual(self.read_child()['tasks']['T2']['attempts'], 1)
         self.assertEqual(len(self.session_files('exec')), 1)
         self.assertEqual(sum(call.startswith('pr create ') for call in self.gh_calls()), 1)
-
-
-class LocalSuccessorHandoffTests(SuccessorCase):
-    edition = 'local'
-
-    def _repository(self):
-        super()._repository()
-        (self.repo / 'scripts').mkdir()
-        source = SCRIPT.with_name('orchestrator.py')
-        (self.repo / 'scripts' / source.name).write_bytes(source.read_bytes())
-        (self.repo / 'docs' / 'PLAN.md').write_text('# Fixture project plan\n')
-        _git(self.repo, 'add', 'scripts/orchestrator.py', 'docs/PLAN.md')
-        _git(self.repo, 'commit', '-q', '-m', 'add fixture task carrier')
-
-    def orchestrate(self, *args):
-        completed = subprocess.run(
-            [PY, str(self.repo / 'scripts' / 'orchestrator.py'), *args],
-            cwd=self.repo, env=self.env, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
-        self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
-        return completed.stdout
-
-    def add_record(self, task, *deps):
-        self.orchestrate('task', 'add', '--id', task['id'], '--title', task['title'],
-                         '--paths', *task['paths'], '--acceptance', *task['acceptance'],
-                         '--depends', *deps)
-
-    def setUp(self):
-        super().setUp()
-        self.orchestrate('init')
-        self.add_record(self.front['tasks'][0])
-        self.add_record(self.child['tasks'][0], 'T1')
-
-    def test_unreadable_successor_keeps_local_front_finalization(self):
-        self.child_path.write_text('{', encoding='utf-8')
-        run = self.run_batch(self.front)
-        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
-        done = self.finalize(self.front, None, *self.merge_flags,
-                             '--next-plan', self.child_path.name)
-        self.assertEqual(done.returncode, 2, done.stderr + done.stdout)
-        self.assertIn('cannot read the batch plan', done.stderr)
-        state = self.journal_data()
-        self.assertEqual(state['phase'], 'verified')
-        self.assertEqual(state['tasks']['T1']['status'], 'VERIFIED')
-        self.assertIsNone(state['error'])
-        self.assertIsNone(state['next_plan'])
-        self.assertNotIn('successor', state)
-        merge = state['merge']
-        self.assertEqual(merge['state'], 'merged')
-        self.assertEqual(merge['commit'], self.head(self.repo, 'main'))
-        self.assertEqual(merge['verified_sha'], merge['commit'])
-        self.assertEqual([check['exit'] for check in merge['post_verify']], [0])
-        # The recorded attempt is absolutized without expanding symlinks; the
-        # operator passed a name relative to the repository root.
-        recorded = state['next_plan_result']['plan']
-        self.assertTrue(Path(recorded).is_absolute())
-        self.assertEqual(Path(recorded).resolve(), self.child_path.resolve())
-        self.assertIn('cannot read the batch plan', state['next_plan_result']['error'])
-        self.assertIn('Status: VERIFIED', self.orchestrate('task', 'show', 'T1'))
-        self.assertIn('Status: PLANNED', self.orchestrate('task', 'show', 'T2'))
-        self.assertFalse(self.child_journal.exists())
-        self.assertEqual(self.count_merges(self.repo, 'main'), 2)
-        self.assertEqual(len(self.session_files('exec')), 1)
-
-    def test_recovers_real_sqlite_dispatch_without_taking_lock_twice(self):
-        other = self.task('T3', 'b.txt')
-        self.add_record(other)
-        self.orchestrate('task', 'ready', 'T3')
-        self.orchestrate('task', 'dispatch', 'T3')
-        self.finish_front_then_interrupt()
-        done = self.finalize(self.front, None, '--resume')
-        self.assertEqual(done.returncode, 1)
-        self.assertIsNone(self.read_child()['dispatch'])
-        self.assertIn('Status: PLANNED', self.orchestrate('task', 'show', 'T2'))
-        self.assertIn('locks: b.txt', self.orchestrate('task', 'list'))
-        self.orchestrate('task', 'status', 'T3', 'CANCELED',
-                         '--note', 'release the fixture conflict')
-        self.interrupt_finalize(self.crash_after_dispatch, '--resume')
-        self.assertIn('Status: DISPATCHED', self.orchestrate('task', 'show', 'T2'))
-        self.assertIsNone(self.read_child()['dispatch'])
-        for _ in range(2):
-            done = self.finalize(self.front, None, '--resume')
-            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
-        note = self.orchestrate('task', 'show', 'T2')
-        self.assertIn('Status: VERIFIED', note)
-        self.assertEqual(note.count('TASK_DISPATCHED'), 1)
-        self.assertEqual(len(self.session_files('exec')), 2)
-        self.assertEqual(self.count_merges(self.repo, 'main'), 4)
-        self.assertFalse(self.gh_state.exists())
-
-    def test_local_external_dependency_blocks_before_dispatch(self):
-        self.add_record(self.task('T3', 'c.txt'))
-        third = self.task('T4', 'd.txt')
-        self.add_record(third, 'T3')
-        self.child['tasks'].append(third)
-        self.child_path.write_text(json.dumps(self.child), encoding='utf-8')
-        self.finish_front_then_interrupt()
-        done = self.finalize(self.front, None, '--resume')
-        self.assertEqual(done.returncode, 1)
-        self.assertIn('local dependency T3 is not VERIFIED', done.stderr)
-        self.assertFalse(self.child_journal.exists())
-        self.assertIn('Status: PLANNED', self.orchestrate('task', 'show', 'T2'))
-        self.assertEqual(len(self.session_files('exec')), 1)
 
 
 class RegistryNewlineTests(unittest.TestCase):

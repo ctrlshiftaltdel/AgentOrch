@@ -34,7 +34,14 @@ from . import lessons, planning, untrusted
 
 LOOP_SCHEMA_VERSION = 1
 
-CARRIER_KINDS = ('local', 'github')
+CARRIER_KINDS = ('github',)
+RETIRED_CARRIER_KINDS = ('local',)
+RETIRED_EDITION_GUIDANCE = (
+    'the `local` edition is retired: the mainline and every next-generation install '
+    'package provide the `github` edition only and no longer schedule through the local '
+    'SQLite task database. Keep an existing local install on the verified Release '
+    'v2.0.0 (tag v2.0.0) and do not upgrade this kit, or run the one-time approved '
+    'local -> github migration in kit/orchestration.md section 6 first.')
 STATUS_NOT_TRIGGERED = 'NOT_TRIGGERED'
 STATUS_CLARIFICATION_REQUIRED = 'CLARIFICATION_REQUIRED'
 STATUS_BLOCKED = 'BLOCKED'
@@ -146,32 +153,6 @@ class _DryRunCarrier:
         raise NotImplementedError
 
 
-class LocalCarrier(_DryRunCarrier):
-    """local edition: the payload is the task-database command sequence, unexecuted."""
-
-    kind = 'local'
-
-    def __init__(self, edition='local'):
-        super().__init__(edition)
-
-    def payload(self, proposal):
-        task_id = 'TASK-<assigned>'
-        arguments = ['python', 'scripts/orchestrator.py', 'task', 'add', '--id', task_id,
-                     '--title', proposal.get('title') or 'untitled']
-        for path in proposal.get('allowed_paths') or []:
-            arguments.extend(['--paths', str(path)])
-        for criterion in proposal.get('acceptance_criteria') or []:
-            if isinstance(criterion, dict):
-                arguments.extend(['--acceptance',
-                                  f"{criterion.get('id')}: {criterion.get('statement')}"])
-        add = ' '.join(shlex.quote(str(item)) for item in arguments)
-        commands = [add,
-                    f'python scripts/orchestrator.py task ready {task_id}',
-                    f'python scripts/orchestrator.py task dispatch {task_id}']
-        return {'task_id': task_id, 'state': 'PLANNED', 'commands': commands,
-                'packet': planning.render_local_task_packet(proposal)}
-
-
 class GithubCarrier(_DryRunCarrier):
     """github edition: the payload is the Issue body + create command, unexecuted."""
 
@@ -187,8 +168,9 @@ class GithubCarrier(_DryRunCarrier):
 
 
 def carrier_for(edition):
-    if edition == 'local':
-        return LocalCarrier()
+    if edition in RETIRED_CARRIER_KINDS:
+        raise LoopError(f'cannot route a proposal to the {edition!r} carrier: '
+                        f'{RETIRED_EDITION_GUIDANCE}')
     if edition == 'github':
         return GithubCarrier()
     raise LoopError(f'unknown edition {edition!r}; expected one of {CARRIER_KINDS}')
@@ -206,7 +188,9 @@ def restore_state(state, *, edition):
     """
     errors = []
     state = dict(state or {})
-    if edition not in CARRIER_KINDS:
+    if edition in RETIRED_CARRIER_KINDS:
+        errors.append(f'edition {edition!r} is retired: {RETIRED_EDITION_GUIDANCE}')
+    elif edition not in CARRIER_KINDS:
         errors.append(f'edition must be one of {CARRIER_KINDS}, got {edition!r}')
     declared = state.get('edition')
     if declared is None:

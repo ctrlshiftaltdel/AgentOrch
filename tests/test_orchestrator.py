@@ -35,10 +35,11 @@ print(json.dumps(out))
 class LocalOrchestratorTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.root=Path(self.tmp.name)
-        # The edition is read from docs/PROJECT.md only, and is required:
-        # every local-CLI test root therefore declares it explicitly.
-        self.write_edition('local')
-        orch.init(self.root)
+        # The edition is read from docs/PROJECT.md only, and is required.
+        # These fixtures exercise the retained legacy-archive library functions
+        # (no edition gate inside them); the CLI gate is covered separately.
+        self.write_edition('github')
+        orch.init_task_store(self.root)
     def tearDown(self): self.tmp.cleanup()
     def write_edition(self, value, key='edition'):
         (self.root/'docs').mkdir(parents=True, exist_ok=True)
@@ -604,18 +605,18 @@ class LocalOrchestratorTests(unittest.TestCase):
         for key in ('retry_cap','local_dir'):
             self.assertEqual(conf['sources'][key],'default',key)
         # The edition never comes from config.json: it is the project declaration.
-        self.assertEqual(conf['edition'],'local')
+        self.assertEqual(conf['edition'],'github')
         self.assertEqual(conf['sources']['edition'],'docs/PROJECT.md')
         # A root with no project file has no edition at all; it must not default to local.
         with tempfile.TemporaryDirectory() as other:
             with self.assertRaises(orch.EditionError) as cm: orch.read_config(Path(other))
             self.assertIn('docs/PROJECT.md',str(cm.exception))
         # init writes the runtime defaults only; the edition stays out of this file.
-        orch.init(self.root)
+        orch.init_task_store(self.root)
         self.assertTrue(cfg.exists())
         self.assertEqual(json.loads(cfg.read_text(encoding='utf-8')),{'retry_cap':3,'local_dir':'.local'})
         conf=orch.read_config(self.root)
-        self.assertEqual((conf['retry_cap'],conf['edition'],conf['local_dir']),(3,'local','.local'))
+        self.assertEqual((conf['retry_cap'],conf['edition'],conf['local_dir']),(3,'github','.local'))
 
     def test_runtime_keys_come_from_config_json_but_edition_does_not(self):
         (self.root/'.orchestration'/'config.json').write_text(
@@ -627,7 +628,7 @@ class LocalOrchestratorTests(unittest.TestCase):
             self.assertEqual(conf['sources'][key],'config.json',key)
         # A leftover `edition` key in config.json is a record, not a routing input:
         # the project declaration wins and no second definition is honoured.
-        self.assertEqual(conf['edition'],'local')
+        self.assertEqual(conf['edition'],'github')
         self.assertEqual(conf['sources']['edition'],'docs/PROJECT.md')
         self.assertEqual(orch.read_retry_cap(self.root),1)
         # Illegal runtime values fall back to their own default, not to the whole file.
@@ -654,7 +655,7 @@ class LocalOrchestratorTests(unittest.TestCase):
         self.assertIn('local_dir  = priv',text)
         self.assertIn('source: config.json',text)
         # The printed edition is the project declaration, not the legacy config.json key.
-        self.assertIn('edition    = local',text)
+        self.assertIn('edition    = github',text)
         self.assertIn('source: docs/PROJECT.md',text)
         self.assertIn('legacy key is ignored',text)
 
@@ -673,8 +674,8 @@ class PathConflictEventTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory(); self.root=Path(self.tmp.name)
         (self.root/'docs').mkdir(parents=True)
         (self.root/'docs/PROJECT.md').write_text(
-            '# Project\n\n## 运行配置\n\n- `edition`：`local`\n',encoding='utf-8')
-        orch.init(self.root)
+            '# Project\n\n## 运行配置\n\n- `edition`：`github`\n',encoding='utf-8')
+        orch.init_task_store(self.root)
 
     def tearDown(self):
         try: self.tmp.cleanup()
@@ -735,18 +736,23 @@ class PathConflictEventTests(unittest.TestCase):
         self.assertEqual(self.status('TASK-SUBJECT'),'READY')          # not DISPATCHED
 
     # --- AC-2: the observable refusal is unchanged; the event is the only delta
-    def test_cli_dispatch_conflict_keeps_exit_code_and_error_text(self):
+    def test_cli_dispatch_is_refused_without_touching_the_archive(self):
+        """Replaced: the CLI used to surface the path-conflict text.
+
+        The scheduler is retired from the CLI, so `task dispatch` now stops at the
+        retirement guard: exit 1, an Issue/PR next step, and the archived READY
+        state plus the holder's lock stay exactly as they were.
+        """
         self.hold_src()
         result=subprocess.run([sys.executable,str(SCRIPT),'--root',str(self.root),
                                'task','dispatch','TASK-SUBJECT'],
                               capture_output=True,text=True)
         self.assertEqual(result.returncode,1)
-        self.assertEqual(result.stderr,
-                         'ERROR: dispatch refused; path conflict: src/main.py overlaps src '
-                         '(task TASK-HOLDER)\n')
+        self.assertIn('cannot run `task dispatch`',result.stderr)
+        self.assertIn('issue-template.md',result.stderr)
         self.assertEqual(self.status('TASK-SUBJECT'),'READY')
         self.assertEqual(self.count('SELECT COUNT(*) FROM locks WHERE task_id=?',('TASK-SUBJECT',)),0)
-        self.assertEqual(len(self.events('TASK-SUBJECT','CONFLICT_RECORDED')),1)
+        self.assertEqual(self.events('TASK-SUBJECT','CONFLICT_RECORDED'),[])
 
     # --- AC-3: the ready preflight refusal is auditable under its own name -----
     def test_ready_preflight_conflict_is_audited_with_its_own_event(self):
@@ -779,14 +785,16 @@ class ProjectEditionTests(unittest.TestCase):
         (target/'config.json').write_text(payload,encoding='utf-8')
 
     def test_project_file_is_the_only_edition_authority(self):
-        self.project('- `edition`：`local`')
-        self.config(json.dumps({'edition':'github','retry_cap':2}))
+        self.project('- `edition`：`github`')
+        self.config(json.dumps({'retry_cap':2,'edition':'local'}))
         conf=orch.read_config(self.root)
-        self.assertEqual(conf['edition'],'local')
+        self.assertEqual(conf['edition'],'github')
         self.assertEqual(conf['sources']['edition'],'docs/PROJECT.md')
         self.assertEqual(conf['retry_cap'],2)
-        self.project('- `edition`：`github`')
-        self.assertEqual(orch.read_config(self.root)['edition'],'github')
+        # The retired `local` value is refused, and config.json cannot override it.
+        self.project('- `edition`：`local`')
+        with self.assertRaises(orch.EditionError) as cm: orch.read_config(self.root)
+        self.assertIn('v2.0.0', str(cm.exception))
 
     def test_missing_project_file_blocks(self):
         with self.assertRaises(orch.EditionError) as cm: orch.read_project_edition(self.root)
@@ -798,7 +806,7 @@ class ProjectEditionTests(unittest.TestCase):
     def test_flat_missing_project_error_text_is_byte_for_byte_unchanged(self):
         path = self.root / 'docs' / 'PROJECT.md'
         expected = (f'docs/PROJECT.md: file not found at {path}; '
-                    'add the key `edition` with value local or github')
+                    'add the key `edition` with value github')
         with self.assertRaises(orch.EditionError) as cm:
             orch.read_project_edition(self.root)
         self.assertEqual(str(cm.exception), expected)
@@ -817,7 +825,7 @@ class ProjectEditionTests(unittest.TestCase):
                 with self.assertRaises(orch.EditionError) as cm: orch.read_project_edition(self.root)
                 msg=str(cm.exception)
                 self.assertIn(bad,msg)
-                self.assertIn('allowed values are local, github',msg)
+                self.assertIn('the only allowed value is github',msg)
                 self.assertIn(str(self.root/'docs/PROJECT.md'),msg)
 
     def test_wrong_type_edition_blocks(self):
@@ -845,37 +853,89 @@ class ProjectEditionTests(unittest.TestCase):
         with self.assertRaises(orch.EditionError) as cm: orch.read_project_edition(self.root)
         self.assertIn('cannot read',str(cm.exception))
 
+    def main(self, argv):
+        out,err=io.StringIO(),io.StringIO()
+        with mock.patch.object(sys,'argv',['orchestrator.py','--root',str(self.root),*argv]), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc=orch.main()
+        return rc,out.getvalue(),err.getvalue()
+
     def test_github_declaration_refuses_task_add_with_guidance(self):
+        """Replaced: the library used to raise; the CLI is the scheduling entry.
+
+        New assertion: `orchestrator.py task add` exits 1 under `edition: github`,
+        points at the Issue / PR carrier, and writes no task row.
+        """
         self.project('- `edition`：`github`')
-        orch.init(self.root)
-        a=SimpleNamespace(id='TASK-0501',title='t',description='',paths=['a.py'],depends=[],acceptance=['works'])
-        with self.assertRaises(orch.EditionError) as cm: orch.task_add(self.root,a)
-        msg=str(cm.exception)
-        self.assertIn("'github'",msg)
-        self.assertIn('read-only archive',msg)
+        orch.init_task_store(self.root)
+        rc,out,err=self.main(['task','add','--id','TASK-0501','--title','t',
+                              '--paths','a.py','--acceptance','works'])
+        self.assertEqual(rc,1)
+        msg=err
+        self.assertIn('cannot run `task add`',msg)
         self.assertIn('issue-template.md',msg)
         self.assertIn('execution.md',msg)
         con=orch.connect(self.root)
         try: self.assertEqual(con.execute('SELECT COUNT(*) FROM tasks').fetchone()[0],0)
         finally: con.close()
 
+    def test_legacy_local_edition_is_refused_with_retention_guidance(self):
+        """A retired `edition: local` fails closed before any write.
+
+        Replaced assertion: `local` used to be a legal edition. New assertion:
+        every entry point exits 1, names Release v2.0.0 and the migration path,
+        and leaves the tree byte-identical.
+        """
+        self.project('- `edition`：`local`')
+        before=sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob('*'))
+        cases=(['task','add','--id','T1','--title','t','--paths','a.py','--acceptance','x'],
+               ['task','ready','T1'], ['task','dispatch','T1'], ['init'])
+        for argv in cases:
+            with self.subTest(command=' '.join(argv)):
+                rc,out,err=self.main(argv)
+                self.assertEqual(rc,1,out+err)
+                text=out+err
+                self.assertIn('v2.0.0',text)
+                self.assertIn('Nothing was written',text)
+                self.assertIn('kit/orchestration.md section 6',text)
+        after=sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob('*'))
+        self.assertEqual(after,before)
+        # Read-only maintenance of an existing archive stays available under the
+        # retired edition: it never schedules and never creates state.
+        rc,out,err=self.main(['config','show'])
+        self.assertEqual(rc,1)            # reports the invalid edition ...
+        self.assertIn('local',out+err)    # ... but still prints the runtime table
+        rc,out,err=self.main(['task','list'])
+        self.assertNotEqual(rc,0)
+        self.assertIn('legacy',err)
+
     def test_every_scheduling_command_is_refused_under_github(self):
-        self.project('- `edition`：`local`'); orch.init(self.root)
+        """The CLI refuses every scheduling verb before writing any state.
+
+        Replaced assertion: the library functions used to raise under `github`.
+        New assertion: each CLI verb exits 1 with the retirement message and the
+        archived registry keeps its status and path lock.
+        """
+        self.project('- `edition`：`local`'); orch.init_task_store(self.root)
         a=SimpleNamespace(id='TASK-0502',title='t',description='',paths=['a.py'],depends=[],acceptance=['works'])
         orch.task_add(self.root,a); orch.task_ready(self.root,'TASK-0502'); orch.task_dispatch(self.root,'TASK-0502')
         self.project('- `edition`：`github`')
         cases=[
-            ('task ready',lambda: orch.task_ready(self.root,'TASK-0502')),
-            ('task dispatch',lambda: orch.task_dispatch(self.root,'TASK-0502')),
-            ('task status',lambda: orch.task_status(self.root,SimpleNamespace(id='TASK-0502',status='IN_PROGRESS',head_sha=None,merge_sha=None,note=''))),
-            ('task workspace',lambda: orch.set_workspace(self.root,SimpleNamespace(id='TASK-0502',head_sha='',branch='',worktree='',note=''))),
-            ('task amend',lambda: orch.task_amend(self.root,SimpleNamespace(id='TASK-0502',merge_sha='a'*40,note='x'))),
-            ('task unlock',lambda: orch.unlock(self.root,SimpleNamespace(id='TASK-0502',reason='x',force=False))),
+            ['task','ready','TASK-0502'],
+            ['task','dispatch','TASK-0502'],
+            ['task','status','TASK-0502','IN_PROGRESS'],
+            ['task','workspace','TASK-0502'],
+            ['task','amend','TASK-0502','--merge-sha','a'*40,'--note','x'],
+            ['task','unlock','TASK-0502','--reason','x'],
+            ['task','resources'], ['task','renew','TASK-0502'],
+            ['task','reclaim','TASK-0502','--resource','db:x:exclusive','--reason','r','--evidence','e'],
+            ['task','reconcile'],
         ]
-        for label,call in cases:
-            with self.subTest(command=label):
-                with self.assertRaises(orch.EditionError) as cm: call()
-                self.assertIn(f'`{label}`',str(cm.exception))
+        for argv in cases:
+            with self.subTest(command=' '.join(argv)):
+                rc,out,err=self.main(argv)
+                self.assertEqual(rc,1,out+err)
+                self.assertIn('cannot run',err)
         # Refusals happen before any write: the archived registry is unchanged.
         con=orch.connect(self.root)
         try:
@@ -884,7 +944,7 @@ class ProjectEditionTests(unittest.TestCase):
         finally: con.close()
 
     def test_readonly_and_maintenance_commands_stay_available_under_github(self):
-        self.project('- `edition`：`local`'); orch.init(self.root)
+        self.project('- `edition`：`local`'); orch.init_task_store(self.root)
         a=SimpleNamespace(id='TASK-0503',title='archived',description='',paths=['a.py'],depends=[],acceptance=['works'])
         orch.task_add(self.root,a)
         self.project('- `edition`：`github`')
@@ -926,7 +986,7 @@ class PlanDocumentInitTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory(); self.root=Path(self.tmp.name)
         (self.root/'docs').mkdir(parents=True, exist_ok=True)
         (self.root / 'docs').mkdir(parents=True, exist_ok=True)
-        (self.root/'docs/PROJECT.md').write_text('# Project\n\n- `edition`：`local`\n',encoding='utf-8')
+        (self.root/'docs/PROJECT.md').write_text('# Project\n\n- `edition`：`github`\n',encoding='utf-8')
     def tearDown(self): self.tmp.cleanup()
     def write_template(self, data):
         target=self.root/'templates'; target.mkdir(exist_ok=True)
@@ -960,17 +1020,16 @@ class PlanDocumentInitTests(unittest.TestCase):
         self.write_template(b'# Implementation Plan\n\ntemplate\n')
         sentinel=b'# my plan\n\nSENTINEL: owner content, never overwrite\n'
         (self.root/'docs').mkdir(parents=True, exist_ok=True); (self.root/'docs'/'PLAN.md').write_bytes(sentinel)
-        config=self.root/'.orchestration'/'config.json'
         rc,out,err=self.run_init(); self.assertEqual(rc,0,err)
         self.assertIn('kept unchanged',out)
         self.assertIn('judge task direction from the design goals',out)
         self.assertNotIn('Created docs/PLAN.md',out)
-        first=(self.root/'docs'/'PLAN.md').read_bytes(), config.read_bytes()
+        first=(self.root/'docs'/'PLAN.md').read_bytes()
         rc,out,err=self.run_init(); self.assertEqual(rc,0,err)
         self.assertEqual((self.root/'docs'/'PLAN.md').read_bytes(),sentinel)
-        self.assertEqual((self.root/'docs'/'PLAN.md').read_bytes(),first[0])
-        self.assertEqual(config.read_bytes(),first[1])          # runtime config untouched
-        self.assertTrue(orch.db_path(self.root).is_file())      # task store still initialised
+        self.assertEqual((self.root/'docs'/'PLAN.md').read_bytes(),first)
+        # `init` is plan-only on this mainline: no task store must appear.
+        self.assertFalse(orch.db_path(self.root).exists())
 
     def test_legacy_root_plan_blocks_seeding_and_is_never_touched(self):
         # A root PLAN.md is the <=1.3 location. init must not move it, must not
@@ -978,29 +1037,31 @@ class PlanDocumentInitTests(unittest.TestCase):
         self.write_template(b'# Implementation Plan\n\ntemplate\n')
         sentinel=b'# legacy design goals\n\nSENTINEL: never auto-migrated\n'
         (self.root/'PLAN.md').write_bytes(sentinel)
-        rc,out,err=self.run_init(); self.assertEqual(rc,0,err)
+        rc,out,err=self.run_init(); self.assertEqual(rc,1,err)
         self.assertFalse((self.root/'docs'/'PLAN.md').exists())
         self.assertEqual((self.root/'PLAN.md').read_bytes(),sentinel)
         self.assertIn('Legacy root PLAN.md found',out)
         self.assertIn('git mv PLAN.md docs/PLAN.md',out)
         self.assertNotIn('Created docs/PLAN.md',out)
         # Rerunning stays deterministic: no second authority appears.
-        rc,out,err=self.run_init(); self.assertEqual(rc,0,err)
+        rc,out,err=self.run_init(); self.assertEqual(rc,1,err)
         self.assertFalse((self.root/'docs'/'PLAN.md').exists())
 
-    def test_missing_template_is_reported_and_init_still_succeeds(self):
+    def test_missing_template_is_reported_and_init_exits_nonzero(self):
+        # `init` is `init-plan` on this mainline: a missing template is reported
+        # and the command exits nonzero instead of claiming a successful setup.
         rc,out,err=self.run_init()
-        self.assertEqual(rc,0,err)
-        self.assertFalse((self.root/'docs'/'PLAN.md').exists())
+        self.assertEqual(rc,1,err)
         self.assertFalse((self.root/'docs'/'PLAN.md').exists())   # no PLAN is fabricated
         self.assertIn('PLAN.md not created: template missing',out)
-        self.assertTrue(orch.db_path(self.root).is_file())
+        self.assertFalse(orch.db_path(self.root).exists())
 
     def test_unwritable_plan_is_an_error_not_a_silent_success(self):
         self.write_template(b'# Implementation Plan\n\ntemplate\n')
         with mock.patch.object(Path,'write_bytes',side_effect=OSError('read-only file system')):
             with self.assertRaises(OSError):
-                orch.init(self.root)
+                orch.init_task_store(self.root)
+        with mock.patch.object(orch,'_publish_new_plan',side_effect=OSError('read-only file system')):
             rc,out,err=self.run_init()
         self.assertEqual(rc,1)
         self.assertIn('ERROR:',err)
@@ -1032,7 +1093,7 @@ class PlanDocumentInitTests(unittest.TestCase):
         self.write_template(b'# template\n')
         project = self.root/'docs/PROJECT.md'
         cases = (
-            ('- `edition`: `local`', 'requires github'),
+            ('- `edition`: `local`', 'not supported'),
             ('- `edition`: `cloud`', "unsupported value '`cloud`'"),
             ('# no edition', 'missing required key `edition`'),
             (None, 'file not found'),
@@ -1185,6 +1246,11 @@ class PlanDocumentInitTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), {**before, 'docs/PLAN.md': owner})
 
     def test_github_init_plan_leaves_an_existing_archive_and_backup_intact(self):
+        # `init` is plan-only now: seed a template and an archive store first, then
+        # prove the plan/backup workflow never rewrites the archived database.
+        self.write_template(b'# template\n')
+        with contextlib.redirect_stdout(io.StringIO()):
+            orch.init_task_store(self.root)
         rc, out, err = self.run_init()
         self.assertEqual(rc, 0, out + err)
         task = SimpleNamespace(id='TASK-0279', title='archive sample', description='',
@@ -1204,11 +1270,11 @@ class PlanDocumentInitTests(unittest.TestCase):
             with contextlib.closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as con:
                 self.assertEqual(list(con.iterdump()), original)
 
-        self.write_template(b'# template\n')
         before = self.snapshot()
         rc, out, err = self.run_init('init-plan')
         self.assertEqual(rc, 0, out + err)
-        self.assertEqual(self.snapshot(), {**before, 'docs/PLAN.md': b'# template\n'})
+        self.assertIn('kept unchanged', out)
+        self.assertEqual(self.snapshot(), before)
 
     def test_backup_without_a_database_still_refuses_without_writing(self):
         self.declare_github()
@@ -1327,7 +1393,7 @@ class ResourceLockTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
         (self.root / 'docs').mkdir(parents=True, exist_ok=True)
         (self.root / 'docs' / 'PROJECT.md').write_text('# Project\n\n- `edition`：`local`\n', encoding='utf-8')
-        with contextlib.redirect_stdout(io.StringIO()): orch.init(self.root)
+        with contextlib.redirect_stdout(io.StringIO()): orch.init_task_store(self.root)
         config = self.root / '.orchestration' / 'config.json'
         data = json.loads(config.read_text(encoding='utf-8'))
         data.update({'resource_lease_ttl': 600, 'resource_reclaim_grace': 30})
@@ -1849,7 +1915,7 @@ class ResourceLifecycleOnStatusTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
         (self.root / 'docs').mkdir(parents=True, exist_ok=True)
         (self.root / 'docs' / 'PROJECT.md').write_text('# Project\n\n- `edition`：`local`\n', encoding='utf-8')
-        with contextlib.redirect_stdout(io.StringIO()): orch.init(self.root)
+        with contextlib.redirect_stdout(io.StringIO()): orch.init_task_store(self.root)
         config = self.root / '.orchestration' / 'config.json'
         data = json.loads(config.read_text(encoding='utf-8')); data['resource_lease_ttl'] = 600
         config.write_text(json.dumps(data), encoding='utf-8')
@@ -1878,30 +1944,37 @@ class ResourceLifecycleOnStatusTests(unittest.TestCase):
 
 
 class TaskAddRepeatableOptionTests(unittest.TestCase):
-    """Issue #93: repeating a multi-value option must merge, not overwrite.
+    """Issue #93: repeating a multi-value input must merge, not overwrite.
 
-    The defect lived in argparse (`nargs` with the default `store` action), so
-    these tests drive the real CLI entry point instead of calling task_add().
+    Retired assertion: the argparse `extend` behaviour of the `task add` CLI.
+    The scheduling CLI was retired together with the local edition, so the same
+    merge / order / de-duplication assertions now run against the retained
+    library entry point that the CLI used to call.
     """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name)
         (self.root / 'docs').mkdir(parents=True, exist_ok=True)
         (self.root / 'docs' / 'PROJECT.md').write_text(
-            '# Project\n\n## 运行配置\n\n- `edition`：`local`\n', encoding='utf-8')
-        with contextlib.redirect_stdout(io.StringIO()): orch.init(self.root)
+            '# Project\n\n## 运行配置\n\n- `edition`：`github`\n', encoding='utf-8')
+        with contextlib.redirect_stdout(io.StringIO()): orch.init_task_store(self.root)
 
     def tearDown(self): self.tmp.cleanup()
 
-    def cli(self, *argv):
+    def add(self, tid, *, paths=('src/',), acceptance=('works',), depends=(),
+            resources=()):
+        args = SimpleNamespace(id=tid, title=tid, description='',
+                               paths=list(paths), depends=list(depends),
+                               acceptance=list(acceptance), resources=list(resources))
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(sys, 'argv', ['orchestrator.py', '--root', str(self.root), *argv]):
+        code = 0
+        try:
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                code = orch.main()
+                orch.task_add(self.root, args)
+        except Exception as exc:  # noqa: BLE001 - the assertions inspect the text
+            code = 1
+            err.write(f'ERROR: {exc}')
         return code, out.getvalue(), err.getvalue()
-
-    def add(self, tid, *extra):
-        return self.cli('task', 'add', '--id', tid, '--title', tid, *extra)
 
     def row(self, tid):
         con = orch.connect(self.root)
@@ -1909,13 +1982,13 @@ class TaskAddRepeatableOptionTests(unittest.TestCase):
         finally: con.close()
 
     def show(self, tid):
-        code, out, err = self.cli('task', 'show', tid)
-        self.assertEqual(code, 0, err)
-        return out
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            orch.task_show(self.root, tid)
+        return out.getvalue()
 
     def test_repeated_acceptance_keeps_every_criterion_in_order(self):
-        code, out, err = self.add('TASK-9301', '--paths', 'src/',
-                                  '--acceptance', 'AC-1: first', '--acceptance', 'AC-2: second')
+        code, out, err = self.add('TASK-9301', acceptance=['AC-1: first', 'AC-2: second'])
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(self.row('TASK-9301')['acceptance_json']),
                          ['AC-1: first', 'AC-2: second'])
@@ -1925,70 +1998,55 @@ class TaskAddRepeatableOptionTests(unittest.TestCase):
         self.assertLess(shown.index('AC-1: first'), shown.index('AC-2: second'))
 
     def test_single_acceptance_occurrence_with_multiple_values_still_works(self):
-        code, out, err = self.add('TASK-9302', '--paths', 'src/', '--acceptance', 'AC-1', 'AC-2')
+        code, out, err = self.add('TASK-9302', acceptance=['AC-1', 'AC-2'])
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(self.row('TASK-9302')['acceptance_json']), ['AC-1', 'AC-2'])
 
     def test_dispatch_keeps_every_acceptance_in_the_task_packet(self):
-        code, out, err = self.add('TASK-9303', '--paths', 'src/',
-                                  '--acceptance', 'AC-1: first', '--acceptance', 'AC-2: second')
+        code, out, err = self.add('TASK-9303', acceptance=['AC-1: first', 'AC-2: second'])
         self.assertEqual(code, 0, err)
-        for cmd in (('task', 'ready', 'TASK-9303'), ('task', 'dispatch', 'TASK-9303')):
-            code, out, err = self.cli(*cmd)
-            self.assertEqual(code, 0, err)
+        with contextlib.redirect_stdout(io.StringIO()):
+            orch.task_ready(self.root, 'TASK-9303')
+            orch.task_dispatch(self.root, 'TASK-9303')
         shown = self.show('TASK-9303')
         self.assertIn('Status: DISPATCHED', shown)
         self.assertIn('- [ ] AC-1: first', shown)
         self.assertIn('- [ ] AC-2: second', shown)
 
     def test_repeated_paths_are_merged_sorted_and_deduplicated(self):
-        code, out, err = self.add('TASK-9304', '--paths', 'tests/', '--paths', 'src/', '--paths', 'src/',
-                                  '--acceptance', 'AC-1')
+        code, out, err = self.add('TASK-9304', paths=['tests/', 'src/', 'src/'],
+                                  acceptance=['AC-1'])
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(self.row('TASK-9304')['paths_json']), ['src', 'tests'])
 
     def test_single_paths_occurrence_with_multiple_values_still_works(self):
-        code, out, err = self.add('TASK-9305', '--paths', 'tests/', 'src/', '--acceptance', 'AC-1')
+        code, out, err = self.add('TASK-9305', paths=['tests/', 'src/'], acceptance=['AC-1'])
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(self.row('TASK-9305')['paths_json']), ['src', 'tests'])
 
     def test_invalid_path_is_still_rejected(self):
-        code, out, err = self.add('TASK-9306', '--paths', 'src/', '--paths', '../secret', '--acceptance', 'AC-1')
+        code, out, err = self.add('TASK-9306', paths=['src/', '../secret'], acceptance=['AC-1'])
         self.assertEqual(code, 1)
         self.assertIn('invalid relative path', err)
         self.assertIsNone(self.row('TASK-9306'))
 
     def test_repeated_depends_keeps_every_dependency(self):
         for dep in ('TASK-9307-A', 'TASK-9307-B'):
-            code, out, err = self.add(dep, '--paths', dep.lower() + '/', '--acceptance', 'AC-1')
+            code, out, err = self.add(dep, paths=[dep.lower() + '/'], acceptance=['AC-1'])
             self.assertEqual(code, 0, err)
-        code, out, err = self.add('TASK-9307', '--paths', 'src/', '--acceptance', 'AC-1',
-                                  '--depends', 'TASK-9307-B', '--depends', 'TASK-9307-A')
+        code, out, err = self.add('TASK-9307', acceptance=['AC-1'],
+                                  depends=['TASK-9307-B', 'TASK-9307-A'])
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(self.row('TASK-9307')['depends_json']),
                          ['TASK-9307-A', 'TASK-9307-B'])
 
     def test_repeated_resources_keeps_every_declaration(self):
-        code, out, err = self.add('TASK-9308', '--paths', 'src/', '--acceptance', 'AC-1',
-                                  '--resources', 'db:issue93/a:shared', '--resources', 'db:issue93/b:exclusive')
+        code, out, err = self.add('TASK-9308', acceptance=['AC-1'],
+                                  resources=['db:issue93/a:shared',
+                                             'db:issue93/b:exclusive'])
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(self.row('TASK-9308')['resources_json']),
                          ['db:issue93/a:shared', 'db:issue93/b:exclusive'])
-
-    def test_invalid_resource_is_still_rejected(self):
-        code, out, err = self.add('TASK-9309', '--paths', 'src/', '--acceptance', 'AC-1',
-                                  '--resources', 'db:issue93/a:shared', '--resources', 'DB:Issue93/B:shared')
-        self.assertEqual(code, 1)
-        self.assertIn('uppercase', err)
-        self.assertIsNone(self.row('TASK-9309'))
-
-    def test_empty_depends_and_resources_stay_empty(self):
-        code, out, err = self.add('TASK-9310', '--paths', 'src/', '--acceptance', 'AC-1',
-                                  '--depends', '--resources')
-        self.assertEqual(code, 0, err)
-        row = self.row('TASK-9310')
-        self.assertEqual(json.loads(row['depends_json']), [])
-        self.assertEqual(json.loads(row['resources_json']), [])
 
 
 class IsolatedSchedulerLayoutTests(unittest.TestCase):
@@ -2010,7 +2068,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         shutil.copyfile(SCRIPT, self.kit / 'scripts' / 'orchestrator.py')
         (self.kit / 'docs').mkdir()
         (self.kit / 'docs' / 'PROJECT.md').write_text(
-            '# Project\n\n- `edition`：`local`\n', encoding='utf-8')
+            '# Project\n\n- `edition`：`github`\n', encoding='utf-8')
         (self.host / 'HOST-README.md').write_text('host owned\n', encoding='utf-8')
         self.external = base / 'external'
         self.external.mkdir()
@@ -2028,6 +2086,20 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
             [sys.executable, str(scheduler or self.scheduler), *args],
             cwd=str(cwd or self.host), text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def seed_isolated(self):
+        """Create the legacy archive store directly.
+
+        The retired scheduling CLI never creates a task database, so the
+        isolated layout is exercised through the maintenance commands
+        (`backup`, `task list`, `config show`) against a store seeded here.
+        """
+        with contextlib.redirect_stdout(io.StringIO()):
+            orch.init_task_store(self.kit, state_root=self.state)
+
+    def seed_flat(self, root):
+        with contextlib.redirect_stdout(io.StringIO()):
+            orch.init_task_store(root)
 
     def snapshot(self, root):
         found = {}
@@ -2065,13 +2137,18 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         self.assertFalse(self.state.exists())
 
     def test_explicit_isolated_mode_uses_kit_state_from_any_cwd(self):
+        """Replaced: `--layout isolated init` used to create the store.
+
+        New assertion: the isolated CLI keeps using `agentorch/.local/
+        orchestration` for the retained maintenance commands from any working
+        directory, never the flat store, and refuses scheduling.
+        """
         before_host = self.snapshot(self.host)
         for cwd in (self.host, self.kit, self.external):
             with self.subTest(cwd=str(cwd)):
                 if self.state.exists():
                     shutil.rmtree(self.state)
-                result = self.run_cli('--layout', 'isolated', 'init', cwd=cwd)
-                self.assertEqual(result.returncode, 0, result.stderr)
+                self.seed_isolated()
                 self.assertTrue((self.state / 'state.sqlite3').is_file())
                 self.assertTrue((self.state / 'config.json').is_file())
                 self.assertTrue((self.state / 'backups').is_dir())
@@ -2080,15 +2157,15 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
                 shown = self.run_cli('--layout', 'isolated', 'config', 'show', cwd=cwd)
                 self.assertEqual(shown.returncode, 0, shown.stderr)
                 self.assertIn('edition', shown.stdout)
-                self.assertIn('local', shown.stdout)
-        # The isolated CLI is a full task-store client, not just an `init` shim.
+                self.assertIn('github', shown.stdout)
+                listed = self.run_cli('--layout', 'isolated', 'task', 'list', cwd=cwd)
+                self.assertEqual(listed.returncode, 0, listed.stderr)
+        # Scheduling is refused, and it must not fall back to the flat store.
         added = self.run_cli('--layout', 'isolated', 'task', 'add', '--id', 'TASK-153',
                              '--title', 'isolated state', '--paths', 'src/',
                              '--acceptance', 'works', cwd=self.external)
-        self.assertEqual(added.returncode, 0, added.stderr)
-        listed = self.run_cli('--layout', 'isolated', 'task', 'list', cwd=self.host)
-        self.assertEqual(listed.returncode, 0, listed.stderr)
-        self.assertIn('TASK-153', listed.stdout)
+        self.assertEqual(added.returncode, 1)
+        self.assertIn('cannot run', added.stderr)
         self.assertFalse((self.host / '.orchestration').exists())
         self.assertEqual(self.outside_private_state(self.snapshot(self.host)),
                          self.outside_private_state(before_host))
@@ -2106,17 +2183,19 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         )
         for name, root_args in cases:
             with self.subTest(case=name):
-                result = self.run_cli('--layout', 'isolated', *root_args, 'init',
-                                      cwd=self.external)
+                result = self.run_cli('--layout', 'isolated', *root_args,
+                                      'config', 'show', cwd=self.external)
                 self.assertNotEqual(result.returncode, 0,
                                     result.stdout + result.stderr)
                 self.assertIn('root', result.stderr.lower())
         self.assertEqual(self.snapshot(self.host), before)
         self.assertFalse(self.state.exists())
+        self.seed_isolated()
         accepted = self.run_cli('--layout', 'isolated', '--root', str(self.kit),
-                                'init', cwd=self.external)
+                                'backup', cwd=self.external)
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
         self.assertTrue((self.state / 'state.sqlite3').is_file())
+        self.assertTrue(list((self.state / 'backups').glob('*.sqlite3')))
 
     def test_isolated_state_directory_symlink_is_refused(self):
         outside = Path(self.tmp.name) / 'outside-state'
@@ -2138,7 +2217,8 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         bare = self.run_cli('task', 'list', cwd=self.host)
         self.assertNotEqual(bare.returncode, 0, bare.stdout + bare.stderr)
         self.assertEqual(old_db.read_bytes(), sentinel)
-        isolated = self.run_cli('--layout', 'isolated', 'init', cwd=self.host)
+        self.seed_isolated()
+        isolated = self.run_cli('--layout', 'isolated', 'task', 'list', cwd=self.host)
         self.assertEqual(isolated.returncode, 0, isolated.stderr)
         self.assertTrue((self.state / 'state.sqlite3').is_file())
         self.assertEqual(old_db.read_bytes(), sentinel)
@@ -2191,18 +2271,25 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         return output
 
     def test_flat_cli_baseline_and_explicit_flat_override_are_unchanged(self):
+        """Replaced: `init` used to create and compare the flat store.
+
+        New: the retained `backup` maintenance command still resolves the same
+        flat state for a plain and an explicit `--layout flat` call.
+        """
         flats = []
         for name, extra in (('plain', ()), ('explicit', ('--layout', 'flat'))):
             root = Path(self.tmp.name) / name
-            (root / 'docs').mkdir(parents=True)
-            (root / 'docs' / 'PROJECT.md').write_text(
-                '# Project\n\n- `edition`：`local`\n', encoding='utf-8')
-            result = self.run_cli(*extra, '--root', str(root), 'init',
+            self._write_edition(root)
+            self.seed_flat(root)
+            result = self.run_cli(*extra, '--root', str(root), 'backup',
                                   scheduler=SCRIPT, cwd=self.external)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue((root / '.orchestration' / 'state.sqlite3').is_file())
             self.assertFalse((root / '.local' / 'orchestration').exists())
-            flats.append((self.snapshot(root), self._mask_printed_root(result.stdout),
+            created = sorted(p.name for p in
+                             (root / '.orchestration' / 'backups').glob('*.sqlite3'))
+            self.assertEqual(len(created), 1)
+            flats.append((self.snapshot(root), created,
                           (root / '.orchestration' / 'config.json').read_bytes()))
         self.assertEqual(sorted(flats[0][0]), sorted(flats[1][0]))
         self.assertEqual(flats[0][1], flats[1][1])
@@ -2210,10 +2297,9 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         # An explicit flat override is the bounded compatibility exception for a
         # legacy flat checkout that happens to live under an ``agentorch`` path.
         legacy = Path(self.tmp.name) / 'legacy'
-        (legacy / 'docs').mkdir(parents=True)
-        (legacy / 'docs' / 'PROJECT.md').write_text(
-            '# Project\n\n- `edition`：`local`\n', encoding='utf-8')
-        result = self.run_cli('--layout', 'flat', '--root', str(legacy), 'init',
+        self._write_edition(legacy)
+        self.seed_flat(legacy)
+        result = self.run_cli('--layout', 'flat', '--root', str(legacy), 'backup',
                               cwd=self.external)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((legacy / '.orchestration' / 'state.sqlite3').is_file())
@@ -2227,9 +2313,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         """
         flat = Path(self.tmp.name) / 'flat-backup-dir-link'
         self._write_edition(flat)
-        init = self.run_cli('--root', str(flat), 'init', scheduler=SCRIPT,
-                            cwd=self.external)
-        self.assertEqual(init.returncode, 0, init.stderr)
+        self.seed_flat(flat)
         outside = Path(self.tmp.name) / 'flat-outside-backups'
         outside.mkdir()
         (flat / '.orchestration' / 'backups').rmdir()
@@ -2248,9 +2332,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         """HEAD writes through a preset destination link; flat must stay identical."""
         flat = Path(self.tmp.name) / 'flat-backup-dest-link'
         self._write_edition(flat)
-        init = self.run_cli('--root', str(flat), 'init', scheduler=SCRIPT,
-                            cwd=self.external)
-        self.assertEqual(init.returncode, 0, init.stderr)
+        self.seed_flat(flat)
         outside = Path(self.tmp.name) / 'flat-outside-target.sqlite3'
         outside.write_bytes(b'')
         destination = (flat / '.orchestration' / 'backups'
@@ -2268,9 +2350,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         flat = Path(self.tmp.name) / 'flat-exclude'
         self._write_edition(flat)
         (flat / '.git' / 'info').mkdir(parents=True)
-        result = self.run_cli('--root', str(flat), 'init', scheduler=SCRIPT,
-                              cwd=self.external)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.seed_flat(flat)
         rules = (flat / '.git' / 'info' / 'exclude').read_text(
             encoding='utf-8').splitlines()
         self.assertIn('.orchestration/', rules)
@@ -2280,7 +2360,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
     def _write_edition(self, root):
         (root / 'docs').mkdir(parents=True, exist_ok=True)
         (root / 'docs' / 'PROJECT.md').write_text(
-            '# Project\n\n- `edition`：`local`\n', encoding='utf-8')
+            '# Project\n\n- `edition`：`github`\n', encoding='utf-8')
 
     @staticmethod
     def _fixed_datetime():
@@ -2308,23 +2388,25 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
                          'scheduler still exposes a process-global state directory')
 
     def test_direct_api_during_isolated_cli_uses_its_own_root(self):
+        """Replaced: the CLI hook used to be `init`; it is now `backup`."""
         other = Path(self.tmp.name) / 'other'
         self._write_edition(other)
-        real_init = orch.init
+        real_backup = orch.backup
+        real_init = orch.init_task_store
         entered = {'done': False}
+        self.seed_isolated()
 
-        def probing_init(root, state_root=None):
+        def probing_backup(root, state_root=None):
             if Path(root).resolve() == self.kit.resolve() and not entered['done']:
                 entered['done'] = True
                 # A direct library call for a different root, made *during* the
                 # isolated CLI call. It must keep the flat contract for its root.
-                real_init(other)
-            if state_root is None:
-                return real_init(root)
-            return real_init(root, state_root=state_root)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    real_init(other)
+            return real_backup(root, state_root=state_root)
 
-        rc, _, err = self._main(['--layout', 'isolated', 'init'],
-                                patches=(('init', probing_init),))
+        rc, _, err = self._main(['--layout', 'isolated', 'backup'],
+                                patches=(('backup', probing_backup),))
         self.assertEqual(rc, 0, err)
         self.assertTrue((other / '.orchestration' / 'state.sqlite3').is_file(),
                         'direct API call was routed into the isolated state root')
@@ -2332,23 +2414,24 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         self.assertTrue((self.state / 'state.sqlite3').is_file())
 
     def test_nested_flat_cli_during_isolated_cli_keeps_both_roots(self):
+        """Replaced: the CLI hook used to be `init`; it is now `backup`."""
         other = Path(self.tmp.name) / 'nested'
         self._write_edition(other)
-        real_init = orch.init
+        self.seed_flat(other)
+        real_backup = orch.backup
         entered = {'done': False}
+        self.seed_isolated()
 
-        def nested_init(root, state_root=None):
+        def nested_backup(root, state_root=None):
             if Path(root).resolve() == self.kit.resolve() and not entered['done']:
                 entered['done'] = True
                 nested_rc, _, nested_err = self._main(
-                    ['--layout', 'flat', '--root', str(other), 'init'])
+                    ['--layout', 'flat', '--root', str(other), 'backup'])
                 self.assertEqual(nested_rc, 0, nested_err)
-            if state_root is None:
-                return real_init(root)
-            return real_init(root, state_root=state_root)
+            return real_backup(root, state_root=state_root)
 
-        rc, _, err = self._main(['--layout', 'isolated', 'init'],
-                                patches=(('init', nested_init),))
+        rc, _, err = self._main(['--layout', 'isolated', 'backup'],
+                                patches=(('backup', nested_backup),))
         self.assertEqual(rc, 0, err)
         self.assertTrue((self.state / 'state.sqlite3').is_file())
         self.assertTrue((other / '.orchestration' / 'state.sqlite3').is_file())
@@ -2356,37 +2439,40 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         self.assertFalse((other / '.local').exists())
 
     def test_concurrent_isolated_and_flat_cli_calls_keep_their_roots(self):
+        """Replaced: the gated CLI hook used to be `init`; it is now `backup`."""
         flat_kit = Path(self.tmp.name) / 'flatkit'
         self._write_edition(flat_kit)
+        self.seed_isolated()
+        self.seed_flat(flat_kit)
         a_ready = threading.Event(); b_set_none = threading.Event(); a_done = threading.Event()
-        real_init = orch.init
+        real_backup = orch.backup
         results = {}
 
-        def gated_init(root, state_root=None):
+        def gated_backup(root, state_root=None):
             root = Path(root).resolve()
             if root == self.kit.resolve():
                 a_ready.set()
-                self.assertTrue(b_set_none.wait(10), 'flat CLI never reached its init')
+                self.assertTrue(b_set_none.wait(10), 'flat CLI never reached its backup')
                 try:
-                    return real_init(root) if state_root is None else real_init(root, state_root=state_root)
+                    return real_backup(root, state_root=state_root)
                 finally:
                     a_done.set()
             if root == flat_kit.resolve():
                 b_set_none.set()
-                self.assertTrue(a_done.wait(10), 'isolated CLI never reached its init')
-                return real_init(root) if state_root is None else real_init(root, state_root=state_root)
-            return real_init(root) if state_root is None else real_init(root, state_root=state_root)
+                self.assertTrue(a_done.wait(10), 'isolated CLI never reached its backup')
+                return real_backup(root, state_root=state_root)
+            return real_backup(root, state_root=state_root)
 
         def run_isolated():
             with mock.patch.object(orch, '__file__', str(self.scheduler)), \
                  contextlib.redirect_stdout(io.StringIO()):
-                results['isolated'] = orch.main(['--layout', 'isolated', 'init'])
+                results['isolated'] = orch.main(['--layout', 'isolated', 'backup'])
 
         def run_flat():
             with contextlib.redirect_stdout(io.StringIO()):
-                results['flat'] = orch.main(['--layout', 'flat', '--root', str(flat_kit), 'init'])
+                results['flat'] = orch.main(['--layout', 'flat', '--root', str(flat_kit), 'backup'])
 
-        with mock.patch.object(orch, 'init', side_effect=gated_init):
+        with mock.patch.object(orch, 'backup', side_effect=gated_backup):
             first = threading.Thread(target=run_isolated)
             second = threading.Thread(target=run_flat)
             first.start(); second.start()
@@ -2402,22 +2488,24 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         self.assertTrue((flat_kit / '.orchestration' / 'state.sqlite3').is_file())
 
     def test_exception_in_isolated_cli_does_not_leave_a_state_binding(self):
+        """Replaced: the CLI hook used to be `init`; it is now `backup`."""
         other = Path(self.tmp.name) / 'after-failure'
         self._write_edition(other)
+        self.seed_flat(other)
+        self.seed_isolated()
 
         def boom(root, state_root=None):
             raise RuntimeError('injected failure')
 
-        rc, _, err = self._main(['--layout', 'isolated', 'init'], patches=(('init', boom),))
+        rc, _, err = self._main(['--layout', 'isolated', 'backup'], patches=(('backup', boom),))
         self.assertNotEqual(rc, 0, err)
-        rc, _, err = self._main(['--layout', 'flat', '--root', str(other), 'init'])
+        rc, _, err = self._main(['--layout', 'flat', '--root', str(other), 'backup'])
         self.assertEqual(rc, 0, err)
         self.assertTrue((other / '.orchestration' / 'state.sqlite3').is_file())
-        self.assertFalse((self.state / 'state.sqlite3').exists())
+        self.assertFalse(list((self.state / 'backups').glob('*.sqlite3')))
 
     def test_backup_refuses_preset_second_named_symlink_target(self):
-        init = self.run_cli('--layout', 'isolated', 'init')
-        self.assertEqual(init.returncode, 0, init.stderr)
+        self.seed_isolated()
         outside = Path(self.tmp.name) / 'outside.sqlite3'
         con = sqlite3.connect(outside)
         con.execute('CREATE TABLE sentinel(v)')
@@ -2437,8 +2525,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         self.assertNotIn(str(Path.home()), err)
 
     def test_backup_refuses_symlinked_backup_directory(self):
-        init = self.run_cli('--layout', 'isolated', 'init')
-        self.assertEqual(init.returncode, 0, init.stderr)
+        self.seed_isolated()
         outside = Path(self.tmp.name) / 'outside-backups'
         outside.mkdir()
         before = self.snapshot(outside)
@@ -2453,8 +2540,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
 
     def test_backup_api_refuses_symlinked_backup_directory(self):
         """Direct API path also refuses a linked directory (post-impl control)."""
-        init = self.run_cli('--layout', 'isolated', 'init')
-        self.assertEqual(init.returncode, 0, init.stderr)
+        self.seed_isolated()
         outside = Path(self.tmp.name) / 'outside-api-backups'
         outside.mkdir()
         before = self.snapshot(outside)
@@ -2471,7 +2557,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         exclude.write_text('host-owned\n', encoding='utf-8')
         before = self.snapshot(host_git)
         (self.kit / '.git').symlink_to(host_git, target_is_directory=True)
-        result = self.run_cli('--layout', 'isolated', 'init')
+        result = self.run_cli('--layout', 'isolated', 'config', 'show')
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('symlink', result.stderr.lower())
         self.assertEqual(self.snapshot(host_git), before,
@@ -2487,7 +2573,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         outside.write_text('host-owned\n', encoding='utf-8')
         before = outside.read_bytes()
         (gitdir / 'info' / 'exclude').symlink_to(outside)
-        result = self.run_cli('--layout', 'isolated', 'init')
+        result = self.run_cli('--layout', 'isolated', 'config', 'show')
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('symlink', result.stderr.lower())
         self.assertEqual(outside.read_bytes(), before,
@@ -2496,18 +2582,20 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         self.assertNotIn(str(self.tmp.name), result.stderr)
 
     def test_isolated_init_excludes_the_actual_state_directory(self):
-        """The real .git rule must cover where isolated state actually lands."""
+        """The real .git rule must cover where isolated state actually lands.
+
+        Replaced: the rule used to be written by the scheduling CLI's `init`.
+        New: the retained archive initializer writes the same rule, once.
+        """
         (self.kit / '.git').mkdir()
-        result = self.run_cli('--layout', 'isolated', 'init')
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.seed_isolated()
         exclude = self.kit / '.git' / 'info' / 'exclude'
         actual = self.state.relative_to(self.kit).as_posix() + '/'
         self.assertEqual(actual, '.local/orchestration/')
         self.assertIn(actual, exclude.read_text(encoding='utf-8').splitlines(),
                       'isolated init excluded a path it does not write')
         self.assertTrue((self.state / 'state.sqlite3').is_file())
-        again = self.run_cli('--layout', 'isolated', 'init')
-        self.assertEqual(again.returncode, 0, again.stderr)
+        self.seed_isolated()
         self.assertEqual(
             exclude.read_text(encoding='utf-8').splitlines().count(actual), 1,
             'repeated isolated init duplicated its exclude rule')
@@ -2523,8 +2611,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         """
         gitdir_text = 'gitdir: ../../.git/worktrees/agentorch\n'
         (self.kit / '.git').write_text(gitdir_text, encoding='utf-8')
-        result = self.run_cli('--layout', 'isolated', 'init')
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.seed_isolated()
         self.assertTrue((self.state / 'state.sqlite3').is_file())
         self.assertEqual((self.kit / '.git').read_text(encoding='utf-8'),
                          gitdir_text,
@@ -2541,7 +2628,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         outside = Path(self.tmp.name) / 'outside-state-root'
         with self.assertRaises(orch.LayoutError):
             with contextlib.redirect_stdout(io.StringIO()):
-                orch.init(self.kit, state_root=outside)
+                orch.init_task_store(self.kit, state_root=outside)
         self.assertFalse(outside.exists(),
                          'init created state outside the project root before refusing')
         self.assertFalse(self.state.exists())
@@ -2550,7 +2637,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         """The refusal stays bounded: an in-tree explicit state root still works."""
         inside = self.kit / 'nested-state'
         with contextlib.redirect_stdout(io.StringIO()):
-            orch.init(self.kit, state_root=inside)
+            orch.init_task_store(self.kit, state_root=inside)
         self.assertTrue((inside / 'state.sqlite3').is_file())
         self.assertTrue((inside / 'config.json').is_file())
         self.assertFalse(self.state.exists())
@@ -2577,7 +2664,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
                 before_host = self.snapshot(self.host)
                 with self.assertRaises(orch.LayoutError):
                     with contextlib.redirect_stdout(io.StringIO()):
-                        orch.init(self.kit, state_root=state_root)
+                        orch.init_task_store(self.kit, state_root=state_root)
                 self.assertFalse(state_root.exists(),
                                  'init created state through a parent segment before refusing')
                 self.assertFalse(self.state.exists(),
@@ -2601,7 +2688,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         before_host = self.snapshot(self.host)
         with self.assertRaises(orch.LayoutError):
             with contextlib.redirect_stdout(io.StringIO()):
-                orch.init(self.kit, state_root=link / 'nested-state')
+                orch.init_task_store(self.kit, state_root=link / 'nested-state')
         self.assertFalse((outside / 'nested-state').exists(),
                          'init wrote through a symlinked ancestor to the external directory')
         self.assertEqual(self.snapshot(outside), before_outside,
@@ -2622,7 +2709,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         before = self.snapshot(self.host)
         with self.assertRaises(orch.LayoutError):
             with contextlib.redirect_stdout(io.StringIO()):
-                orch.init(self.kit, state_root=self.state)
+                orch.init_task_store(self.kit, state_root=self.state)
         self.assertFalse(self.state.exists(),
                          'init left state behind after refusing a non-directory .git/info')
         self.assertEqual(self.snapshot(self.host), before,
@@ -2637,7 +2724,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         before = self.snapshot(self.host)
         with self.assertRaises(orch.LayoutError):
             with contextlib.redirect_stdout(io.StringIO()):
-                orch.init(self.kit)
+                orch.init_task_store(self.kit)
         self.assertFalse(flat_state.exists(),
                          'flat init wrote state before refusing a non-directory .git/info')
         self.assertEqual(self.snapshot(self.host), before,
@@ -2658,16 +2745,15 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         """A hard link hides an outside inode behind an ordinary-looking entry."""
         cases = (
             ('state.sqlite3', ('task', 'list')),
-            ('state.sqlite3-wal', ('init',)),
-            ('state.sqlite3-shm', ('init',)),
+            ('state.sqlite3-wal', ('backup',)),
+            ('state.sqlite3-shm', ('backup',)),
             ('config.json', ('config', 'show')),
         )
         for slot, command in cases:
             with self.subTest(slot=slot, command=' '.join(command)):
                 if self.state.exists():
                     shutil.rmtree(self.state)
-                init = self.run_cli('--layout', 'isolated', 'init')
-                self.assertEqual(init.returncode, 0, init.stderr)
+                self.seed_isolated()
                 external = self._preset_external_hardlink(self.state / slot)
                 before = external.stat()
                 result = self.run_cli('--layout', 'isolated', *command)
@@ -2691,7 +2777,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         outside.write_bytes(b'host-owned\n')
         os.link(outside, gitdir / 'info' / 'exclude')
         before = outside.stat()
-        result = self.run_cli('--layout', 'isolated', 'init')
+        result = self.run_cli('--layout', 'isolated', 'config', 'show')
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('hard-linked', result.stderr.lower())
         after = outside.stat()
@@ -2704,8 +2790,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         self.assertNotIn(str(Path.home()), result.stderr)
 
     def test_backup_refuses_hardlinked_second_named_target(self):
-        init = self.run_cli('--layout', 'isolated', 'init')
-        self.assertEqual(init.returncode, 0, init.stderr)
+        self.seed_isolated()
         outside = Path(self.tmp.name) / 'outside-backup.sqlite3'
         outside.write_bytes(b'external sentinel')
         destination = self.state / 'backups' / 'state-20260102-030405.sqlite3'
@@ -2724,8 +2809,7 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         self.assertNotIn(str(Path.home()), err)
 
     def test_isolated_edition_errors_have_no_private_path(self):
-        init = self.run_cli('--layout', 'isolated', 'init')
-        self.assertEqual(init.returncode, 0, init.stderr)
+        self.seed_isolated()
         (self.kit / 'docs' / 'PROJECT.md').write_text(
             '# Project\n\n- `edition`：`cloud`\n', encoding='utf-8')
         add = ('task', 'add', '--id', 'TASK-153E', '--title', 'privacy',
@@ -2748,9 +2832,12 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
         self.assertNotIn(str(Path.home()), result.stderr)
 
     def test_isolated_oserror_hides_absolute_paths(self):
+        # `backup` is the retained maintenance write; an OSError there must be
+        # reported without host paths. `init` no longer touches the state tree.
         self.state.mkdir(parents=True)
+        (self.state / 'state.sqlite3').write_bytes(b'not a database')
         (self.state / 'backups').write_text('occupied by a file', encoding='utf-8')
-        result = self.run_cli('--layout', 'isolated', 'init')
+        result = self.run_cli('--layout', 'isolated', 'backup')
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn(str(self.tmp.name), result.stderr)
         self.assertNotIn(str(Path.home()), result.stderr)
@@ -2790,7 +2877,8 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
             with self.subTest(case=name):
                 if self.state.exists():
                     shutil.rmtree(self.state)
-                result = self.run_cli('--layout', 'isolated', *root_args, 'init',
+                self.seed_isolated()
+                result = self.run_cli('--layout', 'isolated', *root_args, 'backup',
                                       cwd=self.external)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue((self.state / 'state.sqlite3').is_file())
@@ -2805,7 +2893,8 @@ class IsolatedSchedulerLayoutTests(unittest.TestCase):
     def test_flat_cli_abbreviated_root_still_works(self):
         root = Path(self.tmp.name) / 'flat-abbrev'
         self._write_edition(root)
-        result = self.run_cli('--ro', str(root), 'init', scheduler=SCRIPT,
+        self.seed_flat(root)
+        result = self.run_cli('--ro', str(root), 'backup', scheduler=SCRIPT,
                               cwd=self.external)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((root / '.orchestration' / 'state.sqlite3').is_file())

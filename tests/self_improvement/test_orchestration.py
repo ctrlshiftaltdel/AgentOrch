@@ -19,9 +19,9 @@ from agentorch_self_improvement import lessons, orchestration, pipeline, plannin
 def run_loop(**overrides):
     payload = {
         'request_text': '进行自我完善',
-        'edition': 'local',
+        'edition': 'github',
         'state': loop_support.state(),
-        'carrier': loop_support.RecordingCarrier('local'),
+        'carrier': loop_support.RecordingCarrier('github'),
         'scan_report': loop_support.scan_report(),
         'lesson_records': (),
         'specs': {},
@@ -263,7 +263,7 @@ class GateTests(unittest.TestCase):
                             for item in outcome.report['blocked']))
 
     def test_edition_disagreement_fails_closed(self):
-        state = loop_support.state(edition='github')
+        state = loop_support.state(edition='local')
         carrier = loop_support.RecordingCarrier()
         outcome = run_loop(carrier=carrier, state=state, **ready_case())
         self.assertEqual(outcome.status, 'BLOCKED')
@@ -287,26 +287,37 @@ class GateTests(unittest.TestCase):
 
 
 class CarrierParityTests(unittest.TestCase):
-    def test_both_editions_register_with_their_own_shape(self):
-        results = {}
-        for edition in ('local', 'github'):
-            carrier = orchestration.carrier_for(edition)
-            with low_risk_gate():
-                outcome = run_loop(edition=edition, **ready_case(
-                    state=loop_support.state(edition), carrier=carrier))
-            self.assertEqual(outcome.status, 'COMPLETED')
-            registration = outcome.report['registrations'][0]
-            self.assertEqual(registration['carrier'], edition)
-            self.assertFalse(registration['executed'])
-            results[edition] = registration
-        self.assertIn('task_id', results['local']['payload'])
-        self.assertIn('issue_body', results['github']['payload'])
-        self.assertIsNone(results['github']['payload']['issue_number'])
-        self.assertNotIn('issue_body', results['local']['payload'])
-        self.assertNotIn('task_id', results['github']['payload'])
+    """The loop only routes to the supported `github` carrier.
 
-    def test_the_same_gates_hold_for_both_editions(self):
-        for edition in ('local', 'github'):
+    Retired assertion: `local` and `github` carriers were compared for parity.
+    New assertion: `github` keeps its dry-run shape, and `local` routing fails
+    closed with the Release v2.0.0 / migration guidance instead of emitting
+    task-database command sequences the CLI no longer runs.
+    """
+
+    def test_the_github_edition_registers_with_its_own_shape(self):
+        carrier = orchestration.carrier_for('github')
+        with low_risk_gate():
+            outcome = run_loop(edition='github', **ready_case(
+                state=loop_support.state('github'), carrier=carrier))
+        self.assertEqual(outcome.status, 'COMPLETED')
+        registration = outcome.report['registrations'][0]
+        self.assertEqual(registration['carrier'], 'github')
+        self.assertFalse(registration['executed'])
+        self.assertIn('issue_body', registration['payload'])
+        self.assertIsNone(registration['payload']['issue_number'])
+        self.assertNotIn('task_id', registration['payload'])
+
+    def test_local_carrier_routing_is_refused_with_retirement_guidance(self):
+        with self.assertRaises(orchestration.LoopError) as caught:
+            orchestration.carrier_for('local')
+        message = str(caught.exception)
+        self.assertIn('retired', message)
+        self.assertIn('v2.0.0', message)
+        self.assertNotIn('task add', message)
+
+    def test_the_same_gates_hold_for_the_github_edition(self):
+        for edition in ('github',):
             with self.subTest(edition=edition):
                 record = loop_support.general_lesson()
                 repo = loop_support.GitRepo()
@@ -333,8 +344,8 @@ class CarrierParityTests(unittest.TestCase):
                 self.assertTrue(any(item.get('decision_id') == 'HD-05'
                                     for item in outcome.report['decisions_required']))
 
-    def test_receipt_does_not_unlock_a_docs_typo_for_either_edition(self):
-        for edition in ('local', 'github'):
+    def test_receipt_does_not_unlock_a_docs_typo(self):
+        for edition in ('github',):
             with self.subTest(edition=edition):
                 repo = loop_support.GitRepo()
                 self.addCleanup(repo.close)
@@ -365,25 +376,25 @@ class CarrierParityTests(unittest.TestCase):
                     outcome.report['plan']['proposals'][0]['status'], 'BLOCKED')
 
     def test_a_mismatched_carrier_is_refused_before_it_is_called(self):
-        carrier = loop_support.RecordingCarrier('github')
+        carrier = loop_support.RecordingCarrier('local')
         with self.assertRaises(orchestration.LoopError):
-            run_loop(edition='local', carrier=carrier, **ready_case())
+            run_loop(edition='github', carrier=carrier, **ready_case())
         self.assertEqual(carrier.calls, [])
 
     def test_carrier_refuses_a_non_ready_proposal(self):
         proposal = loop_support.spec()
-        proposal.update({'lesson_id': 'LSN-TALKDND-001', 'edition': 'local',
+        proposal.update({'lesson_id': 'LSN-TALKDND-001', 'edition': 'github',
                          'status': 'BLOCKED', 'status_reason': 'blocked'})
         with self.assertRaises(orchestration.CarrierError):
-            orchestration.LocalCarrier().register(proposal)
+            orchestration.GithubCarrier().register(proposal)
 
     def test_one_edition_writes_one_carrier(self):
-        local = loop_support.RecordingCarrier('local')
         github = loop_support.RecordingCarrier('github')
+        unused = loop_support.RecordingCarrier('github')
         with low_risk_gate():
-            run_loop(edition='local', carrier=local, **ready_case())
-        self.assertEqual(github.calls, [])
-        self.assertEqual(len(local.calls), 1)
+            run_loop(edition='github', carrier=github, **ready_case())
+        self.assertEqual(unused.calls, [])
+        self.assertEqual(len(github.calls), 1)
 
 
 class EndToEndTests(unittest.TestCase):
@@ -412,17 +423,17 @@ class EndToEndTests(unittest.TestCase):
         record, scan = self._eligible_record()
         passed = 'python3 -m unittest tests.self_improvement.test_orchestration'
         unrun = 'python3 scripts/validate_kit.py'
-        carrier = loop_support.RecordingCarrier('local')
+        carrier = loop_support.RecordingCarrier('github')
         with low_risk_gate():
             outcome = orchestration.run_loop(
-                request_text='进行自我完善', edition='local',
+                request_text='进行自我完善', edition='github',
                 state=loop_support.state(),
                 carrier=carrier, scan_report=scan,
                 lesson_records=[record],
                 specs={record['lesson_id']: loop_support.spec(
                     validation_commands=[passed, unrun])},
                 command_runs={passed: {'exit_code': 0, 'output': 'tests passed'}},
-                environment='Linux; Python 3; synthetic fixture; local edition',
+                environment='Linux; Python 3; synthetic fixture; github edition',
                 repo_root=loop_support.DEFAULT_REPO_ROOT)
 
         report = outcome.report
@@ -453,9 +464,9 @@ class EndToEndTests(unittest.TestCase):
 
     def test_repeated_trigger_does_not_duplicate_an_existing_task(self):
         record, scan = self._eligible_record()
-        carrier = loop_support.RecordingCarrier('local')
+        carrier = loop_support.RecordingCarrier('github')
         outcome = orchestration.run_loop(
-            request_text='进行自我完善', edition='local',
+            request_text='进行自我完善', edition='github',
             state=loop_support.state(), carrier=carrier, scan_report=scan,
             lesson_records=[record],
             specs={record['lesson_id']: loop_support.spec()},

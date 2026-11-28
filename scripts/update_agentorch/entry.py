@@ -235,50 +235,6 @@ def _task_packet(environment, report, applied, kept, branch):
     }
 
 
-def _local_next_steps(layout):
-    """State-mutating commands for the local carrier, matching *layout*.
-
-    The commands are copied by an operator from the directory each layout
-    documents: the project root for a flat install, the host root for an
-    isolated one. An isolated scheduler refuses a bare invocation, so its
-    commands use the managed block's ``agentorch/scripts/orchestrator.py
-    --layout isolated`` form; both layouts pass the real ``task add --id``
-    flag so the sequence runs unchanged against the shipped CLI.
-    """
-    if layout == 'isolated':
-        where = 'host root (the directory that contains agentorch/)'
-        command = 'python agentorch/scripts/orchestrator.py --layout isolated'
-    else:
-        where = 'project root (the directory that contains scripts/)'
-        command = 'python scripts/orchestrator.py'
-    return [
-        f'run these from the {where}',
-        f'{command} init',
-        f'{command} task add --id <TASK-ID> --title "<title>" '
-        '--paths <allowed paths> --acceptance "<AC-1>" "<AC-2>"',
-        f'{command} task ready <TASK-ID>',
-        f'{command} task dispatch <TASK-ID>',
-        'pass the packet and the engine report to the Execution Agent',
-    ]
-
-
-def _local_delivery(environment, report, mode):
-    applied, kept = _applied_and_kept(report)
-    branch = _suggested_branch(report, 'local')
-    return {
-        'carrier': 'local_task_database',
-        'automation': 'manual',
-        'writes': [],
-        'note': ('The entry did not write the local task database. The Master registers '
-                 'the packet and dispatches the task; the engine changes stay in the '
-                 'branch / Worktree named below.'),
-        'branch': branch,
-        'worktree': (report.get('operation') or {}).get('worktree'),
-        'task_packet': _task_packet(environment, report, applied, kept, branch),
-        'next_steps': _local_next_steps(environment.get('layout') or _installed_layout()),
-    }
-
-
 def _issue_body(environment, report, applied, kept):
     target = (report.get('target') or {}).get('version')
     lines = [
@@ -401,8 +357,14 @@ def prepare_update(project, request, *, mode='PLAN', source=None, edition=None,
         }
 
     effective_edition = edition or environment['edition']
-    if effective_edition not in ('local', 'github'):
-        raise EntryError(f'edition must be local or github, got {effective_edition!r}')
+    if effective_edition == 'local':
+        raise EntryError(
+            'edition `local` is retired: the mainline and every next-generation install '
+            'package provide the `github` edition only. Keep the project on the verified '
+            'Release v2.0.0 (tag v2.0.0) and do not upgrade this kit, or run the one-time '
+            'approved local -> github migration in kit/orchestration.md section 6 first.')
+    if effective_edition != 'github':
+        raise EntryError(f'edition must be github, got {effective_edition!r}')
 
     source = source if source is not None else sources.GitHubReleaseSource()
     matrix = (versions.DECLARED_SUPPORTED_FORMATS
@@ -414,10 +376,7 @@ def prepare_update(project, request, *, mode='PLAN', source=None, edition=None,
     environment['edition'] = effective_edition
 
     gate_record = gates(environment, report, mode)
-    if effective_edition == 'local':
-        delivery = _local_delivery(environment, report, mode)
-    else:
-        delivery = _github_delivery(environment, report, mode)
+    delivery = _github_delivery(environment, report, mode)
 
     engine_result = report.get('result')
     status = 'PREPARED' if engine_result in ('PLANNED', 'APPLIED') else engine_result
@@ -718,7 +677,7 @@ def build_parser(isolated=True):
                         help='the user message to route, e.g. "更新 AgentOrch"')
     parser.add_argument('--mode', choices=('PLAN', 'APPLY'), default='PLAN',
                         help='PLAN inspects only; APPLY writes the conflict-free change set')
-    parser.add_argument('--edition', choices=('local', 'github'),
+    parser.add_argument('--edition', choices=('github',),
                         help='override the edition read from docs/PROJECT.md')
     parser.add_argument('--no-isolation', action='store_true',
                         help='do not create an isolated worktree on a dirty APPLY')

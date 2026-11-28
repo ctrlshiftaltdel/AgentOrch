@@ -56,7 +56,7 @@ def scenario_d1(ctx):
     """Positive control: a legal edition with a declared resource closes out cleanly."""
     root = _project_root(ctx, config={'resource_lease_ttl': 3600, 'resource_reclaim_grace': 60})
     edition = ctx.orch.read_project_edition(root)
-    _require(edition == 'local', f'expected edition local, got {edition!r}')
+    _require(edition == 'github', f'expected edition github, got {edition!r}')
     _add(ctx, root, 'TASK-D1', ['src/d1.py'], resources=['db:test/main:exclusive'])
     _ready(ctx, root, 'TASK-D1')
     _dispatch(ctx, root, 'TASK-D1')
@@ -76,7 +76,7 @@ def scenario_d1(ctx):
 
 
 def scenario_d2(ctx):
-    """An illegal, missing or duplicated edition stops scheduling instead of guessing."""
+    """An illegal, missing, duplicated or retired edition stops the CLI instead of guessing."""
     cases = []
     for label, body in (('missing key', '# Synthetic project\n\nno edition line here\n'),
                         ('illegal value', '# Synthetic project\n\n- `edition`\uFF1A`gitlab`\n'),
@@ -94,9 +94,17 @@ def scenario_d2(ctx):
     cases.append('missing file: ' + _expect_refused(
         lambda: ctx.orch.read_project_edition(broken), 'file not found', 'missing file'))
 
+    retired = ctx.sandbox / 'edition-retired'
+    retired.mkdir(parents=True, exist_ok=True)
+    (retired / 'docs').mkdir(parents=True, exist_ok=True)
+    (retired / 'docs/PROJECT.md').write_text(
+        '# Synthetic project\n\n- `edition`：`local`\n', encoding='utf-8')
+    cases.append('retired local: ' + _expect_refused(
+        lambda: ctx.orch.read_project_edition(retired), 'v2.0.0', 'retired local edition'))
+
     github = _project_root(ctx, edition='github')
     cases.append('github scheduling: ' + _expect_refused(
-        lambda: ctx.orch.require_local_scheduler(github, 'task dispatch'),
+        lambda: ctx.orch.retire_scheduling(github, 'task dispatch'),
         'cannot run', 'github edition'))
     return cases
 

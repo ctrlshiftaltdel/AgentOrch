@@ -34,7 +34,7 @@ class _ShaLike:
 
 
 def plan_one(record, spec=None, **kwargs):
-    kwargs.setdefault('edition', 'local')
+    kwargs.setdefault('edition', 'github')
     kwargs.setdefault('repo_root', loop_support.DEFAULT_REPO_ROOT)
     kwargs.setdefault('trusted_task', loop_support.state()['task'])
     kwargs.setdefault('required_base_sha', loop_support.DEFAULT_BASE_SHA)
@@ -2007,7 +2007,7 @@ class CompletePacketTests(unittest.TestCase):
     def test_lesson_without_a_spec_is_not_invented(self):
         empty = planning.plan_tasks(
             lesson_records=[loop_support.general_lesson()], specs={},
-            edition='local', repo_root=loop_support.DEFAULT_REPO_ROOT).proposals[0]
+            edition='github', repo_root=loop_support.DEFAULT_REPO_ROOT).proposals[0]
         self.assertEqual(empty['status'], 'BLOCKED')
         self.assertIn('task spec is incomplete', empty['status_reason'])
 

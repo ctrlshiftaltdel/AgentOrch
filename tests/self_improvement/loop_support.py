@@ -177,7 +177,7 @@ def authorization(**overrides):
     return payload
 
 
-def state(edition='local', **overrides):
+def state(edition='github', **overrides):
     payload = {
         'edition': edition,
         'branch': 'task/50-self-improvement-loop',
@@ -240,7 +240,7 @@ def created(lesson_id='LSN-TALKDND-001'):
 class RecordingCarrier:
     """A fake carrier: records calls, returns a shaped registration, executes nothing."""
 
-    def __init__(self, kind='local'):
+    def __init__(self, kind='github'):
         self.kind = kind
         self.edition = kind
         self.calls = []

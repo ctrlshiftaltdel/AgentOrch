@@ -314,9 +314,9 @@ Edit .orchestration/config.json to change retry_cap or local_dir; invalid values
 | 命令 | `edition: github` | `edition: local`（已退场） | `edition` 缺失 / 非法 |
 | --- | --- | --- | --- |
 | `init` / `init-plan` | 可用（只生成 `docs/PLAN.md`，不建任务库） | 拒绝，并给出固定 `v2.0.0` / 迁移指引 | 拒绝，并给出诊断与修复位置 |
-| `backup` | 可用；仅当归档库已存在时运行，缺库拒绝且不 `init` | 拒绝，并给出固定 `v2.0.0` / 迁移指引 | 拒绝，并给出诊断与修复位置 |
+| `backup` | 可用；仅当归档库已存在时运行，缺库拒绝且不 `init` | 可用（维护既有归档，不调度） | 可用（维护既有归档，不调度） |
 | `config show` | 可用，退出码 0 | 打印 `edition = local` 并给出退场指引，退出码 1 | 打印诊断，退出码 1 |
-| `task list` / `task show` | 可用（只读归档；库不存在时报错） | 拒绝，并给出固定 `v2.0.0` / 迁移指引 | 拒绝，并给出实际值与修复位置 |
+| `task list` / `task show` | 可用（只读归档；库不存在时报错） | 可用（只读归档，不调度） | 可用（只读归档，不调度） |
 | `task add` / `ready` / `dispatch` / `status` / `workspace` / `amend` / `unlock` | 拒绝，并给出 Issue / PR 指引 | 拒绝，并给出固定 `v2.0.0` / 迁移指引 | 拒绝，并给出实际值与修复位置 |
 | `task resources` / `renew` / `reclaim` / `reconcile` | 拒绝，并给出 Issue / PR 指引 | 拒绝，并给出固定 `v2.0.0` / 迁移指引 | 拒绝，并给出实际值与修复位置 |
 
@@ -379,7 +379,7 @@ uv run python scripts/report_metrics.py --gold-sample --since 2026-01-01 --until
 
 `validate_kit.py` 检查：
 
-- **133 项必需文件**是否齐全（`REQUIRED` 列表同时是发布包清单，只有一份来源）。
+- **131 项必需文件**是否齐全（`REQUIRED` 列表同时是发布包清单，只有一份来源；`editions/local/` 已随 local 底座退场移除）。
 - **合约模板是否仍问对问题**：`templates/design.md`、`templates/milestone-audit.md`、`templates/contract-decision-log.md` 的必备章节缺一即失败，模板内的相对链接断链也失败（章节缺失会被静默当成“不需要回答”，因此单列一项检查）。
 - **能力登记与指标模板是否仍问对问题**：`templates/runtime-capability.md` 的身份 / 能力矩阵 / 扩展边界 / `UNKNOWN` 与重测 / 权限范围 / 证据与限制，以及 `templates/metrics.md` 的阅读规则 / 公共定义 / 指标定义 / 缺失与覆盖率 / 报告契约 / 金样本 / 限制，缺章节同样失败。
 - **发行包清单是否自洽**：根目录存在 `MANIFEST.json`（发行包内）时，校验其结构、分类、路径可解析与 `REQUIRED` 集合一致；SHA-256 与大小在纯净包与上游 checkout 严格比较，在下游项目只校验结构（见下方“三种树”）。仓库根目录没有该文件，检查自动跳过，不误报。
@@ -527,7 +527,7 @@ uv run python scripts/check_drift.py <项目根> --json   # stdout 只有 JSON�
 
 ## 9. 版本与兼容
 
-> **2026-11-16 注记**：本节下方的版本记录保持原样；其中"CI 在 macOS / Windows 上运行"与"在每个 PR 上跑打包自检"的描述属于**变更前**的历史口径。自 2026-11-16 起 `.github/workflows/ci.yml` 为风险分层：`risk` 作业按真实 Diff 给出 `L0`–`L3`，`L0` 只跑定向结构检查，`L1` 跑完整 Ubuntu 检查但不跑发布打包，`L2` / `L3`、push 到 `main` 与 `workflow_dispatch` 才跑发布打包自检与 macOS / Windows；必需 context 仍是 `checks (Python 3.12)` 与 `checks (Python 3.13)`（见 7.1 节）。同一后续 HEAD 在已发布 2.0.0 之外新增 3 个随包文件（`scripts/batch_delivery.py`、`scripts/delivery_risk.py`、`templates/batch-delivery.md`），当前 `REQUIRED` 为 133 个；`tests/test_batch_delivery.py` 与 `tests/test_delivery_risk.py` 仍为仓库专属、不随包发布。尚未发布新 Release；2.0.0 的 131 个包内文件记录只描述那个已发布 tag。
+> **2026-11-16 注记**：本节下方的版本记录保持原样；其中"CI 在 macOS / Windows 上运行"与"在每个 PR 上跑打包自检"的描述属于**变更前**的历史口径。自 2026-11-16 起 `.github/workflows/ci.yml` 为风险分层：`risk` 作业按真实 Diff 给出 `L0`–`L3`，`L0` 只跑定向结构检查，`L1` 跑完整 Ubuntu 检查但不跑发布打包，`L2` / `L3`、push 到 `main` 与 `workflow_dispatch` 才跑发布打包自检与 macOS / Windows；必需 context 仍是 `checks (Python 3.12)` 与 `checks (Python 3.13)`（见 7.1 节）。同一后续 HEAD 在已发布 2.0.0 之外新增 3 个随包文件（`scripts/batch_delivery.py`、`scripts/delivery_risk.py`、`templates/batch-delivery.md`），当前 `REQUIRED` 为 131 个（`editions/local/` 的两个文件随 local 退场移除，见 #280）；`tests/test_batch_delivery.py` 与 `tests/test_delivery_risk.py` 仍为仓库专属、不随包发布。尚未发布新 Release；2.0.0 的 131 个包内文件记录只描述那个已发布 tag。
 
 - [VERSION.md](../VERSION.md) 记录套件名、支持底座、**Format version**（当前 `1.7`）与**对外 Release 版本**（当前候选 `2.0.0`，未发布；仅作记录）；格式变更时同步更新模板与校验清单。
 - **Format 版本与 Release 版本是两条序列，不要混读**：最新已发布的是 Release `1.7.1`（tag `v1.7.1`、资产 `AgentOrch-1.7.1.zip`），它是给已发布 v1.7.0 更新器的桥接发行，契约仍在 `kit/orchestration.md`。当前候选是 **Release `2.0.0`（未发布）**，`Format version` 仍为 `1.7`：`tag_matches_format('v2.0.0', '1.7')` 为假，所以已发布的 v1.7.0 更新器会拒绝它；只有带显式兼容矩阵 `DECLARED_SUPPORTED_FORMATS = ('1.7',)` 的新更新器（含已发布的 v1.7.1）可通过 `VERSION_MATCH`。`VERSION_MATCH` 通过不等于安装或升级成功。`v1.7.1` 只是版本匹配层的必要桥接候选：已发布的 v1.7.1 CLI 与「更新 AgentOrch」入口固定请求 `/releases/latest`，CLI 没有 tag 参数，一旦 `v2.0.0` 成为 latest 就无法用它选择 `v1.7.1`；因此 ≤1.7.0 的实际迁移方案尚未验证，不得用未经验证的手工覆盖代替。真实 `v1.7.1 → 2.0.0` 升级为 `NOT_RUN`。这一 MAJOR 的破坏性变化：`scripts/self_improvement/orchestration.py` 的 `restore_state()` 现在要求 `base_sha`（v1.7.1 可省略），LOW/READY 自动路径停用（提案停在 `BLOCKED` / `NEEDS_EVIDENCE` 或 `NEEDS_HUMAN_DECISION`）。包内文件集合与 v1.7.1 相同（131 个 = 130 `REQUIRED` + `MANIFEST.json`），`format_version` 仍为 `1.7`。上一个已发布版本是 Release `1.7.0`（tag `v1.7.0`、资产 `AgentOrch-1.7.0.zip`）。`1.7.0` 是 **Phase D 的功能发行**，同时把 `Format version` 从 `1.6` 升到 `1.7`：更新引擎的 `VERSION_MATCH` 要求 tag 的 major.minor 等于清单 `format_version`，`v1.7.0` 必须配 Format `1.7` 才会被接受；包内 118 个文件（117 `REQUIRED` + `MANIFEST.json`）。上一个正式发布是 Release `1.6.3`（tag `v1.6.3`、资产 `AgentOrch-1.6.3.zip`），它是 `1.6.2` 的补丁发行，包含 #99–#104 的路径冲突记账、`task amend --paths`、`check_scope.py` 与文档口径修复，Format 仍为 `1.6`；再往前是 Release `1.6.2`（tag `v1.6.2`、资产 `AgentOrch-1.6.2.zip`），它是 `1.6.1` 的补丁发行（#93 重复多值选项修复）；更早是 Release `1.6.1`（tag `v1.6.1`、资产 `AgentOrch-1.6.1.zip`），它是 `1.6.0` 的补丁发行（#85 下游包修复）；最早是 Release `1.6`（tag `v1.6`、资产 `AgentOrch-1.6.zip`），它同时把 `Format version` 从 `1.5` 升到 `1.6`（新增自我完善 / 安全更新资产，见 `release/README.md` §5.2）。`MANIFEST.json` 的 `format_version` 只由 `Format version:` 一行生成（`1.7`），`Release version` 行不参与解析；下游判断兼容性看 `format_version`。

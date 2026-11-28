@@ -188,8 +188,13 @@ def _packet_errors(ctx, text):
 
 
 # --- orchestrator fixtures --------------------------------------------------
-def _project_root(ctx, edition='local', config=None):
-    """A throw-away project root with an explicit edition and an initialized store."""
+def _project_root(ctx, edition='github', config=None):
+    """A throw-away project root with an explicit edition and an initialized store.
+
+    The scheduling CLI was retired with the local edition, so the legacy archive
+    store is seeded through the library; the declared edition stays `github`
+    unless a scenario deliberately exercises another value.
+    """
     root = ctx.sandbox / f'project-{edition}'
     root.mkdir(parents=True, exist_ok=True)
     (root/'docs').mkdir(parents=True, exist_ok=True) or (root / 'docs/PROJECT.md').write_text(
@@ -200,7 +205,7 @@ def _project_root(ctx, edition='local', config=None):
     (root / '.orchestration' / 'config.json').write_text(
         json.dumps(payload, sort_keys=True), encoding='utf-8')
     with _quiet():
-        ctx.orch.init(root)
+        ctx.orch.init_task_store(root)
     return root
 
 

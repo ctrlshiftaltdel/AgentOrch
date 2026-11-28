@@ -29,7 +29,7 @@
 - `edition: local` 是**不受支持的旧配置**：主线和下一代安装包不再提供 SQLite 任务调度。任何入口读到 `local` 必须在写入任何状态之前失败关闭，并给出同一段指引——既有 local 安装固定在被验证的 Release `v2.0.0`（tag `v2.0.0`）继续运行、不要升级本套件；要跟进主线则按第 6 节做一次性迁移，或整体回退到 `v2.0.0`。
 - 文件缺失、`edition` 键缺失、值为空或不在允许集合内（含类型错误，如 `1`、`true`）：输出明确错误并**停止**，不得猜测、不得按默认值继续、不得自行切换底座。错误信息必须包含缺失项、实际读到的值和建议修复位置。
 - 读取成功后，后续所有路由、命令和证据路径都以该底座为准。
-- 本地 CLI 不再调度任何底座：`task add` / `task ready` / `task dispatch` / `task status` / `task workspace` / `task amend` / `task unlock` 等调度命令一律拒绝执行并指向 Issue / PR；`init`（只生成 docs/PLAN.md）、`init-plan`、`backup`、`config show`、`task list`、`task show` 作为 GitHub-only 兼容的维护入口保留。完整矩阵见 `README.md` 6.2。
+- 本地 CLI 不再调度任何底座：`task add` / `task ready` / `task dispatch` / `task status` / `task workspace` / `task amend` / `task unlock` 等调度命令一律拒绝执行并指向 Issue / PR；`init` / `init-plan`（只生成 docs/PLAN.md）拒绝 `local` 并给出退场指引；`backup`、`config show`、`task list`、`task show` 作为 GitHub-only 兼容的维护入口保留，可在任一 `edition` 下维护 / 只读既有归档。完整矩阵见 `README.md` 6.2。
 
 ### 第二步：恢复状态
 

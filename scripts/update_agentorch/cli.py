@@ -17,7 +17,8 @@ from . import engine, sources, versions
 from . import report as report_module
 
 EDITION_RE = re.compile(r'`?edition`?\s*[:：]\s*`?([^`\s]+)`?', re.IGNORECASE)
-VALID_EDITIONS = ('local', 'github')
+VALID_EDITIONS = ('github',)
+RETIRED_EDITIONS = ('local',)
 
 
 def read_edition(project: Path) -> str:
@@ -29,8 +30,13 @@ def read_edition(project: Path) -> str:
         raise ValueError(f'cannot read {config}: {exc}') from exc
     match = EDITION_RE.search(text)
     if not match:
-        raise ValueError(f'{config} does not declare an edition (expected local or github)')
+        raise ValueError(f'{config} does not declare an edition (expected github)')
     value = match.group(1).strip().strip('`').strip()
+    if value in RETIRED_EDITIONS:
+        raise ValueError(
+            f'{config}: edition {value!r} is retired: the mainline ships the github edition '
+            'only. Keep the project on Release v2.0.0 or run the one-time local -> github '
+            'migration in kit/orchestration.md section 6 first.')
     if value not in VALID_EDITIONS:
         raise ValueError(f'{config}: edition {value!r} is not one of {list(VALID_EDITIONS)}')
     return value

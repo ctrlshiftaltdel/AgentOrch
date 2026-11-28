@@ -246,8 +246,13 @@ def run_update(project, *, mode: str, source, edition: str,
     """Run one PLAN or APPLY against ``project`` and return the report dict."""
     if mode not in ('PLAN', 'APPLY'):
         raise ValueError(f'mode must be PLAN or APPLY, got {mode!r}')
-    if edition not in ('local', 'github'):
-        raise ValueError(f'edition must be local or github, got {edition!r}')
+    if edition == 'local':
+        raise ValueError(
+            'edition `local` is retired: the mainline ships the github edition only. '
+            'Keep the project on Release v2.0.0 or run the one-time local -> github '
+            'migration in kit/orchestration.md section 6 first.')
+    if edition != 'github':
+        raise ValueError(f'edition must be github, got {edition!r}')
     project = Path(project)
     if not project.is_dir():
         raise ValueError(f'project root does not exist or is not a directory: {project}')
