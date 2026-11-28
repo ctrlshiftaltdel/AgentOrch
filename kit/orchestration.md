@@ -276,12 +276,12 @@ PLANNED → READY → DISPATCHED/IN_PROGRESS → TASK_VERIFIED → INTEGRATED �
 
 - `APPROVED` 必须带当前完整 commit SHA。工作树或提交头有任何变化，批准立即失效，需重新审查。
 - 批次交付允许一个批次只开一个最终 PR / 做一次合并；合并前必须在该批次最终 head 上通过必需检查与批次审查（2.2、4.2 节），一个批次 PR 可以包含多个任务 ID。不得用逐任务 PR 的旧规则否定批次交付，也不得用批次合并跳过单任务验收。
-- 只有 Master 执行合并（`local` 例如 `git merge --no-ff <branch>`，`github` 例如平台合并按钮 / `gh pr merge`；具体策略由项目配置决定）。执行者不能自批自合。
+- 只有 Master 可以按 `AGENTS.md` 的角色分工作出并执行合并决定（`local` 例如 `git merge --no-ff <branch>`，`github` 例如平台合并按钮 / `gh pr merge`；具体策略由项目配置决定）。作出决定前，Master 在任务载体记录适用授权的来源和范围，并核对授权仍有效、已解决必须升级的事项、适用的审查及平台门禁已在当前 head 通过。有效常设授权在其范围内可跨会话复用。执行者不得自批自合。
 - 合并前备份或确认可恢复；遇到冲突不自动覆盖他人 / 主分支内容。
 - 合并后运行 `docs/PROJECT.md` 指定的验证命令，保存日志与退出码；全部通过后转 `VERIFIED`。无条件集合是快速测试 + 完整回归 + 静态检查；`backup` 不是无条件项，按 `docs/PROJECT.md` 的「归档备份（条件项）」执行：`.orchestration/state.sqlite3` 存在时必须运行 `python scripts/orchestrator.py backup`，缺库时按维护写入边界拒绝、不得 `init`，合并后验证记 `NOT_APPLICABLE: archive absent`，不计为失败。只有 `verification_profile` 精确为 `risk_pilot` 且调用者显式证明变更为 L0 时，才可以省略完整回归，`validate_kit` 与 `py_compile` 仍必须执行。证明缺失、语义标记为真或路径命中编排器 / `kit/orchestration.md` / CI / `PROJECT.md` / `PLAN.md` / `AGENTS.md` / `editions/` / `scripts/` / `release/` / `templates/` 时不得省略。
 - 批次交付同样要求合并后验证：只有验证通过后才把批次内任务逐个标记 `VERIFIED`；不得把 `INTEGRATED` / `PREPARED` 写成 `VERIFIED`。批次 PR 的描述与证据见 `editions/github/pr-template.md`。
 - 合并成功与分支清理分开记账。清理失败不能触发重复合并。
-- 默认最多 3 轮审查—修复往返；达到上限仍未通过 → `BLOCKED`，由项目所有者决定拆分、扩大范围或取消。
+- 默认最多 3 轮审查—修复往返。达到上限仍未通过时转 `BLOCKED`，Master 可在既有项目范围和授权内决定拆分或取消，并记录理由。需要改变项目范围、方向或涉及其他须由所有者决定的事项时，进入 `NEEDS_HUMAN_DECISION`。
 
 ### 4.1 验收证据矩阵（Evidence Matrix）
 
@@ -373,7 +373,7 @@ python3 scripts/delivery_risk.py --repo PATH --base REF --head REF [--json]
 
 - 退出码：`0` 成功；`1` 部分成功 / 失败 / 阻塞；`2` 输入或前置检查非法（未开始写入）。`1` 与 `2` 都不得当作通过。
 - `--journal` 是本地恢复记录，不是任务库、Issue 登记块或证据矩阵的替代，也不得写在仓库或任务 Worktree 内。恢复判断以 Git 与权威载体为准，journal 只能帮助定位，不能单独证明交付。
-- `--merge` 要求 `--authorization` 与计划中的授权文本逐字一致；合并后仍必须在主分支执行合并后验证，通过后才转 `VERIFIED`（2.2 节）。
+- `--merge` 要求 `--authorization` 与计划中非空的 `finalize.authorization` 逐字一致。Master 负责在调用前核对实际授权及适用范围，可沿用有效的常设授权，并按第 4 节记录。对于这个授权参数，工具只校验文本匹配。合并后仍必须在主分支执行合并后验证，通过后才转 `VERIFIED`（2.2 节）。
 - `run` 在任何 Agent 启动前完成权威派发：`github` 枚举开放 PR、其他活动 Issue 登记块并写入本批次 `mode: batch` 的 `ORCH-TASK-REGISTRY`（`status: DISPATCHED`），`local` 通过 `task ready` / `task dispatch` 取得路径锁并核对任务库的路径、AC 与当前锁。载体缺失、任务记录不一致、枚举截断或派发失败时阻塞，不以 `not_applicable` 代替；已取得的锁按 3.1 节保留。
 - `finalize` 以**生效分支规则**（`repos/{owner}/{repo}/rules/branches/{base}`）得到实际必需 contexts 与集成身份，并用审查 head 上的 check-runs 核对名称、app identity、完成状态与 success；计划中的 `required_checks` 只能是实际集合的子集。规则不可读、集合为空、check-run 缺失/失败/身份不符或列表被截断时阻塞，不得用计划自报或 `gh pr checks` 的观测结果代替平台配置。
 - `L0` 自动合并不启动第二模型，但必须有逐条 AC 的机器证据（计划的 `acceptance_checks`）和在**审查 head 上事后生成**的 Master attestation（`--acceptance-attestation`，绑定 head 与 diff、逐条 PASS 且有可定位证据），或独立审查；缺任一项时阻塞。`L1` / `L2` 的审查提示包含逐任务 AC、验证命令与记录，审查者仍须逐条判定。
