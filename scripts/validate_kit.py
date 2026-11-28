@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static validation for the Agent-Orchestration kit (core + local/github editions)."""
+"""Static validation for the Agent-Orchestration kit (core + the github edition)."""
 from pathlib import Path
 import argparse, fnmatch, hashlib, importlib.util, json, os, posixpath, re, runpy, stat, sys
 
@@ -24,7 +24,6 @@ REQUIRED = [
     'editions/github/active-task-registry.md', 'editions/github/issue-template.md',
     'editions/github/execution.md', 'editions/github/master.md',
     'editions/github/pr-template.md',
-    'editions/local/master.md', 'editions/local/execution.md',
     'templates/architecture/README.md', 'templates/architecture/contract.example.json',
     'templates/batch-delivery.md',
     'templates/contract-decision-log.md', 'templates/design.md',
@@ -267,7 +266,7 @@ EXTERNAL_LINK_PREFIXES = ('http://', 'https://', 'mailto:', '#')
 # the core contract (`kit/orchestration.md` for the 1.7.1 bridge release;
 # `CORE_DOC` below is the machine-readable copy of that path). This module reads
 # that definition back (it does not restate it) and enforces it on the
-# local/github task templates. If the doc drifts away from the contract floor
+# github task templates. If the doc drifts away from the contract floor
 # below, validation fails instead of silently accepting a second definition.
 CORE_DOC = 'kit/orchestration.md'
 TASK_PACKET_DOC = 'templates/task-packet.md'
@@ -1859,40 +1858,29 @@ def validate_kit(root=ROOT, project_ready=False):
     if not isolated:
         errors.extend(check_release_manifest(root))
 
-    # The two editions must expose the same public file set; github additionally
-    # ships three templates. Comparing the *intersection* catches a file that
-    # exists on only one side, while comparing each side against its expected set
-    # catches strays.
-    common_edition_files = ('master.md', 'execution.md')
-    github_only_files = ('active-task-registry.md', 'issue-template.md', 'pr-template.md')
-    edition_names = {}
-    for edition in ('local', 'github'):
-        directory = root / 'editions' / edition
-        if not directory.is_dir():
-            errors.append(f'missing edition directory: editions/{edition}')
-            edition_names[edition] = set()
-            continue
+    # Only the github edition ships. The retired local edition must not linger
+    # in the tree or the package: a leftover `editions/local/` would be a
+    # second, unsupported carrier inside the release.
+    github_files = ('active-task-registry.md', 'execution.md', 'issue-template.md',
+                    'master.md', 'pr-template.md')
+    if (root / 'editions' / 'local').exists():
+        errors.append('retired edition directory must be removed: editions/local '
+                      '(the mainline ships the github edition only)')
+    github_dir = root / 'editions' / 'github'
+    if not github_dir.is_dir():
+        errors.append('missing edition directory: editions/github')
+    else:
         try:
-            actual = {p.name for p in directory.iterdir() if p.is_file()}
+            actual = {p.name for p in github_dir.iterdir() if p.is_file()}
         except OSError as exc:
             code = exc.errno if isinstance(exc.errno, int) else 'unknown'
-            errors.append(f'cannot enumerate editions/{edition} (errno {code})')
-            edition_names[edition] = None
-            continue
-        edition_names[edition] = actual
-        expected = set(common_edition_files) | (set(github_only_files) if edition == 'github' else set())
-        for name in sorted(expected - actual):
-            errors.append(f'editions/{edition} is missing file: {name}')
-        for name in sorted(actual - expected):
-            errors.append(f'editions/{edition} contains unexpected file: {name}')
-    if edition_names.get('local') is not None and edition_names.get('github') is not None:
-        shared = edition_names['local'] & edition_names['github']
-        if shared != set(common_edition_files):
-            errors.append('editions/local and editions/github disagree on the shared file set: '
-                          f'intersection={sorted(shared)}')
-    for name in github_only_files:
-        if not (root / 'editions' / 'github' / name).is_file():
-            errors.append(f'missing github-only template: editions/github/{name}')
+            errors.append(f'cannot enumerate editions/github (errno {code})')
+            actual = None
+        if actual is not None:
+            for name in sorted(set(github_files) - actual):
+                errors.append(f'editions/github is missing file: {name}')
+            for name in sorted(actual - set(github_files)):
+                errors.append(f'editions/github contains unexpected file: {name}')
 
     # The core orchestration document must really define the governance concepts it
     # is supposed to own: PR_OPEN (github-only state), merge gates G1-G6, runtime
@@ -1968,11 +1956,16 @@ def validate_kit(root=ROOT, project_ready=False):
         match = re.search(r'^\s*[-*]\s*`?edition`?\s*[:：]\s*`?([A-Za-z0-9_-]+)`?', config_text, re.M)
         if not match:
             errors.append('docs/PROJECT.md is missing the `edition` key '
-                          "(expected `edition`: `local` or `github`)")
+                          "(expected `edition`: `github`)")
         else:
             edition_value = match.group(1)
-            if edition_value not in ('local', 'github'):
-                errors.append("docs/PROJECT.md `edition` must be 'local' or 'github', "
+            if edition_value == 'local':
+                errors.append("docs/PROJECT.md `edition` is the retired value 'local': "
+                              'the mainline ships the github edition only; stay on Release '
+                              'v2.0.0 or run the one-time migration in '
+                              'kit/orchestration.md section 6')
+            elif edition_value != 'github':
+                errors.append("docs/PROJECT.md `edition` must be 'github', "
                               f"got {edition_value!r}")
 
     # Governance concepts are only meaningful in documentation. Scan document-class
@@ -2089,7 +2082,7 @@ def main(argv=None):
     layout = 'isolated (host: agentorch/ + root AGENTS.md)' if isolated else f'tree mode {mode}'
     print(f'Kit validation passed ({required_count} required files checked; '
           f'{layout}; '
-          f'editions local/github share 2 files, github adds 3 templates; '
+          f'editions/github carries 5 files (local edition retired); '
           f'{documents} repository-only document(s) checked; '
           f'{sample_count} task packet samples validated).')
     manual = plan_status_manual_lines(ROOT)

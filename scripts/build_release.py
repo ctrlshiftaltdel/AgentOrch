@@ -77,7 +77,7 @@ Self-checks (see release/README.md for the published standard):
   m. inside the extracted archive: `scripts/batch_delivery.py --help` and
      `scripts/delivery_risk.py --help` both exit 0 and identify their command,
      and `scripts/batch_delivery.py check` accepts a one-task plan in a throwaway
-     Git repository (edition `local`), prints the task id and edition, and leaves
+     Git repository (edition `github`), prints the task id and edition, and leaves
      that repository clean. The packaged batch capability must therefore work
      without network, a real OpenCode session, a real `gh`, or a model.
   h. inside the extracted archive: `scripts/architecture/check.py` exits 0 with
@@ -358,7 +358,7 @@ def _prepare_batch_self_check_repo(repo):
     (repo / 'docs').mkdir()
     (repo / 'docs' / 'PROJECT.md').write_text(
         '# Project configuration\n\n'
-        '- `edition`: `local`\n'
+        '- `edition`: `github`\n'
         '- 允许改动路径：`app.py`、`tests/`、`docs/`\n'
         '- 永远禁止改动路径 / 文件：`LICENSE.md`\n',
         encoding='utf-8')
@@ -383,11 +383,12 @@ def _batch_self_check_plan(scratch_dir, repo):
     """Return a one-task batch plan with every absolute path under the temp dir.
 
     `check` is read-only: the plan only has to validate. The worktrees are named
-    but never created, `required_checks` is empty because this is a `local`
-    edition, and `authorization` is a non-empty literal because the coordinator
-    requires explicit authorization text even for `check` (this plan is never
-    pushed or merged). Verification commands are `sys.executable -c pass` so
-    nothing outside the standard library runs.
+    but never created. The project is `edition: github`, so one required check
+    name is present; `check` never contacts GitHub. `authorization` is a
+    non-empty literal because the coordinator requires explicit authorization
+    text even for `check` (this plan is never pushed or merged). Verification
+    commands are `sys.executable -c pass` so nothing outside the standard
+    library runs.
     """
     worktrees = scratch_dir / 'worktrees'
     task_id = BATCH_SELF_CHECK_TASK_ID
@@ -418,7 +419,7 @@ def _batch_self_check_plan(scratch_dir, repo):
         'finalize': {
             'verify': [[sys.executable, '-c', 'pass']],
             'post_merge_verify': [[sys.executable, '-c', 'pass']],
-            'required_checks': [],
+            'required_checks': ['checks (release self-check)'],
             'merge_method': 'merge',
             'authorization': 'release self-check only; this plan is never merged',
         },
@@ -466,9 +467,9 @@ def batch_capability_errors(pkg_root, scratch_dir):
         if f'{BATCH_SELF_CHECK_TASK_ID}:' not in out:
             failures.append('(m) batch_delivery.py check did not print the task id '
                             f'{BATCH_SELF_CHECK_TASK_ID!r}:\n{indent(out)}')
-        if 'edition: local' not in out:
+        if 'edition: github' not in out:
             failures.append('(m) batch_delivery.py check did not print edition '
-                            f'"local":\n{indent(out)}')
+                            f'"github":\n{indent(out)}')
     rc, status = run(['git', 'status', '--porcelain'], repo)
     if rc != 0:
         failures.append('(m) cannot read the throwaway repository status '
