@@ -32,7 +32,10 @@
 - 所有者于 2026-11-23 决定以 GitHub-only 支持范围降低长期维护成本。退场拆成三张 Issue：无库 GitHub 初始化（#279，已合并）、主线收口与移除 SQLite 调度（#280，本阶段）、下一代发行（#281，不在本任务范围）。
 - 顺序：先合入 #279 的无库初始化，再在 #280 移除 `local` 调度并同步受支持范围（契约 / 配置 / CLI / 批次 / 发行清单 / 测试），最后才进入 MAJOR 发布单。`local` 安装固定在被验证的 Release `v2.0.0`；主线不提供自动回退，只提供整体回到 `v2.0.0` 的单次路径。
 - #250 的 AC6 新候选改用 `github` 验收口径；历史双底座证据按原提交保留，不得改写为当前支持范围。
-- 未完成项：`docs/testing/delivery-regression-scenarios.md` 的场景表随本地调度场景退役仍需同步（不在 #280 允许路径内）。
+- 未完成项（均因不在 #280 允许路径内而保留，需另立任务或扩范围）：
+  - `docs/testing/delivery-regression-scenarios.md` 的场景表需随本地调度场景退役同步；
+  - `tests/test_update_entry.py`（随包发布）仍钉住“更新入口为 local 编造任务包”的旧行为，因此 `scripts/update_agentorch/{cli,entry,engine}.py` 的 local 退场被阻塞：任何让它失败的改动都会破坏该随包测试。当前更新入口仍接受 `edition: local` 并生成指向已退役 CLI 命令的 next_steps，需在允许修改该测试的任务中一并收口；
+  - `docs/design/verification-planner-b-contract.md` 仍以 `editions/local/master.md` 作为冻结契约样例路径（仓库文档，不随包发布）。
 
 ## 边界与证据
 
